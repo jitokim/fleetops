@@ -44,8 +44,8 @@ def _sample_fleet() -> list[LoopSnapshot]:
         LoopSnapshot("l3", "aboard·slice-5", g("Bifrost gateway integration"),
                      state=LoopState.RUNNING, cycle=4, tokens_spent=54_000,
                      last_verdict=Verdict(Outcome.PROGRESS, "3/6 acceptance checks green")),
-        LoopSnapshot("l4", "spec-0.3-review", g("5-round adversarial review"),
-                     state=LoopState.DONE, cycle=5, tokens_spent=96_000, goal=Goal("review", max_cycles=5),
+        LoopSnapshot("l4", "spec-0.3-review", Goal("5-round adversarial review", max_cycles=5),
+                     state=LoopState.DONE, cycle=5, tokens_spent=96_000,
                      last_verdict=Verdict(Outcome.DONE, "converged — all rounds verified")),
     ]
 
