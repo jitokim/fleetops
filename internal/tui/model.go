@@ -1,9 +1,11 @@
 // Package tui is the fleet cockpit (Bubble Tea): aggregate list + right-pane
 // detail + one-key action, refreshed from the Claude Code logs (seed spec §UX).
+// Visual language matches the approved mockup (html-artifacts/mission-control-tui.html).
 package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -36,15 +38,38 @@ func tick() tea.Cmd {
 	return tea.Tick(refreshEvery, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
+// statusKind colors the status/result line above the keybar (resume
+// successes read green, failures red — anything else is neutral/dim).
+type statusKind int
+
+const (
+	statusNeutral statusKind = iota
+	statusOK
+	statusErr
+)
+
 type Model struct {
-	loops    []domain.Loop
-	cursor   int
-	w, h     int
-	status   string
-	lastScan time.Time
+	loops      []domain.Loop
+	cursor     int
+	w, h       int
+	status     string
+	statusKind statusKind
+	lastScan   time.Time
+	start      time.Time // for the header's uptime clock
+	hostname   string
 }
 
-func New() Model { return Model{status: "watching ~/.claude/projects"} }
+func New() Model {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "localhost"
+	}
+	return Model{
+		status:   "watching ~/.claude/projects",
+		start:    time.Now(),
+		hostname: host,
+	}
+}
 
 func (m Model) Init() tea.Cmd { return tea.Batch(scan, tick()) }
 
@@ -79,16 +104,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			sel, ok := m.selected()
 			if !ok || sel.State != domain.StateStalled {
-				m.status = "select a stalled loop to resume"
+				m.status, m.statusKind = "select a stalled loop to resume", statusNeutral
 				return m, nil
 			}
-			m.status = fmt.Sprintf("resuming %s...", sel.Project)
+			m.status, m.statusKind = fmt.Sprintf("resuming %s...", sel.Project), statusNeutral
 			return m, resumeCmd(sel)
 		case "enter":
-			m.status = "attach/open — TODO (needs cmux integration)"
+			m.status, m.statusKind = "attach/open — TODO (needs cmux integration)", statusNeutral
 		}
 	case resumeResultMsg:
 		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
 	}
 	return m, nil
 }
@@ -133,70 +163,162 @@ func (m Model) selected() (domain.Loop, bool) {
 	return domain.Loop{}, false
 }
 
-func (m Model) View() string {
-	var b strings.Builder
+// termWidth is the usable render width, guarding against 0 before the first
+// tea.WindowSizeMsg arrives.
+func (m Model) termWidth() int {
+	if m.w <= 0 {
+		return 80
+	}
+	return m.w
+}
 
-	// header
-	stalled, idle := 0, 0
+// counts tallies loop states for the summary band and keybar.
+func (m Model) counts() (total, running, stalled, idle int) {
+	total = len(m.loops)
 	for _, l := range m.loops {
 		switch l.State {
+		case domain.StateRunning:
+			running++
 		case domain.StateStalled:
 			stalled++
 		case domain.StateIdle:
 			idle++
 		}
 	}
-	b.WriteString(stTitle.Render("◎ MISSIONCTL"))
-	b.WriteString(stFaint.Render("  fleet cockpit"))
+	return
+}
+
+func (m Model) View() string {
+	width := m.termWidth()
+	var b strings.Builder
+
+	b.WriteString(renderHeaderRow(m, width))
 	b.WriteString("\n")
-	summary := fmt.Sprintf("loops %d · %s %d stalled", len(m.loops), "⚠", stalled)
-	if idle > 0 {
-		summary += fmt.Sprintf(" · %d idle", idle)
-	}
-	summary += fmt.Sprintf(" · window %s", claude.ActiveWindow)
-	b.WriteString(stDim.Render(summary))
+	b.WriteString(renderRule(width))
+	b.WriteString("\n")
+
+	total, running, stalled, idle := m.counts()
+	b.WriteString(renderSummaryBand(total, running, stalled, idle, width))
 	b.WriteString("\n\n")
 
-	// table
-	b.WriteString(renderHeader())
+	b.WriteString(stFaint.Render("LOOPS"))
+	b.WriteString("\n")
+
+	wName, wNote := columnWidths(width)
+	b.WriteString(renderTableHeader(wName, wNote))
 	b.WriteString("\n")
 	if len(m.loops) == 0 {
 		b.WriteString(stFaint.Render("  no active Claude Code loops in the window.\n"))
 	}
 	dupLabels := duplicateLabels(m.loops)
 	for i, l := range m.loops {
-		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project]))
+		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wNote, width))
 		b.WriteString("\n")
 	}
 
 	// detail
 	if sel, ok := m.selected(); ok {
-		b.WriteString(renderDetail(sel))
+		b.WriteString(renderDetail(sel, width))
 	}
 
-	// keybar
+	// status line (its own line, above the keybar) + keybar
 	b.WriteString("\n")
-	b.WriteString(renderKeybar(m.status))
+	if line := renderStatusLine(m.status, m.statusKind); line != "" {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString(renderKeybar(len(m.loops), width))
 	return b.String()
+}
+
+// ── header / band / rule ────────────────────────────────────
+
+// renderHeaderRow: left "◎ MISSIONCTL  fleet cockpit", right-aligned
+// "● LIVE · <uptime> up · <hostname>".
+func renderHeaderRow(m Model, width int) string {
+	left := stTitle.Render("◎ MISSIONCTL") + stFaint.Render("  fleet cockpit")
+	right := stLive.Render("●") + stDim.Render(" LIVE · ") +
+		stDim.Bold(true).Render(formatUptime(time.Since(m.start))) +
+		stDim.Render(" up · "+m.hostname)
+	return padBetween(left, right, width)
+}
+
+func renderRule(width int) string {
+	return lipgloss.NewStyle().Foreground(cLine).Render(strings.Repeat("─", width))
+}
+
+// renderSummaryBand: "fleet N · x run · y stalled · z idle" (zero segments
+// omitted, fleet always shown) with a right-aligned amber "▲ N STALLED NEED
+// YOU" badge when anything is stalled — the mockup's gate badge, repurposed
+// honestly for stalls (the observation MVP has no oracle/gate data yet).
+func renderSummaryBand(total, running, stalled, idle int, width int) string {
+	parts := []string{stDim.Render(fmt.Sprintf("fleet %d", total))}
+	if running > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cBlue).Render(fmt.Sprintf("%d run", running)))
+	}
+	if stalled > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cAmber).Render(fmt.Sprintf("%d stalled", stalled)))
+	}
+	if idle > 0 {
+		parts = append(parts, stDim.Render(fmt.Sprintf("%d idle", idle)))
+	}
+	left := strings.Join(parts, stFaint.Render(" · "))
+
+	right := ""
+	if stalled > 0 {
+		right = stBadgeStalled.Render(fmt.Sprintf("▲ %d STALLED NEED YOU", stalled))
+	}
+	return padBetween(left, right, width)
 }
 
 // ── row rendering ──────────────────────────────────────────
 
 const (
 	wMarker = 2
-	wName   = 20
 	wState  = 12
 	wLast   = 14
-	wNote   = 30
 )
 
-func renderHeader() string {
+// minWidthForNote: below this terminal width the NOTE column is dropped
+// entirely (not just truncated) so NAME/STATE stay legible.
+const minWidthForNote = 70
+
+// columnWidths sizes NAME/NOTE from the remaining width after the fixed
+// columns (marker/state/last) and inter-column gaps; NOTE is dropped below
+// minWidthForNote, and NAME always keeps a usable minimum.
+func columnWidths(width int) (wName, wNote int) {
+	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
+	// leading "  " indent plus cell boundaries need a little slack.
+	fixed := wMarker + wState + wLast + gaps
+	remaining := width - fixed
+	if width >= minWidthForNote {
+		wNote = 24
+		remaining -= wNote
+	}
+	wName = remaining
+	if wName < 10 {
+		wName = 10
+	}
+	// Cap NAME so wide terminals don't stretch it into a chasm between
+	// columns (mockup keeps the table compact); spare width goes to NOTE.
+	if wName > 28 {
+		if wNote > 0 {
+			wNote += wName - 28
+		}
+		wName = 28
+	}
+	return wName, wNote
+}
+
+func renderTableHeader(wName, wNote int) string {
 	cells := []string{
 		stHeader.Width(wMarker).Render(""),
-		stHeader.Width(wName).Render("PROJECT"),
+		stHeader.Width(wName).Render("NAME"),
 		stHeader.Width(wState).Render("STATE"),
-		stHeader.Width(wLast).Render("LAST ACTIVITY"),
-		stHeader.Width(wNote).Render("NOTE"),
+		stHeader.Width(wLast).Render("LAST"),
+	}
+	if wNote > 0 {
+		cells = append(cells, stHeader.Width(wNote).Render("NOTE"))
 	}
 	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, cells...)
 }
@@ -217,12 +339,14 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 	return dup
 }
 
-func renderRow(l domain.Loop, sel bool, dup bool) string {
+func renderRow(l domain.Loop, sel bool, dup bool, wName, wNote, totalWidth int) string {
 	marker := " "
+	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
 	if sel {
 		marker = "▸"
+		markerStyle = lipgloss.NewStyle().Foreground(cAccent)
 	}
-	st := lipgloss.NewStyle().Foreground(stateColor(l))
+	st := stateStyle(l)
 	note := ""
 	if l.Stall != domain.StallNone {
 		note = "⚠ " + string(l.Stall)
@@ -232,17 +356,21 @@ func renderRow(l domain.Loop, sel bool, dup bool) string {
 		label += "·" + shortID(l.SessionID)
 	}
 	cells := []string{
-		lipgloss.NewStyle().Foreground(cAccent).Width(wMarker).Render(marker),
+		markerStyle.Width(wMarker).Render(marker),
 		stInk.Width(wName).Render(trunc(label, wName-1)),
 		st.Width(wState).Render(stateLabel(l)),
 		stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))),
-		st.Width(wNote).Render(trunc(note, wNote-1)),
 	}
-	row := lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+	if wNote > 0 {
+		cells = append(cells, st.Width(wNote).Render(trunc(note, wNote-1)))
+	}
+	row := "  " + lipgloss.JoinHorizontal(lipgloss.Top, cells...)
 	if sel {
-		row = stSelRow.Render(row)
+		// pad to the full table width first so the selection background
+		// spans the whole row, like the mockup's .tr.sel.
+		row = stSelRow.Render(padToWidth(row, totalWidth))
 	}
-	return "  " + row
+	return row
 }
 
 // shortID is the first 4 chars of a session id, for disambiguating rows
@@ -254,44 +382,124 @@ func shortID(id string) string {
 	return id[:4]
 }
 
-func renderDetail(l domain.Loop) string {
+// ── detail pane ──────────────────────────────────────────────
+
+func renderDetail(l domain.Loop, width int) string {
+	// leave room for the ~8-col key + its gap before truncating long values
+	// (paths) so nothing overflows the terminal width.
+	valueWidth := width - 10
+	if valueWidth < 10 {
+		valueWidth = 10
+	}
+
 	var d strings.Builder
 	d.WriteString(stTitle.Render("▸ " + l.Project))
-	d.WriteString(stFaint.Render("  " + l.SessionID))
+	d.WriteString("  " + stFaint.Render(l.SessionID))
 	d.WriteString("\n")
-	d.WriteString(stFaint.Render("STATE   ") + lipgloss.NewStyle().Foreground(stateColor(l)).Render(stateLabel(l)))
-	d.WriteString("\n")
-	d.WriteString(stFaint.Render("LAST    ") + stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")"))
-	d.WriteString("\n")
-	d.WriteString(stFaint.Render("CWD     ") + stDim.Render(l.Cwd))
-	d.WriteString("\n")
-	if l.Stall != domain.StallNone {
-		d.WriteString(stFaint.Render("WHY     ") + lipgloss.NewStyle().Foreground(stateColor(l)).Render(string(l.Stall)))
-		d.WriteString("\n")
-		d.WriteString(stFaint.Render("        ") + stDim.Render("press r to resume (re-send prompt)"))
-		d.WriteString("\n")
-		d.WriteString(stFaint.Render("        ") + stDim.Render("manual: "+manualResumeHint(l.SessionID)))
-		d.WriteString("\n")
+	d.WriteString(detailRow("STATE", stateStyle(l).Render(stateLabel(l))))
+	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
+	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
+	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
+
+	if l.State == domain.StateStalled {
+		d.WriteString(renderResumeCallout(l, width))
 	}
-	d.WriteString(stFaint.Render("LOG     ") + stDim.Render(l.Path))
-	return stDetail.Render(d.String())
+	return stDetail.Width(width).Render(strings.TrimRight(d.String(), "\n"))
 }
 
-func renderKeybar(status string) string {
+// detailRow is one KEY  value line in the mockup's key-value grid (faint
+// uppercase key, ~8 cols wide).
+func detailRow(key, value string) string {
+	return stFaint.Width(8).Render(key) + value + "\n"
+}
+
+// renderResumeCallout is the mockup's amber gate-line, repurposed for a
+// stall: "RESUME ▸ <why>   r re-send prompt   manual: claude --resume <id>".
+// A 429 gets the red accent instead of amber (the turn didn't complete, it
+// was rejected — a sharper signal than a generic stall).
+func renderResumeCallout(l domain.Loop, width int) string {
+	box, accent, chip := stCalloutAmber, cAmber, stKeyChipAmber
+	if l.Stall == domain.StallRateLimit {
+		box, accent, chip = stCalloutRed, cRed, stKeyChipRed
+	}
+	// border(1) + padding(1) on each side.
+	contentWidth := width - 4
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+	line := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("RESUME ▸") +
+		" " + stInk.Render(string(l.Stall)) +
+		"   " + chip.Render("r") + stDim.Render(" re-send prompt") +
+		"   " + stDim.Render("manual: "+manualResumeHint(l.SessionID))
+	return "\n" + box.Width(contentWidth).Render(line)
+}
+
+// ── status line / keybar ─────────────────────────────────────
+
+// renderStatusLine shows the last resume result on its own line above the
+// keybar: green on success, red on failure, dim otherwise.
+func renderStatusLine(status string, kind statusKind) string {
+	if status == "" {
+		return ""
+	}
+	style := stDim
+	switch kind {
+	case statusOK:
+		style = lipgloss.NewStyle().Foreground(cGreen)
+	case statusErr:
+		style = lipgloss.NewStyle().Foreground(cRed)
+	}
+	return style.Render(status)
+}
+
+// renderKeybar: only keys that actually do something today — no
+// approve/pause/etc, those arrive with the engine.
+func renderKeybar(loopCount int, width int) string {
 	keys := []string{
 		stKey.Render("↑↓") + stDim.Render(" select"),
 		stKey.Render("r") + stDim.Render(" resume"),
 		stKey.Render("↵") + stDim.Render(" open"),
 		stKey.Render("q") + stDim.Render(" quit"),
 	}
-	bar := strings.Join(keys, stFaint.Render("  ·  "))
-	if status != "" {
-		bar += "    " + stFaint.Render(status)
-	}
-	return stKeybar.Render(bar)
+	left := strings.Join(keys, stFaint.Render("  ·  "))
+	right := stFaint.Render(fmt.Sprintf("missionctl v0.1 · %d loops · ⧗ %s", loopCount, refreshEvery))
+	return stKeybar.Width(width).Render(padBetween(left, right, width))
 }
 
-// ── helpers ────────────────────────────────────────────────
+// ── layout helpers ────────────────────────────────────────────
+
+// padBetween left-aligns left and right-aligns right within width, joined by
+// spaces. If right is empty, left is returned as-is (no trailing padding).
+func padBetween(left, right string, width int) string {
+	if right == "" {
+		return left
+	}
+	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// padToWidth right-pads s with spaces until it reaches width (visible
+// width, ANSI-aware via lipgloss.Width), so a background fill spans evenly.
+func padToWidth(s string, width int) string {
+	w := lipgloss.Width(s)
+	if w >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-w)
+}
+
+// formatUptime: mm:ss under an hour, hh:mm from an hour on.
+func formatUptime(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%02d:%02d", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%02d:%02d", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// ── misc helpers ────────────────────────────────────────────
 
 func rel(d time.Duration) string {
 	switch {

@@ -26,8 +26,8 @@ type StallKind string
 const (
 	StallNone      StallKind = ""
 	StallTokenOut  StallKind = "token budget exhausted"
-	StallRateLimit StallKind = "rate limited (429)"    // one-key re-send resumes
-	StallNoOutput  StallKind = "no output"             // hung / waiting on nothing
+	StallRateLimit StallKind = "rate limited (429)" // one-key re-send resumes
+	StallNoOutput  StallKind = "no output"          // hung / waiting on nothing
 )
 
 // Terminal reports whether no further work will happen for this loop.
