@@ -176,6 +176,13 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 // sharing that ProjectDir gets its Cwd healed to the confirmed-real lsof
 // path (overwriting the lossy decode) and CwdVerified set — the directory
 // itself is confirmed real, independent of which loop instance is live.
+//
+// Collision guard: encodeCwd is many-to-one (both "/" and "." collapse to
+// "-"), so two DISTINCT real directories — e.g. /x/foo-bar and /x/foo.bar —
+// can map to the SAME ProjectDir. When that happens for a given ProjectDir,
+// which real path is "the" real one is genuinely ambiguous, so healing is
+// skipped entirely for it: Cwd stays the lossy decode and CwdVerified stays
+// false, rather than risk silently healing to the WRONG one of the two.
 func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.Loop {
 	if !ok {
 		return loops // probe failed — do not reclassify the fleet on no data (P1-2)
@@ -183,9 +190,13 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.L
 
 	liveCountByProjectDir := make(map[string]int)
 	realPathByProjectDir := make(map[string]string)
+	collidedProjectDir := make(map[string]bool) // ProjectDir reached from >1 distinct real path
 	for realPath, count := range live {
 		pd := encodeCwd(realPath)
 		liveCountByProjectDir[pd] += count
+		if existing, seen := realPathByProjectDir[pd]; seen && existing != realPath {
+			collidedProjectDir[pd] = true
+		}
 		realPathByProjectDir[pd] = realPath
 	}
 
@@ -196,7 +207,7 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.L
 
 	drop := make(map[int]bool, len(loops))
 	for pd, idxs := range byProjectDir {
-		if realPath, matched := realPathByProjectDir[pd]; matched {
+		if realPath, matched := realPathByProjectDir[pd]; matched && !collidedProjectDir[pd] {
 			for _, i := range idxs {
 				loops[i].Cwd = realPath
 				loops[i].CwdVerified = true
@@ -293,14 +304,14 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 			l.State = domain.StateGate
 			l.Stall = domain.StallNone
 			l.GatePrompt = info.Message
-			l.GateTS = info.TS.Unix() // lets approveCmd compare-and-swap delete only the marker this decision was based on
+			l.GateTS = info.TS.UnixNano() // lets approveCmd compare-and-swap delete only the marker this decision was based on
 		} else {
 			// Compare-and-swap: only delete the marker this scan actually
 			// judged stale/non-gate. A plain delete-by-name could destroy a
 			// BRAND NEW marker that landed between the Pending() snapshot
 			// above and this delete (e.g. the human answered, then a fresh
 			// permission prompt fired moments later) — see gate.DeleteMarkerIfTS.
-			gate.DeleteMarkerIfTS(gatesDir, session, info.TS.Unix())
+			gate.DeleteMarkerIfTS(gatesDir, session, info.TS.UnixNano())
 		}
 	}
 	return l

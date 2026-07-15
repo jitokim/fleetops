@@ -466,7 +466,7 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 		// Controller.LocateClaude and the P0-3 hardening rationale.
 		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
-			return resumeResultMsg{false, "surface not found — resume manually: " + manualResumeHint(l.SessionID)}
+			return resumeResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: " + manualResumeHint(l.SessionID)}
 		}
 		prompt, ok := claude.LastUserPrompt(l.Path)
 		note := ""
@@ -530,7 +530,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// never a bare shell (see resumeCmd's identical rationale).
 		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
-			return approveResultMsg{false, "surface not found — approve manually: attach and press Enter"}
+			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
 		}
 		if err := ctrl.Approve(target); err != nil {
 			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
@@ -588,7 +588,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// "/exit" into an unrelated shell pane would be a real hazard.
 		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
-			return killResultMsg{false, "surface not found — kill manually: type /exit"}
+			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
 		}
 		if err := ctrl.Resume(target, "/exit"); err != nil {
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
@@ -609,7 +609,7 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		// never a bare shell (see resumeCmd's identical rationale).
 		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
-			return interruptResultMsg{false, "surface not found — stop manually: press Esc"}
+			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
 		}
 		if err := ctrl.Interrupt(target); err != nil {
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}

@@ -274,6 +274,9 @@ func TestLoopFromLog_ActivePermissionPromptType_BeatsAnyTailClassification(t *te
 	if l.GatePrompt != "Permission required to run: Bash(npm test)" {
 		t.Errorf("GatePrompt = %q, want %q", l.GatePrompt, "Permission required to run: Bash(npm test)")
 	}
+	if l.GateTS != fi.ModTime().UnixNano() {
+		t.Errorf("GateTS = %d, want %d (nanoseconds, so approveCmd's CAS delete can distinguish same-second markers)", l.GateTS, fi.ModTime().UnixNano())
+	}
 	if l.Stall != domain.StallNone {
 		t.Errorf("Stall = %v, want %v (gated, not stalled)", l.Stall, domain.StallNone)
 	}
@@ -297,9 +300,14 @@ func TestLoopFromLog_ActiveIdlePromptType_NotGated_MarkerDeleted(t *testing.T) {
 	if err := gate.WriteMarker(gatesDir, session, "Claude is waiting for your input", "idle_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
-	pending := map[string]gate.Info{
-		session: {Type: "idle_prompt", Message: "Claude is waiting for your input", TS: fi.ModTime()},
-	}
+	// Read back the REAL on-disk TS rather than fabricating one — mirroring
+	// production, where pending always comes from gate.Pending(gatesDir)
+	// reading this exact file. DeleteMarkerIfTS's compare-and-swap only
+	// deletes when the on-disk TS matches; nanosecond precision means even
+	// a sub-millisecond gap between a synthetic TS and the real one would
+	// (correctly) refuse the delete — see TestLoopFromLog_StaleGate_DeletedAndIgnored's
+	// identical fixture-consistency requirement.
+	pending := gate.Pending(gatesDir)
 
 	l := loopFromLog(path, fi, fi.ModTime(), gatesDir, pending)
 	if l.State != domain.StateIdle {
@@ -357,7 +365,7 @@ func TestLoopFromLog_StaleGate_DeletedAndIgnored(t *testing.T) {
 	// sync to exercise the stale-cleanup path.
 	if err := os.WriteFile(
 		filepath.Join(gatesDir, session+".json"),
-		[]byte(fmt.Sprintf(`{"message":"old question","type":"permission_prompt","ts":%d}`, staleTS.Unix())),
+		[]byte(fmt.Sprintf(`{"message":"old question","type":"permission_prompt","ts":%d}`, staleTS.UnixNano())),
 		0o644,
 	); err != nil {
 		t.Fatalf("write stale marker fixture: %v", err)
@@ -672,6 +680,31 @@ func TestApplyLiveness_HealsCwdEvenWhileDemotedToGone(t *testing.T) {
 	}
 	if demoted.Cwd != "/x/aboard" || !demoted.CwdVerified {
 		t.Errorf("got Cwd=%q CwdVerified=%v, want healed even though this loop was demoted", demoted.Cwd, demoted.CwdVerified)
+	}
+}
+
+func TestApplyLiveness_EncodeCwdCollision_DoesNotHealCwd(t *testing.T) {
+	// /x/foo-bar and /x/foo.bar BOTH encode to "-x-foo-bar" (encodeCwd
+	// collapses both "/" and "." to "-") — two live claudes at those
+	// distinct real paths means it's genuinely ambiguous which one a loop
+	// with ProjectDir "-x-foo-bar" actually lives in. Healing must refuse
+	// rather than silently pick (and potentially heal to) the wrong one.
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-x-foo-bar", Cwd: "/x/foo-bar", State: domain.StateIdle, LastActivity: now, CwdVerified: false},
+	}
+	live := map[string]int{
+		"/x/foo-bar": 1,
+		"/x/foo.bar": 1,
+	}
+
+	out := applyLiveness(loops, live, true)
+
+	if out[0].CwdVerified {
+		t.Errorf("CwdVerified = true, want false — the ProjectDir is ambiguous between two distinct real paths")
+	}
+	if out[0].Cwd != "/x/foo-bar" {
+		t.Errorf("Cwd = %q, want the original lossy decode left untouched (%q)", out[0].Cwd, "/x/foo-bar")
 	}
 }
 

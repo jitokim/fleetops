@@ -1,7 +1,6 @@
 package control
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -91,7 +90,7 @@ func TestLocateVsLocateClaude_ShellPaneFirstClaudePaneSecond(t *testing.T) {
 
 	var locateTarget Target
 	for _, tg := range parseTmuxPanes(out) {
-		if strings.ReplaceAll(tg.Cwd, "/", "-") == projectDir {
+		if encodeCwd(tg.Cwd) == projectDir {
 			locateTarget = tg
 			break
 		}
@@ -100,15 +99,46 @@ func TestLocateVsLocateClaude_ShellPaneFirstClaudePaneSecond(t *testing.T) {
 		t.Errorf("Locate's selection = %+v, want the shell pane (%%3, first match)", locateTarget)
 	}
 
-	var locateClaudeTarget Target
-	for _, tg := range parseTmuxClaudePanes(out) {
-		if strings.ReplaceAll(tg.Cwd, "/", "-") == projectDir {
-			locateClaudeTarget = tg
-			break
-		}
+	locateClaudeTarget, ok := selectClaudeTmuxPane(parseTmuxClaudePanes(out), projectDir)
+	if !ok {
+		t.Fatal("expected ok=true — exactly one claude pane matches")
 	}
 	if locateClaudeTarget.ID != "%7" {
 		t.Errorf("LocateClaude's selection = %+v, want the claude pane (%%7)", locateClaudeTarget)
+	}
+}
+
+func TestSelectClaudeTmuxPane_TwoClaudePanesSameCwd_Refuses(t *testing.T) {
+	// Residual #1: two claude panes at the same directory — no way to tell
+	// which one was meant, so the backstop must refuse rather than pick
+	// either (whichever tmux happens to list first).
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tclaude\n%7\t/Users/imac/IdeaProjects/aboard\tclaude\n"
+	if _, ok := selectClaudeTmuxPane(parseTmuxClaudePanes(out), "-Users-imac-IdeaProjects-aboard"); ok {
+		t.Error("expected ok=false — two claude panes share this directory, ambiguous")
+	}
+}
+
+func TestSelectClaudeTmuxPane_OneClaudePane_Found(t *testing.T) {
+	out := "%7\t/Users/imac/IdeaProjects/aboard\tclaude\n"
+	target, ok := selectClaudeTmuxPane(parseTmuxClaudePanes(out), "-Users-imac-IdeaProjects-aboard")
+	if !ok {
+		t.Fatal("expected ok=true — exactly one claude pane")
+	}
+	if target.ID != "%7" {
+		t.Errorf("got ID %q, want %%7", target.ID)
+	}
+}
+
+func TestSelectClaudeTmuxPane_DotContainingCwd_Matches(t *testing.T) {
+	// Residual #4: encodeCwd (both "/" and "." -> "-") lets a dot-containing
+	// pane cwd actuate instead of always degrading.
+	out := "%7\t/x/foo.bar\tclaude\n"
+	target, ok := selectClaudeTmuxPane(parseTmuxClaudePanes(out), "-x-foo-bar")
+	if !ok {
+		t.Fatal("expected ok=true — encodeCwd must match the dot-containing cwd")
+	}
+	if target.ID != "%7" {
+		t.Errorf("got ID %q, want %%7", target.ID)
 	}
 }
 

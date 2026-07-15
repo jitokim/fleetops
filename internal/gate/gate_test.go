@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -83,7 +84,7 @@ func TestDeleteMarkerIfTS_MatchingTS_Deletes(t *testing.T) {
 	if err := WriteMarker(dir, "s1", "msg", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
-	ts := Pending(dir)["s1"].TS.Unix()
+	ts := Pending(dir)["s1"].TS.UnixNano()
 
 	if !DeleteMarkerIfTS(dir, "s1", ts) {
 		t.Error("expected DeleteMarkerIfTS to succeed with the matching TS")
@@ -98,7 +99,7 @@ func TestDeleteMarkerIfTS_MismatchedTS_Survives(t *testing.T) {
 	if err := WriteMarker(dir, "s1", "msg", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
-	ts := Pending(dir)["s1"].TS.Unix()
+	ts := Pending(dir)["s1"].TS.UnixNano()
 
 	// simulate a FRESH marker having landed (different TS) between the
 	// caller's snapshot and the delete call — the stale delete must not
@@ -114,6 +115,81 @@ func TestDeleteMarkerIfTS_MismatchedTS_Survives(t *testing.T) {
 func TestDeleteMarkerIfTS_MissingFile(t *testing.T) {
 	if DeleteMarkerIfTS(t.TempDir(), "nope", 12345) {
 		t.Error("expected false for a missing marker")
+	}
+}
+
+func TestDeleteMarkerIfTS_SameSecondDifferentNano_WindowClosed(t *testing.T) {
+	// The whole point of the nanosecond migration: two markers landing
+	// within the SAME SECOND must still be distinguishable by TS — under
+	// the old seconds-scale TS they'd have been indistinguishable, and a
+	// stale-delete based on the old marker's TS could have destroyed a
+	// fresh one that arrived a few hundred milliseconds later in that same
+	// second.
+	dir := t.TempDir()
+	base := time.Date(2026, 1, 1, 12, 0, 0, 100_000_000, time.UTC) // :00.100
+	staleNanos := base.UnixNano()
+	freshNanos := base.Add(400 * time.Millisecond).UnixNano() // :00.500 — same second, different nano
+
+	if staleNanos/int64(time.Second) != freshNanos/int64(time.Second) {
+		t.Fatal("test setup bug: the two timestamps must share the same whole second")
+	}
+
+	writeMarkerWithTS(t, dir, "s1", "fresh gate", "permission_prompt", freshNanos)
+
+	// A caller snapshotted the OLD marker's (stale) TS and decides to
+	// delete based on it — must refuse, since the on-disk TS is now the
+	// fresh one landed in the same second.
+	if DeleteMarkerIfTS(dir, "s1", staleNanos) {
+		t.Error("expected DeleteMarkerIfTS to refuse — the fresh, same-second marker must survive")
+	}
+	if len(Pending(dir)) != 1 {
+		t.Error("expected the fresh marker to survive the stale, same-second delete attempt")
+	}
+}
+
+func TestPending_LegacySecondsScaleTS_Normalized(t *testing.T) {
+	// a marker file written before the nanosecond migration has TS in unix
+	// seconds — Pending must still interpret it correctly (not as a
+	// nanosecond value, which would decode to a moment in 1970).
+	dir := t.TempDir()
+	legacySeconds := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC).Unix()
+	writeMarkerWithTS(t, dir, "legacy", "old-style marker", "permission_prompt", legacySeconds)
+
+	info, ok := Pending(dir)["legacy"]
+	if !ok {
+		t.Fatal("expected a pending entry")
+	}
+	if info.TS.Year() < 2020 {
+		t.Errorf("TS = %v, want ~2026 (legacy seconds-scale TS must be upgraded to nanos, not misread as epoch-1970)", info.TS)
+	}
+}
+
+func TestDeleteMarkerIfTS_LegacySecondsScale_MatchesNormalizedTS(t *testing.T) {
+	dir := t.TempDir()
+	legacySeconds := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC).Unix()
+	writeMarkerWithTS(t, dir, "legacy", "old-style marker", "permission_prompt", legacySeconds)
+
+	ts := Pending(dir)["legacy"].TS.UnixNano()
+
+	if !DeleteMarkerIfTS(dir, "legacy", ts) {
+		t.Error("expected DeleteMarkerIfTS to match a legacy seconds-scale marker via its normalized TS")
+	}
+}
+
+// writeMarkerWithTS writes a marker file with an explicit TS (nanoseconds),
+// bypassing WriteMarker's time.Now() stamp — used to construct
+// same-second-different-nanosecond fixtures precisely.
+func writeMarkerWithTS(t *testing.T, dir, sessionID, message, notificationType string, tsNanos int64) {
+	t.Helper()
+	data, err := json.Marshal(markerFile{Message: message, Type: notificationType, TS: tsNanos})
+	if err != nil {
+		t.Fatalf("marshal marker fixture: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir gates dir: %v", err)
+	}
+	if err := os.WriteFile(dir+"/"+sessionID+".json", data, 0o644); err != nil {
+		t.Fatalf("write marker fixture: %v", err)
 	}
 }
 

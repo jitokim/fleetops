@@ -277,7 +277,7 @@ func decodeOrcaTerminals(jsonBytes []byte) ([]orcaTerminal, bool) {
 func selectOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bool) {
 	var matches []orcaTerminal
 	for _, t := range terminals {
-		if strings.ReplaceAll(t.WorktreePath, "/", "-") == projectDir {
+		if encodeCwd(t.WorktreePath) == projectDir {
 			matches = append(matches, t)
 		}
 	}
@@ -300,25 +300,29 @@ func selectOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bo
 	return Target{}, false
 }
 
-// selectClaudeOrcaTerminal picks the freshest CONFIRMED Claude Code terminal
+// selectClaudeOrcaTerminal picks the SOLE confirmed Claude Code terminal
 // (✳-titled, connected, writable) sharing projectDir's worktreePath — tier-1
-// only, no fallback to a bare shell tab even if it's the only match (see
-// LocateClaude). Returns ok=false rather than degrade, unlike
-// selectOrcaTerminal's 3-tier fallback for attach.
+// only, no fallback to a bare shell tab (see LocateClaude). Unlike
+// selectOrcaTerminal's 3-tier fallback (which picks the freshest match for
+// attach), this refuses on ambiguity rather than picking a "best" one: if
+// MORE THAN ONE tier-1 terminal matches, there is no way to tell which one
+// the human actually meant, so ok=false — the authoritative backstop behind
+// the TUI's keypress-time fleet-ambiguity guard (see Controller.LocateClaude
+// and Model.refuseIfAmbiguous).
 func selectClaudeOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bool) {
 	var matches []orcaTerminal
 	for _, t := range terminals {
-		if strings.ReplaceAll(t.WorktreePath, "/", "-") == projectDir {
+		if encodeCwd(t.WorktreePath) != projectDir {
+			continue
+		}
+		if t.Connected && t.Writable && strings.HasPrefix(t.Title, claudeTabPrefix) {
 			matches = append(matches, t)
 		}
 	}
-	best, ok := bestOrcaTerminal(matches, func(t orcaTerminal) bool {
-		return t.Connected && t.Writable && strings.HasPrefix(t.Title, claudeTabPrefix)
-	})
-	if !ok {
+	if len(matches) != 1 {
 		return Target{}, false
 	}
-	return Target{Backend: "orca", ID: best.Handle, Cwd: best.WorktreePath}, true
+	return Target{Backend: "orca", ID: matches[0].Handle, Cwd: matches[0].WorktreePath}, true
 }
 
 // bestOrcaTerminal returns the highest-lastOutputAt terminal matching pred,

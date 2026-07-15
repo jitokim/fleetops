@@ -28,7 +28,7 @@ func (tmuxController) Locate(projectDir string) (Target, bool) {
 		return Target{}, false
 	}
 	for _, t := range parseTmuxPanes(out) {
-		if strings.ReplaceAll(t.Cwd, "/", "-") == projectDir {
+		if encodeCwd(t.Cwd) == projectDir {
 			return t, true
 		}
 	}
@@ -38,18 +38,33 @@ func (tmuxController) Locate(projectDir string) (Target, bool) {
 // LocateClaude is like Locate, but returns only a pane whose foreground
 // command is literally "claude" — typed/destructive actions must never land
 // on a bare shell pane that merely happens to share the directory (see
-// parseTmuxClaudePanes).
+// parseTmuxClaudePanes and selectClaudeTmuxPane).
 func (tmuxController) LocateClaude(projectDir string) (Target, bool) {
 	out, ok := tmuxListPanes()
 	if !ok {
 		return Target{}, false
 	}
-	for _, t := range parseTmuxClaudePanes(out) {
-		if strings.ReplaceAll(t.Cwd, "/", "-") == projectDir {
-			return t, true
+	return selectClaudeTmuxPane(parseTmuxClaudePanes(out), projectDir)
+}
+
+// selectClaudeTmuxPane picks the SOLE claude pane matching projectDir.
+// Refuses (ok=false) when MORE THAN ONE claude pane matches — same "no way
+// to tell which one was meant" reasoning as selectClaudeOrcaTerminal; the
+// authoritative backstop behind the TUI's keypress-time fleet-ambiguity
+// guard (see Controller.LocateClaude's doc). Pulled out of LocateClaude as
+// its own pure function so the ambiguity behavior is unit-testable without a
+// real tmux binary.
+func selectClaudeTmuxPane(candidates []Target, projectDir string) (Target, bool) {
+	var matches []Target
+	for _, t := range candidates {
+		if encodeCwd(t.Cwd) == projectDir {
+			matches = append(matches, t)
 		}
 	}
-	return Target{}, false
+	if len(matches) != 1 {
+		return Target{}, false
+	}
+	return matches[0], true
 }
 
 // tmuxListPanes runs the shared list-panes probe behind both Locate and

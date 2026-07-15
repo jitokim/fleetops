@@ -19,6 +19,23 @@ import (
 // perfectly atomic) — see IsGateActive.
 const staleSlack = 2 * time.Second
 
+// legacySecondsThreshold distinguishes a legacy on-disk TS (unix SECONDS,
+// written before markers moved to nanosecond precision) from a current
+// nanosecond-scale one: any real UnixNano timestamp for a remotely current
+// date is many orders of magnitude larger than this, while a legacy
+// unix-seconds TS is far below it. Lets old marker files on disk keep
+// working across the migration instead of being silently misinterpreted.
+const legacySecondsThreshold = 1_000_000_000_000 // 1e12
+
+// normalizeTSNanos upgrades a possibly-legacy on-disk TS to unix
+// nanoseconds — see legacySecondsThreshold.
+func normalizeTSNanos(ts int64) int64 {
+	if ts != 0 && ts < legacySecondsThreshold {
+		return ts * int64(time.Second)
+	}
+	return ts
+}
+
 // GatesDir is ~/.missionctl/gates (override for tests by passing an
 // explicit dir to the funcs below instead of calling this).
 func GatesDir() string {
@@ -36,7 +53,12 @@ type Info struct {
 	TS      time.Time
 }
 
-// markerFile is Info's on-disk JSON shape.
+// markerFile is Info's on-disk JSON shape. TS is unix NANOSECONDS (see
+// normalizeTSNanos for backward compat with markers written before this
+// migration, when TS was unix seconds) — nanosecond precision is what lets
+// DeleteMarkerIfTS's compare-and-swap actually distinguish two markers that
+// happen to land within the same second (a gate answered and immediately
+// replaced by a fresh one), which whole-second TS could not.
 type markerFile struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
@@ -54,7 +76,7 @@ func WriteMarker(dir, sessionID, message, notificationType string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(markerFile{Message: message, Type: notificationType, TS: time.Now().Unix()})
+	data, err := json.Marshal(markerFile{Message: message, Type: notificationType, TS: time.Now().UnixNano()})
 	if err != nil {
 		return err
 	}
@@ -83,7 +105,7 @@ func Pending(dir string) map[string]Info {
 			continue
 		}
 		sessionID := strings.TrimSuffix(e.Name(), ".json")
-		pending[sessionID] = Info{Message: m.Message, Type: m.Type, TS: time.Unix(m.TS, 0)}
+		pending[sessionID] = Info{Message: m.Message, Type: m.Type, TS: time.Unix(0, normalizeTSNanos(m.TS))}
 	}
 	return pending
 }
@@ -96,13 +118,18 @@ func DeleteMarker(dir, sessionID string) {
 }
 
 // DeleteMarkerIfTS deletes sessionID's marker ONLY if its current on-disk TS
-// (unix seconds) still equals ts — a compare-and-swap guard. Without it, a
-// caller that decided "this marker is stale/answered" based on a snapshot
-// taken moments (or seconds) ago could delete a BRAND NEW marker that
-// arrived in the meantime (a fresh permission prompt right after the old
-// one was answered) — the human would lose that gate notification with no
-// sign anything was wrong. Returns true if a matching marker was found and
-// deleted.
+// (unix NANOSECONDS — pass Info.TS.UnixNano() / domain.Loop.GateTS, both of
+// which are nanosecond-scale) still equals ts — a compare-and-swap guard.
+// Without it, a caller that decided "this marker is stale/answered" based on
+// a snapshot taken moments ago could delete a BRAND NEW marker that arrived
+// in the meantime (a fresh permission prompt right after the old one was
+// answered) — the human would lose that gate notification with no sign
+// anything was wrong. Nanosecond precision (rather than the old whole-second
+// TS) is what actually closes that window: two markers landing within the
+// same second used to be indistinguishable by TS, so a stale-delete could
+// still destroy a fresh one that arrived in the same second as the old one
+// — see the "same-second, different-nanosecond" test. Returns true if a
+// matching marker was found and deleted.
 func DeleteMarkerIfTS(dir, sessionID string, ts int64) bool {
 	path := filepath.Join(dir, sessionID+".json")
 	data, err := os.ReadFile(path)
@@ -113,7 +140,7 @@ func DeleteMarkerIfTS(dir, sessionID string, ts int64) bool {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return false
 	}
-	if m.TS != ts {
+	if normalizeTSNanos(m.TS) != ts {
 		return false
 	}
 	return os.Remove(path) == nil
@@ -123,7 +150,11 @@ func DeleteMarkerIfTS(dir, sessionID string, ts int64) bool {
 // session log's last write. The gate fired at markerTS; if the log's mtime
 // is more than staleSlack after that, new transcript entries were written
 // AFTER the gate fired — the human must have already answered (claude
-// resumed writing), so the marker is stale.
+// resumed writing), so the marker is stale. markerTS now carries real
+// nanosecond resolution (see markerFile's doc) rather than being truncated
+// to whole seconds; staleSlack's 2s window is compared via ordinary
+// time.Duration arithmetic, which is nanosecond-precision throughout, so no
+// change was needed here beyond the more precise input.
 func IsGateActive(markerTS, logMtime time.Time) bool {
 	return !logMtime.After(markerTS.Add(staleSlack))
 }

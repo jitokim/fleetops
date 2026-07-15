@@ -35,7 +35,7 @@ func (cmuxController) Locate(projectDir string) (Target, bool) {
 		return Target{}, false
 	}
 	for _, t := range parseCmuxTree(out) {
-		if strings.ReplaceAll(t.Cwd, "/", "-") == projectDir {
+		if encodeCwd(t.Cwd) == projectDir {
 			return t, true
 		}
 	}

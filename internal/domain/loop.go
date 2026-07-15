@@ -90,7 +90,7 @@ type Loop struct {
 	LastActivity time.Time // last log write
 	Stall        StallKind // why it went silent, if it did
 	LastText     string    // last assistant text (tail), for the detail pane's TAIL row
-	GateTS       int64     // unix seconds of the gate marker this loop's StateGate was derived from, if any — lets approveCmd compare-and-swap delete only the marker it actually decided on (see gate.DeleteMarkerIfTS)
+	GateTS       int64     // unix NANOSECONDS of the gate marker this loop's StateGate was derived from, if any — lets approveCmd compare-and-swap delete only the marker it actually decided on (see gate.DeleteMarkerIfTS; nanosecond precision is what lets the CAS distinguish two markers landing in the same second)
 }
 
 // BudgetFrac is the fraction of the token budget consumed (0..1).

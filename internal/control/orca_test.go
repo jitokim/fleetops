@@ -115,6 +115,49 @@ func TestSelectClaudeOrcaTerminal_PicksTier1EvenWithNewerTier2Present(t *testing
 	}
 }
 
+func TestSelectClaudeOrcaTerminal_TwoTier1Matches_Refuses(t *testing.T) {
+	// Residual #1: two confirmed claude terminals at the same directory —
+	// there is no way to tell which one the human meant, so LocateClaude's
+	// backstop must refuse rather than pick either (freshest-tab tiering
+	// would silently pick one, exactly the wrong-terminal hazard this exists
+	// to prevent).
+	terminals := []orcaTerminal{
+		{Handle: "term_a", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "✳ team", Connected: true, Writable: true, LastOutputAt: 1},
+		{Handle: "term_b", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "✳ team 2", Connected: true, Writable: true, LastOutputAt: 999},
+	}
+	if _, ok := selectClaudeOrcaTerminal(terminals, "-Users-imac-IdeaProjects-aboard"); ok {
+		t.Error("expected ok=false — two tier-1 matches is ambiguous, must refuse")
+	}
+}
+
+func TestSelectClaudeOrcaTerminal_OneTier1Match_Found(t *testing.T) {
+	terminals := []orcaTerminal{
+		{Handle: "term_a", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "✳ team", Connected: true, Writable: true, LastOutputAt: 1},
+	}
+	target, ok := selectClaudeOrcaTerminal(terminals, "-Users-imac-IdeaProjects-aboard")
+	if !ok {
+		t.Fatal("expected ok=true — exactly one tier-1 match")
+	}
+	if target.ID != "term_a" {
+		t.Errorf("got ID %q, want term_a", target.ID)
+	}
+}
+
+func TestSelectClaudeOrcaTerminal_DotContainingWorktreePath_Matches(t *testing.T) {
+	// Residual #4: encodeCwd (both "/" and "." -> "-") lets a dot-containing
+	// worktreePath actuate instead of always degrading.
+	terminals := []orcaTerminal{
+		{Handle: "term_a", WorktreePath: "/Users/imac/.claude-mem/observer-sessions", Title: "✳ team", Connected: true, Writable: true, LastOutputAt: 1},
+	}
+	target, ok := selectClaudeOrcaTerminal(terminals, "-Users-imac--claude-mem-observer-sessions")
+	if !ok {
+		t.Fatal("expected ok=true — encodeCwd must match the dot-containing path")
+	}
+	if target.ID != "term_a" {
+		t.Errorf("got ID %q, want term_a", target.ID)
+	}
+}
+
 func TestSelectClaudeOrcaTerminal_NoMatchAtAll(t *testing.T) {
 	terminals := []orcaTerminal{
 		{Handle: "term_a", WorktreePath: "/x/other", Title: "✳ team", Connected: true, Writable: true},
