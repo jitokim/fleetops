@@ -11,6 +11,7 @@ const (
 	StateRunning LoopState = "running" // a cycle is (or will be) executing
 	StateGate    LoopState = "gate"    // blocked, waiting on a human decision
 	StateStalled LoopState = "stalled" // silently stuck: token budget out / 429 / no output — recoverable
+	StateIdle    LoopState = "idle"    // turn complete, waiting on human — not an incident
 	StateDrift   LoopState = "drift"   // oracle rejected the agent's "done"
 	StateDone    LoopState = "done"    // oracle-verified converged
 	StateFailed  LoopState = "failed"  // governor stopped it, unrecoverable

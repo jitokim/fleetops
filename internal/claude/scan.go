@@ -34,6 +34,15 @@ func ProjectsDir() string {
 // Long-running loops keep writing (so they stay in); old finished sessions fall out.
 var ActiveWindow = 24 * time.Hour
 
+// IncludeHidden: when false (default), sessions whose project dir encodes a
+// hidden (dot-prefixed) path segment are filtered out. Claude Code encodes
+// both "/" and "." as "-", so a dot-dir doubles up a dash, e.g.
+// "/Users/imac/.claude-mem/observer/sessions" → "-Users-imac--claude-mem-observer-sessions".
+// Those are headless/infra sessions (agent tooling like claude-mem's
+// observer), not a human's loop, and otherwise drown out the real fleet.
+// A future flag can flip this to see them.
+var IncludeHidden = false
+
 // DiscoverLoops scans session logs and derives current fleet state, keeping only
 // sessions active within `within` (0 = keep all). Seed spec AC-1 + filter decision:
 // "recent activity + not cleanly ended" — the window drops days-old noise.
@@ -52,12 +61,22 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 		if within > 0 && now.Sub(fi.ModTime()) > within {
 			continue
 		}
+		if !IncludeHidden && isHiddenProjectDir(filepath.Base(filepath.Dir(path))) {
+			continue
+		}
 		loops = append(loops, loopFromLog(path, fi, now))
 	}
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].LastActivity.After(loops[j].LastActivity)
 	})
 	return loops, nil
+}
+
+// isHiddenProjectDir reports whether an encoded project dir contains a
+// dot-prefixed path segment (see IncludeHidden): "/" and "." both encode to
+// "-", so a hidden dir shows up as a double dash.
+func isHiddenProjectDir(dir string) bool {
+	return strings.Contains(dir, "--")
 }
 
 func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
@@ -80,40 +99,95 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
 	}
 
 	if idle {
-		l.State = domain.StateStalled
-		l.Stall = domain.StallNoOutput
-		if tailHasRateLimit(path) {
-			l.Stall = domain.StallRateLimit
-		}
+		l.State, l.Stall = tailState(path)
 	}
 	return l
 }
 
-// tailHasRateLimit reads the last few KB and looks for a recent rate-limit marker.
-func tailHasRateLimit(path string) bool {
+// tailState reads the tail of the session log ONCE and classifies why an
+// idle loop went quiet:
+//   - a rate-limit marker anywhere in the tail ⇒ StateStalled/StallRateLimit
+//     (a 429 means the turn did NOT complete, so this takes precedence over
+//     end_turn below even if both somehow appear in the tail)
+//   - otherwise, if the last user/assistant entry is an assistant message
+//     that finished its turn (stop_reason "end_turn") ⇒ StateIdle: the agent
+//     is done and waiting on a human, not stuck — not an incident
+//   - otherwise (mid-work: last entry is user/tool_result, or an assistant
+//     message that hasn't finished, e.g. tool_use) ⇒ StateStalled/StallNoOutput
+func tailState(path string) (domain.LoopState, domain.StallKind) {
+	buf, ok := readTail(path, tailBytes)
+	if !ok {
+		return domain.StateStalled, domain.StallNoOutput
+	}
+	if hasRateLimitMarker(buf) {
+		return domain.StateStalled, domain.StallRateLimit
+	}
+	if lastTurnEnded(buf) {
+		return domain.StateIdle, domain.StallNone
+	}
+	return domain.StateStalled, domain.StallNoOutput
+}
+
+// readTail reads the last n bytes of path (or the whole file if smaller).
+func readTail(path string, n int64) ([]byte, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return false
+		return nil, false
 	}
 	start := int64(0)
-	if fi.Size() > tailBytes {
-		start = fi.Size() - tailBytes
+	if fi.Size() > n {
+		start = fi.Size() - n
 	}
 	buf := make([]byte, fi.Size()-start)
 	if _, err := f.ReadAt(buf, start); err != nil {
-		return false
+		return nil, false
 	}
+	return buf, true
+}
+
+// hasRateLimitMarker looks for a recent rate-limit marker in the tail.
+func hasRateLimitMarker(buf []byte) bool {
 	s := strings.ToLower(string(buf))
 	return strings.Contains(s, "rate limit") ||
 		strings.Contains(s, "rate-limit") ||
 		strings.Contains(s, "\"status\":429") ||
 		strings.Contains(s, "429 ") ||
 		strings.Contains(s, "usage limit")
+}
+
+// lastTurnEnded reports whether the last parseable user/assistant entry in
+// the tail is an assistant message whose turn finished (stop_reason
+// "end_turn"). A possibly-truncated first line in the tail buffer simply
+// fails to parse and is skipped, same tolerance as LastUserPrompt.
+func lastTurnEnded(buf []byte) bool {
+	var last map[string]any
+	for _, line := range strings.Split(string(buf), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if t, _ := entry["type"].(string); t == "user" || t == "assistant" {
+			last = entry
+		}
+	}
+	if last == nil || last["type"] != "assistant" {
+		return false
+	}
+	msg, ok := last["message"].(map[string]any)
+	if !ok {
+		return false
+	}
+	stopReason, _ := msg["stop_reason"].(string)
+	return stopReason == "end_turn"
 }
 
 // projectLabel turns "-Users-imac-IdeaProjects-aboard" into "aboard".

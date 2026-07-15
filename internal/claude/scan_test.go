@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/jitokim/missionctl/internal/domain"
 )
 
 func writeJSONL(t *testing.T, lines ...string) string {
@@ -93,5 +95,79 @@ func TestLastUserPrompt_UnparseableLineSkipped(t *testing.T) {
 func TestLastUserPrompt_MissingFile(t *testing.T) {
 	if _, ok := LastUserPrompt(filepath.Join(t.TempDir(), "does-not-exist.jsonl")); ok {
 		t.Error("expected ok=false for missing file")
+	}
+}
+
+func TestIsHiddenProjectDir(t *testing.T) {
+	cases := []struct {
+		dir  string
+		want bool
+	}{
+		{"-Users-imac--claude-mem-observer-sessions", true},
+		{"-Users-imac-IdeaProjects-aboard", false},
+	}
+	for _, c := range cases {
+		if got := isHiddenProjectDir(c.dir); got != c.want {
+			t.Errorf("isHiddenProjectDir(%q) = %v, want %v", c.dir, got, c.want)
+		}
+	}
+}
+
+func TestTailState_AssistantEndTurn_Idle(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
+	)
+
+	state, stall := tailState(path)
+	if state != domain.StateIdle || stall != domain.StallNone {
+		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateIdle, domain.StallNone)
+	}
+}
+
+func TestTailState_LastEntryUser_StalledNoOutput(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"working","stop_reason":"end_turn"}}`,
+		`{"type":"user","message":{"content":"still going"}}`,
+	)
+
+	state, stall := tailState(path)
+	if state != domain.StateStalled || stall != domain.StallNoOutput {
+		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
+	}
+}
+
+func TestTailState_AssistantToolUse_StalledNoOutput(t *testing.T) {
+	// an assistant message mid-work (tool_use, no stop_reason end_turn) is
+	// not a finished turn — still an incident, not idle.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"working","stop_reason":"tool_use"}}`,
+	)
+
+	state, stall := tailState(path)
+	if state != domain.StateStalled || stall != domain.StallNoOutput {
+		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
+	}
+}
+
+func TestTailState_RateLimitBeatsEndTurn(t *testing.T) {
+	// even though the last message looks like a finished turn, a 429 marker
+	// anywhere in the tail means the turn did NOT actually complete.
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"429 Too Many Requests: rate limit exceeded"}}`,
+		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
+	)
+
+	state, stall := tailState(path)
+	if state != domain.StateStalled || stall != domain.StallRateLimit {
+		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallRateLimit)
+	}
+}
+
+func TestTailState_MissingFile_StalledNoOutput(t *testing.T) {
+	state, stall := tailState(filepath.Join(t.TempDir(), "does-not-exist.jsonl"))
+	if state != domain.StateStalled || stall != domain.StallNoOutput {
+		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
 	}
 }

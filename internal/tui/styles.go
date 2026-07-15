@@ -62,6 +62,8 @@ func stateLabel(l domain.Loop) string {
 		return "● running"
 	case domain.StateGate:
 		return "◆ gate"
+	case domain.StateIdle:
+		return "· idle"
 	default:
 		return string(l.State)
 	}

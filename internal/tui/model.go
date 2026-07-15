@@ -137,17 +137,23 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	// header
-	stalled := 0
+	stalled, idle := 0, 0
 	for _, l := range m.loops {
-		if l.State == domain.StateStalled {
+		switch l.State {
+		case domain.StateStalled:
 			stalled++
+		case domain.StateIdle:
+			idle++
 		}
 	}
 	b.WriteString(stTitle.Render("◎ MISSIONCTL"))
 	b.WriteString(stFaint.Render("  fleet cockpit"))
 	b.WriteString("\n")
-	summary := fmt.Sprintf("loops %d · %s %d stalled · window %s",
-		len(m.loops), "⚠", stalled, claude.ActiveWindow)
+	summary := fmt.Sprintf("loops %d · %s %d stalled", len(m.loops), "⚠", stalled)
+	if idle > 0 {
+		summary += fmt.Sprintf(" · %d idle", idle)
+	}
+	summary += fmt.Sprintf(" · window %s", claude.ActiveWindow)
 	b.WriteString(stDim.Render(summary))
 	b.WriteString("\n\n")
 
@@ -157,8 +163,9 @@ func (m Model) View() string {
 	if len(m.loops) == 0 {
 		b.WriteString(stFaint.Render("  no active Claude Code loops in the window.\n"))
 	}
+	dupLabels := duplicateLabels(m.loops)
 	for i, l := range m.loops {
-		b.WriteString(renderRow(l, i == m.cursor))
+		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project]))
 		b.WriteString("\n")
 	}
 
@@ -194,7 +201,23 @@ func renderHeader() string {
 	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, cells...)
 }
 
-func renderRow(l domain.Loop, sel bool) string {
+// duplicateLabels reports, for each project label shared by 2+ loops in the
+// current fleet, whether renderRow must disambiguate it with a session-id
+// suffix (many loops sharing "sessions"/"IdeaProjects" are otherwise
+// indistinguishable in the table).
+func duplicateLabels(loops []domain.Loop) map[string]bool {
+	counts := make(map[string]int, len(loops))
+	for _, l := range loops {
+		counts[l.Project]++
+	}
+	dup := make(map[string]bool, len(counts))
+	for label, n := range counts {
+		dup[label] = n > 1
+	}
+	return dup
+}
+
+func renderRow(l domain.Loop, sel bool, dup bool) string {
 	marker := " "
 	if sel {
 		marker = "▸"
@@ -204,9 +227,13 @@ func renderRow(l domain.Loop, sel bool) string {
 	if l.Stall != domain.StallNone {
 		note = "⚠ " + string(l.Stall)
 	}
+	label := l.Project
+	if dup {
+		label += "·" + shortID(l.SessionID)
+	}
 	cells := []string{
 		lipgloss.NewStyle().Foreground(cAccent).Width(wMarker).Render(marker),
-		stInk.Width(wName).Render(trunc(l.Project, wName-1)),
+		stInk.Width(wName).Render(trunc(label, wName-1)),
 		st.Width(wState).Render(stateLabel(l)),
 		stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))),
 		st.Width(wNote).Render(trunc(note, wNote-1)),
@@ -218,6 +245,15 @@ func renderRow(l domain.Loop, sel bool) string {
 	return "  " + row
 }
 
+// shortID is the first 4 chars of a session id, for disambiguating rows
+// that share a project label (e.g. "sessions·1110").
+func shortID(id string) string {
+	if len(id) <= 4 {
+		return id
+	}
+	return id[:4]
+}
+
 func renderDetail(l domain.Loop) string {
 	var d strings.Builder
 	d.WriteString(stTitle.Render("▸ " + l.Project))
@@ -226,6 +262,8 @@ func renderDetail(l domain.Loop) string {
 	d.WriteString(stFaint.Render("STATE   ") + lipgloss.NewStyle().Foreground(stateColor(l)).Render(stateLabel(l)))
 	d.WriteString("\n")
 	d.WriteString(stFaint.Render("LAST    ") + stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")"))
+	d.WriteString("\n")
+	d.WriteString(stFaint.Render("CWD     ") + stDim.Render(l.Cwd))
 	d.WriteString("\n")
 	if l.Stall != domain.StallNone {
 		d.WriteString(stFaint.Render("WHY     ") + lipgloss.NewStyle().Foreground(stateColor(l)).Render(string(l.Stall)))
