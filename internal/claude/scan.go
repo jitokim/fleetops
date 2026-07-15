@@ -28,8 +28,14 @@ func ProjectsDir() string {
 	return filepath.Join(home, ".claude", "projects")
 }
 
-// DiscoverLoops scans every session log and derives its current fleet state.
-func DiscoverLoops(now time.Time) ([]domain.Loop, error) {
+// ActiveWindow: only sessions written within this window are part of "the fleet".
+// Long-running loops keep writing (so they stay in); old finished sessions fall out.
+var ActiveWindow = 24 * time.Hour
+
+// DiscoverLoops scans session logs and derives current fleet state, keeping only
+// sessions active within `within` (0 = keep all). Seed spec AC-1 + filter decision:
+// "recent activity + not cleanly ended" — the window drops days-old noise.
+func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	root := ProjectsDir()
 	matches, err := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
 	if err != nil {
@@ -39,6 +45,9 @@ func DiscoverLoops(now time.Time) ([]domain.Loop, error) {
 	for _, path := range matches {
 		fi, err := os.Stat(path)
 		if err != nil || fi.Size() == 0 {
+			continue
+		}
+		if within > 0 && now.Sub(fi.ModTime()) > within {
 			continue
 		}
 		loops = append(loops, loopFromLog(path, fi, now))
