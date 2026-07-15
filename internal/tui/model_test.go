@@ -44,7 +44,7 @@ func TestManualAttachHint(t *testing.T) {
 
 func TestPagerCmd(t *testing.T) {
 	got := pagerCmd("/x/sess.jsonl")
-	want := []string{"less", "-R", "+G", "--prompt=log: q to return to missionctl", "/x/sess.jsonl"}
+	want := []string{"less", "-R", "+G", "-M", "-PMmissionctl log — q to return (%pB\\%)", "/x/sess.jsonl"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}

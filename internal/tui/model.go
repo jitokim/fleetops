@@ -673,7 +673,11 @@ func judgeCmd(l domain.Loop) tea.Cmd {
 // prompt tells the human how to get back — otherwise "q returns you to the
 // cockpit" isn't obvious once less has taken over the whole screen.
 func pagerCmd(path string) []string {
-	return []string{"less", "-R", "+G", "--prompt=log: q to return to missionctl", path}
+	// -M shows the LONG prompt on the bottom line at all times, and -PM sets
+	// that long prompt's text. The attached -P form matters: with
+	// `--prompt=log:...` less eats the first character ("l") as the
+	// prompt-type selector and the hint never renders (captain-reported).
+	return []string{"less", "-R", "+G", "-M", "-PMmissionctl log — q to return (%pB\\%)", path}
 }
 
 func (m Model) selected() (domain.Loop, bool) {
