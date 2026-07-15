@@ -19,6 +19,7 @@ type Controller interface {
 	Available() bool                         // backend usable right now
 	Locate(projectDir string) (Target, bool) // match surface by encoded cwd
 	Resume(t Target, prompt string) error    // re-send prompt + submit
+	Focus(t Target) error                    // bring the surface to the front (attach)
 }
 
 // Resolve returns the first available controller: orca preferred (the

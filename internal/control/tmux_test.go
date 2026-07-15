@@ -57,3 +57,24 @@ func TestTmuxResumeCmds(t *testing.T) {
 		}
 	}
 }
+
+func TestTmuxFocusCmds(t *testing.T) {
+	cmds := tmuxFocusCmds("%3")
+	want := [][]string{
+		{"tmux", "select-pane", "-t", "%3"},
+		{"tmux", "switch-client", "-t", "%3"},
+	}
+	if len(cmds) != len(want) {
+		t.Fatalf("got %d cmds, want %d", len(cmds), len(want))
+	}
+	for i := range want {
+		if len(cmds[i]) != len(want[i]) {
+			t.Fatalf("cmd[%d] = %v, want %v", i, cmds[i], want[i])
+		}
+		for j := range want[i] {
+			if cmds[i][j] != want[i][j] {
+				t.Errorf("cmd[%d][%d] = %q, want %q", i, j, cmds[i][j], want[i][j])
+			}
+		}
+	}
+}

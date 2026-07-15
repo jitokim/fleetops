@@ -1,8 +1,10 @@
 package claude
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jitokim/missionctl/internal/domain"
@@ -169,5 +171,69 @@ func TestTailState_MissingFile_StalledNoOutput(t *testing.T) {
 	state, stall := tailState(filepath.Join(t.TempDir(), "does-not-exist.jsonl"))
 	if state != domain.StateStalled || stall != domain.StallNoOutput {
 		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
+	}
+}
+
+func TestLastAssistantText_StringContent(t *testing.T) {
+	path := writeJSONL(t, `{"type":"assistant","message":{"content":"plain string reply"}}`)
+
+	got, ok := LastAssistantText(path)
+	if !ok || got != "plain string reply" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "plain string reply")
+	}
+}
+
+func TestLastAssistantText_ArrayContentSkipsToolUse(t *testing.T) {
+	path := writeJSONL(t, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"},{"type":"text","text":"array block reply"}]}}`)
+
+	got, ok := LastAssistantText(path)
+	if !ok || got != "array block reply" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "array block reply")
+	}
+}
+
+func TestLastAssistantText_None(t *testing.T) {
+	path := writeJSONL(t, `{"type":"user","message":{"content":"just a user message"}}`)
+
+	if _, ok := LastAssistantText(path); ok {
+		t.Error("expected ok=false when no assistant text present")
+	}
+}
+
+func TestLastAssistantText_ReturnsLastOfTwo(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"first reply"}}`,
+		`{"type":"user","message":{"content":"more instructions"}}`,
+		`{"type":"assistant","message":{"content":"second reply"}}`,
+	)
+
+	got, ok := LastAssistantText(path)
+	if !ok || got != "second reply" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "second reply")
+	}
+}
+
+func TestLastAssistantText_CollapsesNewlinesAndCaps120(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, "line one\nline two\n"+long))
+
+	got, ok := LastAssistantText(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if strings.Contains(got, "\n") {
+		t.Errorf("got %q, want newlines collapsed to spaces", got)
+	}
+	if !strings.HasPrefix(got, "line one line two") {
+		t.Errorf("got %q, want to start with %q", got, "line one line two")
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("got %q, want truncated with an ellipsis", got)
+	}
+}
+
+func TestLastAssistantText_MissingFile(t *testing.T) {
+	if _, ok := LastAssistantText(filepath.Join(t.TempDir(), "does-not-exist.jsonl")); ok {
+		t.Error("expected ok=false for missing file")
 	}
 }

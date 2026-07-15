@@ -44,6 +44,18 @@ func orcaResumeCmd(handle, prompt string) []string {
 	return []string{"orca", "terminal", "send", "--terminal", handle, "--text", prompt, "--enter", "--json"}
 }
 
+func (orcaController) Focus(t Target) error {
+	argv := orcaFocusCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// orcaFocusCmd builds the argv that brings an Orca terminal tab to the
+// front: "terminal switch" (alias "terminal focus") switches to a terminal
+// tab in the UI.
+func orcaFocusCmd(handle string) []string {
+	return []string{"orca", "terminal", "switch", "--terminal", handle, "--json"}
+}
+
 // orcaTerminalList is the `orca terminal list --json` result payload
 // (RuntimeTerminalSummary, verified against Orca's src/shared/runtime-types.ts
 // + src/cli/specs/core.ts). Unlike cmux's tree (unverified shape), this

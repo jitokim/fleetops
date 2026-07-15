@@ -16,6 +16,14 @@ func TestManualResumeHint(t *testing.T) {
 	}
 }
 
+func TestManualAttachHint(t *testing.T) {
+	got := manualAttachHint("/Users/imac/IdeaProjects/aboard")
+	want := "cd /Users/imac/IdeaProjects/aboard"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestDuplicateLabels(t *testing.T) {
 	loops := []domain.Loop{
 		{Project: "sessions", SessionID: "aaa1"},

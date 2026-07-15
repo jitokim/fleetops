@@ -6,6 +6,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -25,6 +26,18 @@ type resumeResultMsg struct {
 	ok   bool
 	text string
 }
+
+// attachResultMsg reports the outcome of an attach (enter key) attempt,
+// computed off the event loop by attachCmd, mirroring resumeResultMsg.
+type attachResultMsg struct {
+	ok   bool
+	text string
+}
+
+// logClosedMsg reports that the pager opened by the "o" key has exited and
+// control has returned to the TUI (tea.ExecProcess suspends the program
+// while the pager runs).
+type logClosedMsg struct{ err error }
 
 const refreshEvery = 3 * time.Second
 
@@ -110,7 +123,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusKind = fmt.Sprintf("resuming %s...", sel.Project), statusNeutral
 			return m, resumeCmd(sel)
 		case "enter":
-			m.status, m.statusKind = "attach/open — TODO (needs cmux integration)", statusNeutral
+			sel, ok := m.selected()
+			if !ok {
+				m.status, m.statusKind = "select a loop to attach", statusNeutral
+				return m, nil
+			}
+			m.status, m.statusKind = fmt.Sprintf("attaching %s...", sel.Project), statusNeutral
+			return m, attachCmd(sel)
+		case "o":
+			sel, ok := m.selected()
+			if !ok {
+				m.status, m.statusKind = "select a loop to view its log", statusNeutral
+				return m, nil
+			}
+			pager := exec.Command("less", "-R", "+G", sel.Path)
+			return m, tea.ExecProcess(pager, func(err error) tea.Msg {
+				return logClosedMsg{err}
+			})
 		}
 	case resumeResultMsg:
 		m.status = msg.text
@@ -118,6 +147,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusKind = statusOK
 		} else {
 			m.statusKind = statusErr
+		}
+	case attachResultMsg:
+		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
+	case logClosedMsg:
+		if msg.err != nil {
+			m.status, m.statusKind = fmt.Sprintf("open log failed: %v", msg.err), statusErr
+		} else {
+			m.status, m.statusKind = "closed log", statusNeutral
 		}
 	}
 	return m, nil
@@ -154,6 +196,33 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 // actuation degrades to "tell the human what to type".
 func manualResumeHint(sessionID string) string {
 	return "claude --resume " + sessionID
+}
+
+// attachCmd brings the terminal surface hosting l to the front, via
+// whichever multiplexer backend is available. Works for any loop state (not
+// just stalled) — "jump to it" is useful for a running loop too. Runs off
+// the event loop, same non-blocking pattern as resumeCmd.
+func attachCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return attachResultMsg{false, "no orca/tmux/cmux — attach manually: " + manualAttachHint(l.Cwd)}
+		}
+		target, ok := ctrl.Locate(l.ProjectDir)
+		if !ok {
+			return attachResultMsg{false, "surface not found — attach manually: " + manualAttachHint(l.Cwd)}
+		}
+		if err := ctrl.Focus(target); err != nil {
+			return attachResultMsg{false, fmt.Sprintf("attach %s failed: %v", l.Project, err)}
+		}
+		return attachResultMsg{true, fmt.Sprintf("attached %s via %s", l.Project, ctrl.Name())}
+	}
+}
+
+// manualAttachHint is the copy-pasteable fallback for bare terminals (no
+// orca/cmux/tmux to focus) — at least point the human at where the loop lives.
+func manualAttachHint(cwd string) string {
+	return "cd " + cwd
 }
 
 func (m Model) selected() (domain.Loop, bool) {
@@ -400,6 +469,9 @@ func renderDetail(l domain.Loop, width int) string {
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
+	if l.LastText != "" {
+		d.WriteString(detailRow("TAIL", stDim.Render(trunc(l.LastText, valueWidth))))
+	}
 
 	if l.State == domain.StateStalled {
 		d.WriteString(renderResumeCallout(l, width))
@@ -457,8 +529,9 @@ func renderStatusLine(status string, kind statusKind) string {
 func renderKeybar(loopCount int, width int) string {
 	keys := []string{
 		stKey.Render("↑↓") + stDim.Render(" select"),
+		stKey.Render("↵") + stDim.Render(" attach"),
 		stKey.Render("r") + stDim.Render(" resume"),
-		stKey.Render("↵") + stDim.Render(" open"),
+		stKey.Render("o") + stDim.Render(" log"),
 		stKey.Render("q") + stDim.Render(" quit"),
 	}
 	left := strings.Join(keys, stFaint.Render("  ·  "))

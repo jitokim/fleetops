@@ -54,6 +54,26 @@ func tmuxResumeCmds(paneID, prompt string) [][]string {
 	}
 }
 
+func (tmuxController) Focus(t Target) error {
+	for _, argv := range tmuxFocusCmds(t.ID) {
+		if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tmuxFocusCmds builds the argv sequence that brings a pane to the front:
+// select-pane makes it the active pane in its window, switch-client moves
+// the attached client to that window. switch-client fails harmlessly when
+// run from outside tmux (no attached client) — the TUI surfaces the error.
+func tmuxFocusCmds(paneID string) [][]string {
+	return [][]string{
+		{"tmux", "select-pane", "-t", paneID},
+		{"tmux", "switch-client", "-t", paneID},
+	}
+}
+
 // parseTmuxPanes parses `tmux list-panes -a -F '#{pane_id}\t#{pane_current_path}'`
 // output, one pane per line.
 func parseTmuxPanes(out string) []Target {

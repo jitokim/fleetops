@@ -98,14 +98,34 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
 		State:        domain.StateRunning,
 	}
 
-	if idle {
-		l.State, l.Stall = tailState(path)
+	// One shared tail read serves both the idle classification and the
+	// detail pane's TAIL row (LastText) — avoid reading the file twice.
+	if buf, ok := readTail(path, tailBytes); ok {
+		if text, ok := lastAssistantTextFromTail(buf); ok {
+			l.LastText = text
+		}
+		if idle {
+			l.State, l.Stall = classifyTail(buf)
+		}
+	} else if idle {
+		l.State, l.Stall = domain.StateStalled, domain.StallNoOutput
 	}
 	return l
 }
 
-// tailState reads the tail of the session log ONCE and classifies why an
-// idle loop went quiet:
+// tailState reads the tail of the session log and classifies why an idle
+// loop went quiet (see classifyTail). Exposed for tests; loopFromLog itself
+// calls classifyTail directly since it already holds the tail buffer from
+// the LastText read (avoids a second file read).
+func tailState(path string) (domain.LoopState, domain.StallKind) {
+	buf, ok := readTail(path, tailBytes)
+	if !ok {
+		return domain.StateStalled, domain.StallNoOutput
+	}
+	return classifyTail(buf)
+}
+
+// classifyTail is tailState's buffer-only core:
 //   - a rate-limit marker anywhere in the tail ⇒ StateStalled/StallRateLimit
 //     (a 429 means the turn did NOT complete, so this takes precedence over
 //     end_turn below even if both somehow appear in the tail)
@@ -114,11 +134,7 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
 //     is done and waiting on a human, not stuck — not an incident
 //   - otherwise (mid-work: last entry is user/tool_result, or an assistant
 //     message that hasn't finished, e.g. tool_use) ⇒ StateStalled/StallNoOutput
-func tailState(path string) (domain.LoopState, domain.StallKind) {
-	buf, ok := readTail(path, tailBytes)
-	if !ok {
-		return domain.StateStalled, domain.StallNoOutput
-	}
+func classifyTail(buf []byte) (domain.LoopState, domain.StallKind) {
 	if hasRateLimitMarker(buf) {
 		return domain.StateStalled, domain.StallRateLimit
 	}
@@ -267,4 +283,84 @@ func userMessageText(entry map[string]any) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// LastAssistantText returns the last assistant message's text (first 120
+// chars, newlines collapsed to spaces) from the tail of the session log —
+// "what was it last doing", shown in the detail pane's TAIL row. ok is false
+// if the tail has no assistant text. Thin path-based wrapper around
+// lastAssistantTextFromTail, which loopFromLog calls directly against a tail
+// buffer it already read (see readTail).
+func LastAssistantText(path string) (string, bool) {
+	buf, ok := readTail(path, tailBytes)
+	if !ok {
+		return "", false
+	}
+	return lastAssistantTextFromTail(buf)
+}
+
+// lastAssistantTextFromTail is LastAssistantText's buffer-only core.
+func lastAssistantTextFromTail(buf []byte) (string, bool) {
+	last := ""
+	found := false
+	for _, line := range strings.Split(string(buf), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if t, _ := entry["type"].(string); t != "assistant" {
+			continue
+		}
+		if text, ok := assistantMessageText(entry); ok && text != "" {
+			last = text
+			found = true
+		}
+	}
+	if !found {
+		return "", false
+	}
+	return summarizeTailText(last, 120), true
+}
+
+// assistantMessageText mirrors userMessageText for an assistant entry:
+// message.content is either a plain string or an array of blocks (text
+// blocks have "type":"text"; tool_use blocks are skipped — not useful as a
+// one-line summary of "what it was doing").
+func assistantMessageText(entry map[string]any) (string, bool) {
+	msg, ok := entry["message"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	switch content := msg["content"].(type) {
+	case string:
+		return content, content != ""
+	case []any:
+		for _, block := range content {
+			b, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			if b["type"] != "text" {
+				continue
+			}
+			if text, ok := b["text"].(string); ok && text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
+}
+
+// summarizeTailText collapses newlines to spaces and caps length for a
+// one-line TAIL row.
+func summarizeTailText(s string, max int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }

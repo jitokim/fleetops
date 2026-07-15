@@ -83,6 +83,7 @@ type Loop struct {
 	Path         string    // path to the session JSONL
 	LastActivity time.Time // last log write
 	Stall        StallKind // why it went silent, if it did
+	LastText     string    // last assistant text (tail), for the detail pane's TAIL row
 }
 
 // BudgetFrac is the fraction of the token budget consumed (0..1).

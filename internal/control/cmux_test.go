@@ -19,6 +19,19 @@ func TestCmuxResumeCmd(t *testing.T) {
 	}
 }
 
+func TestCmuxFocusCmd(t *testing.T) {
+	got := cmuxFocusCmd("surface:2")
+	want := []string{"cmux", "focus-panel", "--panel", "surface:2"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestParseCmuxTree_NestedFixture(t *testing.T) {
 	// TODO: verify cmux tree --json shape on a machine with the cmux CLI;
 	// this fixture is a guess at plausible shape, the parser is tolerant of

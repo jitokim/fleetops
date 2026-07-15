@@ -39,6 +39,19 @@ func TestOrcaResumeCmd_EmptyPromptFallback(t *testing.T) {
 	}
 }
 
+func TestOrcaFocusCmd(t *testing.T) {
+	got := orcaFocusCmd("term_abc123")
+	want := []string{"orca", "terminal", "switch", "--terminal", "term_abc123", "--json"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 // realOrcaFixture is the (abridged, faithful) real `orca terminal list
 // --json` output captured from the captain's machine: an RPC envelope with
 // four terminals, two of them ("✳ team" and "Terminal 2") sharing the

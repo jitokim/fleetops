@@ -52,6 +52,17 @@ func cmuxResumeCmd(surfaceRef, prompt string) []string {
 	return []string{"cmux", "send", "--surface", surfaceRef, "--", prompt + "\n"}
 }
 
+func (cmuxController) Focus(t Target) error {
+	argv := cmuxFocusCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// cmuxFocusCmd builds the argv that brings a cmux surface to the front:
+// focus-panel is the contract's compatibility alias over surface focus.
+func cmuxFocusCmd(surfaceRef string) []string {
+	return []string{"cmux", "focus-panel", "--panel", surfaceRef}
+}
+
 // parseCmuxTree tolerantly walks `cmux tree --json` output, collecting every
 // node that looks like a surface (a surface-id-like key) paired with a
 // cwd-like key. Unknown shape → empty slice, never panics.
