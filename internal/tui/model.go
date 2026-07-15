@@ -116,13 +116,15 @@ const (
 )
 
 // mode distinguishes normal fleet-navigation input from the "n" key's
-// free-text goal prompt, so arrow/letter keys route to the text input
-// instead of moving the cursor or triggering actions while typing.
+// free-text goal prompt and the "/" key's filter query, so arrow/letter
+// keys route to the text input instead of moving the cursor or triggering
+// actions while typing.
 type mode int
 
 const (
 	modeNormal mode = iota
 	modePrompting
+	modeFiltering
 )
 
 type Model struct {
@@ -138,6 +140,8 @@ type Model struct {
 	mode     mode
 	input    textinput.Model
 	spawnCwd string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
+
+	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
 	pendingKillSession string // non-empty while awaiting the confirming second "k"
 	pendingKillAt      time.Time
@@ -169,8 +173,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.w, m.h = msg.Width, msg.Height
 	case loopsMsg:
 		m.loops = []domain.Loop(msg)
-		if m.cursor >= len(m.loops) {
-			m.cursor = maxInt(0, len(m.loops)-1)
+		if m.cursor >= len(m.visibleLoops()) {
+			m.cursor = maxInt(0, len(m.visibleLoops())-1)
 		}
 		m.lastScan = time.Now()
 		return m, m.triggerJudgments()
@@ -207,6 +211,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.mode == modeFiltering {
+			switch key {
+			case "esc":
+				m.mode = modeNormal
+				m.input.Blur()
+				m.filterQuery = ""
+				if m.cursor >= len(m.visibleLoops()) {
+					m.cursor = maxInt(0, len(m.visibleLoops())-1)
+				}
+				m.status, m.statusKind = "filter cleared", statusNeutral
+				return m, nil
+			case "enter":
+				m.filterQuery = strings.TrimSpace(m.input.Value())
+				m.mode = modeNormal
+				m.input.Blur()
+				if m.cursor >= len(m.visibleLoops()) {
+					m.cursor = maxInt(0, len(m.visibleLoops())-1)
+				}
+				if m.filterQuery == "" {
+					m.status, m.statusKind = "filter cleared", statusNeutral
+				} else {
+					m.status, m.statusKind = fmt.Sprintf("filter: %q", m.filterQuery), statusNeutral
+				}
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				// live-filter: clamp as the matching set shrinks/grows while typing.
+				if m.cursor >= len(m.visibleLoops()) {
+					m.cursor = maxInt(0, len(m.visibleLoops())-1)
+				}
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -215,13 +254,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor--
 			}
 		case "down", "j":
-			if m.cursor < len(m.loops)-1 {
+			if m.cursor < len(m.visibleLoops())-1 {
 				m.cursor++
 			}
 		case "g":
 			m.cursor = 0
 		case "G":
-			m.cursor = maxInt(0, len(m.loops)-1)
+			m.cursor = maxInt(0, len(m.visibleLoops())-1)
+		case "/":
+			m.mode = modeFiltering
+			m.input = textinput.New()
+			m.input.Prompt = ""
+			m.input.Focus()
+			if m.filterQuery != "" {
+				m.input.SetValue(m.filterQuery)
+				m.input.CursorEnd()
+			}
+			return m, textinput.Blink
+		case "esc":
+			if m.filterQuery == "" {
+				return m, nil
+			}
+			m.filterQuery = ""
+			if m.cursor >= len(m.visibleLoops()) {
+				m.cursor = maxInt(0, len(m.visibleLoops())-1)
+			}
+			m.status, m.statusKind = "filter cleared", statusNeutral
 		case "r":
 			sel, ok := m.selected()
 			if !ok || (sel.State != domain.StateStalled && sel.State != domain.StateDrift) {
@@ -556,7 +614,7 @@ func (m *Model) triggerJudgments() tea.Cmd {
 func judgeCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		lastText, _ := claude.LastAssistantTextFull(l.Path) // ok=false just means an empty report is judged as-is
-		verdict, err := judgeFn(l.Goal.Text, lastText)
+		verdict, err := judgeFn(l.Goal.Text, l.Cwd, lastText)
 		if err != nil {
 			return verdictMsg{sessionID: l.SessionID, err: err}
 		}
@@ -576,10 +634,48 @@ func pagerCmd(path string) []string {
 }
 
 func (m Model) selected() (domain.Loop, bool) {
-	if m.cursor >= 0 && m.cursor < len(m.loops) {
-		return m.loops[m.cursor], true
+	loops := m.visibleLoops()
+	if m.cursor >= 0 && m.cursor < len(loops) {
+		return loops[m.cursor], true
 	}
 	return domain.Loop{}, false
+}
+
+// visibleLoops is what the table/cursor/actions operate on: all loops, or
+// the subset matching the filter — the applied one (m.filterQuery) normally,
+// or the live in-progress query while modeFiltering is actively typing (so
+// the table live-filters as you type, before enter commits it).
+func (m Model) visibleLoops() []domain.Loop {
+	query := m.filterQuery
+	if m.mode == modeFiltering {
+		query = m.input.Value()
+	}
+	if query == "" {
+		return m.loops
+	}
+	out := make([]domain.Loop, 0, len(m.loops))
+	for _, l := range m.loops {
+		if matchesFilter(l, query) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// matchesFilter is the "/" filter's matching rule: a case-insensitive
+// substring match against Project, SessionID, the STATE label, or the Stall
+// kind — the fields a human would actually search by.
+func matchesFilter(l domain.Loop, query string) bool {
+	if query == "" {
+		return true
+	}
+	q := strings.ToLower(query)
+	for _, field := range []string{l.Project, l.SessionID, stateLabel(l), string(l.Stall)} {
+		if strings.Contains(strings.ToLower(field), q) {
+			return true
+		}
+	}
+	return false
 }
 
 // termWidth is the usable render width, guarding against 0 before the first
@@ -630,7 +726,16 @@ func (m Model) View() string {
 	b.WriteString("\n")
 
 	total, running, stalled, idle, gated, totalTokens, judged, good := m.counts()
-	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good, width))
+	// The summary band's counts always describe the whole fleet, not the
+	// filtered view — a filter narrows what you're looking AT, not the
+	// facts. Only show the applied-filter indicator once it's committed
+	// (not while still typing it — the prompt line below already shows the
+	// live query, showing both would be redundant).
+	bandFilter := ""
+	if m.mode != modeFiltering {
+		bandFilter = m.filterQuery
+	}
+	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good, bandFilter, width))
 	b.WriteString("\n\n")
 
 	b.WriteString(stFaint.Render("LOOPS"))
@@ -639,11 +744,15 @@ func (m Model) View() string {
 	wName, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
 	b.WriteString(renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote))
 	b.WriteString("\n")
-	if len(m.loops) == 0 {
+	visible := m.visibleLoops()
+	switch {
+	case len(m.loops) == 0:
 		b.WriteString(stFaint.Render("  no active Claude Code loops in the window.\n"))
+	case len(visible) == 0:
+		b.WriteString(stFaint.Render(fmt.Sprintf("  no loops match filter %q.\n", m.filterQuery)))
 	}
-	dupLabels := duplicateLabels(m.loops)
-	for i, l := range m.loops {
+	dupLabels := duplicateLabels(visible)
+	for i, l := range visible {
 		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wCycle, wOracle, wBudget, wNI, wNote, width))
 		b.WriteString("\n")
 	}
@@ -653,15 +762,21 @@ func (m Model) View() string {
 		b.WriteString(renderDetail(sel, width))
 	}
 
-	// status line (its own line, above the keybar) — replaced by the new-loop
-	// prompt while in modePrompting — + keybar.
+	// status line (its own line, above the keybar) — replaced by the
+	// new-loop / filter prompt while in modePrompting/modeFiltering — + keybar.
 	b.WriteString("\n")
-	if m.mode == modePrompting {
+	switch {
+	case m.mode == modePrompting:
 		b.WriteString(renderNewLoopPrompt(m.input))
 		b.WriteString("\n")
-	} else if line := renderStatusLine(m.status, m.statusKind); line != "" {
-		b.WriteString(line)
+	case m.mode == modeFiltering:
+		b.WriteString(renderFilterPrompt(m.input))
 		b.WriteString("\n")
+	default:
+		if line := renderStatusLine(m.status, m.statusKind); line != "" {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
 	}
 	b.WriteString(renderKeybar(len(m.loops), width))
 	return b.String()
@@ -684,18 +799,20 @@ func renderRule(width int) string {
 }
 
 // renderSummaryBand: "fleet N · x run · y gate · z stalled · w idle ·
-// budget <spent> · oracle P%" (zero-count segments omitted, fleet always
-// shown; budget/oracle omitted when there's no spend/no judged loops yet)
-// with a right-aligned amber badge: gates take priority ("▲ N GATE NEEDS
-// YOU") since a gate is a human actively being asked something right now;
-// otherwise stalls get the badge ("▲ N STALLED NEED YOU") — the mockup's
-// gate badge, honestly repurposed for stalls when there's no gate. budget
-// is total spend across the fleet, not spent/cap — per-loop caps are all
-// the same v0 default (DefaultBudgetTokens), so a fleet-wide cap would be a
-// meaningless sum. oracle% is the share of judged (bound + verdict-rendered
-// at least once) loops whose latest outcome is done or progress — i.e. "not
-// currently drifting".
-func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good int, width int) string {
+// budget <spent> · oracle P% · filter "q"" (zero-count segments omitted,
+// fleet always shown; budget/oracle/filter omitted when there's no
+// spend/no judged loops/no applied filter) with a right-aligned amber
+// badge: gates take priority ("▲ N GATE NEEDS YOU") since a gate is a human
+// actively being asked something right now; otherwise stalls get the badge
+// ("▲ N STALLED NEED YOU") — the mockup's gate badge, honestly repurposed
+// for stalls when there's no gate. budget is total spend across the fleet,
+// not spent/cap — per-loop caps are all the same v0 default
+// (DefaultBudgetTokens), so a fleet-wide cap would be a meaningless sum.
+// oracle% is the share of judged (bound + verdict-rendered at least once)
+// loops whose latest outcome is done or progress — i.e. "not currently
+// drifting". These counts always describe the WHOLE fleet, not a filtered
+// subset — see View's bandFilter comment.
+func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good int, filterQuery string, width int) string {
 	parts := []string{stDim.Render(fmt.Sprintf("fleet %d", total))}
 	if running > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cBlue).Render(fmt.Sprintf("%d run", running)))
@@ -715,6 +832,9 @@ func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged
 	if judged > 0 {
 		pct := int(math.Round(float64(good) / float64(judged) * 100))
 		parts = append(parts, stDim.Render(fmt.Sprintf("oracle %d%%", pct)))
+	}
+	if filterQuery != "" {
+		parts = append(parts, stFaint.Render(fmt.Sprintf("filter: %q", filterQuery)))
 	}
 	left := strings.Join(parts, stFaint.Render(" · "))
 
@@ -1096,10 +1216,17 @@ func renderNewLoopPrompt(input textinput.Model) string {
 	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ goal: ") + input.View()
 }
 
+// renderFilterPrompt replaces the status line while the "/" key's filter
+// query is active: "FILTER ▸ <input>".
+func renderFilterPrompt(input textinput.Model) string {
+	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("FILTER ▸ ") + input.View()
+}
+
 // renderKeybar: only keys that actually do something today.
 func renderKeybar(loopCount int, width int) string {
 	keys := []string{
 		stKey.Render("↑↓") + stDim.Render(" select"),
+		stKey.Render("/") + stDim.Render(" filter"),
 		stKey.Render("↵") + stDim.Render(" attach"),
 		stKey.Render("a") + stDim.Render(" approve"),
 		stKey.Render("r") + stDim.Render(" resume"),
@@ -1109,8 +1236,17 @@ func renderKeybar(loopCount int, width int) string {
 		stKey.Render("o") + stDim.Render(" log"),
 		stKey.Render("q") + stDim.Render(" quit"),
 	}
-	left := strings.Join(keys, stFaint.Render("  ·  "))
+	sep := stFaint.Render("  ·  ")
+	left := strings.Join(keys, sep)
 	right := stFaint.Render(fmt.Sprintf("missionctl v0.1 · %d loops · ⧗ %s", loopCount, refreshEvery))
+	// Degrade instead of wrapping: drop the right-side info when the bar is
+	// tight, then tighten the key separators — a wrapped keybar reads broken.
+	if lipgloss.Width(left)+lipgloss.Width(right)+1 > width {
+		right = ""
+	}
+	if lipgloss.Width(left) > width {
+		left = strings.Join(keys, stFaint.Render(" · "))
+	}
 	return stKeybar.Width(width).Render(padBetween(left, right, width))
 }
 

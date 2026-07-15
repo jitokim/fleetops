@@ -512,7 +512,7 @@ func TestJudgeCmd_SavesVerdictAndReportsResult(t *testing.T) {
 	origDirFn, origJudgeFn := registryDirFn, judgeFn
 	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
 	registryDirFn = func() string { return dir }
-	judgeFn = func(goal, lastText string) (domain.Verdict, error) {
+	judgeFn = func(goal, cwd, lastText string) (domain.Verdict, error) {
 		return domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no test output shown"}, nil
 	}
 
@@ -520,7 +520,7 @@ func TestJudgeCmd_SavesVerdictAndReportsResult(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	l := domain.Loop{SessionID: "s1", Cycle: 2, Goal: domain.Goal{Text: "fix the bug"}, Path: "/no/such/file.jsonl"}
+	l := domain.Loop{SessionID: "s1", Cycle: 2, Goal: domain.Goal{Text: "fix the bug"}, Cwd: "/x/aboard", Path: "/no/such/file.jsonl"}
 	msg := judgeCmd(l)()
 
 	vm, ok := msg.(verdictMsg)
@@ -551,7 +551,7 @@ func TestJudgeCmd_JudgeErrorReportedWithoutSaving(t *testing.T) {
 	origDirFn, origJudgeFn := registryDirFn, judgeFn
 	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
 	registryDirFn = func() string { return dir }
-	judgeFn = func(goal, lastText string) (domain.Verdict, error) {
+	judgeFn = func(goal, cwd, lastText string) (domain.Verdict, error) {
 		return domain.Verdict{}, errTestJudgeFailed
 	}
 
@@ -610,3 +610,171 @@ var errTestJudgeFailed = &testJudgeError{}
 type testJudgeError struct{}
 
 func (*testJudgeError) Error() string { return "test judge failure" }
+
+// ── "/" filter ───────────────────────────────────────────────────
+
+func TestMatchesFilter(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "sess-asre1234", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	cases := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{"empty query matches everything", "", true},
+		{"project, case-insensitive", "ABOARD", true},
+		{"session id substring", "asre", true},
+		{"state label substring", "429", true}, // stateLabel is "✗ 429"
+		{"stall kind substring", "rate limited", true},
+		{"no match", "nomatch", false},
+	}
+	for _, c := range cases {
+		if got := matchesFilter(l, c.query); got != c.want {
+			t.Errorf("%s: matchesFilter(%q) = %v, want %v", c.name, c.query, got, c.want)
+		}
+	}
+}
+
+func modelWithTwoLoops() Model {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "aboard", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	m.cursor = 0
+	return m
+}
+
+func TestUpdate_SlashKey_EntersFilteringMode(t *testing.T) {
+	m := modelWithTwoLoops()
+
+	m, cmd := updateModel(t, m, runeKey('/'))
+
+	if m.mode != modeFiltering {
+		t.Fatalf("mode = %v, want modeFiltering", m.mode)
+	}
+	if !m.input.Focused() {
+		t.Error("expected the text input to be focused")
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil cmd (textinput.Blink)")
+	}
+}
+
+func TestVisibleLoops_FiltersLiveWhileTyping(t *testing.T) {
+	m := modelWithTwoLoops()
+	m, _ = updateModel(t, m, runeKey('/'))
+
+	for _, r := range "asre" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+
+	visible := m.visibleLoops()
+	if len(visible) != 1 || visible[0].Project != "asre" {
+		t.Errorf("got %+v, want only the \"asre\" loop (live-filtered while typing, before enter)", visible)
+	}
+}
+
+func TestUpdate_FilterEnter_AppliesAndExitsToNormalMode(t *testing.T) {
+	m := modelWithTwoLoops()
+	m, _ = updateModel(t, m, runeKey('/'))
+	for _, r := range "asre" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after enter", m.mode)
+	}
+	if m.filterQuery != "asre" {
+		t.Errorf("filterQuery = %q, want %q", m.filterQuery, "asre")
+	}
+	visible := m.visibleLoops()
+	if len(visible) != 1 || visible[0].Project != "asre" {
+		t.Errorf("got %+v, want the filter to stay applied after enter", visible)
+	}
+}
+
+func TestUpdate_FilterEsc_ClearsAndExits(t *testing.T) {
+	m := modelWithTwoLoops()
+	m, _ = updateModel(t, m, runeKey('/'))
+	for _, r := range "asre" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after esc", m.mode)
+	}
+	if m.filterQuery != "" {
+		t.Errorf("filterQuery = %q, want empty (esc clears, doesn't apply)", m.filterQuery)
+	}
+	if len(m.visibleLoops()) != len(m.loops) {
+		t.Error("expected all loops visible again after esc clears the filter")
+	}
+}
+
+func TestUpdate_EscInNormalMode_ClearsAppliedFilter(t *testing.T) {
+	m := modelWithTwoLoops()
+	m, _ = updateModel(t, m, runeKey('/'))
+	for _, r := range "asre" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.filterQuery != "asre" {
+		t.Fatalf("precondition failed: filterQuery = %q, want applied", m.filterQuery)
+	}
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.filterQuery != "" {
+		t.Errorf("filterQuery = %q, want cleared by esc in normal mode", m.filterQuery)
+	}
+	if len(m.visibleLoops()) != len(m.loops) {
+		t.Error("expected all loops visible again")
+	}
+}
+
+func TestUpdate_CursorClampsToFilteredList(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "aboard", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "aboard", SessionID: "sess-2", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-3", State: domain.StateIdle},
+	}
+	m.cursor = 1 // second "aboard" loop
+
+	m, _ = updateModel(t, m, runeKey('/'))
+	for _, r := range "asre" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+
+	// only one loop matches "asre" (index 0 of the filtered list) — cursor
+	// must clamp down from 1, it can't stay pointing past the filtered set.
+	if m.cursor != 0 {
+		t.Errorf("cursor = %d, want clamped to 0 (only 1 loop matches)", m.cursor)
+	}
+	sel, ok := m.selected()
+	if !ok || sel.Project != "asre" {
+		t.Errorf("selected() = %+v, ok=%v, want the \"asre\" loop", sel, ok)
+	}
+}
+
+func TestUpdate_ActionsOperateOnFilteredSelection(t *testing.T) {
+	// r/a/k/p/enter/o all go through m.selected(), which now goes through
+	// visibleLoops() — verify selected() picks the right loop once filtered,
+	// not the raw m.loops[cursor].
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "aboard", SessionID: "sess-1", State: domain.StateStalled},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateStalled},
+	}
+	m.filterQuery = "asre"
+	m.cursor = 0
+
+	sel, ok := m.selected()
+	if !ok || sel.SessionID != "sess-2" {
+		t.Errorf("selected() = %+v, ok=%v, want sess-2 (the filtered match at index 0)", sel, ok)
+	}
+}
