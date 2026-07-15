@@ -39,54 +39,119 @@ func TestOrcaResumeCmd_EmptyPromptFallback(t *testing.T) {
 	}
 }
 
-func TestParseOrcaTerminals_PicksConnectedWritable(t *testing.T) {
-	fixture := []byte(`{
+// realOrcaFixture is the (abridged, faithful) real `orca terminal list
+// --json` output captured from the captain's machine: an RPC envelope with
+// four terminals, two of them ("✳ team" and "Terminal 2") sharing the
+// "aboard" worktree.
+const realOrcaFixture = `{
+	"id": "7c02555b-...",
+	"ok": true,
+	"result": {
 		"terminals": [
-			{"handle": "term_wrong", "worktreePath": "/Users/imac/IdeaProjects/other", "connected": true, "writable": true},
-			{"handle": "term_stale", "worktreePath": "/Users/imac/IdeaProjects/aboard", "connected": false, "writable": false},
-			{"handle": "term_live", "worktreePath": "/Users/imac/IdeaProjects/aboard", "connected": true, "writable": true}
+			{"handle":"term_df51fe60-...","worktreePath":"/Users/imac/IdeaProjects/aboard","title":"✳ team","connected":true,"writable":true,"lastOutputAt":1784134661341,"preview":""},
+			{"handle":"term_f15e252e-...","worktreePath":"/Users/imac/IdeaProjects/aboard","title":"Terminal 2","connected":true,"writable":true,"lastOutputAt":1784134661258,"preview":"zsh: command not found: cmux"},
+			{"handle":"term_8d0a6496-...","worktreePath":"/Users/imac/IdeaProjects/dotfiles","title":"✳ team","connected":true,"writable":true,"lastOutputAt":1784028618065,"preview":"..."},
+			{"handle":"term_73a99234-...","worktreePath":"/Users/imac/orca/projects/asre","title":"✳ team","connected":true,"writable":true,"lastOutputAt":1784134574859,"preview":""}
 		],
-		"totalCount": 3,
+		"visualLayouts": [],
+		"totalCount": 4,
 		"truncated": false
-	}`)
+	},
+	"_meta": {"runtimeId":"..."}
+}`
 
-	target, ok := parseOrcaTerminals(fixture, "-Users-imac-IdeaProjects-aboard")
+func TestParseOrcaTerminals_EnvelopeUnwrap_PicksClaudeTabOverShell(t *testing.T) {
+	// Both "aboard" terminals are connected+writable, so without the title
+	// tier this would be ambiguous / could pick the bare-zsh "Terminal 2".
+	// The Claude Code tab ("✳" prefix) must win regardless — sending a
+	// prompt into a bare shell would execute it as a shell command.
+	target, ok := parseOrcaTerminals([]byte(realOrcaFixture), "-Users-imac-IdeaProjects-aboard")
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	want := Target{Backend: "orca", ID: "term_live", Cwd: "/Users/imac/IdeaProjects/aboard"}
+	want := Target{Backend: "orca", ID: "term_df51fe60-...", Cwd: "/Users/imac/IdeaProjects/aboard"}
 	if target != want {
-		t.Errorf("got %+v, want %+v", target, want)
+		t.Errorf("got %+v, want %+v (the \"✳ team\" tab, not \"Terminal 2\")", target, want)
 	}
 }
 
-func TestParseOrcaTerminals_FallsBackToFirstMatchWhenNoneWritable(t *testing.T) {
-	fixture := []byte(`{
-		"terminals": [
-			{"handle": "term_a", "worktreePath": "/Users/imac/IdeaProjects/aboard", "connected": false, "writable": false},
-			{"handle": "term_b", "worktreePath": "/Users/imac/IdeaProjects/aboard", "connected": false, "writable": false}
-		]
-	}`)
+func TestSelectOrcaTerminal_TitleTierBeatsRecencyAcrossTiers(t *testing.T) {
+	// The Claude Code tab has an OLDER lastOutputAt than the bare shell tab —
+	// title tier must still win; recency only breaks ties within a tier.
+	terminals := []orcaTerminal{
+		{Handle: "term_shell", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "Terminal 2", Connected: true, Writable: true, LastOutputAt: 999999},
+		{Handle: "term_claude", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "✳ team", Connected: true, Writable: true, LastOutputAt: 1},
+	}
+	target, ok := selectOrcaTerminal(terminals, "-Users-imac-IdeaProjects-aboard")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_claude" {
+		t.Errorf("got ID %q, want term_claude (title tier must win despite lower lastOutputAt)", target.ID)
+	}
+}
+
+func TestSelectOrcaTerminal_RecencyBreaksTieWithinTier(t *testing.T) {
+	// Two Claude Code tabs (same tier) sharing a worktree — the more
+	// recently active one wins.
+	terminals := []orcaTerminal{
+		{Handle: "term_older", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "✳ team", Connected: true, Writable: true, LastOutputAt: 100},
+		{Handle: "term_newer", WorktreePath: "/Users/imac/IdeaProjects/aboard", Title: "✳ team", Connected: true, Writable: true, LastOutputAt: 200},
+	}
+	target, ok := selectOrcaTerminal(terminals, "-Users-imac-IdeaProjects-aboard")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_newer" {
+		t.Errorf("got ID %q, want term_newer (higher lastOutputAt within same tier)", target.ID)
+	}
+}
+
+func TestSelectOrcaTerminal_AnyMatchTierAlsoUsesRecency(t *testing.T) {
+	// Neither terminal is connected+writable, so both fall to the last
+	// (any-match) tier — recency still breaks the tie there.
+	terminals := []orcaTerminal{
+		{Handle: "term_a", WorktreePath: "/Users/imac/IdeaProjects/aboard", Connected: false, Writable: false, LastOutputAt: 5},
+		{Handle: "term_b", WorktreePath: "/Users/imac/IdeaProjects/aboard", Connected: false, Writable: false, LastOutputAt: 10},
+	}
+	target, ok := selectOrcaTerminal(terminals, "-Users-imac-IdeaProjects-aboard")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_b" {
+		t.Errorf("got ID %q, want term_b (highest lastOutputAt in the any-match tier)", target.ID)
+	}
+}
+
+func TestParseOrcaTerminals_BareShapeFallback(t *testing.T) {
+	// Source types also show a bare (non-envelope) shape — must still work.
+	fixture := []byte(`{"terminals":[{"handle":"term_bare","worktreePath":"/Users/imac/IdeaProjects/aboard","title":"✳ team","connected":true,"writable":true,"lastOutputAt":1}]}`)
 
 	target, ok := parseOrcaTerminals(fixture, "-Users-imac-IdeaProjects-aboard")
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	if target.ID != "term_a" {
-		t.Errorf("got ID %q, want first match term_a", target.ID)
+	if target.ID != "term_bare" {
+		t.Errorf("got ID %q, want term_bare", target.ID)
+	}
+}
+
+func TestParseOrcaTerminals_EnvelopeOKFalse(t *testing.T) {
+	fixture := []byte(`{"id":"x","ok":false,"result":{"terminals":[]}}`)
+	if _, ok := parseOrcaTerminals(fixture, "-Users-imac-IdeaProjects-aboard"); ok {
+		t.Error("expected ok=false when envelope reports ok:false")
 	}
 }
 
 func TestParseOrcaTerminals_NoMatch(t *testing.T) {
-	fixture := []byte(`{"terminals": [{"handle": "term_a", "worktreePath": "/Users/imac/IdeaProjects/other", "connected": true, "writable": true}]}`)
-
+	fixture := []byte(`{"ok":true,"result":{"terminals":[{"handle":"term_a","worktreePath":"/Users/imac/IdeaProjects/other","connected":true,"writable":true}]}}`)
 	if _, ok := parseOrcaTerminals(fixture, "-Users-imac-IdeaProjects-aboard"); ok {
 		t.Error("expected ok=false when no worktreePath matches projectDir")
 	}
 }
 
 func TestParseOrcaTerminals_EmptyTerminals(t *testing.T) {
-	if _, ok := parseOrcaTerminals([]byte(`{"terminals": []}`), "-Users-imac-IdeaProjects-aboard"); ok {
+	if _, ok := parseOrcaTerminals([]byte(`{"ok":true,"result":{"terminals":[]}}`), "-Users-imac-IdeaProjects-aboard"); ok {
 		t.Error("expected ok=false for empty terminals list")
 	}
 }
