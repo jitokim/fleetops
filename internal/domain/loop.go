@@ -76,6 +76,8 @@ type Loop struct {
 	Last         *Verdict
 	GatePrompt   string
 	Project      string    // decoded project label (e.g. "aboard")
+	ProjectDir   string    // raw encoded project dir name, e.g. "-Users-imac-IdeaProjects-aboard"
+	Cwd          string    // best-effort decoded absolute cwd, for display only
 	SessionID    string    // Claude Code session id
 	Path         string    // path to the session JSONL
 	LastActivity time.Time // last log write

@@ -5,6 +5,8 @@
 package claude
 
 import (
+	"bufio"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -59,7 +61,8 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 }
 
 func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
-	proj := projectLabel(filepath.Base(filepath.Dir(path)))
+	projectDir := filepath.Base(filepath.Dir(path))
+	proj := projectLabel(projectDir)
 	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	last := fi.ModTime()
 	idle := now.Sub(last) >= IdleThreshold
@@ -68,6 +71,8 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
 		ID:           session,
 		Name:         proj,
 		Project:      proj,
+		ProjectDir:   projectDir,
+		Cwd:          decodeCwd(projectDir),
 		SessionID:    session,
 		Path:         path,
 		LastActivity: last,
@@ -120,4 +125,72 @@ func projectLabel(dir string) string {
 		}
 	}
 	return dir
+}
+
+// decodeCwd best-effort reverses the "/" → "-" project-dir encoding, for
+// display only. Lossy when a path segment itself contains "-"; ProjectDir
+// (the raw encoded string) is the source of truth for matching, see
+// internal/control.
+func decodeCwd(dir string) string {
+	return "/" + strings.ReplaceAll(strings.TrimPrefix(dir, "-"), "-", "/")
+}
+
+// LastUserPrompt returns the text of the last user message in a Claude Code
+// session log, for re-sending on resume (DESIGN.md: resume re-drives the
+// loop rather than restarting it). ok is false if the file has no user
+// message (or can't be read).
+func LastUserPrompt(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+
+	last := ""
+	found := false
+	for scanner.Scan() {
+		var entry map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if entry["type"] != "user" {
+			continue
+		}
+		if text, ok := userMessageText(entry); ok && text != "" {
+			last = text
+			found = true
+		}
+	}
+	return last, found
+}
+
+// userMessageText extracts the text of a user transcript entry's
+// message.content, which is either a plain string or an array of content
+// blocks (text blocks have "type":"text").
+func userMessageText(entry map[string]any) (string, bool) {
+	msg, ok := entry["message"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	switch content := msg["content"].(type) {
+	case string:
+		return content, content != ""
+	case []any:
+		for _, block := range content {
+			b, ok := block.(map[string]any)
+			if !ok {
+				continue
+			}
+			if b["type"] != "text" {
+				continue
+			}
+			if text, ok := b["text"].(string); ok && text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
 }

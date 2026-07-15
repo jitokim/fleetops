@@ -10,11 +10,19 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jitokim/missionctl/internal/claude"
+	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
 )
 
 type loopsMsg []domain.Loop
 type tickMsg time.Time
+
+// resumeResultMsg reports the outcome of a resume (r key) attempt, computed
+// off the event loop by resumeCmd so the TUI never blocks on exec.
+type resumeResultMsg struct {
+	ok   bool
+	text string
+}
 
 const refreshEvery = 3 * time.Second
 
@@ -69,19 +77,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "G":
 			m.cursor = maxInt(0, len(m.loops)-1)
 		case "r":
-			m.status = m.resumeHint()
+			sel, ok := m.selected()
+			if !ok || sel.State != domain.StateStalled {
+				m.status = "select a stalled loop to resume"
+				return m, nil
+			}
+			m.status = fmt.Sprintf("resuming %s...", sel.Project)
+			return m, resumeCmd(sel)
 		case "enter":
 			m.status = "attach/open — TODO (needs cmux integration)"
 		}
+	case resumeResultMsg:
+		m.status = msg.text
 	}
 	return m, nil
 }
 
-func (m Model) resumeHint() string {
-	if sel, ok := m.selected(); ok && sel.State == domain.StateStalled {
-		return fmt.Sprintf("resume %s → re-send prompt to its cmux pane (TODO: wire cmux send-keys)", sel.Project)
+// resumeCmd re-sends a stalled loop's last prompt to the terminal surface
+// hosting it, via whichever multiplexer backend (orca/cmux/tmux) is
+// available. Runs off the event loop — exec calls belong in a tea.Cmd, never
+// in Update.
+func resumeCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return resumeResultMsg{false, "no orca/tmux/cmux — resume manually: " + manualResumeHint(l.SessionID)}
+		}
+		target, ok := ctrl.Locate(l.ProjectDir)
+		if !ok {
+			return resumeResultMsg{false, "surface not found — resume manually: " + manualResumeHint(l.SessionID)}
+		}
+		prompt, ok := claude.LastUserPrompt(l.Path)
+		note := ""
+		if !ok {
+			note = " (no prior prompt found — sent Enter only)"
+		}
+		if err := ctrl.Resume(target, prompt); err != nil {
+			return resumeResultMsg{false, fmt.Sprintf("resume %s failed: %v", l.Project, err)}
+		}
+		return resumeResultMsg{true, fmt.Sprintf("resumed %s via %s%s", l.Project, ctrl.Name(), note)}
 	}
-	return "select a stalled loop to resume"
+}
+
+// manualResumeHint is the copy-pasteable fallback for bare terminals (no
+// orca/cmux/tmux to actuate into) — observation still works everywhere, but
+// actuation degrades to "tell the human what to type".
+func manualResumeHint(sessionID string) string {
+	return "claude --resume " + sessionID
 }
 
 func (m Model) selected() (domain.Loop, bool) {
@@ -189,6 +231,8 @@ func renderDetail(l domain.Loop) string {
 		d.WriteString(stFaint.Render("WHY     ") + lipgloss.NewStyle().Foreground(stateColor(l)).Render(string(l.Stall)))
 		d.WriteString("\n")
 		d.WriteString(stFaint.Render("        ") + stDim.Render("press r to resume (re-send prompt)"))
+		d.WriteString("\n")
+		d.WriteString(stFaint.Render("        ") + stDim.Render("manual: "+manualResumeHint(l.SessionID)))
 		d.WriteString("\n")
 	}
 	d.WriteString(stFaint.Render("LOG     ") + stDim.Render(l.Path))
