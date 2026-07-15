@@ -78,7 +78,19 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	registry.BindPending(loopsDir, registry.PendingDir(), loops, now)
 	loops = enrichFromRegistry(loops, loopsDir)
 
-	return applyLiveness(loops, LiveClaudeCwds()), nil
+	live, liveOK := LiveClaudeCwds()
+	loops = applyLiveness(loops, live, liveOK)
+
+	// Keep metricsCache bounded to sessions actually present in this scan —
+	// otherwise it grows forever as old sessions age out of the window or
+	// get deleted, over a long-running missionctl process.
+	keep := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		keep[m] = true
+	}
+	pruneMetricsCache(keep)
+
+	return loops, nil
 }
 
 // enrichFromRegistry attaches goal-bound metadata (Goal.Text/MaxCycles/
@@ -107,7 +119,13 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 		loops[i].NoImprove = rec.NoImprove
 		loops[i].Last = rec.Verdict
 
-		if rec.Verdict != nil && rec.Verdict.AtCycle == loops[i].Cycle {
+		// A live gate always wins over a stale verdict: the loop is blocked
+		// on a human decision RIGHT NOW, which is more urgent and more
+		// current than a judgment rendered against an earlier cycle's
+		// output. Without this guard, a bound loop that hit a fresh
+		// permission prompt after being judged done/rejected would show
+		// DONE/DRIFT instead of the ◆ GATE it's actually sitting in.
+		if rec.Verdict != nil && rec.Verdict.AtCycle == loops[i].Cycle && loops[i].State != domain.StateGate {
 			switch rec.Verdict.Outcome {
 			case domain.OutcomeDone:
 				loops[i].State = domain.StateDone
@@ -128,7 +146,19 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 // within any cwd the earliest-indexed entries are the most recently active
 // ones — no extra sort needed here.
 //
-// Per cwd, the `live` count of most-recently-active loops are left
+// live is keyed by REAL (unencoded) lsof cwd paths (see LiveClaudeCwds), not
+// by a loop's lossily-decoded Cwd — decodeCwd can't tell a "-" that was
+// originally "/" from one that was originally in the directory name itself
+// (e.g. "my-app"), so matching against it would silently miss real
+// directories. Instead each live real path is re-encoded with encodeCwd
+// (Claude Code's own "/" and "." → "-" scheme) and matched against the
+// loop's ProjectDir, which IS that raw encoded string — lossless in this
+// direction. ok=false (the ps/lsof probe itself failed) short-circuits to
+// "leave the fleet exactly as classified" — see LiveClaudeCwds: a probe
+// failure is not evidence of anything, and must never be treated as "0 live
+// processes", which would wrongly mark the entire fleet StallGone/dropped.
+//
+// Per ProjectDir, the live count of most-recently-active loops are left
 // untouched (there's a real process behind them). The rest are presumed
 // dead:
 //   - StateIdle (finished its turn, then the process went away) → dropped
@@ -140,17 +170,42 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 //   - anything else (StateStalled, or StateRunning past the live count —
 //     e.g. a process that just died mid-turn) → kept, reclassified
 //     StateStalled/StallGone: a mid-work death IS an incident.
-func applyLiveness(loops []domain.Loop, live map[string]int) []domain.Loop {
-	byCwd := make(map[string][]int)
+//
+// Bonus: whenever a ProjectDir has ANY live process backing it (regardless
+// of which specific loop in the group that process belongs to), every loop
+// sharing that ProjectDir gets its Cwd healed to the confirmed-real lsof
+// path (overwriting the lossy decode) and CwdVerified set — the directory
+// itself is confirmed real, independent of which loop instance is live.
+func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.Loop {
+	if !ok {
+		return loops // probe failed — do not reclassify the fleet on no data (P1-2)
+	}
+
+	liveCountByProjectDir := make(map[string]int)
+	realPathByProjectDir := make(map[string]string)
+	for realPath, count := range live {
+		pd := encodeCwd(realPath)
+		liveCountByProjectDir[pd] += count
+		realPathByProjectDir[pd] = realPath
+	}
+
+	byProjectDir := make(map[string][]int)
 	for i, l := range loops {
-		byCwd[l.Cwd] = append(byCwd[l.Cwd], i)
+		byProjectDir[l.ProjectDir] = append(byProjectDir[l.ProjectDir], i)
 	}
 
 	drop := make(map[int]bool, len(loops))
-	for cwd, idxs := range byCwd {
-		k := live[cwd]
+	for pd, idxs := range byProjectDir {
+		if realPath, matched := realPathByProjectDir[pd]; matched {
+			for _, i := range idxs {
+				loops[i].Cwd = realPath
+				loops[i].CwdVerified = true
+			}
+		}
+
+		k := liveCountByProjectDir[pd]
 		if k >= len(idxs) {
-			continue // enough live processes for every loop sharing this cwd
+			continue // enough live processes for every loop sharing this dir
 		}
 		for _, i := range idxs[k:] {
 			switch loops[i].State {
@@ -238,8 +293,14 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 			l.State = domain.StateGate
 			l.Stall = domain.StallNone
 			l.GatePrompt = info.Message
+			l.GateTS = info.TS.Unix() // lets approveCmd compare-and-swap delete only the marker this decision was based on
 		} else {
-			gate.DeleteMarker(gatesDir, session) // already answered, or not a real gate
+			// Compare-and-swap: only delete the marker this scan actually
+			// judged stale/non-gate. A plain delete-by-name could destroy a
+			// BRAND NEW marker that landed between the Pending() snapshot
+			// above and this delete (e.g. the human answered, then a fresh
+			// permission prompt fired moments later) — see gate.DeleteMarkerIfTS.
+			gate.DeleteMarkerIfTS(gatesDir, session, info.TS.Unix())
 		}
 	}
 	return l
@@ -379,6 +440,18 @@ func projectLabel(dir string) string {
 // internal/control.
 func decodeCwd(dir string) string {
 	return "/" + strings.ReplaceAll(strings.TrimPrefix(dir, "-"), "-", "/")
+}
+
+// encodeCwd applies Claude Code's own project-dir encoding to a real
+// (unencoded) absolute path — both "/" AND "." become "-" (verified:
+// "/Users/imac/.claude-mem/observer-sessions" →
+// "-Users-imac--claude-mem-observer-sessions"). This is the lossless
+// direction (unlike decodeCwd): encoding a known-real path can be compared
+// exactly against a loop's ProjectDir, which is why applyLiveness uses this
+// instead of decoding ProjectDir and fuzzy-matching against a live path.
+func encodeCwd(realPath string) string {
+	encoded := strings.ReplaceAll(realPath, "/", "-")
+	return strings.ReplaceAll(encoded, ".", "-")
 }
 
 // LastUserPrompt returns the text of the last user message in a Claude Code

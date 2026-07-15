@@ -347,8 +347,20 @@ func TestLoopFromLog_StaleGate_DeletedAndIgnored(t *testing.T) {
 	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	gatesDir := t.TempDir()
 	staleTS := fi.ModTime().Add(-time.Hour) // long before the log's last write
-	if err := gate.WriteMarker(gatesDir, session, "old question", "permission_prompt"); err != nil {
-		t.Fatalf("WriteMarker: %v", err)
+
+	// Write the on-disk marker with the SAME stale TS the pending map below
+	// carries — mirroring production, where pending always comes from
+	// gate.Pending(gatesDir) reading this exact file. DeleteMarkerIfTS's
+	// compare-and-swap only deletes when the on-disk TS matches, so a
+	// pending map with a synthetic TS that doesn't match what's on disk
+	// would (correctly) refuse the delete — this fixture must keep them in
+	// sync to exercise the stale-cleanup path.
+	if err := os.WriteFile(
+		filepath.Join(gatesDir, session+".json"),
+		[]byte(fmt.Sprintf(`{"message":"old question","type":"permission_prompt","ts":%d}`, staleTS.Unix())),
+		0o644,
+	); err != nil {
+		t.Fatalf("write stale marker fixture: %v", err)
 	}
 	pending := map[string]gate.Info{session: {Message: "old question", TS: staleTS}}
 
@@ -428,12 +440,12 @@ func TestLastAssistantText_MissingFile(t *testing.T) {
 func TestApplyLiveness_OneLiveProcess_NewestKeepsOlderDemoted(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "newer", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
-		{SessionID: "older-idle", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now.Add(-time.Hour)},
+		{SessionID: "newer", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "older-idle", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now.Add(-time.Hour)},
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (older idle loop dropped): %+v", len(out), out)
@@ -446,12 +458,12 @@ func TestApplyLiveness_OneLiveProcess_NewestKeepsOlderDemoted(t *testing.T) {
 func TestApplyLiveness_OlderStalled_BecomesGone(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "newer", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
-		{SessionID: "older-stalled", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Hour)},
+		{SessionID: "newer", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "older-stalled", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Hour)},
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2 (stalled loop kept, reclassified): %+v", len(out), out)
@@ -465,12 +477,12 @@ func TestApplyLiveness_OlderStalled_BecomesGone(t *testing.T) {
 func TestApplyLiveness_ZeroLiveProcesses_IdleDroppedStalledGone(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "idle-one", Cwd: "/x/dead", State: domain.StateIdle, LastActivity: now},
-		{SessionID: "stalled-one", Cwd: "/x/dead", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Minute)},
+		{SessionID: "idle-one", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "stalled-one", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Minute)},
 	}
 	live := map[string]int{} // no live process at all for this cwd
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (idle dropped, stalled kept): %+v", len(out), out)
@@ -485,12 +497,12 @@ func TestApplyLiveness_RunningPastLiveCount_BecomesGone(t *testing.T) {
 	// there's no live process backing it once past the live count.
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "newer", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now},
-		{SessionID: "just-died", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now.Add(-time.Second)},
+		{SessionID: "newer", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now},
+		{SessionID: "just-died", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now.Add(-time.Second)},
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2: %+v", len(out), out)
@@ -503,12 +515,12 @@ func TestApplyLiveness_RunningPastLiveCount_BecomesGone(t *testing.T) {
 func TestApplyLiveness_EnoughLiveProcesses_Untouched(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "a", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now},
-		{SessionID: "b", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now.Add(-time.Minute)},
+		{SessionID: "a", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now},
+		{SessionID: "b", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now.Add(-time.Minute)},
 	}
 	live := map[string]int{"/x/aboard": 2} // one live process per loop
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2 (nothing dropped)", len(out))
@@ -521,12 +533,12 @@ func TestApplyLiveness_EnoughLiveProcesses_Untouched(t *testing.T) {
 func TestApplyLiveness_DifferentCwdsIndependent(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "a", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
-		{SessionID: "b", Cwd: "/x/other", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "a", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "b", ProjectDir: "-x-other", Cwd: "/x/other", State: domain.StateIdle, LastActivity: now},
 	}
 	live := map[string]int{"/x/aboard": 1, "/x/other": 0}
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 1 || out[0].SessionID != "a" {
 		t.Errorf("got %+v, want only loop \"a\" (its cwd has a live process; \"b\"'s doesn't)", out)
@@ -536,11 +548,11 @@ func TestApplyLiveness_DifferentCwdsIndependent(t *testing.T) {
 func TestApplyLiveness_StateDone_NotDroppedNorDemoted(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "done-one", Cwd: "/x/aboard", State: domain.StateDone, LastActivity: now},
+		{SessionID: "done-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateDone, LastActivity: now},
 	}
 	live := map[string]int{} // zero live processes for this cwd — would normally drop/demote everything
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (StateDone must survive, not be dropped)", len(out))
@@ -553,17 +565,113 @@ func TestApplyLiveness_StateDone_NotDroppedNorDemoted(t *testing.T) {
 func TestApplyLiveness_StateDrift_NotDroppedNorDemoted(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "drift-one", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
+		{SessionID: "drift-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
 	}
 	live := map[string]int{}
 
-	out := applyLiveness(loops, live)
+	out := applyLiveness(loops, live, true)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (StateDrift must survive)", len(out))
 	}
 	if out[0].State != domain.StateDrift || out[0].Stall != domain.StallNone {
 		t.Errorf("got %+v, want State=StateDrift Stall=StallNone (untouched by liveness)", out[0])
+	}
+}
+
+func TestApplyLiveness_ProbeFailed_FleetUnchanged(t *testing.T) {
+	// ok=false (ps/lsof error or timeout) must NOT be treated as "confirmed
+	// zero live processes" — that would wrongly drop/demote the entire
+	// fleet on a transient probe hiccup (P1-2).
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "idle-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "stalled-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Minute)},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, false)
+
+	if len(out) != 2 {
+		t.Fatalf("got %d loops, want 2 (probe failure must leave the fleet untouched): %+v", len(out), out)
+	}
+	if out[0].State != domain.StateIdle || out[1].Stall != domain.StallNoOutput {
+		t.Errorf("got %+v, want both loops exactly as classified before the probe", out)
+	}
+}
+
+func TestApplyLiveness_HyphenatedRealDir_MatchesEncodedProjectDir(t *testing.T) {
+	// the real directory name itself contains a "-" (e.g. "my-app") — a
+	// naive decode-and-compare would be ambiguous about which "-" came from
+	// "/" and which was literal. Matching in the encode direction
+	// (encodeCwd(realPath) == ProjectDir) is lossless and must succeed here.
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-Users-x-my-app", Cwd: "/Users/x/my-app", State: domain.StateIdle, LastActivity: now},
+	}
+	live := map[string]int{"/Users/x/my-app": 1}
+
+	out := applyLiveness(loops, live, true)
+
+	if len(out) != 1 || out[0].State != domain.StateIdle {
+		t.Errorf("got %+v, want the loop kept and untouched (its real process is live)", out)
+	}
+}
+
+func TestApplyLiveness_DottedRealDir_MatchesEncodedProjectDir(t *testing.T) {
+	// verifies the exact example from the hardening spec: both "/" and "."
+	// encode to "-".
+	now := time.Now()
+	loops := []domain.Loop{
+		{
+			SessionID:    "s1",
+			ProjectDir:   "-Users-imac--claude-mem-observer-sessions",
+			Cwd:          "/Users/imac/-claude-mem-observer-sessions", // stale lossy decode
+			State:        domain.StateIdle,
+			LastActivity: now,
+		},
+	}
+	live := map[string]int{"/Users/imac/.claude-mem/observer-sessions": 1}
+
+	out := applyLiveness(loops, live, true)
+
+	if len(out) != 1 || out[0].State != domain.StateIdle {
+		t.Errorf("got %+v, want the loop kept and untouched (its real process is live)", out)
+	}
+}
+
+func TestApplyLiveness_HealsCwdAndSetsCwdVerified(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now, CwdVerified: false},
+	}
+	live := map[string]int{"/x/aboard": 1}
+
+	out := applyLiveness(loops, live, true)
+
+	if out[0].Cwd != "/x/aboard" || !out[0].CwdVerified {
+		t.Errorf("got Cwd=%q CwdVerified=%v, want the real lsof path and CwdVerified=true", out[0].Cwd, out[0].CwdVerified)
+	}
+}
+
+func TestApplyLiveness_HealsCwdEvenWhileDemotedToGone(t *testing.T) {
+	// the directory itself is confirmed real by SOME live process there,
+	// independent of whether THIS specific loop's own process is the live
+	// one — a demoted/stale loop still gets its Cwd healed.
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "newer", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now},
+		{SessionID: "just-died", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now.Add(-time.Second), CwdVerified: false},
+	}
+	live := map[string]int{"/x/aboard": 1}
+
+	out := applyLiveness(loops, live, true)
+
+	demoted := out[1]
+	if demoted.State != domain.StateStalled || demoted.Stall != domain.StallGone {
+		t.Fatalf("got %+v, want demoted to StateStalled/StallGone", demoted)
+	}
+	if demoted.Cwd != "/x/aboard" || !demoted.CwdVerified {
+		t.Errorf("got Cwd=%q CwdVerified=%v, want healed even though this loop was demoted", demoted.Cwd, demoted.CwdVerified)
 	}
 }
 
@@ -682,5 +790,44 @@ func TestEnrichFromRegistry_VerdictFromEarlierCycle_DoesNotOverrideState(t *test
 	}
 	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeDone {
 		t.Errorf("Last = %+v, want the stale done verdict still surfaced for the ORACLE column", out[0].Last)
+	}
+}
+
+func TestEnrichFromRegistry_GateWinsOverDoneVerdict(t *testing.T) {
+	// P2-2: a live gate is more urgent and more current than a verdict
+	// rendered against this exact cycle — must not be clobbered by DONE/DRIFT.
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 5); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateGate, GatePrompt: "approve?", Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateGate {
+		t.Errorf("State = %v, want StateGate preserved (gate wins over a same-cycle DONE verdict)", out[0].State)
+	}
+	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeDone {
+		t.Errorf("Last = %+v, want the verdict still surfaced for the ORACLE column despite not overriding State", out[0].Last)
+	}
+}
+
+func TestEnrichFromRegistry_GateWinsOverRejectedVerdict(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 5); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateGate, GatePrompt: "approve?", Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateGate {
+		t.Errorf("State = %v, want StateGate preserved (gate wins over a same-cycle DRIFT verdict)", out[0].State)
 	}
 }

@@ -14,20 +14,27 @@ import (
 // hangs the TUI's 3s refresh.
 const procTimeout = 2 * time.Second
 
-// LiveClaudeCwds returns cwd → count of live `claude` CLI processes, used to
-// cross-check the JSONL-only signal (a session that stopped writing could be
-// "waiting for human" or "the process is gone" — the log alone can't tell
-// them apart; see applyLiveness in scan.go).
-func LiveClaudeCwds() map[string]int {
+// LiveClaudeCwds returns real (unencoded) cwd → count of live `claude` CLI
+// processes there, used to cross-check the JSONL-only signal (a session
+// that stopped writing could be "waiting for human" or "the process is
+// gone" — the log alone can't tell them apart; see applyLiveness in
+// scan.go, which also does the path encoding needed to match these real
+// paths against a loop's ProjectDir).
+//
+// ok=false means the probe itself failed (ps/lsof error or timeout) — the
+// caller MUST NOT treat that as "confirmed dead": an empty-but-successful
+// probe (ok=true, empty map) genuinely means zero live claude processes,
+// which is real information, not a failure.
+func LiveClaudeCwds() (map[string]int, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), procTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "ps", "axo", "pid,comm").Output()
 	if err != nil {
-		return map[string]int{}
+		return map[string]int{}, false
 	}
 	pids := parsePsClaudePids(string(out))
 	if len(pids) == 0 {
-		return map[string]int{}
+		return map[string]int{}, true // ps succeeded; genuinely zero live claude processes
 	}
 	pidStrs := make([]string, len(pids))
 	for i, p := range pids {
@@ -38,9 +45,9 @@ func LiveClaudeCwds() map[string]int {
 	defer cancel2()
 	lsofOut, err := exec.CommandContext(ctx2, "lsof", "-a", "-p", strings.Join(pidStrs, ","), "-d", "cwd", "-Fn").Output()
 	if err != nil {
-		return map[string]int{}
+		return map[string]int{}, false
 	}
-	return parseLsofCwds(string(lsofOut))
+	return parseLsofCwds(string(lsofOut)), true
 }
 
 // parsePsClaudePids parses `ps axo pid,comm` output into the pids whose comm

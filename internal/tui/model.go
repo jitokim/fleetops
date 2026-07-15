@@ -137,9 +137,10 @@ type Model struct {
 	start      time.Time // for the header's uptime clock
 	hostname   string
 
-	mode     mode
-	input    textinput.Model
-	spawnCwd string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
+	mode      mode
+	input     textinput.Model
+	spawnCwd  string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
+	spawnNote string // captured alongside spawnCwd: non-empty when the selected loop's cwd wasn't verified-real and spawn fell back to os.Getwd() (see the "n" handler and P1-3's CwdVerified gating)
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
@@ -202,7 +203,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status, m.statusKind = "cancelled (empty goal)", statusNeutral
 					return m, nil
 				}
-				m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...", cwd), statusNeutral
+				m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", cwd, m.spawnNote), statusNeutral
 				return m, spawnCmd(cwd, goal)
 			default:
 				var cmd tea.Cmd
@@ -286,12 +287,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = "select a stalled or drifted loop to resume", statusNeutral
 				return m, nil
 			}
+			if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+				m.status, m.statusKind = msg, statusErr
+				return m, nil
+			}
 			m.status, m.statusKind = fmt.Sprintf("resuming %s...", sel.Project), statusNeutral
 			return m, resumeCmd(sel)
 		case "a":
 			sel, ok := m.selected()
 			if !ok || sel.State != domain.StateGate {
 				m.status, m.statusKind = "select a gated loop", statusNeutral
+				return m, nil
+			}
+			if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+				m.status, m.statusKind = msg, statusErr
 				return m, nil
 			}
 			m.status, m.statusKind = fmt.Sprintf("approving %s...", sel.Project), statusNeutral
@@ -320,10 +329,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err != nil {
 				cwd = "."
 			}
+			spawnNote := ""
 			if sel, ok := m.selected(); ok && sel.Cwd != "" {
-				cwd = sel.Cwd
+				// Only spawn into a loop's cwd once it's been confirmed
+				// against a live process's real lsof path (see
+				// applyLiveness/CwdVerified) — a dead loop's Cwd is at best
+				// a lossy decode of ProjectDir (ambiguous when the real
+				// directory name itself contains "-") and could point
+				// spawn at the wrong directory entirely (P1-3).
+				if sel.CwdVerified {
+					cwd = sel.Cwd
+				} else {
+					spawnNote = fmt.Sprintf(" (%s's cwd wasn't verified — using %s instead)", sel.Project, cwd)
+				}
 			}
 			m.spawnCwd = cwd
+			m.spawnNote = spawnNote
 			m.mode = modePrompting
 			m.input = textinput.New()
 			m.input.Placeholder = "goal"
@@ -339,6 +360,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			now := time.Now()
 			if m.pendingKillSession == sel.SessionID && now.Sub(m.pendingKillAt) <= killConfirmWindow {
 				m.pendingKillSession = ""
+				if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+					m.status, m.statusKind = msg, statusErr
+					return m, nil
+				}
 				m.status, m.statusKind = fmt.Sprintf("killing %s...", sel.Project), statusNeutral
 				return m, killCmd(sel)
 			}
@@ -349,6 +374,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sel, ok := m.selected()
 			if !ok || (sel.State != domain.StateRunning && sel.State != domain.StateGate) {
 				m.status, m.statusKind = "select a running or gated loop to stop", statusNeutral
+				return m, nil
+			}
+			if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+				m.status, m.statusKind = msg, statusErr
 				return m, nil
 			}
 			m.status, m.statusKind = fmt.Sprintf("stopping %s...", sel.Project), statusNeutral
@@ -432,7 +461,10 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 		if !ok {
 			return resumeResultMsg{false, "no orca/tmux/cmux — resume manually: " + manualResumeHint(l.SessionID)}
 		}
-		target, ok := ctrl.Locate(l.ProjectDir)
+		// LocateClaude (not Locate): resuming must land on a CONFIRMED claude
+		// surface, never a bare shell sharing the same directory — see
+		// Controller.LocateClaude and the P0-3 hardening rationale.
+		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
 			return resumeResultMsg{false, "surface not found — resume manually: " + manualResumeHint(l.SessionID)}
 		}
@@ -494,14 +526,20 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		if !ok {
 			return approveResultMsg{false, "no orca/tmux/cmux — approve manually: attach and press Enter"}
 		}
-		target, ok := ctrl.Locate(l.ProjectDir)
+		// LocateClaude: approving must land on a confirmed claude surface,
+		// never a bare shell (see resumeCmd's identical rationale).
+		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
 			return approveResultMsg{false, "surface not found — approve manually: attach and press Enter"}
 		}
 		if err := ctrl.Approve(target); err != nil {
 			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
 		}
-		gate.DeleteMarker(gate.GatesDir(), l.SessionID)
+		// Compare-and-swap delete: only remove the marker THIS decision was
+		// based on (l.GateTS) — a plain delete-by-name could destroy a BRAND
+		// NEW marker that landed between this loop's scan snapshot and this
+		// approve call (see gate.DeleteMarkerIfTS).
+		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
 		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, ctrl.Name())}
 	}
 }
@@ -545,7 +583,10 @@ func killCmd(l domain.Loop) tea.Cmd {
 		if !ok {
 			return killResultMsg{false, "no orca/tmux/cmux — kill manually: type /exit in " + l.Project}
 		}
-		target, ok := ctrl.Locate(l.ProjectDir)
+		// LocateClaude: killing must land on a confirmed claude surface,
+		// never a bare shell (see resumeCmd's identical rationale) — typing
+		// "/exit" into an unrelated shell pane would be a real hazard.
+		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
 			return killResultMsg{false, "surface not found — kill manually: type /exit"}
 		}
@@ -564,7 +605,9 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		if !ok {
 			return interruptResultMsg{false, "no orca/tmux/cmux — stop manually: press Esc in " + l.Project}
 		}
-		target, ok := ctrl.Locate(l.ProjectDir)
+		// LocateClaude: interrupting must land on a confirmed claude surface,
+		// never a bare shell (see resumeCmd's identical rationale).
+		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
 			return interruptResultMsg{false, "surface not found — stop manually: press Esc"}
 		}
@@ -639,6 +682,37 @@ func (m Model) selected() (domain.Loop, bool) {
 		return loops[m.cursor], true
 	}
 	return domain.Loop{}, false
+}
+
+// refuseIfAmbiguous is the P0-1/P0-2 actuation guard: Locate/LocateClaude
+// match a terminal surface by ProjectDir (a directory), but loops are
+// SESSIONS — when more than one loop in the current fleet shares l's
+// directory, a typed/destructive action (resume/kill/approve/interrupt)
+// could silently land on the wrong one (freshest-tab tiering picks whichever
+// surface looks healthiest, not necessarily the loop the human selected).
+// Callers must check this immediately before dispatching resumeCmd/killCmd/
+// approveCmd/interruptCmd — NOT attachCmd/o, which are read-only/navigation
+// and safe regardless of which sibling surface they land on.
+func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
+	n := m.sameProjectDirCount(l.ProjectDir)
+	if n <= 1 {
+		return "", false
+	}
+	return fmt.Sprintf("ambiguous: %d loops share %s's directory — attach (↵) and act manually", n, l.Project), true
+}
+
+// sameProjectDirCount counts how many loops in the current fleet (not just
+// the visible/filtered subset — ambiguity is a property of the WHOLE fleet
+// sharing a terminal surface, filtering doesn't change that) have this exact
+// encoded ProjectDir.
+func (m Model) sameProjectDirCount(projectDir string) int {
+	n := 0
+	for _, l := range m.loops {
+		if l.ProjectDir == projectDir {
+			n++
+		}
+	}
+	return n
 }
 
 // visibleLoops is what the table/cursor/actions operate on: all loops, or

@@ -83,3 +83,23 @@ func TestSessionMetrics_CacheInvalidatesOnChange(t *testing.T) {
 		t.Errorf("cycles after append = %d, want 2 (cache must invalidate on size/mtime change)", cycles)
 	}
 }
+
+func TestPruneMetricsCache_RemovesUntrackedPaths(t *testing.T) {
+	pathA := writeJSONL(t, `{"type":"user","message":{"content":"a"}}`)
+	pathB := writeJSONL(t, `{"type":"user","message":{"content":"b"}}`)
+
+	SessionMetrics(pathA)
+	SessionMetrics(pathB)
+	if _, ok := metricsCache.Load(pathA); !ok {
+		t.Fatal("precondition failed: pathA should be cached")
+	}
+
+	pruneMetricsCache(map[string]bool{pathB: true})
+
+	if _, ok := metricsCache.Load(pathA); ok {
+		t.Error("expected pathA's cache entry to be pruned (not in the keep set)")
+	}
+	if _, ok := metricsCache.Load(pathB); !ok {
+		t.Error("expected pathB's cache entry to survive (in the keep set)")
+	}
+}

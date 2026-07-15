@@ -42,9 +42,20 @@ func (cmuxController) Locate(projectDir string) (Target, bool) {
 	return Target{}, false
 }
 
+// LocateClaude always returns not-found. cmux's `tree --json` shape is
+// unverified (see parseCmuxTree's TODO) and carries no per-surface
+// running-command field, so there is no way to confirm a surface is
+// actually running claude (vs. a bare shell) — degrading to Locate's
+// permissive cwd-only match here would reintroduce exactly the
+// wrong-terminal actuation hazard LocateClaude exists to prevent. Typed
+// actions on cmux fall back to the TUI's manual resume hint instead (see
+// DESIGN.md's graceful-degrade path).
+func (cmuxController) LocateClaude(projectDir string) (Target, bool) {
+	return Target{}, false
+}
+
 func (cmuxController) Resume(t Target, prompt string) error {
-	argv := cmuxResumeCmd(t.ID, prompt)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(cmuxResumeCmd(t.ID, prompt))
 }
 
 // cmuxResumeCmd builds the argv that re-sends prompt to a surface and submits
@@ -60,8 +71,7 @@ func cmuxResumeCmd(surfaceRef, prompt string) []string {
 // TODO: verify cmux's send-key subcommand shape on a machine with the cmux
 // CLI — unverified, same caveat as parseCmuxTree.
 func (cmuxController) Approve(t Target) error {
-	argv := cmuxApproveCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(cmuxApproveCmd(t.ID))
 }
 
 // cmuxApproveCmd builds the argv for a bare Enter keypress into a surface.
@@ -70,8 +80,7 @@ func cmuxApproveCmd(surfaceRef string) []string {
 }
 
 func (cmuxController) Focus(t Target) error {
-	argv := cmuxFocusCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(cmuxFocusCmd(t.ID))
 }
 
 // cmuxFocusCmd builds the argv that brings a cmux surface to the front:
@@ -93,8 +102,7 @@ func (cmuxController) Spawn(cwd, goal string) error {
 // TODO: verify cmux's send-key escape convention on a machine with the cmux
 // CLI — unverified, same caveat as parseCmuxTree/Approve.
 func (cmuxController) Interrupt(t Target) error {
-	argv := cmuxInterruptCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(cmuxInterruptCmd(t.ID))
 }
 
 // cmuxInterruptCmd builds the argv for an Escape keypress into a surface.

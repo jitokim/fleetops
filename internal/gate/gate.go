@@ -95,6 +95,30 @@ func DeleteMarker(dir, sessionID string) {
 	_ = os.Remove(filepath.Join(dir, sessionID+".json"))
 }
 
+// DeleteMarkerIfTS deletes sessionID's marker ONLY if its current on-disk TS
+// (unix seconds) still equals ts — a compare-and-swap guard. Without it, a
+// caller that decided "this marker is stale/answered" based on a snapshot
+// taken moments (or seconds) ago could delete a BRAND NEW marker that
+// arrived in the meantime (a fresh permission prompt right after the old
+// one was answered) — the human would lose that gate notification with no
+// sign anything was wrong. Returns true if a matching marker was found and
+// deleted.
+func DeleteMarkerIfTS(dir, sessionID string, ts int64) bool {
+	path := filepath.Join(dir, sessionID+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var m markerFile
+	if err := json.Unmarshal(data, &m); err != nil {
+		return false
+	}
+	if m.TS != ts {
+		return false
+	}
+	return os.Remove(path) == nil
+}
+
 // IsGateActive reports whether a gate marker is still live relative to the
 // session log's last write. The gate fired at markerTS; if the log's mtime
 // is more than staleSlack after that, new transcript entries were written

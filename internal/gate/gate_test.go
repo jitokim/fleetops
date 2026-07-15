@@ -78,6 +78,45 @@ func TestDeleteMarker_MissingFileIsHarmless(t *testing.T) {
 	DeleteMarker(t.TempDir(), "does-not-exist")
 }
 
+func TestDeleteMarkerIfTS_MatchingTS_Deletes(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteMarker(dir, "s1", "msg", "permission_prompt"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	ts := Pending(dir)["s1"].TS.Unix()
+
+	if !DeleteMarkerIfTS(dir, "s1", ts) {
+		t.Error("expected DeleteMarkerIfTS to succeed with the matching TS")
+	}
+	if len(Pending(dir)) != 0 {
+		t.Error("expected the marker to be gone")
+	}
+}
+
+func TestDeleteMarkerIfTS_MismatchedTS_Survives(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteMarker(dir, "s1", "msg", "permission_prompt"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	ts := Pending(dir)["s1"].TS.Unix()
+
+	// simulate a FRESH marker having landed (different TS) between the
+	// caller's snapshot and the delete call — the stale delete must not
+	// destroy it.
+	if DeleteMarkerIfTS(dir, "s1", ts-999) {
+		t.Error("expected DeleteMarkerIfTS to refuse — the on-disk TS doesn't match")
+	}
+	if len(Pending(dir)) != 1 {
+		t.Error("expected the marker to survive (a fresh marker must not be destroyed by a stale delete)")
+	}
+}
+
+func TestDeleteMarkerIfTS_MissingFile(t *testing.T) {
+	if DeleteMarkerIfTS(t.TempDir(), "nope", 12345) {
+		t.Error("expected false for a missing marker")
+	}
+}
+
 func TestIsGateActive(t *testing.T) {
 	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	cases := []struct {

@@ -26,6 +26,19 @@ type sessionMetricsEntry struct {
 
 var metricsCache sync.Map // path (string) -> sessionMetricsEntry
 
+// pruneMetricsCache removes cached entries for paths not in keep — called at
+// the end of each DiscoverLoops scan (with the current glob's matches) so
+// metricsCache doesn't grow unboundedly as old sessions age out of
+// ActiveWindow or get deleted, over a long-running missionctl process.
+func pruneMetricsCache(keep map[string]bool) {
+	metricsCache.Range(func(key, _ any) bool {
+		if path, ok := key.(string); ok && !keep[path] {
+			metricsCache.Delete(key)
+		}
+		return true
+	})
+}
+
 // SessionMetrics returns (cycles, tokensSpent) for a session log:
 //   - cycles = count of "type":"user" entries with actual user text (reuses
 //     userMessageText) — tool_result-only user entries don't count as a

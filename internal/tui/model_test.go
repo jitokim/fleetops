@@ -244,7 +244,7 @@ func TestPrettyTokens(t *testing.T) {
 
 func modelWithOneLoop() Model {
 	m := New()
-	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", State: domain.StateRunning}}
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", ProjectDir: "-x-aboard", Cwd: "/x/aboard", CwdVerified: true, State: domain.StateRunning}}
 	m.cursor = 0
 	return m
 }
@@ -275,6 +275,50 @@ func TestUpdate_NKey_NoSelectionFallsBackToGetwd(t *testing.T) {
 	}
 	if m.spawnCwd == "" {
 		t.Error("expected spawnCwd to fall back to a non-empty cwd (os.Getwd) when nothing is selected")
+	}
+}
+
+func TestUpdate_NKey_SelectedCwdNotVerified_FallsBackWithNote(t *testing.T) {
+	// P1-3: a dead loop's Cwd is at best a lossy decode of ProjectDir — spawn
+	// must not trust it unless applyLiveness confirmed it against a live
+	// process's real lsof path (CwdVerified).
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", CwdVerified: false, State: domain.StateStalled}}
+	m.cursor = 0
+
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	if m.spawnCwd == "/x/aboard" {
+		t.Error("expected spawnCwd NOT to use the unverified Cwd")
+	}
+	if m.spawnCwd == "" {
+		t.Error("expected spawnCwd to fall back to a non-empty cwd (os.Getwd)")
+	}
+	if m.spawnNote == "" {
+		t.Error("expected a spawnNote explaining the fallback")
+	}
+}
+
+func TestUpdate_SpawnNote_SurfacesInStatusOnSubmit(t *testing.T) {
+	// the note set at "n" keypress time must actually reach the user —
+	// View() replaces the status line with the prompt the instant
+	// modePrompting is entered, so the note can only surface later, at the
+	// "enter"-submit status message.
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", CwdVerified: false, State: domain.StateStalled}}
+	m.cursor = 0
+	m, _ = updateModel(t, m, runeKey('n'))
+	for _, r := range "goal" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if !strings.Contains(m.status, "wasn't verified") {
+		t.Errorf("status = %q, want it to surface the spawnNote about the unverified cwd", m.status)
 	}
 }
 
@@ -421,6 +465,102 @@ func TestUpdate_AnyOtherKey_ClearsPendingKill(t *testing.T) {
 
 	if m.pendingKillSession != "" {
 		t.Error("expected pendingKillSession to be cleared by an unrelated keypress")
+	}
+}
+
+// ── P0-1/P0-2 ambiguity guard ───────────────────────────────────────
+//
+// Locate/LocateClaude match a terminal surface by ProjectDir (a directory),
+// but loops are SESSIONS — when more than one loop in the fleet shares a
+// directory, a typed/destructive action could silently land on the wrong
+// one. refuseIfAmbiguous must block r/a/p/k (never attach/o) whenever the
+// selected loop's ProjectDir is shared by another loop in the fleet.
+
+func modelWithTwoLoopsSharingDir() Model {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "aboard", SessionID: "sess-1", ProjectDir: "-x-aboard", Cwd: "/x/aboard", CwdVerified: true, State: domain.StateStalled},
+		{Project: "aboard", SessionID: "sess-2", ProjectDir: "-x-aboard", Cwd: "/x/aboard", CwdVerified: true, State: domain.StateStalled},
+	}
+	m.cursor = 0
+	return m
+}
+
+func TestUpdate_RKey_AmbiguousSharedDir_Refuses(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — ambiguous target must refuse before any actuation")
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
+	}
+	if !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q, want it to mention the ambiguity", m.status)
+	}
+}
+
+func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
+	// the counterpart case: exactly one loop shares this directory, so the
+	// guard must NOT refuse.
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (resumeCmd) — only one loop shares this directory")
+	}
+	if m.statusKind == statusErr {
+		t.Errorf("statusKind = %v, want not statusErr (a single loop must not be refused)", m.statusKind)
+	}
+}
+
+func TestUpdate_AKey_AmbiguousSharedDir_Refuses(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].State = domain.StateGate
+
+	m, cmd := updateModel(t, m, runeKey('a'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — ambiguous target must refuse before any actuation")
+	}
+	if !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q, want it to mention the ambiguity", m.status)
+	}
+}
+
+func TestUpdate_PKey_AmbiguousSharedDir_Refuses(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].State = domain.StateRunning
+
+	m, cmd := updateModel(t, m, runeKey('p'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — ambiguous target must refuse before any actuation")
+	}
+	if !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q, want it to mention the ambiguity", m.status)
+	}
+}
+
+func TestUpdate_KKey_AmbiguousSharedDir_ConfirmingPressRefuses(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+
+	m, _ = updateModel(t, m, runeKey('k')) // arm the pending-kill confirm
+	if m.pendingKillSession == "" {
+		t.Fatal("precondition failed: expected the first k to arm the pending kill")
+	}
+
+	m, cmd := updateModel(t, m, runeKey('k')) // confirming press
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd on the confirming k — ambiguous target must refuse")
+	}
+	if !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q, want it to mention the ambiguity", m.status)
 	}
 }
 

@@ -1,9 +1,12 @@
 package control
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseTmuxPanes(t *testing.T) {
-	out := "%3\t/Users/imac/IdeaProjects/aboard\n%7\t/Users/imac/IdeaProjects/other\n"
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tclaude\n%7\t/Users/imac/IdeaProjects/other\tzsh\n"
 	targets := parseTmuxPanes(out)
 
 	if len(targets) != 2 {
@@ -29,11 +32,83 @@ func TestParseTmuxPanes_Empty(t *testing.T) {
 }
 
 func TestParseTmuxPanes_MalformedLineSkipped(t *testing.T) {
-	// a line missing the tab separator (no cwd) must be skipped, not panic.
-	out := "%3\t/Users/imac/IdeaProjects/aboard\nnotabline\n%9\t/tmp\n"
+	// a line missing a field (no command) must be skipped, not panic.
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tclaude\nnotabline\n%9\t/tmp\tzsh\n"
 	targets := parseTmuxPanes(out)
 	if len(targets) != 2 {
 		t.Fatalf("got %d targets, want 2 (malformed line skipped): %+v", len(targets), targets)
+	}
+}
+
+func TestParseTmuxPanes_IncludesNonClaudePanes(t *testing.T) {
+	// Locate/Focus (attach) must be able to reach a bare shell pane — unlike
+	// parseTmuxClaudePanes, parseTmuxPanes does not filter by command.
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tzsh\n"
+	targets := parseTmuxPanes(out)
+	if len(targets) != 1 || targets[0].ID != "%3" {
+		t.Errorf("got %+v, want the shell pane included", targets)
+	}
+}
+
+func TestParseTmuxClaudePanes_FiltersToClaudeOnly(t *testing.T) {
+	// P0-3: a shell pane first, a claude pane second, sharing no particular
+	// order — only the claude pane must come back.
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tzsh\n%7\t/Users/imac/IdeaProjects/aboard\tclaude\n"
+	targets := parseTmuxClaudePanes(out)
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1 (only the claude pane): %+v", len(targets), targets)
+	}
+	if targets[0].ID != "%7" {
+		t.Errorf("got %+v, want the claude pane (%%7)", targets[0])
+	}
+}
+
+func TestParseTmuxClaudePanes_Empty(t *testing.T) {
+	if targets := parseTmuxClaudePanes(""); len(targets) != 0 {
+		t.Errorf("empty input: got %d targets, want 0", len(targets))
+	}
+}
+
+func TestParseTmuxClaudePanes_NoClaudePanes(t *testing.T) {
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tzsh\n%7\t/Users/imac/IdeaProjects/aboard\tvim\n"
+	if targets := parseTmuxClaudePanes(out); len(targets) != 0 {
+		t.Errorf("got %d targets, want 0 (no claude panes)", len(targets))
+	}
+}
+
+// TestLocateVsLocateClaude_ShellPaneFirstClaudePaneSecond exercises the
+// exact P0-3 scenario: two panes share a directory, a bare shell pane
+// listed first and a claude pane listed second. Locate (attach, permissive)
+// and LocateClaude (typed actions, claude-only) share the same "first
+// match wins" selection over parseTmuxPanes/parseTmuxClaudePanes
+// respectively — this proves they diverge exactly as required: Locate must
+// not skip past the shell pane to find claude (attach should reach
+// whichever surface is actually at that directory), while LocateClaude must
+// never return the shell pane at all.
+func TestLocateVsLocateClaude_ShellPaneFirstClaudePaneSecond(t *testing.T) {
+	out := "%3\t/Users/imac/IdeaProjects/aboard\tzsh\n%7\t/Users/imac/IdeaProjects/aboard\tclaude\n"
+	projectDir := "-Users-imac-IdeaProjects-aboard"
+
+	var locateTarget Target
+	for _, tg := range parseTmuxPanes(out) {
+		if strings.ReplaceAll(tg.Cwd, "/", "-") == projectDir {
+			locateTarget = tg
+			break
+		}
+	}
+	if locateTarget.ID != "%3" {
+		t.Errorf("Locate's selection = %+v, want the shell pane (%%3, first match)", locateTarget)
+	}
+
+	var locateClaudeTarget Target
+	for _, tg := range parseTmuxClaudePanes(out) {
+		if strings.ReplaceAll(tg.Cwd, "/", "-") == projectDir {
+			locateClaudeTarget = tg
+			break
+		}
+	}
+	if locateClaudeTarget.ID != "%7" {
+		t.Errorf("LocateClaude's selection = %+v, want the claude pane (%%7)", locateClaudeTarget)
 	}
 }
 

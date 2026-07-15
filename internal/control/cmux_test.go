@@ -2,6 +2,19 @@ package control
 
 import "testing"
 
+func TestCmuxController_LocateClaude_AlwaysNotFound(t *testing.T) {
+	// P0-3: cmux's tree shape carries no running-command field, so it can
+	// never confirm a surface is running claude — degrading to Locate's
+	// cwd-only match would reintroduce the wrong-terminal hazard. Any
+	// projectDir must come back not-found.
+	if _, ok := (cmuxController{}).LocateClaude("-Users-imac-IdeaProjects-aboard"); ok {
+		t.Error("expected ok=false — cmux can never confirm a claude surface")
+	}
+	if _, ok := (cmuxController{}).LocateClaude(""); ok {
+		t.Error("expected ok=false for an empty projectDir too")
+	}
+}
+
 func TestCmuxResumeCmd(t *testing.T) {
 	got := cmuxResumeCmd("surface:2", "hello world")
 	want := []string{"cmux", "send", "--surface", "surface:2", "--", "hello world\n"}

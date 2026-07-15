@@ -34,9 +34,27 @@ func (orcaController) Locate(projectDir string) (Target, bool) {
 	return parseOrcaTerminals(out, projectDir)
 }
 
+// LocateClaude is like Locate, but returns only a tier-1 terminal (✳-titled,
+// connected, writable) — a confirmed Claude Code surface. Typed/destructive
+// actions must never fall back to tier-2/3 (a bare shell tab sharing the
+// same worktreePath), which Locate's 3-tier fallback exists to hand back for
+// attach — see selectClaudeOrcaTerminal.
+func (orcaController) LocateClaude(projectDir string) (Target, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "orca", "terminal", "list", "--json").Output()
+	if err != nil {
+		return Target{}, false
+	}
+	terminals, ok := decodeOrcaTerminals(out)
+	if !ok {
+		return Target{}, false
+	}
+	return selectClaudeOrcaTerminal(terminals, projectDir)
+}
+
 func (orcaController) Resume(t Target, prompt string) error {
-	argv := orcaResumeCmd(t.ID, prompt)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(orcaResumeCmd(t.ID, prompt))
 }
 
 // orcaResumeCmd builds the argv that re-sends prompt to an Orca terminal and
@@ -50,13 +68,11 @@ func orcaResumeCmd(handle, prompt string) []string {
 // permission prompt) by sending a bare Enter — reuses orcaResumeCmd with an
 // empty prompt, since an empty --text plus --enter is exactly that.
 func (orcaController) Approve(t Target) error {
-	argv := orcaResumeCmd(t.ID, "")
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(orcaResumeCmd(t.ID, ""))
 }
 
 func (orcaController) Focus(t Target) error {
-	argv := orcaFocusCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(orcaFocusCmd(t.ID))
 }
 
 // orcaFocusCmd builds the argv that brings an Orca terminal tab to the
@@ -69,8 +85,7 @@ func orcaFocusCmd(handle string) []string {
 // Interrupt stops the current turn without killing claude, via orca's
 // verified --interrupt flag on `terminal send`.
 func (orcaController) Interrupt(t Target) error {
-	argv := orcaInterruptCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(orcaInterruptCmd(t.ID))
 }
 
 // orcaInterruptCmd builds the argv for orca's verified interrupt flag.
@@ -283,6 +298,27 @@ func selectOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bo
 		}
 	}
 	return Target{}, false
+}
+
+// selectClaudeOrcaTerminal picks the freshest CONFIRMED Claude Code terminal
+// (✳-titled, connected, writable) sharing projectDir's worktreePath — tier-1
+// only, no fallback to a bare shell tab even if it's the only match (see
+// LocateClaude). Returns ok=false rather than degrade, unlike
+// selectOrcaTerminal's 3-tier fallback for attach.
+func selectClaudeOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bool) {
+	var matches []orcaTerminal
+	for _, t := range terminals {
+		if strings.ReplaceAll(t.WorktreePath, "/", "-") == projectDir {
+			matches = append(matches, t)
+		}
+	}
+	best, ok := bestOrcaTerminal(matches, func(t orcaTerminal) bool {
+		return t.Connected && t.Writable && strings.HasPrefix(t.Title, claudeTabPrefix)
+	})
+	if !ok {
+		return Target{}, false
+	}
+	return Target{Backend: "orca", ID: best.Handle, Cwd: best.WorktreePath}, true
 }
 
 // bestOrcaTerminal returns the highest-lastOutputAt terminal matching pred,

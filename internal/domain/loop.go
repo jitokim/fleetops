@@ -83,12 +83,14 @@ type Loop struct {
 	GatePrompt   string
 	Project      string    // decoded project label (e.g. "aboard")
 	ProjectDir   string    // raw encoded project dir name, e.g. "-Users-imac-IdeaProjects-aboard"
-	Cwd          string    // best-effort decoded absolute cwd, for display only
+	Cwd          string    // best-effort decoded absolute cwd, for display only — see CwdVerified
+	CwdVerified  bool      // true once Cwd was confirmed against a live process's real lsof path (not a lossy decode); gates spawn-into-this-dir (see tui's "n" key)
 	SessionID    string    // Claude Code session id
 	Path         string    // path to the session JSONL
 	LastActivity time.Time // last log write
 	Stall        StallKind // why it went silent, if it did
 	LastText     string    // last assistant text (tail), for the detail pane's TAIL row
+	GateTS       int64     // unix seconds of the gate marker this loop's StateGate was derived from, if any — lets approveCmd compare-and-swap delete only the marker it actually decided on (see gate.DeleteMarkerIfTS)
 }
 
 // BudgetFrac is the fraction of the token budget consumed (0..1).

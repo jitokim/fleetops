@@ -23,13 +23,11 @@ func (tmuxController) Available() bool {
 }
 
 func (tmuxController) Locate(projectDir string) (Target, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_path}").Output()
-	if err != nil {
+	out, ok := tmuxListPanes()
+	if !ok {
 		return Target{}, false
 	}
-	for _, t := range parseTmuxPanes(string(out)) {
+	for _, t := range parseTmuxPanes(out) {
 		if strings.ReplaceAll(t.Cwd, "/", "-") == projectDir {
 			return t, true
 		}
@@ -37,9 +35,39 @@ func (tmuxController) Locate(projectDir string) (Target, bool) {
 	return Target{}, false
 }
 
+// LocateClaude is like Locate, but returns only a pane whose foreground
+// command is literally "claude" — typed/destructive actions must never land
+// on a bare shell pane that merely happens to share the directory (see
+// parseTmuxClaudePanes).
+func (tmuxController) LocateClaude(projectDir string) (Target, bool) {
+	out, ok := tmuxListPanes()
+	if !ok {
+		return Target{}, false
+	}
+	for _, t := range parseTmuxClaudePanes(out) {
+		if strings.ReplaceAll(t.Cwd, "/", "-") == projectDir {
+			return t, true
+		}
+	}
+	return Target{}, false
+}
+
+// tmuxListPanes runs the shared list-panes probe behind both Locate and
+// LocateClaude, extended with #{pane_current_command} (P0-3) so callers can
+// tell a claude pane from a bare shell sharing the same directory.
+func tmuxListPanes() (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}").Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
 func (tmuxController) Resume(t Target, prompt string) error {
 	for _, argv := range tmuxResumeCmds(t.ID, prompt) {
-		if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil {
+		if err := runWithTimeout(argv); err != nil {
 			return err
 		}
 	}
@@ -59,8 +87,7 @@ func tmuxResumeCmds(paneID, prompt string) [][]string {
 // Approve accepts claude's default highlighted option at a gate by sending
 // a bare Enter — no text typed, just the key.
 func (tmuxController) Approve(t Target) error {
-	argv := tmuxApproveCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(tmuxApproveCmd(t.ID))
 }
 
 // tmuxApproveCmd builds the argv for a bare Enter keypress into a pane.
@@ -70,7 +97,7 @@ func tmuxApproveCmd(paneID string) []string {
 
 func (tmuxController) Focus(t Target) error {
 	for _, argv := range tmuxFocusCmds(t.ID) {
-		if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil {
+		if err := runWithTimeout(argv); err != nil {
 			return err
 		}
 	}
@@ -125,8 +152,7 @@ func tmuxNewWindowCmd(cwd string) []string {
 
 // Interrupt stops the current turn without killing claude — a bare Esc.
 func (tmuxController) Interrupt(t Target) error {
-	argv := tmuxInterruptCmd(t.ID)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	return runWithTimeout(tmuxInterruptCmd(t.ID))
 }
 
 // tmuxInterruptCmd builds the argv for an Escape keypress into a pane.
@@ -134,20 +160,56 @@ func tmuxInterruptCmd(paneID string) []string {
 	return []string{"tmux", "send-keys", "-t", paneID, "Escape"}
 }
 
-// parseTmuxPanes parses `tmux list-panes -a -F '#{pane_id}\t#{pane_current_path}'`
-// output, one pane per line.
-func parseTmuxPanes(out string) []Target {
-	var targets []Target
+// tmuxPaneLine is one parsed row of tmuxListPanes' 3-field output — the
+// shared core behind parseTmuxPanes (permissive, feeds Locate/Focus) and
+// parseTmuxClaudePanes (claude-only, feeds LocateClaude).
+type tmuxPaneLine struct {
+	ID      string
+	Cwd     string
+	Command string
+}
+
+// parseTmuxPaneLines parses `tmux list-panes -a -F
+// '#{pane_id}\t#{pane_current_path}\t#{pane_current_command}'` output, one
+// pane per line. A line that doesn't split into exactly 3 tab-separated
+// fields is skipped, not an error.
+func parseTmuxPaneLines(out string) []tmuxPaneLine {
+	var lines []tmuxPaneLine
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
 			continue
 		}
-		targets = append(targets, Target{Backend: "tmux", ID: parts[0], Cwd: parts[1]})
+		lines = append(lines, tmuxPaneLine{ID: parts[0], Cwd: parts[1], Command: parts[2]})
+	}
+	return lines
+}
+
+// parseTmuxPanes returns every pane regardless of its foreground command —
+// used by Locate (attach/Focus must be able to jump to a bare shell pane in
+// the right directory, not just a claude pane).
+func parseTmuxPanes(out string) []Target {
+	var targets []Target
+	for _, l := range parseTmuxPaneLines(out) {
+		targets = append(targets, Target{Backend: "tmux", ID: l.ID, Cwd: l.Cwd})
+	}
+	return targets
+}
+
+// parseTmuxClaudePanes returns only panes whose foreground command is
+// literally "claude" — used by LocateClaude for typed/destructive actions,
+// which must never land on a bare shell pane sharing the same directory.
+func parseTmuxClaudePanes(out string) []Target {
+	var targets []Target
+	for _, l := range parseTmuxPaneLines(out) {
+		if l.Command != "claude" {
+			continue
+		}
+		targets = append(targets, Target{Backend: "tmux", ID: l.ID, Cwd: l.Cwd})
 	}
 	return targets
 }
