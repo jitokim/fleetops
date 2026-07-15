@@ -15,6 +15,7 @@ import (
 
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/gate"
+	"github.com/jitokim/missionctl/internal/registry"
 )
 
 // IdleThreshold: no log write for this long ⇒ the loop is considered stuck.
@@ -72,7 +73,52 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].LastActivity.After(loops[j].LastActivity)
 	})
+
+	loopsDir := registry.LoopsDir()
+	registry.BindPending(loopsDir, registry.PendingDir(), loops, now)
+	loops = enrichFromRegistry(loops, loopsDir)
+
 	return applyLiveness(loops, LiveClaudeCwds()), nil
+}
+
+// enrichFromRegistry attaches goal-bound metadata (Goal.Text/MaxCycles/
+// NoImproveLimit, Last verdict, NoImprove) from the registry to each loop
+// that has a record — observed (non-spawned) sessions have none and are
+// left untouched (Goal.Text stays "", which the TUI treats as "unbound").
+//
+// A bound loop whose latest verdict was rendered AT this exact cycle
+// (Verdict.AtCycle == Cycle — i.e. nothing has happened since it was
+// judged) gets its State promoted to the oracle's conclusion: done →
+// StateDone, rejected → StateDrift. "progress" leaves State as already
+// classified (idle/running) — real work is happening, there's no terminal
+// call to make yet. A verdict from an EARLIER cycle (AtCycle < Cycle) is
+// still shown (Last stays populated for the ORACLE column) but does not
+// override State — the loop has moved on since that judgment, and it's due
+// to be judged again (see the TUI's judge trigger policy).
+func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
+	for i := range loops {
+		rec, ok := registry.Load(loopsDir, loops[i].SessionID)
+		if !ok {
+			continue
+		}
+		loops[i].Goal.Text = rec.Goal
+		loops[i].Goal.MaxCycles = rec.MaxCycles
+		loops[i].Goal.NoImproveLimit = rec.NoImproveLimit
+		loops[i].NoImprove = rec.NoImprove
+		loops[i].Last = rec.Verdict
+
+		if rec.Verdict != nil && rec.Verdict.AtCycle == loops[i].Cycle {
+			switch rec.Verdict.Outcome {
+			case domain.OutcomeDone:
+				loops[i].State = domain.StateDone
+				loops[i].Stall = domain.StallNone
+			case domain.OutcomeRejected:
+				loops[i].State = domain.StateDrift
+				loops[i].Stall = domain.StallNone
+			}
+		}
+	}
+	return loops
 }
 
 // applyLiveness cross-checks each loop against live `claude` CLI processes
@@ -87,6 +133,10 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 // dead:
 //   - StateIdle (finished its turn, then the process went away) → dropped
 //     entirely: the loop ended cleanly, it's not part of the fleet anymore.
+//   - StateDone / StateDrift (the oracle already rendered a verdict this
+//     cycle — see enrichFromRegistry) → left alone, dropped or demoted by
+//     neither rule: that's the terminal record of a judgment, not an
+//     incident, regardless of whether the terminal later closed.
 //   - anything else (StateStalled, or StateRunning past the live count —
 //     e.g. a process that just died mid-turn) → kept, reclassified
 //     StateStalled/StallGone: a mid-work death IS an incident.
@@ -103,12 +153,15 @@ func applyLiveness(loops []domain.Loop, live map[string]int) []domain.Loop {
 			continue // enough live processes for every loop sharing this cwd
 		}
 		for _, i := range idxs[k:] {
-			if loops[i].State == domain.StateIdle {
+			switch loops[i].State {
+			case domain.StateIdle:
 				drop[i] = true
-				continue
+			case domain.StateDone, domain.StateDrift:
+				// oracle-judged and settled; leave as-is.
+			default:
+				loops[i].State = domain.StateStalled
+				loops[i].Stall = domain.StallGone
 			}
-			loops[i].State = domain.StateStalled
-			loops[i].Stall = domain.StallGone
 		}
 	}
 	if len(drop) == 0 {
@@ -402,8 +455,32 @@ func LastAssistantText(path string) (string, bool) {
 	return lastAssistantTextFromTail(buf)
 }
 
-// lastAssistantTextFromTail is LastAssistantText's buffer-only core.
+// lastAssistantTextFromTail is LastAssistantText's buffer-only core: finds
+// the raw text, then caps it to 120 chars for the TAIL row.
 func lastAssistantTextFromTail(buf []byte) (string, bool) {
+	text, ok := lastAssistantTextRawFromTail(buf)
+	if !ok {
+		return "", false
+	}
+	return summarizeTailText(text, 120), true
+}
+
+// LastAssistantTextFull returns the last assistant message's RAW text from
+// the tail of the session log — uncapped, unlike LastAssistantText (which
+// caps at 120 chars for the TUI's TAIL row). The oracle (internal/oracle)
+// needs the full report to judge accurately; a 120-char summary would
+// throw away exactly the evidence it's supposed to check.
+func LastAssistantTextFull(path string) (string, bool) {
+	buf, ok := readTail(path, tailBytes)
+	if !ok {
+		return "", false
+	}
+	return lastAssistantTextRawFromTail(buf)
+}
+
+// lastAssistantTextRawFromTail is the shared, uncapped core of both
+// lastAssistantTextFromTail and LastAssistantTextFull.
+func lastAssistantTextRawFromTail(buf []byte) (string, bool) {
 	last := ""
 	found := false
 	for _, line := range strings.Split(string(buf), "\n") {
@@ -426,7 +503,7 @@ func lastAssistantTextFromTail(buf []byte) (string, bool) {
 	if !found {
 		return "", false
 	}
-	return summarizeTailText(last, 120), true
+	return last, true
 }
 
 // assistantMessageText mirrors userMessageText for an assistant entry:

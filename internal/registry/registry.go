@@ -1,0 +1,258 @@
+// Package registry persists goal-bound loop metadata — the "we spawned this
+// with a goal" record that lets the oracle (internal/oracle) judge whether
+// a loop is done, making progress, or drifting. Observed sessions that
+// weren't spawned via missionctl's "n" key have no record here, and render
+// as "—" (unbound) in the TUI's ORACLE/N-I columns: verdicts only make
+// sense against a known goal.
+package registry
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jitokim/missionctl/internal/domain"
+)
+
+// LoopsDir is ~/.missionctl/loops (override for tests by passing an
+// explicit dir to the funcs below instead of calling this).
+func LoopsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".missionctl", "loops")
+}
+
+// PendingDir is ~/.missionctl/pending (same override pattern as LoopsDir).
+func PendingDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".missionctl", "pending")
+}
+
+const (
+	DefaultMaxCycles      = 12
+	DefaultNoImproveLimit = 3
+
+	// pendingStaleAfter: a pending spawn nobody could match to a session
+	// within this long is presumed failed (or landed somewhere BindPending
+	// can't see) and is dropped rather than kept around forever.
+	pendingStaleAfter = 10 * time.Minute
+)
+
+// Record is one goal-bound loop's persisted state.
+type Record struct {
+	Goal           string
+	BoundAt        time.Time
+	MaxCycles      int
+	NoImproveLimit int
+	Verdict        *domain.Verdict // nil if never judged
+	NoImprove      int
+}
+
+// recordFile is Record's on-disk JSON shape.
+type recordFile struct {
+	Goal           string       `json:"goal"`
+	BoundAt        int64        `json:"boundAt"`
+	MaxCycles      int          `json:"maxCycles"`
+	NoImproveLimit int          `json:"noImproveLimit"`
+	Verdict        *verdictFile `json:"verdict,omitempty"`
+	NoImprove      int          `json:"noImprove"`
+}
+
+type verdictFile struct {
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason"`
+	AtCycle int    `json:"atCycle"`
+	TS      int64  `json:"ts"`
+}
+
+// Bind creates a new registry record for sessionID with the default caps —
+// called by BindPending once it matches a pending spawn to its session.
+func Bind(dir, sessionID, goal string) error {
+	return writeRecordFile(dir, sessionID, recordFile{
+		Goal:           goal,
+		BoundAt:        time.Now().Unix(),
+		MaxCycles:      DefaultMaxCycles,
+		NoImproveLimit: DefaultNoImproveLimit,
+	})
+}
+
+// Load reads sessionID's record. ok=false if unbound (no record) or the
+// file is unreadable/malformed.
+func Load(dir, sessionID string) (Record, bool) {
+	data, err := os.ReadFile(filepath.Join(dir, sessionID+".json"))
+	if err != nil {
+		return Record{}, false
+	}
+	var rf recordFile
+	if err := json.Unmarshal(data, &rf); err != nil {
+		return Record{}, false
+	}
+	return recordFromFile(rf), true
+}
+
+func recordFromFile(rf recordFile) Record {
+	r := Record{
+		Goal:           rf.Goal,
+		BoundAt:        time.Unix(rf.BoundAt, 0),
+		MaxCycles:      rf.MaxCycles,
+		NoImproveLimit: rf.NoImproveLimit,
+		NoImprove:      rf.NoImprove,
+	}
+	if rf.Verdict != nil {
+		r.Verdict = &domain.Verdict{
+			Outcome: domain.Outcome(rf.Verdict.Outcome),
+			Reason:  rf.Verdict.Reason,
+			AtCycle: rf.Verdict.AtCycle,
+		}
+	}
+	return r
+}
+
+// SaveVerdict records the oracle's judgment for sessionID at atCycle, and
+// updates the no-improve streak: a rejected verdict increments it (the
+// agent claimed done but wasn't — no real step forward); done/progress
+// resets it to 0 (either it's finished, or genuine progress happened,
+// either way the stall streak is broken). Loads the existing record first
+// so Goal/caps survive — returns an error if sessionID isn't bound yet
+// (SaveVerdict never creates a record; Bind does that).
+func SaveVerdict(dir, sessionID string, verdict domain.Verdict, atCycle int) error {
+	rec, ok := Load(dir, sessionID)
+	if !ok {
+		return fmt.Errorf("registry: no record for session %s to attach a verdict to", sessionID)
+	}
+	rec.Verdict = &domain.Verdict{Outcome: verdict.Outcome, Reason: verdict.Reason, AtCycle: atCycle}
+	if verdict.Outcome == domain.OutcomeRejected {
+		rec.NoImprove++
+	} else {
+		rec.NoImprove = 0
+	}
+	return writeRecordFile(dir, sessionID, recordFile{
+		Goal:           rec.Goal,
+		BoundAt:        rec.BoundAt.Unix(),
+		MaxCycles:      rec.MaxCycles,
+		NoImproveLimit: rec.NoImproveLimit,
+		NoImprove:      rec.NoImprove,
+		Verdict: &verdictFile{
+			Outcome: string(rec.Verdict.Outcome),
+			Reason:  rec.Verdict.Reason,
+			AtCycle: rec.Verdict.AtCycle,
+			TS:      time.Now().Unix(),
+		},
+	})
+}
+
+func writeRecordFile(dir, sessionID string, rf recordFile) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(rf)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, sessionID+".json"), data, 0o644)
+}
+
+// PendingSpawn is a not-yet-matched spawn request.
+type PendingSpawn struct {
+	Cwd  string
+	Goal string
+	TS   time.Time
+}
+
+type pendingFile struct {
+	Cwd  string `json:"cwd"`
+	Goal string `json:"goal"`
+	TS   int64  `json:"ts"`
+}
+
+// WritePending records a just-spawned loop's cwd+goal, to be matched to its
+// session id by the next scan (BindPending). Controller.Spawn's caller
+// (tui's spawnCmd) has no way to know the new session id directly — Spawn
+// just starts a process — so binding happens out-of-band here.
+func WritePending(dir, cwd, goal string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(pendingFile{Cwd: cwd, Goal: goal, TS: time.Now().Unix()})
+	if err != nil {
+		return err
+	}
+	name := strconv.FormatInt(time.Now().UnixNano(), 10) + ".json"
+	return os.WriteFile(filepath.Join(dir, name), data, 0o644)
+}
+
+// listPending reads every pending file in dir, keyed by filename (so
+// BindPending can delete the exact file it matched or judged stale).
+func listPending(dir string) map[string]PendingSpawn {
+	out := make(map[string]PendingSpawn)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var pf pendingFile
+		if err := json.Unmarshal(data, &pf); err != nil {
+			continue
+		}
+		out[e.Name()] = PendingSpawn{Cwd: pf.Cwd, Goal: pf.Goal, TS: time.Unix(pf.TS, 0)}
+	}
+	return out
+}
+
+// BindPending matches unmatched pending spawns to the newest not-yet-bound
+// session sharing the pending spawn's cwd, whose log was written after the
+// spawn fired (LastActivity > pending.TS — a scan-time proxy for "born from
+// this spawn": not a birth-time proof, but robust in practice, since an
+// unrelated pre-existing session in the same cwd won't happen to write to
+// its own log in the same instant a brand new claude boots up there).
+// Matched pendings are bound (see Bind) and their pending file removed.
+// Pendings older than pendingStaleAfter are dropped unmatched — the spawn
+// presumably failed, or landed somewhere BindPending can't see.
+func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time) {
+	for name, p := range listPending(pendingDir) {
+		if now.Sub(p.TS) > pendingStaleAfter {
+			os.Remove(filepath.Join(pendingDir, name))
+			continue
+		}
+
+		var best *domain.Loop
+		for i := range loops {
+			l := &loops[i]
+			if l.Cwd != p.Cwd {
+				continue
+			}
+			if !l.LastActivity.After(p.TS) {
+				continue
+			}
+			if _, bound := Load(loopsDir, l.SessionID); bound {
+				continue
+			}
+			if best == nil || l.LastActivity.After(best.LastActivity) {
+				best = l
+			}
+		}
+		if best == nil {
+			continue // no match yet; retry next scan (until stale)
+		}
+		if err := Bind(loopsDir, best.SessionID, p.Goal); err != nil {
+			continue // best-effort; retry next scan
+		}
+		os.Remove(filepath.Join(pendingDir, name))
+	}
+}

@@ -58,10 +58,14 @@ type Goal struct {
 	NoImproveLimit int
 }
 
-// Verdict is the oracle's independent judgment of a cycle.
+// Verdict is the oracle's independent judgment of a cycle. AtCycle is the
+// Loop.Cycle this verdict was rendered against — lets the scanner and the
+// TUI's judge trigger-policy tell "already judged this cycle" (AtCycle ==
+// Cycle) from "cycle advanced since" (Cycle > AtCycle).
 type Verdict struct {
 	Outcome Outcome
 	Reason  string
+	AtCycle int
 }
 
 // Loop is one autonomous loop's renderable state. For the observation MVP a loop

@@ -18,6 +18,17 @@ import (
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/gate"
+	"github.com/jitokim/missionctl/internal/oracle"
+	"github.com/jitokim/missionctl/internal/registry"
+)
+
+// judgeFn/registryDirFn are oracle.Judge/registry.LoopsDir by default,
+// overridable in tests so the judge trigger-policy state machine (and
+// judgeCmd's registry write) can be verified without exec or touching the
+// real ~/.missionctl/loops.
+var (
+	judgeFn       = oracle.Judge
+	registryDirFn = registry.LoopsDir
 )
 
 type loopsMsg []domain.Loop
@@ -70,6 +81,16 @@ type interruptResultMsg struct {
 	text string
 }
 
+// verdictMsg reports the outcome of a background oracle judgment, computed
+// off the event loop by judgeCmd — one per bound loop the trigger policy
+// (Model.triggerJudgments) decided was due. Clears that loop's in-flight
+// guard regardless of success; the next scan picks up any saved verdict.
+type verdictMsg struct {
+	sessionID string
+	verdict   domain.Verdict
+	err       error
+}
+
 const refreshEvery = 3 * time.Second
 
 // scan is a tea.Cmd: rediscover the fleet from the logs.
@@ -120,6 +141,8 @@ type Model struct {
 
 	pendingKillSession string // non-empty while awaiting the confirming second "k"
 	pendingKillAt      time.Time
+
+	judging map[string]bool // sessionID -> a judgeCmd is in flight for it (in-flight guard, see triggerJudgments)
 }
 
 func New() Model {
@@ -150,6 +173,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = maxInt(0, len(m.loops)-1)
 		}
 		m.lastScan = time.Now()
+		return m, m.triggerJudgments()
 	case tickMsg:
 		return m, tea.Batch(scan, tick())
 	case tea.KeyMsg:
@@ -200,8 +224,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = maxInt(0, len(m.loops)-1)
 		case "r":
 			sel, ok := m.selected()
-			if !ok || sel.State != domain.StateStalled {
-				m.status, m.statusKind = "select a stalled loop to resume", statusNeutral
+			if !ok || (sel.State != domain.StateStalled && sel.State != domain.StateDrift) {
+				m.status, m.statusKind = "select a stalled or drifted loop to resume", statusNeutral
 				return m, nil
 			}
 			m.status, m.statusKind = fmt.Sprintf("resuming %s...", sel.Project), statusNeutral
@@ -320,6 +344,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status, m.statusKind = "closed log", statusNeutral
 		}
+	case verdictMsg:
+		// Clear the in-flight guard regardless of outcome — the next scan
+		// (which re-reads the registry) is the source of truth for what got
+		// saved; a background judgment failure/success intentionally does
+		// NOT overwrite m.status, so it can't clobber more pressing
+		// foreground feedback (e.g. a pending kill-confirm warning).
+		if m.judging != nil {
+			delete(m.judging, msg.sessionID)
+		}
 	}
 	return m, nil
 }
@@ -416,9 +449,12 @@ func approveCmd(l domain.Loop) tea.Cmd {
 }
 
 // spawnCmd starts a brand new claude loop in cwd with the given goal, via
-// whichever multiplexer backend is available. The 3s rescan picks the new
-// session up organically once it starts writing its own JSONL, so this
-// doesn't need to construct a domain.Loop itself.
+// whichever multiplexer backend is available. Controller.Spawn has no way
+// to report back the new session's id (it just starts a process), so on
+// success this writes a pending record (registry.WritePending) that the
+// next scan's registry.BindPending matches to the new session once it
+// starts writing its own JSONL — that's also what picks the loop up into
+// the fleet in the first place; spawnCmd doesn't construct a domain.Loop.
 func spawnCmd(cwd, goal string) tea.Cmd {
 	return func() tea.Msg {
 		ctrl, ok := control.Resolve()
@@ -427,6 +463,11 @@ func spawnCmd(cwd, goal string) tea.Cmd {
 		}
 		if err := ctrl.Spawn(cwd, goal); err != nil {
 			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
+		}
+		if err := registry.WritePending(registry.PendingDir(), cwd, goal); err != nil {
+			// best-effort: the loop still spawned and will show up
+			// unbound — just won't get ORACLE/N-I tracking.
+			return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s (goal not recorded: %v)", cwd, ctrl.Name(), err)}
 		}
 		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
 	}
@@ -476,6 +517,56 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 	}
 }
 
+// triggerJudgments fires one judgeCmd per bound loop that's due for
+// judgment: idle (the natural checkpoint — a finished turn means its report
+// is final, unlike mid-turn) and either never judged, or the loop has moved
+// past the cycle it was last judged at (Cycle > Last.AtCycle). A per-session
+// in-flight guard (m.judging) ensures at most one judgeCmd runs per loop at
+// a time — a slow `claude -p` call can't pile up duplicate judgments across
+// 3s refreshes, and a verdict already rendered for the CURRENT cycle isn't
+// re-requested just because the loop is still sitting idle.
+func (m *Model) triggerJudgments() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, l := range m.loops {
+		if l.Goal.Text == "" || l.State != domain.StateIdle {
+			continue
+		}
+		if l.Last != nil && l.Cycle <= l.Last.AtCycle {
+			continue
+		}
+		if m.judging[l.SessionID] {
+			continue
+		}
+		if m.judging == nil {
+			m.judging = make(map[string]bool)
+		}
+		m.judging[l.SessionID] = true
+		cmds = append(cmds, judgeCmd(l))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// judgeCmd asks the oracle to verdict a bound loop's progress against its
+// goal, using its full (uncapped) last report, then saves the verdict to
+// the registry at the loop's current cycle. Runs off the event loop, same
+// non-blocking pattern as the other *Cmd funcs.
+func judgeCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		lastText, _ := claude.LastAssistantTextFull(l.Path) // ok=false just means an empty report is judged as-is
+		verdict, err := judgeFn(l.Goal.Text, lastText)
+		if err != nil {
+			return verdictMsg{sessionID: l.SessionID, err: err}
+		}
+		if err := registry.SaveVerdict(registryDirFn(), l.SessionID, verdict, l.Cycle); err != nil {
+			return verdictMsg{sessionID: l.SessionID, err: err}
+		}
+		return verdictMsg{sessionID: l.SessionID, verdict: verdict}
+	}
+}
+
 // pagerCmd builds the argv for the "o" key's log pager: -R renders color
 // codes, +G jumps to the end (most recent activity first), and a custom
 // prompt tells the human how to get back — otherwise "q returns you to the
@@ -500,8 +591,11 @@ func (m Model) termWidth() int {
 	return m.w
 }
 
-// counts tallies loop states and total spend for the summary band and keybar.
-func (m Model) counts() (total, running, stalled, idle, gated, totalTokens int) {
+// counts tallies loop states, total spend, and oracle judgment share for the
+// summary band and keybar. judged/good are over bound loops that have been
+// judged at least once (Last != nil): good counts a latest outcome of
+// done or progress — "the loop is fine" — vs rejected/drift.
+func (m Model) counts() (total, running, stalled, idle, gated, totalTokens, judged, good int) {
 	total = len(m.loops)
 	for _, l := range m.loops {
 		switch l.State {
@@ -515,6 +609,13 @@ func (m Model) counts() (total, running, stalled, idle, gated, totalTokens int) 
 			gated++
 		}
 		totalTokens += l.TokensSpent
+
+		if l.Last != nil {
+			judged++
+			if l.Last.Outcome == domain.OutcomeDone || l.Last.Outcome == domain.OutcomeProgress {
+				good++
+			}
+		}
 	}
 	return
 }
@@ -528,22 +629,22 @@ func (m Model) View() string {
 	b.WriteString(renderRule(width))
 	b.WriteString("\n")
 
-	total, running, stalled, idle, gated, totalTokens := m.counts()
-	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, width))
+	total, running, stalled, idle, gated, totalTokens, judged, good := m.counts()
+	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good, width))
 	b.WriteString("\n\n")
 
 	b.WriteString(stFaint.Render("LOOPS"))
 	b.WriteString("\n")
 
-	wName, wCycle, wBudget, wNote := columnWidths(width)
-	b.WriteString(renderTableHeader(wName, wCycle, wBudget, wNote))
+	wName, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
+	b.WriteString(renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote))
 	b.WriteString("\n")
 	if len(m.loops) == 0 {
 		b.WriteString(stFaint.Render("  no active Claude Code loops in the window.\n"))
 	}
 	dupLabels := duplicateLabels(m.loops)
 	for i, l := range m.loops {
-		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wCycle, wBudget, wNote, width))
+		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wCycle, wOracle, wBudget, wNI, wNote, width))
 		b.WriteString("\n")
 	}
 
@@ -583,15 +684,18 @@ func renderRule(width int) string {
 }
 
 // renderSummaryBand: "fleet N · x run · y gate · z stalled · w idle ·
-// budget <spent>" (zero-count segments omitted, fleet always shown; budget
-// omitted only when there's no spend at all yet) with a right-aligned amber
-// badge: gates take priority ("▲ N GATE NEEDS YOU") since a gate is a human
-// actively being asked something right now; otherwise stalls get the badge
-// ("▲ N STALLED NEED YOU") — the mockup's gate badge, honestly repurposed
-// for stalls when there's no gate. budget is total spend across the fleet,
-// not spent/cap — per-loop caps are all the same v0 default
-// (DefaultBudgetTokens), so a fleet-wide cap would be a meaningless sum.
-func renderSummaryBand(total, running, stalled, idle, gated, totalTokens int, width int) string {
+// budget <spent> · oracle P%" (zero-count segments omitted, fleet always
+// shown; budget/oracle omitted when there's no spend/no judged loops yet)
+// with a right-aligned amber badge: gates take priority ("▲ N GATE NEEDS
+// YOU") since a gate is a human actively being asked something right now;
+// otherwise stalls get the badge ("▲ N STALLED NEED YOU") — the mockup's
+// gate badge, honestly repurposed for stalls when there's no gate. budget
+// is total spend across the fleet, not spent/cap — per-loop caps are all
+// the same v0 default (DefaultBudgetTokens), so a fleet-wide cap would be a
+// meaningless sum. oracle% is the share of judged (bound + verdict-rendered
+// at least once) loops whose latest outcome is done or progress — i.e. "not
+// currently drifting".
+func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good int, width int) string {
 	parts := []string{stDim.Render(fmt.Sprintf("fleet %d", total))}
 	if running > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cBlue).Render(fmt.Sprintf("%d run", running)))
@@ -607,6 +711,10 @@ func renderSummaryBand(total, running, stalled, idle, gated, totalTokens int, wi
 	}
 	if totalTokens > 0 {
 		parts = append(parts, stDim.Render("budget "+prettyTokens(totalTokens)))
+	}
+	if judged > 0 {
+		pct := int(math.Round(float64(good) / float64(judged) * 100))
+		parts = append(parts, stDim.Render(fmt.Sprintf("oracle %d%%", pct)))
 	}
 	left := strings.Join(parts, stFaint.Render(" · "))
 
@@ -630,31 +738,43 @@ const (
 
 const (
 	cycleColWidth  = 6
+	oracleColWidth = 12
 	budgetColWidth = 13
+	niColWidth     = 5
 )
 
-// minWidthForNote/Budget/Cycle: below these terminal widths the
+// minWidthForNote/NI/Oracle/Budget/Cycle: below these terminal widths the
 // corresponding column is dropped entirely (not just truncated), in this
 // degradation order as width shrinks: NOTE first (least essential — the
-// state label already hints at "why"), then BUDGET, then CYCLE.
+// state label already hints at "why"), then N/I, then ORACLE, then BUDGET,
+// then CYCLE (most essential — kept the longest). Each threshold is
+// strictly less than the last so that order actually holds.
 const (
 	minWidthForNote   = 70
+	minWidthForNI     = 68
+	minWidthForOracle = 64
 	minWidthForBudget = 60
 	minWidthForCycle  = 50
 )
 
-// columnWidths sizes NAME/CYCLE/BUDGET/NOTE from the terminal width: CYCLE
-// and BUDGET are fixed-width when shown at all (dropped below their
-// thresholds, see minWidthForNote/Budget/Cycle), and NAME soaks up whatever
-// remains, with a usable minimum and a cap so wide terminals don't stretch
-// it into a chasm between columns (mockup keeps the table compact) — spare
-// width beyond the cap goes to NOTE.
-func columnWidths(width int) (wName, wCycle, wBudget, wNote int) {
+// columnWidths sizes NAME/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
+// width: CYCLE/ORACLE/BUDGET/N-I are fixed-width when shown at all (dropped
+// below their thresholds, see minWidthForNote/NI/Oracle/Budget/Cycle), and
+// NAME soaks up whatever remains, with a usable minimum and a cap so wide
+// terminals don't stretch it into a chasm between columns (mockup keeps the
+// table compact) — spare width beyond the cap goes to NOTE.
+func columnWidths(width int) (wName, wCycle, wOracle, wBudget, wNI, wNote int) {
 	if width >= minWidthForCycle {
 		wCycle = cycleColWidth
 	}
+	if width >= minWidthForOracle {
+		wOracle = oracleColWidth
+	}
 	if width >= minWidthForBudget {
 		wBudget = budgetColWidth
+	}
+	if width >= minWidthForNI {
+		wNI = niColWidth
 	}
 	if width >= minWidthForNote {
 		wNote = 24
@@ -662,7 +782,7 @@ func columnWidths(width int) (wName, wCycle, wBudget, wNote int) {
 
 	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
 	// leading "  " indent plus cell boundaries need a little slack.
-	fixed := wMarker + wState + wLast + wCycle + wBudget + wNote + gaps
+	fixed := wMarker + wState + wLast + wCycle + wOracle + wBudget + wNI + wNote + gaps
 	wName = width - fixed
 	if wName < 10 {
 		wName = 10
@@ -673,10 +793,10 @@ func columnWidths(width int) (wName, wCycle, wBudget, wNote int) {
 		}
 		wName = 28
 	}
-	return wName, wCycle, wBudget, wNote
+	return wName, wCycle, wOracle, wBudget, wNI, wNote
 }
 
-func renderTableHeader(wName, wCycle, wBudget, wNote int) string {
+func renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote int) string {
 	cells := []string{
 		stHeader.Width(wMarker).Render(""),
 		stHeader.Width(wName).Render("NAME"),
@@ -685,8 +805,14 @@ func renderTableHeader(wName, wCycle, wBudget, wNote int) string {
 	if wCycle > 0 {
 		cells = append(cells, stHeader.Width(wCycle).Render("CYCLE"))
 	}
+	if wOracle > 0 {
+		cells = append(cells, stHeader.Width(wOracle).Render("ORACLE"))
+	}
 	if wBudget > 0 {
 		cells = append(cells, stHeader.Width(wBudget).Render("BUDGET"))
+	}
+	if wNI > 0 {
+		cells = append(cells, stHeader.Width(wNI).Render("N/I"))
 	}
 	cells = append(cells, stHeader.Width(wLast).Render("LAST"))
 	if wNote > 0 {
@@ -711,7 +837,7 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 	return dup
 }
 
-func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wBudget, wNote, totalWidth int) string {
+func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudget, wNI, wNote, totalWidth int) string {
 	marker := " "
 	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
 	if sel {
@@ -720,8 +846,11 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wBudget, wNote,
 	}
 	st := stateStyle(l)
 	note := ""
-	if l.Stall != domain.StallNone {
+	switch {
+	case l.Stall != domain.StallNone:
 		note = "⚠ " + string(l.Stall)
+	case l.State == domain.StateDrift && l.Last != nil:
+		note = "✗ " + l.Last.Reason
 	}
 	label := l.Project
 	if dup {
@@ -735,9 +864,15 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wBudget, wNote,
 	if wCycle > 0 {
 		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
 	}
+	if wOracle > 0 {
+		cells = append(cells, oracleStyle(l).Width(wOracle).Render(trunc(oracleLabel(l), wOracle-1)))
+	}
 	if wBudget > 0 {
 		bar := budgetBar(l.BudgetFrac(), 7)
 		cells = append(cells, budgetStyle(l).Width(wBudget).Render(trunc(bar, wBudget-1)))
+	}
+	if wNI > 0 {
+		cells = append(cells, noImproveStyle(l).Width(wNI).Render(noImproveLabel(l)))
 	}
 	cells = append(cells, stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))))
 	if wNote > 0 {
@@ -758,6 +893,33 @@ func cycleLabel(l domain.Loop) string {
 		return fmt.Sprintf("%d/%d", l.Cycle, l.Goal.MaxCycles)
 	}
 	return fmt.Sprintf("%d", l.Cycle)
+}
+
+// oracleLabel: "—" for an unbound loop or a bound one never yet judged;
+// otherwise the latest verdict, mockup-style ("✓ verified" done, "✓
+// progress", "✗ rejected").
+func oracleLabel(l domain.Loop) string {
+	if l.Last == nil {
+		return "—"
+	}
+	switch l.Last.Outcome {
+	case domain.OutcomeDone:
+		return "✓ verified"
+	case domain.OutcomeProgress:
+		return "✓ progress"
+	case domain.OutcomeRejected:
+		return "✗ rejected"
+	default:
+		return "—"
+	}
+}
+
+// noImproveLabel: "—" for an unbound loop; "<n>/<limit>" for a bound one.
+func noImproveLabel(l domain.Loop) string {
+	if l.Goal.Text == "" {
+		return "—"
+	}
+	return fmt.Sprintf("%d/%d", l.NoImprove, l.Goal.NoImproveLimit)
 }
 
 // shortID is the first 4 chars of a session id, for disambiguating rows
@@ -785,8 +947,15 @@ func renderDetail(l domain.Loop, width int) string {
 	d.WriteString("\n")
 	d.WriteString(detailRow("STATE", stateStyle(l).Render(stateLabel(l))))
 	d.WriteString(detailRow("CYCLE", stInk.Render(cycleLabel(l))))
+	if l.Goal.Text != "" {
+		d.WriteString(detailRow("GOAL", stInk.Render(trunc(l.Goal.Text, valueWidth))))
+		d.WriteString(detailRow("ORACLE", renderOracleDetail(l, valueWidth)))
+	}
 	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(fmt.Sprintf("%s / %s (%d%%)",
 		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100))))))
+	if l.Goal.Text != "" {
+		d.WriteString(detailRow("N/I", noImproveStyle(l).Render(noImproveLabel(l))))
+	}
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
@@ -799,8 +968,28 @@ func renderDetail(l domain.Loop, width int) string {
 		d.WriteString(renderResumeCallout(l, width))
 	case domain.StateGate:
 		d.WriteString(renderGateCallout(l, width))
+	case domain.StateDrift:
+		d.WriteString(renderDriftCallout(l, width))
 	}
 	return stDetail.Width(width).Render(strings.TrimRight(d.String(), "\n"))
+}
+
+// renderOracleDetail is the ORACLE row's value: icon + the verdict's actual
+// reason (not just the short table-cell label), colored by outcome. "—" if
+// never judged yet.
+func renderOracleDetail(l domain.Loop, valueWidth int) string {
+	if l.Last == nil {
+		return stFaint.Render("—")
+	}
+	icon, style := "✓", stDim
+	switch l.Last.Outcome {
+	case domain.OutcomeDone:
+		style = lipgloss.NewStyle().Foreground(cGreen)
+	case domain.OutcomeRejected:
+		icon = "✗"
+		style = lipgloss.NewStyle().Foreground(cRed)
+	}
+	return style.Render(icon + " " + trunc(l.Last.Reason, valueWidth-2))
 }
 
 // detailRow is one KEY  value line in the mockup's key-value grid (faint
@@ -858,6 +1047,26 @@ func renderGateCallout(l domain.Loop, width int) string {
 		"   " + stKeyChipAmber.Render("a") + stDim.Render(" approve") +
 		"   " + stKeyChipAmber.Render("↵") + stDim.Render(" attach to answer")
 	return "\n" + stCalloutAmber.Width(contentWidth).Render(line)
+}
+
+// renderDriftCallout is the mockup's red gate-line for a loop the oracle
+// rejected: "DRIFT ▸ <reason>   r re-drive   k kill". "r" re-drives the
+// loop by re-sending its LAST USER PROMPT (resumeCmd already allows
+// StateDrift, same send path as a stalled loop's resume).
+func renderDriftCallout(l domain.Loop, width int) string {
+	contentWidth := width - 4
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+	reason := "oracle rejected this loop's \"done\" claim"
+	if l.Last != nil && l.Last.Reason != "" {
+		reason = l.Last.Reason
+	}
+	line := lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("DRIFT ▸") +
+		" " + stInk.Render(reason) +
+		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive") +
+		"   " + stKeyChipRed.Render("k") + stDim.Render(" kill")
+	return "\n" + stCalloutRed.Width(contentWidth).Render(line)
 }
 
 // ── status line / keybar ─────────────────────────────────────

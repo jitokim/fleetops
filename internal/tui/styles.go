@@ -59,7 +59,7 @@ var (
 func stateStyle(l domain.Loop) lipgloss.Style {
 	s := lipgloss.NewStyle().Foreground(stateColor(l))
 	switch l.State {
-	case domain.StateStalled, domain.StateGate, domain.StateRunning:
+	case domain.StateStalled, domain.StateGate, domain.StateRunning, domain.StateDone, domain.StateDrift:
 		s = s.Bold(true)
 	}
 	return s
@@ -76,6 +76,10 @@ func stateColor(l domain.Loop) lipgloss.Color {
 		return cAmber
 	case domain.StateRunning:
 		return cBlue
+	case domain.StateDone:
+		return cGreen
+	case domain.StateDrift:
+		return cRed
 	default:
 		return cDim
 	}
@@ -97,6 +101,10 @@ func stateLabel(l domain.Loop) string {
 		return "◆ GATE"
 	case domain.StateIdle:
 		return "· idle"
+	case domain.StateDone:
+		return "✓ DONE"
+	case domain.StateDrift:
+		return "✗ DRIFT"
 	default:
 		return string(l.State)
 	}
@@ -110,6 +118,40 @@ func budgetStyle(l domain.Loop) lipgloss.Style {
 	case frac >= 0.9:
 		return lipgloss.NewStyle().Foreground(cRed)
 	case frac >= 0.75:
+		return lipgloss.NewStyle().Foreground(cAmber)
+	default:
+		return stDim
+	}
+}
+
+// oracleStyle colors the ORACLE cell/row by the loop's latest verdict:
+// green for done, red for rejected, dim for progress or unbound/unjudged.
+func oracleStyle(l domain.Loop) lipgloss.Style {
+	if l.Last == nil {
+		return stFaint
+	}
+	switch l.Last.Outcome {
+	case domain.OutcomeDone:
+		return lipgloss.NewStyle().Foreground(cGreen)
+	case domain.OutcomeRejected:
+		return lipgloss.NewStyle().Foreground(cRed)
+	default:
+		return stDim
+	}
+}
+
+// noImproveStyle colors the N/I cell/row: dim normally, amber one short of
+// the limit, red at (or past) the limit — the same "heads up before the
+// hard ceiling" pattern as budgetStyle. Unbound loops (no NoImproveLimit)
+// are always dim, since "—" isn't a real number to threshold against.
+func noImproveStyle(l domain.Loop) lipgloss.Style {
+	if l.Goal.Text == "" || l.Goal.NoImproveLimit <= 0 {
+		return stFaint
+	}
+	switch {
+	case l.NoImprove >= l.Goal.NoImproveLimit:
+		return lipgloss.NewStyle().Foreground(cRed)
+	case l.NoImprove == l.Goal.NoImproveLimit-1:
 		return lipgloss.NewStyle().Foreground(cAmber)
 	default:
 		return stDim

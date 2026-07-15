@@ -10,6 +10,7 @@ import (
 
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/gate"
+	"github.com/jitokim/missionctl/internal/registry"
 )
 
 func writeJSONL(t *testing.T, lines ...string) string {
@@ -529,5 +530,157 @@ func TestApplyLiveness_DifferentCwdsIndependent(t *testing.T) {
 
 	if len(out) != 1 || out[0].SessionID != "a" {
 		t.Errorf("got %+v, want only loop \"a\" (its cwd has a live process; \"b\"'s doesn't)", out)
+	}
+}
+
+func TestApplyLiveness_StateDone_NotDroppedNorDemoted(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "done-one", Cwd: "/x/aboard", State: domain.StateDone, LastActivity: now},
+	}
+	live := map[string]int{} // zero live processes for this cwd — would normally drop/demote everything
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (StateDone must survive, not be dropped)", len(out))
+	}
+	if out[0].State != domain.StateDone || out[0].Stall != domain.StallNone {
+		t.Errorf("got %+v, want State=StateDone Stall=StallNone (untouched by liveness)", out[0])
+	}
+}
+
+func TestApplyLiveness_StateDrift_NotDroppedNorDemoted(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "drift-one", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
+	}
+	live := map[string]int{}
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (StateDrift must survive)", len(out))
+	}
+	if out[0].State != domain.StateDrift || out[0].Stall != domain.StallNone {
+		t.Errorf("got %+v, want State=StateDrift Stall=StallNone (untouched by liveness)", out[0])
+	}
+}
+
+func TestEnrichFromRegistry_UnboundLoopUntouched(t *testing.T) {
+	loops := []domain.Loop{{SessionID: "unbound-1", State: domain.StateIdle}}
+
+	out := enrichFromRegistry(loops, t.TempDir())
+
+	if out[0].Goal.Text != "" {
+		t.Errorf("Goal.Text = %q, want empty (no registry record)", out[0].Goal.Text)
+	}
+	if out[0].State != domain.StateIdle {
+		t.Errorf("State = %v, want unchanged StateIdle", out[0].State)
+	}
+}
+
+func TestEnrichFromRegistry_BoundLoop_SetsGoalCapsAndNoImprove(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "fix the flaky test"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 2); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateStalled, Cycle: 3}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].Goal.Text != "fix the flaky test" {
+		t.Errorf("Goal.Text = %q, want %q", out[0].Goal.Text, "fix the flaky test")
+	}
+	if out[0].Goal.MaxCycles != registry.DefaultMaxCycles {
+		t.Errorf("Goal.MaxCycles = %d, want %d", out[0].Goal.MaxCycles, registry.DefaultMaxCycles)
+	}
+	if out[0].Goal.NoImproveLimit != registry.DefaultNoImproveLimit {
+		t.Errorf("Goal.NoImproveLimit = %d, want %d", out[0].Goal.NoImproveLimit, registry.DefaultNoImproveLimit)
+	}
+	if out[0].NoImprove != 1 {
+		t.Errorf("NoImprove = %d, want 1", out[0].NoImprove)
+	}
+	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeRejected {
+		t.Errorf("Last = %+v, want a rejected verdict", out[0].Last)
+	}
+}
+
+func TestEnrichFromRegistry_DoneAtCurrentCycle_PromotesToStateDone(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 5); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle, Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateDone {
+		t.Errorf("State = %v, want StateDone (verdict.AtCycle == Cycle)", out[0].State)
+	}
+}
+
+func TestEnrichFromRegistry_RejectedAtCurrentCycle_PromotesToStateDrift(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 5); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle, Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateDrift {
+		t.Errorf("State = %v, want StateDrift (verdict.AtCycle == Cycle)", out[0].State)
+	}
+}
+
+func TestEnrichFromRegistry_ProgressAtCurrentCycle_LeavesStateUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeProgress, Reason: "still working"}, 5); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle, Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateIdle {
+		t.Errorf("State = %v, want unchanged StateIdle (progress doesn't override state)", out[0].State)
+	}
+	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeProgress {
+		t.Errorf("Last = %+v, want a progress verdict (still shown for the ORACLE column)", out[0].Last)
+	}
+}
+
+func TestEnrichFromRegistry_VerdictFromEarlierCycle_DoesNotOverrideState(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 3); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	// the loop has since moved to cycle 5 — the cycle-3 "done" verdict is
+	// stale and must not resurrect StateDone.
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateRunning, Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateRunning {
+		t.Errorf("State = %v, want unchanged StateRunning (verdict is from an earlier cycle)", out[0].State)
+	}
+	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeDone {
+		t.Errorf("Last = %+v, want the stale done verdict still surfaced for the ORACLE column", out[0].Last)
 	}
 }

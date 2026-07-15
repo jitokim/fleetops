@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/registry"
 )
 
 // runeKey builds the tea.KeyMsg bubbletea sends for a single printable
@@ -137,37 +138,61 @@ func TestPadToWidth_AlreadyAtOrOverWidth(t *testing.T) {
 }
 
 func TestColumnWidths_DropsNoteBelowThreshold(t *testing.T) {
-	if _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
+	if _, _, _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
 		t.Errorf("at width %d, wNote = %d, want 0 (NOTE column dropped)", minWidthForNote-1, wNote)
 	}
-	if _, _, _, wNote := columnWidths(minWidthForNote); wNote == 0 {
+	if _, _, _, _, _, wNote := columnWidths(minWidthForNote); wNote == 0 {
 		t.Errorf("at width %d, wNote = 0, want > 0 (NOTE column kept)", minWidthForNote)
 	}
 }
 
+func TestColumnWidths_DropsNIBelowThreshold(t *testing.T) {
+	if _, _, _, _, wNI, _ := columnWidths(minWidthForNI - 1); wNI != 0 {
+		t.Errorf("at width %d, wNI = %d, want 0 (N/I column dropped)", minWidthForNI-1, wNI)
+	}
+	if _, _, _, _, wNI, _ := columnWidths(minWidthForNI); wNI == 0 {
+		t.Errorf("at width %d, wNI = 0, want > 0 (N/I column kept)", minWidthForNI)
+	}
+}
+
+func TestColumnWidths_DropsOracleBelowThreshold(t *testing.T) {
+	if _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle - 1); wOracle != 0 {
+		t.Errorf("at width %d, wOracle = %d, want 0 (ORACLE column dropped)", minWidthForOracle-1, wOracle)
+	}
+	if _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle); wOracle == 0 {
+		t.Errorf("at width %d, wOracle = 0, want > 0 (ORACLE column kept)", minWidthForOracle)
+	}
+}
+
 func TestColumnWidths_DropsBudgetBelowThreshold(t *testing.T) {
-	if _, _, wBudget, _ := columnWidths(minWidthForBudget - 1); wBudget != 0 {
+	if _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget - 1); wBudget != 0 {
 		t.Errorf("at width %d, wBudget = %d, want 0 (BUDGET column dropped)", minWidthForBudget-1, wBudget)
 	}
-	if _, _, wBudget, _ := columnWidths(minWidthForBudget); wBudget == 0 {
+	if _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget); wBudget == 0 {
 		t.Errorf("at width %d, wBudget = 0, want > 0 (BUDGET column kept)", minWidthForBudget)
 	}
 }
 
 func TestColumnWidths_DropsCycleBelowThreshold(t *testing.T) {
-	if _, wCycle, _, _ := columnWidths(minWidthForCycle - 1); wCycle != 0 {
+	if _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle - 1); wCycle != 0 {
 		t.Errorf("at width %d, wCycle = %d, want 0 (CYCLE column dropped)", minWidthForCycle-1, wCycle)
 	}
-	if _, wCycle, _, _ := columnWidths(minWidthForCycle); wCycle == 0 {
+	if _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle); wCycle == 0 {
 		t.Errorf("at width %d, wCycle = 0, want > 0 (CYCLE column kept)", minWidthForCycle)
 	}
 }
 
 func TestColumnWidths_DegradationOrder(t *testing.T) {
-	// NOTE must drop before BUDGET, which must drop before CYCLE, as width
-	// shrinks — never the other way around.
-	if minWidthForNote <= minWidthForBudget {
-		t.Errorf("minWidthForNote (%d) must be > minWidthForBudget (%d)", minWidthForNote, minWidthForBudget)
+	// NOTE must drop before N/I, before ORACLE, before BUDGET, before CYCLE,
+	// as width shrinks — never any other order.
+	if minWidthForNote <= minWidthForNI {
+		t.Errorf("minWidthForNote (%d) must be > minWidthForNI (%d)", minWidthForNote, minWidthForNI)
+	}
+	if minWidthForNI <= minWidthForOracle {
+		t.Errorf("minWidthForNI (%d) must be > minWidthForOracle (%d)", minWidthForNI, minWidthForOracle)
+	}
+	if minWidthForOracle <= minWidthForBudget {
+		t.Errorf("minWidthForOracle (%d) must be > minWidthForBudget (%d)", minWidthForOracle, minWidthForBudget)
 	}
 	if minWidthForBudget <= minWidthForCycle {
 		t.Errorf("minWidthForBudget (%d) must be > minWidthForCycle (%d)", minWidthForBudget, minWidthForCycle)
@@ -175,7 +200,7 @@ func TestColumnWidths_DegradationOrder(t *testing.T) {
 }
 
 func TestColumnWidths_NameNeverBelowMinimum(t *testing.T) {
-	wName, _, _, _ := columnWidths(20)
+	wName, _, _, _, _, _ := columnWidths(20)
 	if wName < 10 {
 		t.Errorf("wName = %d at a very narrow width, want >= 10 (usable minimum)", wName)
 	}
@@ -398,3 +423,190 @@ func TestUpdate_AnyOtherKey_ClearsPendingKill(t *testing.T) {
 		t.Error("expected pendingKillSession to be cleared by an unrelated keypress")
 	}
 }
+
+// ── oracle judge trigger policy ────────────────────────────────────
+
+func TestTriggerJudgments_FiresForBoundIdleLoopNeverJudged(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{SessionID: "s1", State: domain.StateIdle, Cycle: 3, Goal: domain.Goal{Text: "fix the bug"}},
+	}
+
+	cmd := m.triggerJudgments()
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil batch cmd")
+	}
+	if !m.judging["s1"] {
+		t.Error("expected s1 marked in-flight after triggering")
+	}
+}
+
+func TestTriggerJudgments_SkipsUnboundLoops(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateIdle, Cycle: 1}} // no Goal.Text
+
+	if cmd := m.triggerJudgments(); cmd != nil {
+		t.Error("expected nil cmd for an unbound loop")
+	}
+}
+
+func TestTriggerJudgments_SkipsNonIdleState(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning, Cycle: 1, Goal: domain.Goal{Text: "x"}}}
+
+	if cmd := m.triggerJudgments(); cmd != nil {
+		t.Error("expected nil cmd for a non-idle loop (not a done-candidate checkpoint yet)")
+	}
+}
+
+func TestTriggerJudgments_SkipsAlreadyJudgedThisCycle(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{
+		SessionID: "s1", State: domain.StateIdle, Cycle: 3, Goal: domain.Goal{Text: "x"},
+		Last: &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 3},
+	}}
+
+	if cmd := m.triggerJudgments(); cmd != nil {
+		t.Error("expected nil cmd — this exact cycle was already judged")
+	}
+}
+
+func TestTriggerJudgments_FiresAgainAfterCycleAdvances(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{
+		SessionID: "s1", State: domain.StateIdle, Cycle: 4, Goal: domain.Goal{Text: "x"},
+		Last: &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 3},
+	}}
+
+	if cmd := m.triggerJudgments(); cmd == nil {
+		t.Error("expected a non-nil cmd — cycle advanced past the last judged cycle")
+	}
+}
+
+func TestTriggerJudgments_InFlightGuardPreventsDoubleJudging(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateIdle, Cycle: 1, Goal: domain.Goal{Text: "x"}}}
+
+	if cmd := m.triggerJudgments(); cmd == nil {
+		t.Fatal("expected the first call to fire")
+	}
+	if cmd := m.triggerJudgments(); cmd != nil {
+		t.Error("expected the second call (same scan cycle, still in-flight) to fire nothing")
+	}
+}
+
+func TestUpdate_VerdictMsg_ClearsInFlightGuard(t *testing.T) {
+	m := New()
+	m.judging = map[string]bool{"s1": true}
+
+	m, _ = updateModel(t, m, verdictMsg{sessionID: "s1", verdict: domain.Verdict{Outcome: domain.OutcomeDone}})
+
+	if m.judging["s1"] {
+		t.Error("expected in-flight guard cleared after verdictMsg")
+	}
+}
+
+func TestJudgeCmd_SavesVerdictAndReportsResult(t *testing.T) {
+	dir := t.TempDir()
+	origDirFn, origJudgeFn := registryDirFn, judgeFn
+	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
+	registryDirFn = func() string { return dir }
+	judgeFn = func(goal, lastText string) (domain.Verdict, error) {
+		return domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no test output shown"}, nil
+	}
+
+	if err := registry.Bind(dir, "s1", "fix the bug"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "s1", Cycle: 2, Goal: domain.Goal{Text: "fix the bug"}, Path: "/no/such/file.jsonl"}
+	msg := judgeCmd(l)()
+
+	vm, ok := msg.(verdictMsg)
+	if !ok {
+		t.Fatalf("got %T, want verdictMsg", msg)
+	}
+	if vm.err != nil {
+		t.Fatalf("unexpected err: %v", vm.err)
+	}
+	if vm.verdict.Outcome != domain.OutcomeRejected {
+		t.Errorf("Outcome = %v, want rejected", vm.verdict.Outcome)
+	}
+
+	rec, ok := registry.Load(dir, "s1")
+	if !ok {
+		t.Fatal("expected a record to exist")
+	}
+	if rec.NoImprove != 1 {
+		t.Errorf("NoImprove = %d, want 1 (rejected increments it)", rec.NoImprove)
+	}
+	if rec.Verdict == nil || rec.Verdict.AtCycle != 2 {
+		t.Errorf("Verdict.AtCycle = %+v, want AtCycle=2", rec.Verdict)
+	}
+}
+
+func TestJudgeCmd_JudgeErrorReportedWithoutSaving(t *testing.T) {
+	dir := t.TempDir()
+	origDirFn, origJudgeFn := registryDirFn, judgeFn
+	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
+	registryDirFn = func() string { return dir }
+	judgeFn = func(goal, lastText string) (domain.Verdict, error) {
+		return domain.Verdict{}, errTestJudgeFailed
+	}
+
+	if err := registry.Bind(dir, "s1", "goal"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "s1", Cycle: 1, Goal: domain.Goal{Text: "goal"}}
+	msg := judgeCmd(l)()
+
+	vm, ok := msg.(verdictMsg)
+	if !ok {
+		t.Fatalf("got %T, want verdictMsg", msg)
+	}
+	if vm.err == nil {
+		t.Error("expected a non-nil err")
+	}
+	if rec, _ := registry.Load(dir, "s1"); rec.Verdict != nil {
+		t.Error("expected no verdict saved when judging fails")
+	}
+}
+
+// ── ORACLE / N-I label pure funcs ───────────────────────────────────
+
+func TestOracleLabel(t *testing.T) {
+	cases := []struct {
+		name string
+		l    domain.Loop
+		want string
+	}{
+		{"unbound/never judged", domain.Loop{}, "—"},
+		{"done", domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeDone}}, "✓ verified"},
+		{"progress", domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeProgress}}, "✓ progress"},
+		{"rejected", domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeRejected}}, "✗ rejected"},
+	}
+	for _, c := range cases {
+		if got := oracleLabel(c.l); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestNoImproveLabel(t *testing.T) {
+	if got := noImproveLabel(domain.Loop{}); got != "—" {
+		t.Errorf("unbound: got %q, want %q", got, "—")
+	}
+	bound := domain.Loop{Goal: domain.Goal{Text: "x", NoImproveLimit: 3}, NoImprove: 1}
+	if got := noImproveLabel(bound); got != "1/3" {
+		t.Errorf("bound: got %q, want %q", got, "1/3")
+	}
+}
+
+// errTestJudgeFailed is a sentinel error for TestJudgeCmd_JudgeErrorReportedWithoutSaving.
+var errTestJudgeFailed = &testJudgeError{}
+
+type testJudgeError struct{}
+
+func (*testJudgeError) Error() string { return "test judge failure" }
