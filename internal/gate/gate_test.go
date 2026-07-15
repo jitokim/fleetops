@@ -9,7 +9,7 @@ import (
 func TestWriteMarker_PendingRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
-	if err := WriteMarker(dir, "sess-abc123", "approve merge to main?"); err != nil {
+	if err := WriteMarker(dir, "sess-abc123", "approve merge to main?", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 
@@ -28,7 +28,7 @@ func TestWriteMarker_PendingRoundTrip(t *testing.T) {
 
 func TestWriteMarker_CreatesDir(t *testing.T) {
 	dir := t.TempDir() + "/nested/gates"
-	if err := WriteMarker(dir, "sess-1", "hi"); err != nil {
+	if err := WriteMarker(dir, "sess-1", "hi", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	if len(Pending(dir)) != 1 {
@@ -47,7 +47,7 @@ func TestPending_EmptyOrMissingDir(t *testing.T) {
 
 func TestPending_SkipsMalformedAndNonJSONFiles(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteMarker(dir, "good", "ok"); err != nil {
+	if err := WriteMarker(dir, "good", "ok", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	writeRaw(t, dir+"/bad.json", "not json at all")
@@ -64,7 +64,7 @@ func TestPending_SkipsMalformedAndNonJSONFiles(t *testing.T) {
 
 func TestDeleteMarker(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteMarker(dir, "sess-1", "hi"); err != nil {
+	if err := WriteMarker(dir, "sess-1", "hi", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	DeleteMarker(dir, "sess-1")

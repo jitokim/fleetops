@@ -2,8 +2,10 @@ package control
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // tmuxController drives a tmux pane via the tmux CLI.
@@ -84,6 +86,52 @@ func tmuxFocusCmds(paneID string) [][]string {
 		{"tmux", "select-pane", "-t", paneID},
 		{"tmux", "switch-client", "-t", paneID},
 	}
+}
+
+// spawnBootWait is a pragmatic fixed pause for claude's TUI to boot inside
+// the new pane before typing the goal into it — tmux has no equivalent of
+// orca's "wait --for tui-idle", so this is a flat sleep rather than a poll.
+const spawnBootWait = 8 * time.Second
+
+// Spawn opens a new tmux window running claude in cwd, waits for it to boot
+// (pragmatic fixed delay, see spawnBootWait), then sends the goal + Enter.
+func (tmuxController) Spawn(cwd, goal string) error {
+	argv := tmuxNewWindowCmd(cwd)
+	out, err := exec.Command(argv[0], argv[1:]...).Output()
+	if err != nil {
+		return err
+	}
+	paneID := strings.TrimSpace(string(out))
+	if paneID == "" {
+		return fmt.Errorf("tmux new-window: empty pane id")
+	}
+
+	time.Sleep(spawnBootWait)
+
+	for _, argv := range tmuxResumeCmds(paneID, goal) {
+		if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tmuxNewWindowCmd builds the argv that opens a new tmux window running
+// claude in cwd, printing just the new pane's id to stdout (-P -F) so Spawn
+// can target it directly.
+func tmuxNewWindowCmd(cwd string) []string {
+	return []string{"tmux", "new-window", "-c", cwd, "-P", "-F", "#{pane_id}", "claude"}
+}
+
+// Interrupt stops the current turn without killing claude — a bare Esc.
+func (tmuxController) Interrupt(t Target) error {
+	argv := tmuxInterruptCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// tmuxInterruptCmd builds the argv for an Escape keypress into a pane.
+func tmuxInterruptCmd(paneID string) []string {
+	return []string{"tmux", "send-keys", "-t", paneID, "Escape"}
 }
 
 // parseTmuxPanes parses `tmux list-panes -a -F '#{pane_id}\t#{pane_current_path}'`

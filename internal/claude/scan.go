@@ -170,18 +170,45 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 	}
 
 	// A pending Notification-hook marker beats any tail heuristic above —
-	// the human is being asked something RIGHT NOW, which is a stronger,
-	// more direct signal than anything inferred from the transcript.
+	// but only when it's actually asking for a decision. Claude Code fires
+	// the SAME hook for the 60s "Claude is waiting for your input" idle
+	// notification, which is NOT a gate (verified live). The official
+	// notification_type field is the authoritative signal
+	// (permission_prompt/elicitation_dialog/agent_needs_input all mean
+	// "blocked on a human"; idle_prompt and anything else don't); older
+	// claude versions that omit it (Type == "") fall back to the
+	// message-contains-"permission" heuristic. Anything that isn't a gate
+	// falls through to the normal tail classification above (→ Idle) and
+	// the marker is best-effort deleted so it doesn't linger.
 	if info, ok := pending[session]; ok {
-		if gate.IsGateActive(info.TS, last) {
+		if gate.IsGateActive(info.TS, last) && isGateNotification(info) {
 			l.State = domain.StateGate
 			l.Stall = domain.StallNone
 			l.GatePrompt = info.Message
 		} else {
-			gate.DeleteMarker(gatesDir, session) // best-effort: already answered
+			gate.DeleteMarker(gatesDir, session) // already answered, or not a real gate
 		}
 	}
 	return l
+}
+
+// gateNotificationTypes are Claude Code's notification_type values that mean
+// "blocked on a human decision" — the rest (idle_prompt, auth_success, etc.)
+// are informational, not a gate.
+var gateNotificationTypes = map[string]bool{
+	"permission_prompt":  true,
+	"elicitation_dialog": true,
+	"agent_needs_input":  true,
+}
+
+// isGateNotification decides whether a marker represents a real gate.
+// Type is authoritative when present; when empty (older claude versions
+// that predate notification_type), falls back to a message-text heuristic.
+func isGateNotification(info gate.Info) bool {
+	if info.Type != "" {
+		return gateNotificationTypes[info.Type]
+	}
+	return strings.Contains(strings.ToLower(info.Message), "permission")
 }
 
 // tailState reads the tail of the session log and classifies it given how

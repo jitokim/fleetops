@@ -225,9 +225,34 @@ func TestLoopFromLog_EndTurnRecent_IsIdleNotRunning(t *testing.T) {
 	}
 }
 
-func TestLoopFromLog_ActiveGate_BeatsAnyTailClassification(t *testing.T) {
+func TestIsGateNotification(t *testing.T) {
+	cases := []struct {
+		name string
+		info gate.Info
+		want bool
+	}{
+		{"permission_prompt type", gate.Info{Type: "permission_prompt", Message: "Permission required to run: Bash(npm test)"}, true},
+		{"elicitation_dialog type", gate.Info{Type: "elicitation_dialog", Message: "anything"}, true},
+		{"agent_needs_input type", gate.Info{Type: "agent_needs_input", Message: "anything"}, true},
+		{"idle_prompt type", gate.Info{Type: "idle_prompt", Message: "Claude is waiting for your input"}, false},
+		{"unknown type", gate.Info{Type: "auth_success", Message: "anything"}, false},
+		{"empty type, permission-ish message (fallback)", gate.Info{Type: "", Message: "Permission required to run: Bash(npm test)"}, true},
+		{"empty type, idle message (fallback)", gate.Info{Type: "", Message: "Claude is waiting for your input"}, false},
+		{"empty type, empty message (fallback)", gate.Info{Type: "", Message: ""}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isGateNotification(c.info); got != c.want {
+				t.Errorf("isGateNotification(%+v) = %v, want %v", c.info, got, c.want)
+			}
+		})
+	}
+}
+
+func TestLoopFromLog_ActivePermissionPromptType_BeatsAnyTailClassification(t *testing.T) {
 	// mid-turn AND idle long past IdleThreshold — would classify Stalled on
-	// its own — but an active gate marker must win regardless.
+	// its own — but an active permission_prompt gate marker must win
+	// regardless.
 	path := writeJSONL(t,
 		`{"type":"user","message":{"content":"do the thing"}}`,
 		`{"type":"assistant","message":{"content":"working","stop_reason":"tool_use"}}`,
@@ -238,18 +263,71 @@ func TestLoopFromLog_ActiveGate_BeatsAnyTailClassification(t *testing.T) {
 	}
 	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	pending := map[string]gate.Info{
-		session: {Message: "approve merge to main?", TS: fi.ModTime()},
+		session: {Type: "permission_prompt", Message: "Permission required to run: Bash(npm test)", TS: fi.ModTime()},
 	}
 
 	l := loopFromLog(path, fi, fi.ModTime().Add(time.Hour), t.TempDir(), pending)
 	if l.State != domain.StateGate {
 		t.Errorf("got State=%v, want %v", l.State, domain.StateGate)
 	}
-	if l.GatePrompt != "approve merge to main?" {
-		t.Errorf("GatePrompt = %q, want %q", l.GatePrompt, "approve merge to main?")
+	if l.GatePrompt != "Permission required to run: Bash(npm test)" {
+		t.Errorf("GatePrompt = %q, want %q", l.GatePrompt, "Permission required to run: Bash(npm test)")
 	}
 	if l.Stall != domain.StallNone {
 		t.Errorf("Stall = %v, want %v (gated, not stalled)", l.Stall, domain.StallNone)
+	}
+}
+
+func TestLoopFromLog_ActiveIdlePromptType_NotGated_MarkerDeleted(t *testing.T) {
+	// Claude Code fires the SAME Notification hook for the 60s idle nudge
+	// (notification_type "idle_prompt") — that is NOT a gate, it just means
+	// idle. Ends on a finished turn, so the fallthrough classification lands
+	// on StateIdle.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	gatesDir := t.TempDir()
+	if err := gate.WriteMarker(gatesDir, session, "Claude is waiting for your input", "idle_prompt"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	pending := map[string]gate.Info{
+		session: {Type: "idle_prompt", Message: "Claude is waiting for your input", TS: fi.ModTime()},
+	}
+
+	l := loopFromLog(path, fi, fi.ModTime(), gatesDir, pending)
+	if l.State != domain.StateIdle {
+		t.Errorf("got State=%v, want %v (idle_prompt is not a gate)", l.State, domain.StateIdle)
+	}
+	if len(gate.Pending(gatesDir)) != 0 {
+		t.Error("expected the non-gate marker to be deleted")
+	}
+}
+
+func TestLoopFromLog_ActiveEmptyTypePermissionMessage_GatedViaFallback(t *testing.T) {
+	// older claude versions that predate notification_type: falls back to
+	// the message-text heuristic.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"working","stop_reason":"tool_use"}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	pending := map[string]gate.Info{
+		session: {Message: "Permission required to run: Bash(npm test)", TS: fi.ModTime()},
+	}
+
+	l := loopFromLog(path, fi, fi.ModTime().Add(time.Hour), t.TempDir(), pending)
+	if l.State != domain.StateGate {
+		t.Errorf("got State=%v, want %v (empty-type fallback on a permission-ish message)", l.State, domain.StateGate)
 	}
 }
 
@@ -268,7 +346,7 @@ func TestLoopFromLog_StaleGate_DeletedAndIgnored(t *testing.T) {
 	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	gatesDir := t.TempDir()
 	staleTS := fi.ModTime().Add(-time.Hour) // long before the log's last write
-	if err := gate.WriteMarker(gatesDir, session, "old question"); err != nil {
+	if err := gate.WriteMarker(gatesDir, session, "old question", "permission_prompt"); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	pending := map[string]gate.Info{session: {Message: "old question", TS: staleTS}}

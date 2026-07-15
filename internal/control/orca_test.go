@@ -190,3 +190,100 @@ func TestParseOrcaTerminals_GarbageJSON(t *testing.T) {
 		t.Error("expected ok=false for unparseable JSON")
 	}
 }
+
+func TestOrcaInterruptCmd(t *testing.T) {
+	got := orcaInterruptCmd("term_abc123")
+	want := []string{"orca", "terminal", "send", "--terminal", "term_abc123", "--interrupt", "--json"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseOrcaCreateHandle(t *testing.T) {
+	fixture := []byte(`{"id":"x","ok":true,"result":{"terminal":{"handle":"term_new123","worktreePath":"/x"}}}`)
+	handle, ok := parseOrcaCreateHandle(fixture)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if handle != "term_new123" {
+		t.Errorf("got %q, want %q", handle, "term_new123")
+	}
+}
+
+func TestParseOrcaCreateHandle_OKFalse(t *testing.T) {
+	fixture := []byte(`{"ok":false}`)
+	if _, ok := parseOrcaCreateHandle(fixture); ok {
+		t.Error("expected ok=false when envelope reports ok:false")
+	}
+}
+
+func TestParseOrcaCreateHandle_MissingHandle(t *testing.T) {
+	fixture := []byte(`{"ok":true,"result":{"terminal":{"worktreePath":"/x"}}}`)
+	if _, ok := parseOrcaCreateHandle(fixture); ok {
+		t.Error("expected ok=false when handle is empty/missing")
+	}
+}
+
+func TestParseOrcaCreateHandle_GarbageJSON(t *testing.T) {
+	if _, ok := parseOrcaCreateHandle([]byte(`not json`)); ok {
+		t.Error("expected ok=false for unparseable JSON")
+	}
+}
+
+func TestSelectSpawnedOrcaTerminal_PicksSpawnTitleAtCwd(t *testing.T) {
+	terminals := []orcaTerminal{
+		{Handle: "term_wrong_cwd", WorktreePath: "/x/other", Title: spawnTitle, LastOutputAt: 999},
+		{Handle: "term_wrong_title", WorktreePath: "/x/aboard", Title: "Terminal 2", LastOutputAt: 999},
+		{Handle: "term_match", WorktreePath: "/x/aboard", Title: spawnTitle, LastOutputAt: 1},
+	}
+	target, ok := selectSpawnedOrcaTerminal(terminals, "/x/aboard")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_match" {
+		t.Errorf("got ID %q, want term_match", target.ID)
+	}
+}
+
+func TestSelectSpawnedOrcaTerminal_AlsoMatchesClaudeTabPrefix(t *testing.T) {
+	// once the TUI boots it may relabel the tab with the "✳" prefix instead
+	// of keeping spawnTitle — Spawn must still find it.
+	terminals := []orcaTerminal{
+		{Handle: "term_relabeled", WorktreePath: "/x/aboard", Title: "✳ team", LastOutputAt: 1},
+	}
+	target, ok := selectSpawnedOrcaTerminal(terminals, "/x/aboard")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_relabeled" {
+		t.Errorf("got ID %q, want term_relabeled", target.ID)
+	}
+}
+
+func TestSelectSpawnedOrcaTerminal_PicksNewestAmongMatches(t *testing.T) {
+	terminals := []orcaTerminal{
+		{Handle: "term_older", WorktreePath: "/x/aboard", Title: spawnTitle, LastOutputAt: 100},
+		{Handle: "term_newer", WorktreePath: "/x/aboard", Title: spawnTitle, LastOutputAt: 200},
+	}
+	target, ok := selectSpawnedOrcaTerminal(terminals, "/x/aboard")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_newer" {
+		t.Errorf("got ID %q, want term_newer (highest lastOutputAt)", target.ID)
+	}
+}
+
+func TestSelectSpawnedOrcaTerminal_NoMatch(t *testing.T) {
+	terminals := []orcaTerminal{
+		{Handle: "term_a", WorktreePath: "/x/other", Title: spawnTitle, LastOutputAt: 1},
+	}
+	if _, ok := selectSpawnedOrcaTerminal(terminals, "/x/aboard"); ok {
+		t.Error("expected ok=false when no terminal matches cwd")
+	}
+}

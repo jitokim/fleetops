@@ -45,6 +45,26 @@ func TestCmuxApproveCmd(t *testing.T) {
 	}
 }
 
+func TestCmuxInterruptCmd(t *testing.T) {
+	got := cmuxInterruptCmd("surface:2")
+	want := []string{"cmux", "send-key", "--surface", "surface:2", "escape"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCmuxController_Spawn_ReturnsUnsupportedError(t *testing.T) {
+	err := (cmuxController{}).Spawn("/x/aboard", "do the thing")
+	if err == nil {
+		t.Fatal("expected an error — spawn is not supported on cmux yet")
+	}
+}
+
 func TestParseCmuxTree_NestedFixture(t *testing.T) {
 	// TODO: verify cmux tree --json shape on a machine with the cmux CLI;
 	// this fixture is a guess at plausible shape, the parser is tolerant of

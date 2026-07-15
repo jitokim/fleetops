@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jitokim/missionctl/internal/claude"
@@ -48,6 +49,27 @@ type approveResultMsg struct {
 	text string
 }
 
+// spawnResultMsg reports the outcome of a new-loop spawn (n key) attempt,
+// computed off the event loop by spawnCmd, mirroring resumeResultMsg.
+type spawnResultMsg struct {
+	ok   bool
+	text string
+}
+
+// killResultMsg reports the outcome of a kill (k key, double-press confirm)
+// attempt, computed off the event loop by killCmd, mirroring resumeResultMsg.
+type killResultMsg struct {
+	ok   bool
+	text string
+}
+
+// interruptResultMsg reports the outcome of an interrupt (p key) attempt,
+// computed off the event loop by interruptCmd, mirroring resumeResultMsg.
+type interruptResultMsg struct {
+	ok   bool
+	text string
+}
+
 const refreshEvery = 3 * time.Second
 
 // scan is a tea.Cmd: rediscover the fleet from the logs.
@@ -61,13 +83,25 @@ func tick() tea.Cmd {
 }
 
 // statusKind colors the status/result line above the keybar (resume
-// successes read green, failures red — anything else is neutral/dim).
+// successes read green, failures red, a pending kill-confirm reads amber —
+// anything else is neutral/dim).
 type statusKind int
 
 const (
 	statusNeutral statusKind = iota
 	statusOK
 	statusErr
+	statusWarn
+)
+
+// mode distinguishes normal fleet-navigation input from the "n" key's
+// free-text goal prompt, so arrow/letter keys route to the text input
+// instead of moving the cursor or triggering actions while typing.
+type mode int
+
+const (
+	modeNormal mode = iota
+	modePrompting
 )
 
 type Model struct {
@@ -79,6 +113,13 @@ type Model struct {
 	lastScan   time.Time
 	start      time.Time // for the header's uptime clock
 	hostname   string
+
+	mode     mode
+	input    textinput.Model
+	spawnCwd string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
+
+	pendingKillSession string // non-empty while awaiting the confirming second "k"
+	pendingKillAt      time.Time
 }
 
 func New() Model {
@@ -92,6 +133,10 @@ func New() Model {
 		hostname: host,
 	}
 }
+
+// killConfirmWindow: the second "k" must land within this long of the first
+// to actually kill — otherwise it starts a fresh confirm cycle instead.
+const killConfirmWindow = 3 * time.Second
 
 func (m Model) Init() tea.Cmd { return tea.Batch(scan, tick()) }
 
@@ -108,10 +153,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tea.Batch(scan, tick())
 	case tea.KeyMsg:
-		switch msg.String() {
+		key := msg.String()
+		if key != "k" {
+			m.pendingKillSession = "" // any key other than a repeat "k" cancels a pending kill-confirm
+		}
+
+		if m.mode == modePrompting {
+			switch key {
+			case "esc":
+				m.mode = modeNormal
+				m.input.Blur()
+				m.status, m.statusKind = "cancelled", statusNeutral
+				return m, nil
+			case "enter":
+				goal := strings.TrimSpace(m.input.Value())
+				cwd := m.spawnCwd
+				m.mode = modeNormal
+				m.input.Blur()
+				if goal == "" {
+					m.status, m.statusKind = "cancelled (empty goal)", statusNeutral
+					return m, nil
+				}
+				m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...", cwd), statusNeutral
+				return m, spawnCmd(cwd, goal)
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
+			}
+		}
+
+		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "up", "k":
+		case "up":
 			if m.cursor > 0 {
 				m.cursor--
 			}
@@ -158,6 +233,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.ExecProcess(pager, func(err error) tea.Msg {
 				return logClosedMsg{err}
 			})
+		case "n":
+			cwd, err := os.Getwd()
+			if err != nil {
+				cwd = "."
+			}
+			if sel, ok := m.selected(); ok && sel.Cwd != "" {
+				cwd = sel.Cwd
+			}
+			m.spawnCwd = cwd
+			m.mode = modePrompting
+			m.input = textinput.New()
+			m.input.Placeholder = "goal"
+			m.input.Prompt = ""
+			m.input.Focus()
+			return m, textinput.Blink
+		case "k":
+			sel, ok := m.selected()
+			if !ok {
+				m.status, m.statusKind = "select a loop to kill", statusNeutral
+				return m, nil
+			}
+			now := time.Now()
+			if m.pendingKillSession == sel.SessionID && now.Sub(m.pendingKillAt) <= killConfirmWindow {
+				m.pendingKillSession = ""
+				m.status, m.statusKind = fmt.Sprintf("killing %s...", sel.Project), statusNeutral
+				return m, killCmd(sel)
+			}
+			m.pendingKillSession = sel.SessionID
+			m.pendingKillAt = now
+			m.status, m.statusKind = fmt.Sprintf("press k again within 3s to kill %s", sel.Project), statusWarn
+		case "p":
+			sel, ok := m.selected()
+			if !ok || (sel.State != domain.StateRunning && sel.State != domain.StateGate) {
+				m.status, m.statusKind = "select a running or gated loop to stop", statusNeutral
+				return m, nil
+			}
+			m.status, m.statusKind = fmt.Sprintf("stopping %s...", sel.Project), statusNeutral
+			return m, interruptCmd(sel)
 		}
 	case resumeResultMsg:
 		m.status = msg.text
@@ -174,6 +287,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusKind = statusErr
 		}
 	case approveResultMsg:
+		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
+	case spawnResultMsg:
+		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
+	case killResultMsg:
+		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
+	case interruptResultMsg:
 		m.status = msg.text
 		if msg.ok {
 			m.statusKind = statusOK
@@ -281,6 +415,67 @@ func approveCmd(l domain.Loop) tea.Cmd {
 	}
 }
 
+// spawnCmd starts a brand new claude loop in cwd with the given goal, via
+// whichever multiplexer backend is available. The 3s rescan picks the new
+// session up organically once it starts writing its own JSONL, so this
+// doesn't need to construct a domain.Loop itself.
+func spawnCmd(cwd, goal string) tea.Cmd {
+	return func() tea.Msg {
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
+		}
+		if err := ctrl.Spawn(cwd, goal); err != nil {
+			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
+		}
+		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
+	}
+}
+
+// killCmd cleanly quits a loop's claude process by re-sending "/exit" +
+// Enter — reuses Resume, which does exactly "type text, press Enter".
+func killCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		// SAFETY: same reasoning as resumeCmd's StallGone guard — if the
+		// process is already gone, there's nothing to send "/exit" into
+		// (and doing so anyway risks typing it into a bare shell instead).
+		if l.Stall == domain.StallGone {
+			return killResultMsg{true, fmt.Sprintf("%s already gone — nothing to kill", l.Project)}
+		}
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return killResultMsg{false, "no orca/tmux/cmux — kill manually: type /exit in " + l.Project}
+		}
+		target, ok := ctrl.Locate(l.ProjectDir)
+		if !ok {
+			return killResultMsg{false, "surface not found — kill manually: type /exit"}
+		}
+		if err := ctrl.Resume(target, "/exit"); err != nil {
+			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
+		}
+		return killResultMsg{true, fmt.Sprintf("killed %s", l.Project)}
+	}
+}
+
+// interruptCmd stops a loop's current turn (Esc) without killing the
+// process — the loop stays alive, resumable with r.
+func interruptCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return interruptResultMsg{false, "no orca/tmux/cmux — stop manually: press Esc in " + l.Project}
+		}
+		target, ok := ctrl.Locate(l.ProjectDir)
+		if !ok {
+			return interruptResultMsg{false, "surface not found — stop manually: press Esc"}
+		}
+		if err := ctrl.Interrupt(target); err != nil {
+			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
+		}
+		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
+	}
+}
+
 // pagerCmd builds the argv for the "o" key's log pager: -R renders color
 // codes, +G jumps to the end (most recent activity first), and a custom
 // prompt tells the human how to get back — otherwise "q returns you to the
@@ -357,9 +552,13 @@ func (m Model) View() string {
 		b.WriteString(renderDetail(sel, width))
 	}
 
-	// status line (its own line, above the keybar) + keybar
+	// status line (its own line, above the keybar) — replaced by the new-loop
+	// prompt while in modePrompting — + keybar.
 	b.WriteString("\n")
-	if line := renderStatusLine(m.status, m.statusKind); line != "" {
+	if m.mode == modePrompting {
+		b.WriteString(renderNewLoopPrompt(m.input))
+		b.WriteString("\n")
+	} else if line := renderStatusLine(m.status, m.statusKind); line != "" {
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
@@ -663,8 +862,9 @@ func renderGateCallout(l domain.Loop, width int) string {
 
 // ── status line / keybar ─────────────────────────────────────
 
-// renderStatusLine shows the last resume result on its own line above the
-// keybar: green on success, red on failure, dim otherwise.
+// renderStatusLine shows the last action's result on its own line above the
+// keybar: green on success, red on failure, amber for a pending kill-confirm
+// warning, dim otherwise.
 func renderStatusLine(status string, kind statusKind) string {
 	if status == "" {
 		return ""
@@ -675,18 +875,28 @@ func renderStatusLine(status string, kind statusKind) string {
 		style = lipgloss.NewStyle().Foreground(cGreen)
 	case statusErr:
 		style = lipgloss.NewStyle().Foreground(cRed)
+	case statusWarn:
+		style = lipgloss.NewStyle().Foreground(cAmber)
 	}
 	return style.Render(status)
 }
 
-// renderKeybar: only keys that actually do something today — no
-// pause/kill/etc, those arrive with the engine.
+// renderNewLoopPrompt replaces the status line while the "n" key's free-text
+// goal prompt is active: "NEW LOOP ▸ goal: <input>".
+func renderNewLoopPrompt(input textinput.Model) string {
+	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ goal: ") + input.View()
+}
+
+// renderKeybar: only keys that actually do something today.
 func renderKeybar(loopCount int, width int) string {
 	keys := []string{
 		stKey.Render("↑↓") + stDim.Render(" select"),
 		stKey.Render("↵") + stDim.Render(" attach"),
 		stKey.Render("a") + stDim.Render(" approve"),
 		stKey.Render("r") + stDim.Render(" resume"),
+		stKey.Render("p") + stDim.Render(" stop"),
+		stKey.Render("k") + stDim.Render(" kill"),
+		stKey.Render("n") + stDim.Render(" new"),
 		stKey.Render("o") + stDim.Render(" log"),
 		stKey.Render("q") + stDim.Render(" quit"),
 	}

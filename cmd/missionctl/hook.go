@@ -19,11 +19,16 @@ func runHookCmd(args []string) {
 
 // hookPayload is the subset of Claude Code's Notification hook JSON we care
 // about; other fields are ignored, not an error (forward-compatible with
-// whatever else the hook payload contains).
+// whatever else the hook payload contains). notification_type distinguishes
+// a real gate ("permission_prompt" et al) from the 60s idle nudge
+// ("idle_prompt") — see internal/gate's scanner-side classification. Older
+// claude versions may omit it (empty string), handled by a message-text
+// fallback there.
 type hookPayload struct {
-	SessionID string `json:"session_id"`
-	Message   string `json:"message"`
-	Cwd       string `json:"cwd"`
+	SessionID        string `json:"session_id"`
+	Message          string `json:"message"`
+	Cwd              string `json:"cwd"`
+	NotificationType string `json:"notification_type"`
 }
 
 // notifyHook reads the Notification hook's JSON from stdin and writes a
@@ -40,5 +45,5 @@ func notifyHook() {
 	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
 		return
 	}
-	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, payload.Message)
+	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, payload.Message, payload.NotificationType)
 }

@@ -32,12 +32,14 @@ func GatesDir() string {
 // Info is one pending gate marker.
 type Info struct {
 	Message string
+	Type    string // Claude Code's notification_type, e.g. "permission_prompt"; "" on older claude versions that don't send it
 	TS      time.Time
 }
 
 // markerFile is Info's on-disk JSON shape.
 type markerFile struct {
 	Message string `json:"message"`
+	Type    string `json:"type"`
 	TS      int64  `json:"ts"`
 }
 
@@ -45,11 +47,14 @@ type markerFile struct {
 // from the Notification hook on every notification — must be fast, and its
 // error is only ever used by the hook to decide what to log; the hook
 // itself always exits 0 regardless (see cmd/missionctl's hook subcommand).
-func WriteMarker(dir, sessionID, message string) error {
+// notificationType is Claude Code's notification_type field verbatim (may
+// be empty on older claude versions) — see Pending's caller (the scanner)
+// for how it disambiguates a real gate from the 60s idle nudge.
+func WriteMarker(dir, sessionID, message, notificationType string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(markerFile{Message: message, TS: time.Now().Unix()})
+	data, err := json.Marshal(markerFile{Message: message, Type: notificationType, TS: time.Now().Unix()})
 	if err != nil {
 		return err
 	}
@@ -78,7 +83,7 @@ func Pending(dir string) map[string]Info {
 			continue
 		}
 		sessionID := strings.TrimSuffix(e.Name(), ".json")
-		pending[sessionID] = Info{Message: m.Message, TS: time.Unix(m.TS, 0)}
+		pending[sessionID] = Info{Message: m.Message, Type: m.Type, TS: time.Unix(m.TS, 0)}
 	}
 	return pending
 }

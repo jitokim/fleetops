@@ -91,3 +91,29 @@ func TestTmuxFocusCmds(t *testing.T) {
 		}
 	}
 }
+
+func TestTmuxInterruptCmd(t *testing.T) {
+	got := tmuxInterruptCmd("%3")
+	want := []string{"tmux", "send-keys", "-t", "%3", "Escape"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTmuxNewWindowCmd(t *testing.T) {
+	got := tmuxNewWindowCmd("/Users/imac/IdeaProjects/aboard")
+	want := []string{"tmux", "new-window", "-c", "/Users/imac/IdeaProjects/aboard", "-P", "-F", "#{pane_id}", "claude"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}

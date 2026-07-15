@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
@@ -77,6 +78,28 @@ func (cmuxController) Focus(t Target) error {
 // focus-panel is the contract's compatibility alias over surface focus.
 func cmuxFocusCmd(surfaceRef string) []string {
 	return []string{"cmux", "focus-panel", "--panel", surfaceRef}
+}
+
+// Spawn is not supported on cmux yet — creating a brand new surface running
+// claude hasn't been verified against the real cmux CLI (unlike the other
+// actions here, which at least have a plausible/partially-verified
+// contract). Fail explicitly rather than guess at a create-surface command.
+func (cmuxController) Spawn(cwd, goal string) error {
+	return fmt.Errorf("spawn not supported on cmux yet")
+}
+
+// Interrupt stops the current turn without killing claude — a bare Escape.
+//
+// TODO: verify cmux's send-key escape convention on a machine with the cmux
+// CLI — unverified, same caveat as parseCmuxTree/Approve.
+func (cmuxController) Interrupt(t Target) error {
+	argv := cmuxInterruptCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// cmuxInterruptCmd builds the argv for an Escape keypress into a surface.
+func cmuxInterruptCmd(surfaceRef string) []string {
+	return []string{"cmux", "send-key", "--surface", surfaceRef, "escape"}
 }
 
 // parseCmuxTree tolerantly walks `cmux tree --json` output, collecting every

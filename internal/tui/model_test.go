@@ -5,8 +5,25 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jitokim/missionctl/internal/domain"
 )
+
+// runeKey builds the tea.KeyMsg bubbletea sends for a single printable
+// character keypress (msg.String() == string(r)).
+func runeKey(r rune) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
+}
+
+func updateModel(t *testing.T, m Model, msg tea.Msg) (Model, tea.Cmd) {
+	t.Helper()
+	newModel, cmd := m.Update(msg)
+	mm, ok := newModel.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want Model", newModel)
+	}
+	return mm, cmd
+}
 
 func TestManualResumeHint(t *testing.T) {
 	got := manualResumeHint("abc-123")
@@ -195,5 +212,189 @@ func TestPrettyTokens(t *testing.T) {
 		if got := prettyTokens(c.n); got != c.want {
 			t.Errorf("prettyTokens(%d) = %q, want %q", c.n, got, c.want)
 		}
+	}
+}
+
+// ── mode state machine ("n" new-loop prompt) ──────────────────────
+
+func modelWithOneLoop() Model {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", State: domain.StateRunning}}
+	m.cursor = 0
+	return m
+}
+
+func TestUpdate_NKey_EntersPromptingModeWithSelectedCwd(t *testing.T) {
+	m := modelWithOneLoop()
+
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	if m.mode != modePrompting {
+		t.Fatalf("mode = %v, want modePrompting", m.mode)
+	}
+	if m.spawnCwd != "/x/aboard" {
+		t.Errorf("spawnCwd = %q, want the selected loop's Cwd %q", m.spawnCwd, "/x/aboard")
+	}
+	if !m.input.Focused() {
+		t.Error("expected the text input to be focused after entering prompting mode")
+	}
+}
+
+func TestUpdate_NKey_NoSelectionFallsBackToGetwd(t *testing.T) {
+	m := New() // no loops, nothing selected
+
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	if m.mode != modePrompting {
+		t.Fatalf("mode = %v, want modePrompting", m.mode)
+	}
+	if m.spawnCwd == "" {
+		t.Error("expected spawnCwd to fall back to a non-empty cwd (os.Getwd) when nothing is selected")
+	}
+}
+
+func TestUpdate_Esc_CancelsPromptingMode(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+	if m.mode != modePrompting {
+		t.Fatalf("precondition failed: mode = %v, want modePrompting", m.mode)
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after esc", m.mode)
+	}
+	if m.status != "cancelled" {
+		t.Errorf("status = %q, want %q", m.status, "cancelled")
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd from cancelling (no spawn should be triggered)")
+	}
+}
+
+func TestUpdate_Enter_EmptyGoal_CancelsWithoutSpawning(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if !strings.Contains(m.status, "empty goal") {
+		t.Errorf("status = %q, want it to mention the empty goal", m.status)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an empty goal (spawn must not be triggered)")
+	}
+}
+
+func TestUpdate_TypeThenEnter_SubmitsSpawn(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	for _, r := range "fix the bug" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+	if m.input.Value() != "fix the bug" {
+		t.Fatalf("input value = %q, want %q (typing must reach the textinput while prompting)", m.input.Value(), "fix the bug")
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after submit", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) on submit with a non-empty goal")
+	}
+	if !strings.Contains(m.status, "spawning") {
+		t.Errorf("status = %q, want it to mention spawning", m.status)
+	}
+}
+
+func TestUpdate_ArrowKeysWhilePrompting_RouteToInputNotCursor(t *testing.T) {
+	// two loops so cursor movement would be observable if it were (wrongly)
+	// still handled by the normal navigation path while prompting.
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "a", SessionID: "s1", State: domain.StateRunning},
+		{Project: "b", SessionID: "s2", State: domain.StateRunning},
+	}
+	m.cursor = 0
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	if m.cursor != 0 {
+		t.Errorf("cursor = %d, want unchanged at 0 (down arrow must route to the text input while prompting)", m.cursor)
+	}
+}
+
+// ── "k" kill double-press confirm ─────────────────────────────────
+
+func TestUpdate_FirstK_SetsPendingKillWarning(t *testing.T) {
+	m := modelWithOneLoop()
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if m.pendingKillSession != "sess-1" {
+		t.Errorf("pendingKillSession = %q, want %q", m.pendingKillSession, "sess-1")
+	}
+	if m.statusKind != statusWarn {
+		t.Errorf("statusKind = %v, want statusWarn", m.statusKind)
+	}
+	if !strings.Contains(m.status, "press k again") {
+		t.Errorf("status = %q, want it to prompt for a confirming k", m.status)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd on the first k (not confirmed yet)")
+	}
+}
+
+func TestUpdate_SecondKWithinWindow_TriggersKill(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('k'))
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if m.pendingKillSession != "" {
+		t.Error("expected pendingKillSession to clear once confirmed")
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (killCmd) on the confirming second k")
+	}
+	if !strings.Contains(m.status, "killing") {
+		t.Errorf("status = %q, want it to mention killing", m.status)
+	}
+}
+
+func TestUpdate_SecondKAfterWindowExpires_RestartsConfirmCycle(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('k'))
+	m.pendingKillAt = time.Now().Add(-killConfirmWindow - time.Second) // simulate the window having expired
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if cmd != nil {
+		t.Error("expected no kill to trigger once the confirm window has expired — a fresh cycle should start instead")
+	}
+	if m.pendingKillSession != "sess-1" {
+		t.Error("expected a fresh pending-kill cycle to start for the same loop")
+	}
+}
+
+func TestUpdate_AnyOtherKey_ClearsPendingKill(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('k'))
+	if m.pendingKillSession == "" {
+		t.Fatal("precondition failed: expected pendingKillSession to be set")
+	}
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	if m.pendingKillSession != "" {
+		t.Error("expected pendingKillSession to be cleared by an unrelated keypress")
 	}
 }

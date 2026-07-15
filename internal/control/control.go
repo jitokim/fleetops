@@ -21,6 +21,8 @@ type Controller interface {
 	Resume(t Target, prompt string) error    // re-send prompt + submit
 	Focus(t Target) error                    // bring the surface to the front (attach)
 	Approve(t Target) error                  // accept the default option at a gate (bare Enter)
+	Spawn(cwd, goal string) error            // start a brand new claude loop in cwd
+	Interrupt(t Target) error                // stop the current turn (Esc) without killing the process
 }
 
 // Resolve returns the first available controller: orca preferred (the

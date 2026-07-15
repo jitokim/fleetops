@@ -3,8 +3,10 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // orcaController drives an Orca (stablyai/orca) terminal via the orca CLI —
@@ -62,6 +64,123 @@ func (orcaController) Focus(t Target) error {
 // tab in the UI.
 func orcaFocusCmd(handle string) []string {
 	return []string{"orca", "terminal", "switch", "--terminal", handle, "--json"}
+}
+
+// Interrupt stops the current turn without killing claude, via orca's
+// verified --interrupt flag on `terminal send`.
+func (orcaController) Interrupt(t Target) error {
+	argv := orcaInterruptCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// orcaInterruptCmd builds the argv for orca's verified interrupt flag.
+func orcaInterruptCmd(handle string) []string {
+	return []string{"orca", "terminal", "send", "--terminal", handle, "--interrupt", "--json"}
+}
+
+const (
+	spawnTitle           = "mctl loop" // the --title Spawn gives its created terminal, used to re-find it (see selectSpawnedOrcaTerminal)
+	spawnCreateTimeout   = 5 * time.Second
+	spawnWaitTimeout     = 35 * time.Second // covers orca's own --timeout-ms 30000 plus process-exec overhead
+	spawnBootTimeoutMs   = "30000"
+	spawnLocateTimeout   = 5 * time.Second
+	spawnSendTextTimeout = 5 * time.Second
+)
+
+// Spawn starts a brand new claude loop: creates an orca terminal running
+// claude in cwd, waits for its TUI to finish booting, then sends the goal.
+//
+// create's returned handle can go STALE once orca's UI adopts the pane
+// (verified live) — so after waiting, Spawn re-locates the terminal by
+// worktreePath + title (spawnTitle, or a Claude-Code-prefixed title if the
+// TUI already relabeled it) via a fresh `terminal list`, rather than
+// trusting the handle create returned.
+func (orcaController) Spawn(cwd, goal string) error {
+	ctxCreate, cancelCreate := context.WithTimeout(context.Background(), spawnCreateTimeout)
+	defer cancelCreate()
+	createOut, err := exec.CommandContext(ctxCreate, "orca", "terminal", "create",
+		"--worktree", "path:"+cwd, "--command", "claude", "--title", spawnTitle, "--json").Output()
+	if err != nil {
+		return fmt.Errorf("orca terminal create: %w", err)
+	}
+	handle, ok := parseOrcaCreateHandle(createOut)
+	if !ok {
+		return fmt.Errorf("orca terminal create: could not parse a terminal handle from the output")
+	}
+
+	ctxWait, cancelWait := context.WithTimeout(context.Background(), spawnWaitTimeout)
+	defer cancelWait()
+	// best-effort: even if the wait itself errors or times out, still try
+	// to locate + send below — the terminal may already be usable.
+	_ = exec.CommandContext(ctxWait, "orca", "terminal", "wait",
+		"--terminal", handle, "--for", "tui-idle", "--timeout-ms", spawnBootTimeoutMs, "--json").Run()
+
+	ctxLocate, cancelLocate := context.WithTimeout(context.Background(), spawnLocateTimeout)
+	defer cancelLocate()
+	listOut, err := exec.CommandContext(ctxLocate, "orca", "terminal", "list", "--json").Output()
+	if err != nil {
+		return fmt.Errorf("orca terminal list: %w", err)
+	}
+	target := Target{Backend: "orca", ID: handle, Cwd: cwd} // fallback: the create handle, in case re-locate misses
+	if terminals, ok := decodeOrcaTerminals(listOut); ok {
+		if t, ok := selectSpawnedOrcaTerminal(terminals, cwd); ok {
+			target = t
+		}
+	}
+
+	argv := orcaResumeCmd(target.ID, goal)
+	ctxSend, cancelSend := context.WithTimeout(context.Background(), spawnSendTextTimeout)
+	defer cancelSend()
+	return exec.CommandContext(ctxSend, argv[0], argv[1:]...).Run()
+}
+
+// orcaCreateEnvelope is `orca terminal create --json`'s response shape —
+// same RPC envelope convention as `terminal list`.
+type orcaCreateEnvelope struct {
+	OK     *bool `json:"ok"`
+	Result *struct {
+		Terminal struct {
+			Handle string `json:"handle"`
+		} `json:"terminal"`
+	} `json:"result"`
+}
+
+// parseOrcaCreateHandle extracts result.terminal.handle from `orca terminal
+// create --json`'s output. ok=false on any decode failure, an explicit
+// {"ok":false}, or a missing/empty handle.
+func parseOrcaCreateHandle(jsonBytes []byte) (string, bool) {
+	var envelope orcaCreateEnvelope
+	if err := json.Unmarshal(jsonBytes, &envelope); err != nil {
+		return "", false
+	}
+	if envelope.OK != nil && !*envelope.OK {
+		return "", false
+	}
+	if envelope.Result == nil || envelope.Result.Terminal.Handle == "" {
+		return "", false
+	}
+	return envelope.Result.Terminal.Handle, true
+}
+
+// selectSpawnedOrcaTerminal finds the freshest (highest lastOutputAt)
+// terminal at cwd whose title is spawnTitle or Claude-Code-prefixed
+// (claudeTabPrefix) — i.e. the terminal Spawn just created, re-found by
+// cwd+title since its create-time handle can go stale (see Spawn's doc).
+func selectSpawnedOrcaTerminal(terminals []orcaTerminal, cwd string) (Target, bool) {
+	var matches []orcaTerminal
+	for _, t := range terminals {
+		if t.WorktreePath != cwd {
+			continue
+		}
+		if t.Title == spawnTitle || strings.HasPrefix(t.Title, claudeTabPrefix) {
+			matches = append(matches, t)
+		}
+	}
+	best, ok := bestOrcaTerminal(matches, func(orcaTerminal) bool { return true })
+	if !ok {
+		return Target{}, false
+	}
+	return Target{Backend: "orca", ID: best.Handle, Cwd: best.WorktreePath}, true
 }
 
 // orcaTerminalList is the `orca terminal list --json` result payload
