@@ -39,6 +39,22 @@ func TestOrcaResumeCmd_EmptyPromptFallback(t *testing.T) {
 	}
 }
 
+func TestOrcaApproveCmd_ReusesResumeCmdWithEmptyPrompt(t *testing.T) {
+	// Approve is defined as Resume with an empty prompt (--text '' --enter
+	// accepts the default highlighted option via a bare Enter) — same argv
+	// shape as the empty-prompt resume case.
+	got := orcaResumeCmd("term_abc123", "")
+	want := []string{"orca", "terminal", "send", "--terminal", "term_abc123", "--text", "", "--enter", "--json"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestOrcaFocusCmd(t *testing.T) {
 	got := orcaFocusCmd("term_abc123")
 	want := []string{"orca", "terminal", "switch", "--terminal", "term_abc123", "--json"}

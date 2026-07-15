@@ -5,6 +5,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/jitokim/missionctl/internal/claude"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/gate"
 )
 
 type loopsMsg []domain.Loop
@@ -38,6 +40,13 @@ type attachResultMsg struct {
 // control has returned to the TUI (tea.ExecProcess suspends the program
 // while the pager runs).
 type logClosedMsg struct{ err error }
+
+// approveResultMsg reports the outcome of an approve (a key) attempt,
+// computed off the event loop by approveCmd, mirroring resumeResultMsg.
+type approveResultMsg struct {
+	ok   bool
+	text string
+}
 
 const refreshEvery = 3 * time.Second
 
@@ -122,6 +131,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.status, m.statusKind = fmt.Sprintf("resuming %s...", sel.Project), statusNeutral
 			return m, resumeCmd(sel)
+		case "a":
+			sel, ok := m.selected()
+			if !ok || sel.State != domain.StateGate {
+				m.status, m.statusKind = "select a gated loop", statusNeutral
+				return m, nil
+			}
+			m.status, m.statusKind = fmt.Sprintf("approving %s...", sel.Project), statusNeutral
+			return m, approveCmd(sel)
 		case "enter":
 			sel, ok := m.selected()
 			if !ok {
@@ -136,7 +153,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = "select a loop to view its log", statusNeutral
 				return m, nil
 			}
-			pager := exec.Command("less", "-R", "+G", sel.Path)
+			argv := pagerCmd(sel.Path)
+			pager := exec.Command(argv[0], argv[1:]...)
 			return m, tea.ExecProcess(pager, func(err error) tea.Msg {
 				return logClosedMsg{err}
 			})
@@ -149,6 +167,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusKind = statusErr
 		}
 	case attachResultMsg:
+		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
+	case approveResultMsg:
 		m.status = msg.text
 		if msg.ok {
 			m.statusKind = statusOK
@@ -171,6 +196,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // in Update.
 func resumeCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
+		// SAFETY: a StallGone loop's claude process is gone — the terminal
+		// surface (if any) is now a bare shell. Sending the prompt into it
+		// would type the prompt as a shell command instead of resuming
+		// anything. Refuse before even resolving a backend.
+		if l.Stall == domain.StallGone {
+			return resumeResultMsg{false, "process gone — restart with: " + manualResumeHint(l.SessionID)}
+		}
 		ctrl, ok := control.Resolve()
 		if !ok {
 			return resumeResultMsg{false, "no orca/tmux/cmux — resume manually: " + manualResumeHint(l.SessionID)}
@@ -225,6 +257,38 @@ func manualAttachHint(cwd string) string {
 	return "cd " + cwd
 }
 
+// approveCmd accepts claude's default option at a gate (a bare Enter to the
+// surface hosting the loop) via whichever multiplexer backend is available.
+// On success it also best-effort deletes the loop's gate marker, so the UI
+// clears the ◆ GATE state on the very next scan rather than waiting for the
+// staleness check to catch up. Runs off the event loop, same non-blocking
+// pattern as resumeCmd/attachCmd.
+func approveCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return approveResultMsg{false, "no orca/tmux/cmux — approve manually: attach and press Enter"}
+		}
+		target, ok := ctrl.Locate(l.ProjectDir)
+		if !ok {
+			return approveResultMsg{false, "surface not found — approve manually: attach and press Enter"}
+		}
+		if err := ctrl.Approve(target); err != nil {
+			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
+		}
+		gate.DeleteMarker(gate.GatesDir(), l.SessionID)
+		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, ctrl.Name())}
+	}
+}
+
+// pagerCmd builds the argv for the "o" key's log pager: -R renders color
+// codes, +G jumps to the end (most recent activity first), and a custom
+// prompt tells the human how to get back — otherwise "q returns you to the
+// cockpit" isn't obvious once less has taken over the whole screen.
+func pagerCmd(path string) []string {
+	return []string{"less", "-R", "+G", "--prompt=log: q to return to missionctl", path}
+}
+
 func (m Model) selected() (domain.Loop, bool) {
 	if m.cursor >= 0 && m.cursor < len(m.loops) {
 		return m.loops[m.cursor], true
@@ -241,8 +305,8 @@ func (m Model) termWidth() int {
 	return m.w
 }
 
-// counts tallies loop states for the summary band and keybar.
-func (m Model) counts() (total, running, stalled, idle int) {
+// counts tallies loop states and total spend for the summary band and keybar.
+func (m Model) counts() (total, running, stalled, idle, gated, totalTokens int) {
 	total = len(m.loops)
 	for _, l := range m.loops {
 		switch l.State {
@@ -252,7 +316,10 @@ func (m Model) counts() (total, running, stalled, idle int) {
 			stalled++
 		case domain.StateIdle:
 			idle++
+		case domain.StateGate:
+			gated++
 		}
+		totalTokens += l.TokensSpent
 	}
 	return
 }
@@ -266,22 +333,22 @@ func (m Model) View() string {
 	b.WriteString(renderRule(width))
 	b.WriteString("\n")
 
-	total, running, stalled, idle := m.counts()
-	b.WriteString(renderSummaryBand(total, running, stalled, idle, width))
+	total, running, stalled, idle, gated, totalTokens := m.counts()
+	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, width))
 	b.WriteString("\n\n")
 
 	b.WriteString(stFaint.Render("LOOPS"))
 	b.WriteString("\n")
 
-	wName, wNote := columnWidths(width)
-	b.WriteString(renderTableHeader(wName, wNote))
+	wName, wCycle, wBudget, wNote := columnWidths(width)
+	b.WriteString(renderTableHeader(wName, wCycle, wBudget, wNote))
 	b.WriteString("\n")
 	if len(m.loops) == 0 {
 		b.WriteString(stFaint.Render("  no active Claude Code loops in the window.\n"))
 	}
 	dupLabels := duplicateLabels(m.loops)
 	for i, l := range m.loops {
-		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wNote, width))
+		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wCycle, wBudget, wNote, width))
 		b.WriteString("\n")
 	}
 
@@ -316,14 +383,22 @@ func renderRule(width int) string {
 	return lipgloss.NewStyle().Foreground(cLine).Render(strings.Repeat("─", width))
 }
 
-// renderSummaryBand: "fleet N · x run · y stalled · z idle" (zero segments
-// omitted, fleet always shown) with a right-aligned amber "▲ N STALLED NEED
-// YOU" badge when anything is stalled — the mockup's gate badge, repurposed
-// honestly for stalls (the observation MVP has no oracle/gate data yet).
-func renderSummaryBand(total, running, stalled, idle int, width int) string {
+// renderSummaryBand: "fleet N · x run · y gate · z stalled · w idle ·
+// budget <spent>" (zero-count segments omitted, fleet always shown; budget
+// omitted only when there's no spend at all yet) with a right-aligned amber
+// badge: gates take priority ("▲ N GATE NEEDS YOU") since a gate is a human
+// actively being asked something right now; otherwise stalls get the badge
+// ("▲ N STALLED NEED YOU") — the mockup's gate badge, honestly repurposed
+// for stalls when there's no gate. budget is total spend across the fleet,
+// not spent/cap — per-loop caps are all the same v0 default
+// (DefaultBudgetTokens), so a fleet-wide cap would be a meaningless sum.
+func renderSummaryBand(total, running, stalled, idle, gated, totalTokens int, width int) string {
 	parts := []string{stDim.Render(fmt.Sprintf("fleet %d", total))}
 	if running > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cBlue).Render(fmt.Sprintf("%d run", running)))
+	}
+	if gated > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cAmber).Render(fmt.Sprintf("%d gate", gated)))
 	}
 	if stalled > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cAmber).Render(fmt.Sprintf("%d stalled", stalled)))
@@ -331,10 +406,16 @@ func renderSummaryBand(total, running, stalled, idle int, width int) string {
 	if idle > 0 {
 		parts = append(parts, stDim.Render(fmt.Sprintf("%d idle", idle)))
 	}
+	if totalTokens > 0 {
+		parts = append(parts, stDim.Render("budget "+prettyTokens(totalTokens)))
+	}
 	left := strings.Join(parts, stFaint.Render(" · "))
 
 	right := ""
-	if stalled > 0 {
+	switch {
+	case gated > 0:
+		right = stBadgeStalled.Render(fmt.Sprintf("▲ %d GATE NEEDS YOU", gated))
+	case stalled > 0:
 		right = stBadgeStalled.Render(fmt.Sprintf("▲ %d STALLED NEED YOU", stalled))
 	}
 	return padBetween(left, right, width)
@@ -348,44 +429,67 @@ const (
 	wLast   = 14
 )
 
-// minWidthForNote: below this terminal width the NOTE column is dropped
-// entirely (not just truncated) so NAME/STATE stay legible.
-const minWidthForNote = 70
+const (
+	cycleColWidth  = 6
+	budgetColWidth = 13
+)
 
-// columnWidths sizes NAME/NOTE from the remaining width after the fixed
-// columns (marker/state/last) and inter-column gaps; NOTE is dropped below
-// minWidthForNote, and NAME always keeps a usable minimum.
-func columnWidths(width int) (wName, wNote int) {
-	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
-	// leading "  " indent plus cell boundaries need a little slack.
-	fixed := wMarker + wState + wLast + gaps
-	remaining := width - fixed
+// minWidthForNote/Budget/Cycle: below these terminal widths the
+// corresponding column is dropped entirely (not just truncated), in this
+// degradation order as width shrinks: NOTE first (least essential — the
+// state label already hints at "why"), then BUDGET, then CYCLE.
+const (
+	minWidthForNote   = 70
+	minWidthForBudget = 60
+	minWidthForCycle  = 50
+)
+
+// columnWidths sizes NAME/CYCLE/BUDGET/NOTE from the terminal width: CYCLE
+// and BUDGET are fixed-width when shown at all (dropped below their
+// thresholds, see minWidthForNote/Budget/Cycle), and NAME soaks up whatever
+// remains, with a usable minimum and a cap so wide terminals don't stretch
+// it into a chasm between columns (mockup keeps the table compact) — spare
+// width beyond the cap goes to NOTE.
+func columnWidths(width int) (wName, wCycle, wBudget, wNote int) {
+	if width >= minWidthForCycle {
+		wCycle = cycleColWidth
+	}
+	if width >= minWidthForBudget {
+		wBudget = budgetColWidth
+	}
 	if width >= minWidthForNote {
 		wNote = 24
-		remaining -= wNote
 	}
-	wName = remaining
+
+	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
+	// leading "  " indent plus cell boundaries need a little slack.
+	fixed := wMarker + wState + wLast + wCycle + wBudget + wNote + gaps
+	wName = width - fixed
 	if wName < 10 {
 		wName = 10
 	}
-	// Cap NAME so wide terminals don't stretch it into a chasm between
-	// columns (mockup keeps the table compact); spare width goes to NOTE.
 	if wName > 28 {
 		if wNote > 0 {
 			wNote += wName - 28
 		}
 		wName = 28
 	}
-	return wName, wNote
+	return wName, wCycle, wBudget, wNote
 }
 
-func renderTableHeader(wName, wNote int) string {
+func renderTableHeader(wName, wCycle, wBudget, wNote int) string {
 	cells := []string{
 		stHeader.Width(wMarker).Render(""),
 		stHeader.Width(wName).Render("NAME"),
 		stHeader.Width(wState).Render("STATE"),
-		stHeader.Width(wLast).Render("LAST"),
 	}
+	if wCycle > 0 {
+		cells = append(cells, stHeader.Width(wCycle).Render("CYCLE"))
+	}
+	if wBudget > 0 {
+		cells = append(cells, stHeader.Width(wBudget).Render("BUDGET"))
+	}
+	cells = append(cells, stHeader.Width(wLast).Render("LAST"))
 	if wNote > 0 {
 		cells = append(cells, stHeader.Width(wNote).Render("NOTE"))
 	}
@@ -408,7 +512,7 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 	return dup
 }
 
-func renderRow(l domain.Loop, sel bool, dup bool, wName, wNote, totalWidth int) string {
+func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wBudget, wNote, totalWidth int) string {
 	marker := " "
 	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
 	if sel {
@@ -428,8 +532,15 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wNote, totalWidth int) 
 		markerStyle.Width(wMarker).Render(marker),
 		stInk.Width(wName).Render(trunc(label, wName-1)),
 		st.Width(wState).Render(stateLabel(l)),
-		stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))),
 	}
+	if wCycle > 0 {
+		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
+	}
+	if wBudget > 0 {
+		bar := budgetBar(l.BudgetFrac(), 7)
+		cells = append(cells, budgetStyle(l).Width(wBudget).Render(trunc(bar, wBudget-1)))
+	}
+	cells = append(cells, stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))))
 	if wNote > 0 {
 		cells = append(cells, st.Width(wNote).Render(trunc(note, wNote-1)))
 	}
@@ -440,6 +551,14 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wNote, totalWidth int) 
 		row = stSelRow.Render(padToWidth(row, totalWidth))
 	}
 	return row
+}
+
+// cycleLabel: plain count ("6"), or "6/12" once a per-loop MaxCycles exists.
+func cycleLabel(l domain.Loop) string {
+	if l.Goal.MaxCycles > 0 {
+		return fmt.Sprintf("%d/%d", l.Cycle, l.Goal.MaxCycles)
+	}
+	return fmt.Sprintf("%d", l.Cycle)
 }
 
 // shortID is the first 4 chars of a session id, for disambiguating rows
@@ -466,6 +585,9 @@ func renderDetail(l domain.Loop, width int) string {
 	d.WriteString("  " + stFaint.Render(l.SessionID))
 	d.WriteString("\n")
 	d.WriteString(detailRow("STATE", stateStyle(l).Render(stateLabel(l))))
+	d.WriteString(detailRow("CYCLE", stInk.Render(cycleLabel(l))))
+	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(fmt.Sprintf("%s / %s (%d%%)",
+		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100))))))
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
@@ -473,8 +595,11 @@ func renderDetail(l domain.Loop, width int) string {
 		d.WriteString(detailRow("TAIL", stDim.Render(trunc(l.LastText, valueWidth))))
 	}
 
-	if l.State == domain.StateStalled {
+	switch l.State {
+	case domain.StateStalled:
 		d.WriteString(renderResumeCallout(l, width))
+	case domain.StateGate:
+		d.WriteString(renderGateCallout(l, width))
 	}
 	return stDetail.Width(width).Render(strings.TrimRight(d.String(), "\n"))
 }
@@ -488,10 +613,13 @@ func detailRow(key, value string) string {
 // renderResumeCallout is the mockup's amber gate-line, repurposed for a
 // stall: "RESUME ▸ <why>   r re-send prompt   manual: claude --resume <id>".
 // A 429 gets the red accent instead of amber (the turn didn't complete, it
-// was rejected — a sharper signal than a generic stall).
+// was rejected — a sharper signal than a generic stall). A gone process
+// gets red too, but with "restart" wording instead of "resume" — there's no
+// claude process left to re-send a prompt into (see resumeCmd's guard).
 func renderResumeCallout(l domain.Loop, width int) string {
+	gone := l.Stall == domain.StallGone
 	box, accent, chip := stCalloutAmber, cAmber, stKeyChipAmber
-	if l.Stall == domain.StallRateLimit {
+	if l.Stall == domain.StallRateLimit || gone {
 		box, accent, chip = stCalloutRed, cRed, stKeyChipRed
 	}
 	// border(1) + padding(1) on each side.
@@ -499,11 +627,38 @@ func renderResumeCallout(l domain.Loop, width int) string {
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
-	line := lipgloss.NewStyle().Foreground(accent).Bold(true).Render("RESUME ▸") +
-		" " + stInk.Render(string(l.Stall)) +
-		"   " + chip.Render("r") + stDim.Render(" re-send prompt") +
+
+	label := "RESUME ▸"
+	action := chip.Render("r") + stDim.Render(" re-send prompt") +
 		"   " + stDim.Render("manual: "+manualResumeHint(l.SessionID))
+	if gone {
+		label = "RESTART ▸"
+		action = stDim.Render("restart: " + manualResumeHint(l.SessionID))
+	}
+
+	line := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(label) +
+		" " + stInk.Render(string(l.Stall)) +
+		"   " + action
 	return "\n" + box.Width(contentWidth).Render(line)
+}
+
+// renderGateCallout is the mockup's gate-line for a loop waiting on a human
+// decision — driven by the Notification hook, not a screen-scrape guess:
+// "GATE ▸ <prompt>   a approve   ↵ attach to answer".
+func renderGateCallout(l domain.Loop, width int) string {
+	contentWidth := width - 4
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+	prompt := l.GatePrompt
+	if prompt == "" {
+		prompt = "claude is asking for permission"
+	}
+	line := lipgloss.NewStyle().Foreground(cAmber).Bold(true).Render("GATE ▸") +
+		" " + stInk.Render(prompt) +
+		"   " + stKeyChipAmber.Render("a") + stDim.Render(" approve") +
+		"   " + stKeyChipAmber.Render("↵") + stDim.Render(" attach to answer")
+	return "\n" + stCalloutAmber.Width(contentWidth).Render(line)
 }
 
 // ── status line / keybar ─────────────────────────────────────
@@ -525,11 +680,12 @@ func renderStatusLine(status string, kind statusKind) string {
 }
 
 // renderKeybar: only keys that actually do something today — no
-// approve/pause/etc, those arrive with the engine.
+// pause/kill/etc, those arrive with the engine.
 func renderKeybar(loopCount int, width int) string {
 	keys := []string{
 		stKey.Render("↑↓") + stDim.Render(" select"),
 		stKey.Render("↵") + stDim.Render(" attach"),
+		stKey.Render("a") + stDim.Render(" approve"),
 		stKey.Render("r") + stDim.Render(" resume"),
 		stKey.Render("o") + stDim.Render(" log"),
 		stKey.Render("q") + stDim.Render(" quit"),
@@ -572,6 +728,39 @@ func formatUptime(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", int(d.Hours()), int(d.Minutes())%60)
 }
 
+// budgetBar renders the mockup's budget meter: a width-char bar of █
+// (filled, rounded from frac) then ░ (remainder), followed by " NN%". frac
+// is clamped to [0,1] first — defensive, since BudgetFrac() already clamps,
+// but this is a general-purpose pure func.
+func budgetBar(frac float64, width int) string {
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(math.Round(frac * float64(width)))
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return fmt.Sprintf("%s %d%%", bar, int(math.Round(frac*100)))
+}
+
+// prettyTokens pretty-prints a token count in the mockup's compact k/M
+// style: under 1,000 → plain digits, under 1,000,000 → "<n>k" (rounded),
+// otherwise → "<n.n>M" (one decimal).
+func prettyTokens(n int) string {
+	switch {
+	case n < 1000:
+		return fmt.Sprintf("%d", n)
+	case n < 1_000_000:
+		return fmt.Sprintf("%dk", int(math.Round(float64(n)/1000)))
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+}
+
 // ── misc helpers ────────────────────────────────────────────
 
 func rel(d time.Duration) string {
@@ -587,14 +776,20 @@ func rel(d time.Duration) string {
 	}
 }
 
+// trunc truncates s to at most n runes — NOT bytes: multi-byte glyphs (█/░
+// in the budget bar, ⚠/✗/◆ elsewhere) are 3 bytes each in UTF-8, and a
+// byte-index slice can land mid-character, corrupting the output (seen as
+// stray "�" replacement glyphs). Truncating replaces the last kept rune
+// with an ellipsis.
 func trunc(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }
 
 func maxInt(a, b int) int {

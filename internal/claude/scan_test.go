@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/gate"
 )
 
 func writeJSONL(t *testing.T, lines ...string) string {
@@ -115,62 +117,168 @@ func TestIsHiddenProjectDir(t *testing.T) {
 	}
 }
 
-func TestTailState_AssistantEndTurn_Idle(t *testing.T) {
+func TestTailState_AssistantEndTurn_IdleRegardlessOfRecency(t *testing.T) {
+	// "running" means a turn is in flight, not just "wrote recently" — a
+	// finished turn is idle no matter how long (or briefly) ago that was.
 	path := writeJSONL(t,
 		`{"type":"user","message":{"content":"do the thing"}}`,
 		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
 	)
 
-	state, stall := tailState(path)
-	if state != domain.StateIdle || stall != domain.StallNone {
-		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateIdle, domain.StallNone)
+	for _, idleFor := range []time.Duration{time.Second, IdleThreshold * 10} {
+		state, stall := tailState(path, idleFor)
+		if state != domain.StateIdle || stall != domain.StallNone {
+			t.Errorf("idleFor=%v: got (%v, %v), want (%v, %v)", idleFor, state, stall, domain.StateIdle, domain.StallNone)
+		}
 	}
 }
 
-func TestTailState_LastEntryUser_StalledNoOutput(t *testing.T) {
+func TestTailState_MidTurn_RunningWhenRecent(t *testing.T) {
 	path := writeJSONL(t,
 		`{"type":"assistant","message":{"content":"working","stop_reason":"end_turn"}}`,
 		`{"type":"user","message":{"content":"still going"}}`,
 	)
 
-	state, stall := tailState(path)
+	state, stall := tailState(path, time.Second)
+	if state != domain.StateRunning || stall != domain.StallNone {
+		t.Errorf("got (%v, %v), want (%v, %v) — mid-turn + recent write = running, not stalled", state, stall, domain.StateRunning, domain.StallNone)
+	}
+}
+
+func TestTailState_MidTurn_StalledNoOutputWhenIdle(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"working","stop_reason":"end_turn"}}`,
+		`{"type":"user","message":{"content":"still going"}}`,
+	)
+
+	state, stall := tailState(path, IdleThreshold)
 	if state != domain.StateStalled || stall != domain.StallNoOutput {
 		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
 	}
 }
 
-func TestTailState_AssistantToolUse_StalledNoOutput(t *testing.T) {
+func TestTailState_AssistantToolUse_StalledWhenIdle(t *testing.T) {
 	// an assistant message mid-work (tool_use, no stop_reason end_turn) is
-	// not a finished turn — still an incident, not idle.
+	// not a finished turn — an incident once idle, not idle-state.
 	path := writeJSONL(t,
 		`{"type":"user","message":{"content":"do the thing"}}`,
 		`{"type":"assistant","message":{"content":"working","stop_reason":"tool_use"}}`,
 	)
 
-	state, stall := tailState(path)
+	state, stall := tailState(path, IdleThreshold)
 	if state != domain.StateStalled || stall != domain.StallNoOutput {
 		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
 	}
 }
 
-func TestTailState_RateLimitBeatsEndTurn(t *testing.T) {
-	// even though the last message looks like a finished turn, a 429 marker
-	// anywhere in the tail means the turn did NOT actually complete.
+func TestTailState_RateLimitMidTurn_StalledRateLimit(t *testing.T) {
+	// a 429 with no subsequent end_turn: the turn never completed.
 	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"go"}}`,
 		`{"type":"assistant","message":{"content":"429 Too Many Requests: rate limit exceeded"}}`,
-		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
 	)
 
-	state, stall := tailState(path)
+	state, stall := tailState(path, IdleThreshold)
 	if state != domain.StateStalled || stall != domain.StallRateLimit {
 		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallRateLimit)
 	}
 }
 
+func TestTailState_EndTurnAfterEarlierRateLimitMention_Idle(t *testing.T) {
+	// the LAST meaningful entry decides: an end_turn after an earlier
+	// rate-limit mention elsewhere in the tail is still idle — the turn
+	// evidently did complete after all.
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"429 Too Many Requests: rate limit exceeded"}}`,
+		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
+	)
+
+	state, stall := tailState(path, IdleThreshold)
+	if state != domain.StateIdle || stall != domain.StallNone {
+		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateIdle, domain.StallNone)
+	}
+}
+
 func TestTailState_MissingFile_StalledNoOutput(t *testing.T) {
-	state, stall := tailState(filepath.Join(t.TempDir(), "does-not-exist.jsonl"))
+	state, stall := tailState(filepath.Join(t.TempDir(), "does-not-exist.jsonl"), IdleThreshold)
 	if state != domain.StateStalled || stall != domain.StallNoOutput {
 		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallNoOutput)
+	}
+}
+
+func TestLoopFromLog_EndTurnRecent_IsIdleNotRunning(t *testing.T) {
+	// the addendum bug: a loop that finished its turn 1 minute ago (well
+	// within IdleThreshold) must show idle, not running — "running" means a
+	// turn is in flight, not merely "wrote recently".
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+
+	l := loopFromLog(path, fi, time.Now(), t.TempDir(), nil)
+	if l.State != domain.StateIdle {
+		t.Errorf("got State=%v, want %v (a finished turn is idle regardless of recency, not running)", l.State, domain.StateIdle)
+	}
+}
+
+func TestLoopFromLog_ActiveGate_BeatsAnyTailClassification(t *testing.T) {
+	// mid-turn AND idle long past IdleThreshold — would classify Stalled on
+	// its own — but an active gate marker must win regardless.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"working","stop_reason":"tool_use"}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	pending := map[string]gate.Info{
+		session: {Message: "approve merge to main?", TS: fi.ModTime()},
+	}
+
+	l := loopFromLog(path, fi, fi.ModTime().Add(time.Hour), t.TempDir(), pending)
+	if l.State != domain.StateGate {
+		t.Errorf("got State=%v, want %v", l.State, domain.StateGate)
+	}
+	if l.GatePrompt != "approve merge to main?" {
+		t.Errorf("GatePrompt = %q, want %q", l.GatePrompt, "approve merge to main?")
+	}
+	if l.Stall != domain.StallNone {
+		t.Errorf("Stall = %v, want %v (gated, not stalled)", l.Stall, domain.StallNone)
+	}
+}
+
+func TestLoopFromLog_StaleGate_DeletedAndIgnored(t *testing.T) {
+	// the marker fired, but the log was written to well after — the human
+	// already answered, so the marker is stale and must not override State,
+	// and the marker file itself should get cleaned up.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"do the thing"}}`,
+		`{"type":"assistant","message":{"content":"working","stop_reason":"tool_use"}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	gatesDir := t.TempDir()
+	staleTS := fi.ModTime().Add(-time.Hour) // long before the log's last write
+	if err := gate.WriteMarker(gatesDir, session, "old question"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	pending := map[string]gate.Info{session: {Message: "old question", TS: staleTS}}
+
+	l := loopFromLog(path, fi, fi.ModTime().Add(time.Hour), gatesDir, pending)
+	if l.State == domain.StateGate {
+		t.Errorf("got State=%v, want anything but StateGate (marker is stale)", l.State)
+	}
+	if len(gate.Pending(gatesDir)) != 0 {
+		t.Error("expected the stale marker file to be deleted")
 	}
 }
 
@@ -235,5 +343,113 @@ func TestLastAssistantText_CollapsesNewlinesAndCaps120(t *testing.T) {
 func TestLastAssistantText_MissingFile(t *testing.T) {
 	if _, ok := LastAssistantText(filepath.Join(t.TempDir(), "does-not-exist.jsonl")); ok {
 		t.Error("expected ok=false for missing file")
+	}
+}
+
+func TestApplyLiveness_OneLiveProcess_NewestKeepsOlderDemoted(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "newer", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "older-idle", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now.Add(-time.Hour)},
+	}
+	live := map[string]int{"/x/aboard": 1}
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (older idle loop dropped): %+v", len(out), out)
+	}
+	if out[0].SessionID != "newer" || out[0].State != domain.StateIdle {
+		t.Errorf("got %+v, want the newer loop untouched (idle)", out[0])
+	}
+}
+
+func TestApplyLiveness_OlderStalled_BecomesGone(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "newer", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "older-stalled", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Hour)},
+	}
+	live := map[string]int{"/x/aboard": 1}
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 2 {
+		t.Fatalf("got %d loops, want 2 (stalled loop kept, reclassified): %+v", len(out), out)
+	}
+	demoted := out[1]
+	if demoted.SessionID != "older-stalled" || demoted.State != domain.StateStalled || demoted.Stall != domain.StallGone {
+		t.Errorf("got %+v, want {older-stalled, StateStalled, StallGone}", demoted)
+	}
+}
+
+func TestApplyLiveness_ZeroLiveProcesses_IdleDroppedStalledGone(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "idle-one", Cwd: "/x/dead", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "stalled-one", Cwd: "/x/dead", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Minute)},
+	}
+	live := map[string]int{} // no live process at all for this cwd
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (idle dropped, stalled kept): %+v", len(out), out)
+	}
+	if out[0].SessionID != "stalled-one" || out[0].Stall != domain.StallGone {
+		t.Errorf("got %+v, want {stalled-one, StallGone}", out[0])
+	}
+}
+
+func TestApplyLiveness_RunningPastLiveCount_BecomesGone(t *testing.T) {
+	// a process that just died mid-turn: JSONL still says "running" but
+	// there's no live process backing it once past the live count.
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "newer", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now},
+		{SessionID: "just-died", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now.Add(-time.Second)},
+	}
+	live := map[string]int{"/x/aboard": 1}
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 2 {
+		t.Fatalf("got %d loops, want 2: %+v", len(out), out)
+	}
+	if out[1].State != domain.StateStalled || out[1].Stall != domain.StallGone {
+		t.Errorf("got %+v, want {StateStalled, StallGone}", out[1])
+	}
+}
+
+func TestApplyLiveness_EnoughLiveProcesses_Untouched(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "a", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now},
+		{SessionID: "b", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now.Add(-time.Minute)},
+	}
+	live := map[string]int{"/x/aboard": 2} // one live process per loop
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 2 {
+		t.Fatalf("got %d loops, want 2 (nothing dropped)", len(out))
+	}
+	if out[0].Stall != domain.StallNoOutput || out[1].State != domain.StateIdle {
+		t.Errorf("got %+v, want both loops untouched", out)
+	}
+}
+
+func TestApplyLiveness_DifferentCwdsIndependent(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "a", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+		{SessionID: "b", Cwd: "/x/other", State: domain.StateIdle, LastActivity: now},
+	}
+	live := map[string]int{"/x/aboard": 1, "/x/other": 0}
+
+	out := applyLiveness(loops, live)
+
+	if len(out) != 1 || out[0].SessionID != "a" {
+		t.Errorf("got %+v, want only loop \"a\" (its cwd has a live process; \"b\"'s doesn't)", out)
 	}
 }

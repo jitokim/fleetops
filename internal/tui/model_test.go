@@ -24,6 +24,19 @@ func TestManualAttachHint(t *testing.T) {
 	}
 }
 
+func TestPagerCmd(t *testing.T) {
+	got := pagerCmd("/x/sess.jsonl")
+	want := []string{"less", "-R", "+G", "--prompt=log: q to return to missionctl", "/x/sess.jsonl"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestDuplicateLabels(t *testing.T) {
 	loops := []domain.Loop{
 		{Project: "sessions", SessionID: "aaa1"},
@@ -107,17 +120,80 @@ func TestPadToWidth_AlreadyAtOrOverWidth(t *testing.T) {
 }
 
 func TestColumnWidths_DropsNoteBelowThreshold(t *testing.T) {
-	if _, wNote := columnWidths(60); wNote != 0 {
-		t.Errorf("at width 60, wNote = %d, want 0 (NOTE column dropped)", wNote)
+	if _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
+		t.Errorf("at width %d, wNote = %d, want 0 (NOTE column dropped)", minWidthForNote-1, wNote)
 	}
-	if _, wNote := columnWidths(minWidthForNote); wNote == 0 {
+	if _, _, _, wNote := columnWidths(minWidthForNote); wNote == 0 {
 		t.Errorf("at width %d, wNote = 0, want > 0 (NOTE column kept)", minWidthForNote)
 	}
 }
 
+func TestColumnWidths_DropsBudgetBelowThreshold(t *testing.T) {
+	if _, _, wBudget, _ := columnWidths(minWidthForBudget - 1); wBudget != 0 {
+		t.Errorf("at width %d, wBudget = %d, want 0 (BUDGET column dropped)", minWidthForBudget-1, wBudget)
+	}
+	if _, _, wBudget, _ := columnWidths(minWidthForBudget); wBudget == 0 {
+		t.Errorf("at width %d, wBudget = 0, want > 0 (BUDGET column kept)", minWidthForBudget)
+	}
+}
+
+func TestColumnWidths_DropsCycleBelowThreshold(t *testing.T) {
+	if _, wCycle, _, _ := columnWidths(minWidthForCycle - 1); wCycle != 0 {
+		t.Errorf("at width %d, wCycle = %d, want 0 (CYCLE column dropped)", minWidthForCycle-1, wCycle)
+	}
+	if _, wCycle, _, _ := columnWidths(minWidthForCycle); wCycle == 0 {
+		t.Errorf("at width %d, wCycle = 0, want > 0 (CYCLE column kept)", minWidthForCycle)
+	}
+}
+
+func TestColumnWidths_DegradationOrder(t *testing.T) {
+	// NOTE must drop before BUDGET, which must drop before CYCLE, as width
+	// shrinks — never the other way around.
+	if minWidthForNote <= minWidthForBudget {
+		t.Errorf("minWidthForNote (%d) must be > minWidthForBudget (%d)", minWidthForNote, minWidthForBudget)
+	}
+	if minWidthForBudget <= minWidthForCycle {
+		t.Errorf("minWidthForBudget (%d) must be > minWidthForCycle (%d)", minWidthForBudget, minWidthForCycle)
+	}
+}
+
 func TestColumnWidths_NameNeverBelowMinimum(t *testing.T) {
-	wName, _ := columnWidths(20)
+	wName, _, _, _ := columnWidths(20)
 	if wName < 10 {
 		t.Errorf("wName = %d at a very narrow width, want >= 10 (usable minimum)", wName)
+	}
+}
+
+func TestBudgetBar_Boundaries(t *testing.T) {
+	cases := []struct {
+		frac float64
+		want string
+	}{
+		{0, "░░░░░░░ 0%"},
+		{0.32, "██░░░░░ 32%"},
+		{1.0, "███████ 100%"},
+		{1.5, "███████ 100%"}, // clamps
+		{-0.5, "░░░░░░░ 0%"},  // clamps
+	}
+	for _, c := range cases {
+		if got := budgetBar(c.frac, 7); got != c.want {
+			t.Errorf("budgetBar(%v, 7) = %q, want %q", c.frac, got, c.want)
+		}
+	}
+}
+
+func TestPrettyTokens(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{950, "950"},
+		{12_400, "12k"},
+		{1_234_567, "1.2M"},
+	}
+	for _, c := range cases {
+		if got := prettyTokens(c.n); got != c.want {
+			t.Errorf("prettyTokens(%d) = %q, want %q", c.n, got, c.want)
+		}
 	}
 }

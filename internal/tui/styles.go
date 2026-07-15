@@ -68,7 +68,7 @@ func stateStyle(l domain.Loop) lipgloss.Style {
 func stateColor(l domain.Loop) lipgloss.Color {
 	switch l.State {
 	case domain.StateStalled:
-		if l.Stall == domain.StallRateLimit || l.Stall == domain.StallTokenOut {
+		if l.Stall == domain.StallRateLimit || l.Stall == domain.StallTokenOut || l.Stall == domain.StallGone {
 			return cRed
 		}
 		return cAmber
@@ -87,14 +87,31 @@ func stateLabel(l domain.Loop) string {
 		if l.Stall == domain.StallRateLimit {
 			return "✗ 429"
 		}
+		if l.Stall == domain.StallGone {
+			return "✗ gone"
+		}
 		return "◆ STALLED"
 	case domain.StateRunning:
 		return "● run"
 	case domain.StateGate:
-		return "◆ gate"
+		return "◆ GATE"
 	case domain.StateIdle:
 		return "· idle"
 	default:
 		return string(l.State)
+	}
+}
+
+// budgetStyle colors the BUDGET cell/row by how close a loop is to its
+// token budget: dim normally, amber past 75%, red past 90% — an at-a-glance
+// heads-up before a loop hits StallTokenOut.
+func budgetStyle(l domain.Loop) lipgloss.Style {
+	switch frac := l.BudgetFrac(); {
+	case frac >= 0.9:
+		return lipgloss.NewStyle().Foreground(cRed)
+	case frac >= 0.75:
+		return lipgloss.NewStyle().Foreground(cAmber)
+	default:
+		return stDim
 	}
 }

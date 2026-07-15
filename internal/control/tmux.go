@@ -54,6 +54,18 @@ func tmuxResumeCmds(paneID, prompt string) [][]string {
 	}
 }
 
+// Approve accepts claude's default highlighted option at a gate by sending
+// a bare Enter — no text typed, just the key.
+func (tmuxController) Approve(t Target) error {
+	argv := tmuxApproveCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// tmuxApproveCmd builds the argv for a bare Enter keypress into a pane.
+func tmuxApproveCmd(paneID string) []string {
+	return []string{"tmux", "send-keys", "-t", paneID, "Enter"}
+}
+
 func (tmuxController) Focus(t Target) error {
 	for _, argv := range tmuxFocusCmds(t.ID) {
 		if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil {

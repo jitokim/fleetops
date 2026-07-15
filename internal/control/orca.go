@@ -44,6 +44,14 @@ func orcaResumeCmd(handle, prompt string) []string {
 	return []string{"orca", "terminal", "send", "--terminal", handle, "--text", prompt, "--enter", "--json"}
 }
 
+// Approve accepts claude's default highlighted option at a gate (e.g. a
+// permission prompt) by sending a bare Enter — reuses orcaResumeCmd with an
+// empty prompt, since an empty --text plus --enter is exactly that.
+func (orcaController) Approve(t Target) error {
+	argv := orcaResumeCmd(t.ID, "")
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
 func (orcaController) Focus(t Target) error {
 	argv := orcaFocusCmd(t.ID)
 	return exec.Command(argv[0], argv[1:]...).Run()

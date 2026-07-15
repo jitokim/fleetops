@@ -28,6 +28,7 @@ const (
 	StallTokenOut  StallKind = "token budget exhausted"
 	StallRateLimit StallKind = "rate limited (429)" // one-key re-send resumes
 	StallNoOutput  StallKind = "no output"          // hung / waiting on nothing
+	StallGone      StallKind = "process gone"       // terminal closed/crashed mid-work — an incident, not a resume (restart instead)
 )
 
 // Terminal reports whether no further work will happen for this loop.

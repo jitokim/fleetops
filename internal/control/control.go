@@ -20,6 +20,7 @@ type Controller interface {
 	Locate(projectDir string) (Target, bool) // match surface by encoded cwd
 	Resume(t Target, prompt string) error    // re-send prompt + submit
 	Focus(t Target) error                    // bring the surface to the front (attach)
+	Approve(t Target) error                  // accept the default option at a gate (bare Enter)
 }
 
 // Resolve returns the first available controller: orca preferred (the

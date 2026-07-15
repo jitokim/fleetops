@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/gate"
 )
 
 // IdleThreshold: no log write for this long ⇒ the loop is considered stuck.
@@ -52,6 +53,8 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	if err != nil {
 		return nil, err
 	}
+	gatesDir := gate.GatesDir()
+	pending := gate.Pending(gatesDir)
 	loops := make([]domain.Loop, 0, len(matches))
 	for _, path := range matches {
 		fi, err := os.Stat(path)
@@ -64,12 +67,61 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 		if !IncludeHidden && isHiddenProjectDir(filepath.Base(filepath.Dir(path))) {
 			continue
 		}
-		loops = append(loops, loopFromLog(path, fi, now))
+		loops = append(loops, loopFromLog(path, fi, now, gatesDir, pending))
 	}
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].LastActivity.After(loops[j].LastActivity)
 	})
-	return loops, nil
+	return applyLiveness(loops, LiveClaudeCwds()), nil
+}
+
+// applyLiveness cross-checks each loop against live `claude` CLI processes
+// in its cwd — the JSONL alone can't tell "waiting for human" (idle) from
+// "process dead" (terminal closed/crashed): both just stop writing. loops
+// must already be sorted by LastActivity desc (as DiscoverLoops does), so
+// within any cwd the earliest-indexed entries are the most recently active
+// ones — no extra sort needed here.
+//
+// Per cwd, the `live` count of most-recently-active loops are left
+// untouched (there's a real process behind them). The rest are presumed
+// dead:
+//   - StateIdle (finished its turn, then the process went away) → dropped
+//     entirely: the loop ended cleanly, it's not part of the fleet anymore.
+//   - anything else (StateStalled, or StateRunning past the live count —
+//     e.g. a process that just died mid-turn) → kept, reclassified
+//     StateStalled/StallGone: a mid-work death IS an incident.
+func applyLiveness(loops []domain.Loop, live map[string]int) []domain.Loop {
+	byCwd := make(map[string][]int)
+	for i, l := range loops {
+		byCwd[l.Cwd] = append(byCwd[l.Cwd], i)
+	}
+
+	drop := make(map[int]bool, len(loops))
+	for cwd, idxs := range byCwd {
+		k := live[cwd]
+		if k >= len(idxs) {
+			continue // enough live processes for every loop sharing this cwd
+		}
+		for _, i := range idxs[k:] {
+			if loops[i].State == domain.StateIdle {
+				drop[i] = true
+				continue
+			}
+			loops[i].State = domain.StateStalled
+			loops[i].Stall = domain.StallGone
+		}
+	}
+	if len(drop) == 0 {
+		return loops
+	}
+
+	out := make([]domain.Loop, 0, len(loops)-len(drop))
+	for i, l := range loops {
+		if !drop[i] {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // isHiddenProjectDir reports whether an encoded project dir contains a
@@ -79,12 +131,12 @@ func isHiddenProjectDir(dir string) bool {
 	return strings.Contains(dir, "--")
 }
 
-func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
+func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pending map[string]gate.Info) domain.Loop {
 	projectDir := filepath.Base(filepath.Dir(path))
 	proj := projectLabel(projectDir)
 	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	last := fi.ModTime()
-	idle := now.Sub(last) >= IdleThreshold
+	idleFor := now.Sub(last)
 
 	l := domain.Loop{
 		ID:           session,
@@ -95,51 +147,75 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time) domain.Loop {
 		SessionID:    session,
 		Path:         path,
 		LastActivity: last,
-		State:        domain.StateRunning,
+		State:        domain.StateRunning, // fallback if the tail can't be read at all
 	}
 
-	// One shared tail read serves both the idle classification and the
-	// detail pane's TAIL row (LastText) — avoid reading the file twice.
+	l.Cycle, l.TokensSpent = SessionMetrics(path)
+	if l.Goal.BudgetTokens == 0 {
+		l.Goal.BudgetTokens = DefaultBudgetTokens // v0 default until per-loop budgets exist
+	}
+
+	// One shared tail read serves both classification and the detail pane's
+	// TAIL row (LastText) — avoid reading the file twice. Classification
+	// always runs (not just once "idle"): "running" means a turn is
+	// genuinely in flight, not merely "wrote recently" (see classifyLoop) —
+	// a loop that finished its turn a second ago is idle, not running.
 	if buf, ok := readTail(path, tailBytes); ok {
 		if text, ok := lastAssistantTextFromTail(buf); ok {
 			l.LastText = text
 		}
-		if idle {
-			l.State, l.Stall = classifyTail(buf)
-		}
-	} else if idle {
+		l.State, l.Stall = classifyLoop(buf, idleFor)
+	} else if idleFor >= IdleThreshold {
 		l.State, l.Stall = domain.StateStalled, domain.StallNoOutput
+	}
+
+	// A pending Notification-hook marker beats any tail heuristic above —
+	// the human is being asked something RIGHT NOW, which is a stronger,
+	// more direct signal than anything inferred from the transcript.
+	if info, ok := pending[session]; ok {
+		if gate.IsGateActive(info.TS, last) {
+			l.State = domain.StateGate
+			l.Stall = domain.StallNone
+			l.GatePrompt = info.Message
+		} else {
+			gate.DeleteMarker(gatesDir, session) // best-effort: already answered
+		}
 	}
 	return l
 }
 
-// tailState reads the tail of the session log and classifies why an idle
-// loop went quiet (see classifyTail). Exposed for tests; loopFromLog itself
-// calls classifyTail directly since it already holds the tail buffer from
-// the LastText read (avoids a second file read).
-func tailState(path string) (domain.LoopState, domain.StallKind) {
+// tailState reads the tail of the session log and classifies it given how
+// long it's been since the last write (see classifyLoop). Exposed for
+// tests; loopFromLog itself calls classifyLoop directly since it already
+// holds the tail buffer from the LastText read (avoids a second file read).
+func tailState(path string, idleFor time.Duration) (domain.LoopState, domain.StallKind) {
 	buf, ok := readTail(path, tailBytes)
 	if !ok {
 		return domain.StateStalled, domain.StallNoOutput
 	}
-	return classifyTail(buf)
+	return classifyLoop(buf, idleFor)
 }
 
-// classifyTail is tailState's buffer-only core:
-//   - a rate-limit marker anywhere in the tail ⇒ StateStalled/StallRateLimit
-//     (a 429 means the turn did NOT complete, so this takes precedence over
-//     end_turn below even if both somehow appear in the tail)
-//   - otherwise, if the last user/assistant entry is an assistant message
-//     that finished its turn (stop_reason "end_turn") ⇒ StateIdle: the agent
-//     is done and waiting on a human, not stuck — not an incident
-//   - otherwise (mid-work: last entry is user/tool_result, or an assistant
-//     message that hasn't finished, e.g. tool_use) ⇒ StateStalled/StallNoOutput
-func classifyTail(buf []byte) (domain.LoopState, domain.StallKind) {
-	if hasRateLimitMarker(buf) {
-		return domain.StateStalled, domain.StallRateLimit
-	}
+// classifyLoop is tailState's buffer-only core. "Running" means "a turn is
+// in flight", not just "the log was touched recently", so a finished turn
+// is idle regardless of how long ago that was:
+//   - the last meaningful (user/assistant) entry is an assistant message
+//     whose turn finished (stop_reason "end_turn") ⇒ StateIdle: waiting on
+//     a human, not stuck — not an incident, no matter the recency.
+//   - otherwise (mid-turn: last entry is user/tool_result, or an assistant
+//     message that hasn't finished, e.g. tool_use):
+//   - idleFor < IdleThreshold ⇒ StateRunning: genuinely still working.
+//   - idleFor >= IdleThreshold ⇒ StateStalled (a rate-limit marker
+//     anywhere in the tail ⇒ StallRateLimit, else StallNoOutput).
+func classifyLoop(buf []byte, idleFor time.Duration) (domain.LoopState, domain.StallKind) {
 	if lastTurnEnded(buf) {
 		return domain.StateIdle, domain.StallNone
+	}
+	if idleFor < IdleThreshold {
+		return domain.StateRunning, domain.StallNone
+	}
+	if hasRateLimitMarker(buf) {
+		return domain.StateStalled, domain.StallRateLimit
 	}
 	return domain.StateStalled, domain.StallNoOutput
 }

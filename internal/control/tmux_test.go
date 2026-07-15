@@ -58,6 +58,19 @@ func TestTmuxResumeCmds(t *testing.T) {
 	}
 }
 
+func TestTmuxApproveCmd(t *testing.T) {
+	got := tmuxApproveCmd("%3")
+	want := []string{"tmux", "send-keys", "-t", "%3", "Enter"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestTmuxFocusCmds(t *testing.T) {
 	cmds := tmuxFocusCmds("%3")
 	want := [][]string{

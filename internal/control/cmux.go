@@ -52,6 +52,22 @@ func cmuxResumeCmd(surfaceRef, prompt string) []string {
 	return []string{"cmux", "send", "--surface", surfaceRef, "--", prompt + "\n"}
 }
 
+// Approve accepts claude's default highlighted option at a gate by sending
+// a bare Enter key (distinct from Resume's `send`, which types literal
+// text) targeted at the surface.
+//
+// TODO: verify cmux's send-key subcommand shape on a machine with the cmux
+// CLI — unverified, same caveat as parseCmuxTree.
+func (cmuxController) Approve(t Target) error {
+	argv := cmuxApproveCmd(t.ID)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// cmuxApproveCmd builds the argv for a bare Enter keypress into a surface.
+func cmuxApproveCmd(surfaceRef string) []string {
+	return []string{"cmux", "send-key", "--surface", surfaceRef, "enter"}
+}
+
 func (cmuxController) Focus(t Target) error {
 	argv := cmuxFocusCmd(t.ID)
 	return exec.Command(argv[0], argv[1:]...).Run()
