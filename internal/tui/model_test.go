@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -116,12 +117,29 @@ func TestPadBetween_EmptyRightReturnsLeftUnpadded(t *testing.T) {
 	}
 }
 
-func TestPadBetween_OverflowStillFitsBothWithMinGap(t *testing.T) {
-	// left+right alone exceed width — must not truncate either side, just
-	// shrink the gap to its 1-space floor.
+// F1: padBetween used to just floor the gap at 1 space and concatenate
+// regardless of whether left+right actually fit — which is exactly why the
+// header/summary band didn't degrade at narrow widths (a live w=45 render
+// measured 65 cols). It now degrades in two steps: drop right first, then
+// (if even left alone overflows) ANSI-aware truncate left.
+
+func TestPadBetween_Overflow_DropsRightFirst(t *testing.T) {
+	got := padBetween("short left", "right", 10)
+	if strings.Contains(got, "right") {
+		t.Errorf("got %q, want right dropped entirely — it doesn't fit alongside left", got)
+	}
+	if got != "short left" {
+		t.Errorf("got %q, want left unchanged (it alone fits within width)", got)
+	}
+}
+
+func TestPadBetween_Overflow_TruncatesLeftWhenEvenLeftAloneOverflows(t *testing.T) {
 	got := padBetween("a very long left string", "right", 10)
-	if !strings.HasPrefix(got, "a very long left string") || !strings.HasSuffix(got, "right") {
-		t.Errorf("got %q, want both sides intact with at least a 1-space gap", got)
+	if lipgloss.Width(got) > 10 {
+		t.Errorf("got %q (width %d), want <= 10", got, lipgloss.Width(got))
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("got %q, want a truncation marker since even left alone overflows", got)
 	}
 }
 
@@ -145,8 +163,15 @@ func TestColumnWidths_DropsNoteBelowThreshold(t *testing.T) {
 	if _, _, _, _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
 		t.Errorf("at width %d, wNote = %d, want 0 (NOTE column dropped)", minWidthForNote-1, wNote)
 	}
-	if _, _, _, _, _, _, wNote := columnWidths(minWidthForNote); wNote == 0 {
-		t.Errorf("at width %d, wNote = 0, want > 0 (NOTE column kept)", minWidthForNote)
+	// F1: NOTE is no longer guaranteed to survive exactly AT
+	// minWidthForNote — the cascade may ALSO drop it there if the other
+	// threshold-gated columns don't leave enough real room once the true
+	// fixed cost (marker/state/last/indent/nameFloor) is counted. That's
+	// the actual bug this fixes: showing everything the naive thresholds
+	// nominally allowed could overflow. It's still guaranteed to survive at
+	// a comfortably wide, mainstream terminal.
+	if _, _, _, _, _, _, wNote := columnWidths(120); wNote == 0 {
+		t.Error("at width 120, wNote = 0, want > 0 (NOTE column kept at a mainstream width)")
 	}
 }
 
@@ -269,8 +294,11 @@ func TestColumnWidths_DropsNIBelowThreshold(t *testing.T) {
 	if _, _, _, _, _, wNI, _ := columnWidths(minWidthForNI - 1); wNI != 0 {
 		t.Errorf("at width %d, wNI = %d, want 0 (N/I column dropped)", minWidthForNI-1, wNI)
 	}
-	if _, _, _, _, _, wNI, _ := columnWidths(minWidthForNI); wNI == 0 {
-		t.Errorf("at width %d, wNI = 0, want > 0 (N/I column kept)", minWidthForNI)
+	// F1: see TestColumnWidths_DropsNoteBelowThreshold — the cascade may
+	// drop N/I too, exactly at its nominal threshold, if the true fixed
+	// cost doesn't leave enough real room. Guaranteed at a mainstream width.
+	if _, _, _, _, _, wNI, _ := columnWidths(120); wNI == 0 {
+		t.Error("at width 120, wNI = 0, want > 0 (N/I column kept at a mainstream width)")
 	}
 }
 
@@ -278,8 +306,9 @@ func TestColumnWidths_DropsOracleBelowThreshold(t *testing.T) {
 	if _, _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle - 1); wOracle != 0 {
 		t.Errorf("at width %d, wOracle = %d, want 0 (ORACLE column dropped)", minWidthForOracle-1, wOracle)
 	}
-	if _, _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle); wOracle == 0 {
-		t.Errorf("at width %d, wOracle = 0, want > 0 (ORACLE column kept)", minWidthForOracle)
+	// F1: see TestColumnWidths_DropsNoteBelowThreshold — same reasoning.
+	if _, _, _, wOracle, _, _, _ := columnWidths(120); wOracle == 0 {
+		t.Error("at width 120, wOracle = 0, want > 0 (ORACLE column kept at a mainstream width)")
 	}
 }
 
@@ -323,6 +352,83 @@ func TestColumnWidths_NameNeverBelowMinimum(t *testing.T) {
 	wName, _, _, _, _, _, _ := columnWidths(20)
 	if wName < 10 {
 		t.Errorf("wName = %d at a very narrow width, want >= 10 (usable minimum)", wName)
+	}
+}
+
+// ── F1 acceptance bar: no rendered line ever exceeds the terminal width ──
+
+// viewRegressionLoops is a representative fleet for the full-frame width
+// regression: a running loop with a long name/goal/note, a gate with a
+// Korean prompt (the callout path), a drifted loop with a long rejection
+// reason, and a plain idle loop — exercising every row/callout/detail-pane
+// path renderRow, renderGateCallout, and renderDetail can take.
+func viewRegressionLoops() []domain.Loop {
+	now := time.Now()
+	return []domain.Loop{
+		{
+			Project: "IdeaProjects-very-long-label", SessionID: "abcd1234", ProjectDir: "-x-a",
+			Cwd: "/Users/imac/IdeaProjects/very-long-label", Path: "/Users/imac/.claude/projects/-x-a/abcd1234.jsonl",
+			State: domain.StateRunning, Cycle: 6,
+			Goal:         domain.Goal{Text: "add pagination to the search results endpoint and cache it", MaxCycles: 12, BudgetTokens: 200000},
+			TokensSpent:  64000,
+			LastActivity: now.Add(-30 * time.Second),
+			Note:         "⚠ over budget please look",
+			LastText:     "이 기능을 추가하고 테스트를 실행했습니다. 모든 테스트가 통과했습니다.",
+		},
+		{
+			Project: "voc-triage", SessionID: "kor00001", ProjectDir: "-x-b",
+			Cwd: "/Users/imac/IdeaProjects/voc-triage", Path: "/Users/imac/.claude/projects/-x-b/kor00001.jsonl",
+			State: domain.StateGate, GatePrompt: "캡틴, 재설치가 완료되었습니다. 계속 진행할까요?",
+			LastActivity: now.Add(-2 * time.Minute),
+		},
+		{
+			Project: "flaky-hunt", SessionID: "drift001", ProjectDir: "-x-c",
+			Cwd: "/Users/imac/IdeaProjects/flaky-hunt", Path: "/Users/imac/.claude/projects/-x-c/drift001.jsonl",
+			State: domain.StateDrift, Cycle: 3,
+			Goal:         domain.Goal{Text: "fix the flaky auth test", MaxCycles: 12},
+			Last:         &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence of a passing test run shown, claim unsubstantiated"},
+			LastActivity: now.Add(-10 * time.Minute),
+		},
+		{
+			Project: "asre", SessionID: "idle0001", ProjectDir: "-x-d",
+			Cwd: "/Users/imac/orca/projects/asre", Path: "/Users/imac/.claude/projects/-x-d/idle0001.jsonl",
+			State:        domain.StateIdle,
+			LastActivity: now.Add(-1 * time.Hour),
+		},
+		{
+			Project: "dotfiles", SessionID: "fail0001", ProjectDir: "-x-e",
+			Cwd: "/Users/imac/dotfiles", Path: "/Users/imac/.claude/projects/-x-e/fail0001.jsonl",
+			State: domain.StateFailed, Cycle: 12, NoImprove: 3,
+			Goal:         domain.Goal{Text: "refactor the dotfiles bootstrap script", MaxCycles: 12, NoImproveLimit: 3},
+			Note:         "stopped: no improvement 3/3",
+			Stall:        domain.StallGone,
+			LastActivity: now.Add(-3 * time.Hour),
+		},
+	}
+}
+
+// TestView_NoLineExceedsTerminalWidth is F1's acceptance bar: at each width
+// in {45,65,90,120,175}, every line of the full rendered frame (header,
+// summary band, table, detail pane, prompt/status/keybar) must fit within
+// the terminal width — ANSI-stripped, wide runes (incl. Korean) counted via
+// lipgloss.Width. This is the regression test for the live-measured
+// overflow (w=90 rendering 100 cols, w=45 header rendering 65 cols) and
+// must keep passing through any future layout change.
+func TestView_NoLineExceedsTerminalWidth(t *testing.T) {
+	for _, width := range []int{45, 65, 90, 120, 175} {
+		t.Run(fmt.Sprintf("width=%d", width), func(t *testing.T) {
+			m := New()
+			m.w, m.h = width, 40
+			m.loops = viewRegressionLoops()
+			m.cursor = 0
+
+			out := m.View()
+			for i, line := range strings.Split(out, "\n") {
+				if got := lipgloss.Width(line); got > width {
+					t.Errorf("width=%d: line %d is %d cols wide, want <= %d: %q", width, i, got, width, line)
+				}
+			}
+		})
 	}
 }
 
@@ -1229,6 +1335,114 @@ func TestSendPromptCmd_TierTwoRedriveFails_ReportsError(t *testing.T) {
 	}
 	if !strings.Contains(rm.text, "re-drive") {
 		t.Errorf("text = %q, want it to mention the failed re-drive", rm.text)
+	}
+}
+
+// ── F4: the ambiguity guard's authoritative backstop survives the
+// keypress-time ttyPathPlausible skip ──────────────────────────────
+//
+// ttyPathPlausible only skips refuseIfAmbiguous's FAST/FRIENDLY keypress-time
+// message when a registry entry with a tty exists — it does not (and
+// synchronously cannot) validate the tty↔pid binding. If that binding
+// later fails inside control.ResolveActuationTarget (recycled tty, dead
+// pid, or the tty simply doesn't resolve to a claude pane), Tier 1a is
+// skipped and resolution falls to Tier 1b (cwd chain), whose LocateClaude
+// carries its own internal ">1 match" refusal. These tests prove that
+// fallback refusal actually fires — a genuinely ambiguous loop is never
+// silently misrouted just because the keypress guard was bypassed.
+
+func TestSendPromptCmd_TTYPlausibleButBindingFails_FallsToTierTwoNotMisrouted(t *testing.T) {
+	// Tier 1 (both a and b) fails to find an unambiguous surface — for
+	// resume/inject this correctly falls to Tier 2 (redrive by session id,
+	// which doesn't care about cwd ambiguity at all), rather than guessing
+	// at a Tier 1 target.
+	redriveCalled := false
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			// simulates: tty binding failed, AND the cwd chain's LocateClaude
+			// refused internally because >1 loop matched that directory.
+			return nil, control.Target{}, true, false
+		},
+		func(sessionID, prompt string) error {
+			redriveCalled = true
+			return nil
+		},
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
+
+	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+
+	if !redriveCalled {
+		t.Error("expected Tier 2 (redriveFn) to run once Tier 1 fails to find an unambiguous surface")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg (Tier 2 succeeded)", msg)
+	}
+	if !strings.Contains(rm.text, "tier 2") {
+		t.Errorf("text = %q, want it to mention the tier-2 fallback", rm.text)
+	}
+}
+
+func TestApproveCmd_TierOneFailsAmbiguously_RefusesWithoutMisrouting(t *testing.T) {
+	// approve/interrupt/kill have no Tier 2 — when Tier 1 fails to find an
+	// unambiguous surface, they must refuse outright, never guess.
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false // ambiguous cwd match, refused internally by LocateClaude
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", GateTS: 123}
+
+	msg := approveCmd(l)()
+
+	am, ok := msg.(approveResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want approveResultMsg", msg)
+	}
+	if am.ok {
+		t.Error("expected ok=false — must refuse rather than guess when Tier 1 is ambiguous")
+	}
+	if !strings.Contains(am.text, "no unambiguous claude surface") {
+		t.Errorf("text = %q, want the ambiguity-refusal message", am.text)
+	}
+}
+
+func TestUpdate_AKey_TTYPlausibleSkipsGuard_ButAsyncResultStillRefusesOnAmbiguity(t *testing.T) {
+	// full round trip through the tui: two loops share a directory, so
+	// refuseIfAmbiguous WOULD normally refuse at keypress time — but the
+	// selected loop has a registry tty, so ttyPathPlausible skips that
+	// keypress-time guard and dispatches approveCmd. The async resolution
+	// (faked here to simulate a binding failure that falls to an ambiguous
+	// cwd match) must still surface a refusal once the result arrives —
+	// proving the skip never lets an ambiguous action silently succeed.
+	dir := withSessionsDir(t)
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].State = domain.StateGate
+	if err := sessions.WriteSession(dir, m.loops[0].SessionID, sessions.SessionEntry{TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false
+		},
+		nil,
+	)
+
+	m, cmd := updateModel(t, m, runeKey('a'))
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd — the tty path skips the keypress-time ambiguity guard")
+	}
+
+	msg := cmd()
+	m, _ = updateModel(t, m, msg)
+
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr — the async resolution must still refuse", m.statusKind)
+	}
+	if !strings.Contains(m.status, "no unambiguous claude surface") {
+		t.Errorf("status = %q, want the ambiguity-refusal message once the async result arrives", m.status)
 	}
 }
 

@@ -324,6 +324,17 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 	if haveTail {
 		if text, ok := lastAssistantTextFromTail(buf); ok {
 			l.LastText = text
+		} else if biggerBuf, ok := readTail(path, lastTextTailBytes); ok {
+			// F2: the standard tail had NO assistant text at all — a busy
+			// loop's large tool_use/tool_result payloads can fill the
+			// whole small window without a single text block, even though
+			// a perfectly good "what it was doing" report sits just
+			// outside it. Widen the search specifically for LastText;
+			// classification below still runs on the cheaper, smaller buf
+			// (it doesn't need this — see classifyLoop).
+			if text, ok := lastAssistantTextFromTail(biggerBuf); ok {
+				l.LastText = text
+			}
 		}
 		l.State, l.Stall = classifyLoop(buf, idleFor)
 	} else if idleFor >= IdleThreshold {
@@ -674,15 +685,42 @@ func userMessageText(entry map[string]any) (string, bool) {
 // LastAssistantText returns the last assistant message's text (first
 // tailTextCap chars, newlines collapsed to spaces) from the tail of the
 // session log — "what was it last doing", shown in the detail pane's TAIL
-// row. ok is false if the tail has no assistant text. Thin path-based wrapper
-// around lastAssistantTextFromTail, which loopFromLog calls directly against a
+// row. ok is false only when EVEN the widened search (see widenedTailRead)
+// finds no assistant text at all. Thin path-based wrapper around
+// lastAssistantTextFromTail, which loopFromLog calls directly against a
 // tail buffer it already read (see readTail).
 func LastAssistantText(path string) (string, bool) {
-	buf, ok := readTail(path, tailBytes)
+	return widenedTailRead(path, lastAssistantTextFromTail)
+}
+
+// lastTextTailBytes is a much larger fallback tail window, tried ONLY when
+// the standard tailBytes window (shared with classification) contains no
+// assistant text at all. A busy loop's large tool_use/tool_result payloads
+// (e.g. a big file read or grep) can fill the entire small tail without a
+// single text block, even though a perfectly good "what it was doing"
+// report sits just outside that window — this is F2's "DOING/TAIL empty
+// for the busiest loops" bug. Widening only on an actual miss keeps the
+// common case (small tail already has text) exactly as cheap as before.
+const lastTextTailBytes = 256 * 1024
+
+// widenedTailRead reads path's standard tailBytes-sized tail and applies
+// extract; if that finds nothing, it retries with the much larger
+// lastTextTailBytes window before giving up. Shared by
+// LastAssistantText/LastAssistantTextFull (both callers of readTail — see
+// each's doc) so busy loops' DOING/TAIL AND the oracle's judged report
+// (internal/oracle.Judge, via LastAssistantTextFull) both get the same
+// fallback — the same root cause, one fix.
+func widenedTailRead(path string, extract func([]byte) (string, bool)) (string, bool) {
+	if buf, ok := readTail(path, tailBytes); ok {
+		if text, ok := extract(buf); ok {
+			return text, true
+		}
+	}
+	buf, ok := readTail(path, lastTextTailBytes)
 	if !ok {
 		return "", false
 	}
-	return lastAssistantTextFromTail(buf)
+	return extract(buf)
 }
 
 // tailTextCap bounds LastText, the summarized last-assistant message. It's
@@ -708,13 +746,12 @@ func lastAssistantTextFromTail(buf []byte) (string, bool) {
 // caps at tailTextCap chars for the TUI's TAIL row). The oracle
 // (internal/oracle) needs the full report to judge accurately; an
 // 800-char summary would throw away exactly the evidence it's supposed to
-// check.
+// check. ok is false only when EVEN the widened search (see
+// widenedTailRead) finds no assistant text at all — otherwise a busy
+// loop's judged report would go missing for the same reason F2 fixed
+// DOING/TAIL.
 func LastAssistantTextFull(path string) (string, bool) {
-	buf, ok := readTail(path, tailBytes)
-	if !ok {
-		return "", false
-	}
-	return lastAssistantTextRawFromTail(buf)
+	return widenedTailRead(path, lastAssistantTextRawFromTail)
 }
 
 // lastAssistantTextRawFromTail is the shared, uncapped core of both
