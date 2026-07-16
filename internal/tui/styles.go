@@ -11,7 +11,7 @@ import (
 // visual weight where it mattered (e.g. the ◎ MISSIONCTL logo).
 var (
 	cChrome = lipgloss.Color("#161d25")
-	cLine   = lipgloss.Color("#3d5266") // panel borders/hairlines — must stay VISIBLE on any dark terminal bg (was #20303c, which vanished; captain-reported)
+	cLine   = lipgloss.Color("#20303c")
 	cInk    = lipgloss.Color("#c9d4de")
 	cDim    = lipgloss.Color("#7a8896")
 	cFaint  = lipgloss.Color("#4f5c69")
@@ -59,6 +59,10 @@ func stateStyle(l domain.Loop) lipgloss.Style {
 	case domain.StateStalled, domain.StateGate, domain.StateRunning, domain.StateDone, domain.StateDrift, domain.StateFailed:
 		s = s.Bold(true)
 	}
+	// StateKilled is deliberately NOT bold — fix/killed-state: it's a
+	// completed human decision, not an incident (unlike the states above,
+	// all of which are either currently happening or need attention), so
+	// it reads calm/settled, same visual register as StateIdle.
 	return s
 }
 
@@ -79,6 +83,11 @@ func stateColor(l domain.Loop) lipgloss.Color {
 		return cRed
 	case domain.StateFailed:
 		return cRed
+	case domain.StateKilled:
+		// fix/killed-state: dim, NOT red — a human's own kill decision is
+		// not an incident to flag (unlike StateFailed, the governor
+		// stopping a loop against the human's wishes).
+		return cDim
 	default:
 		return cDim
 	}
@@ -106,6 +115,8 @@ func stateLabel(l domain.Loop) string {
 		return "✗ DRIFT"
 	case domain.StateFailed:
 		return "✗ FAILED"
+	case domain.StateKilled:
+		return "☠ KILLED"
 	default:
 		return string(l.State)
 	}

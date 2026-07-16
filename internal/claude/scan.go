@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,7 +84,7 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	loops = enrichFromRegistry(loops, loopsDir, historyDir)
 
 	live, liveOK := LiveClaudeCwds()
-	loops = applyLiveness(loops, live, liveOK)
+	loops = applyLiveness(loops, live, liveOK, historyDir, now, within)
 
 	// Keep metricsCache bounded to sessions actually present in this scan —
 	// otherwise it grows forever as old sessions age out of the window or
@@ -125,6 +126,7 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		loops[i].Goal.NoImproveLimit = rec.NoImproveLimit
 		loops[i].NoImprove = rec.NoImprove
 		loops[i].Last = rec.Verdict
+		loops[i].BoundAt = rec.BoundAt
 
 		// A live gate always wins over a stale verdict: the loop is blocked
 		// on a human decision RIGHT NOW, which is more urgent and more
@@ -230,7 +232,14 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 //
 // Per ProjectDir, the live count of most-recently-active loops are left
 // untouched (there's a real process behind them). The rest are presumed
-// dead:
+// dead, and — fix/killed-state — FIRST checked for a human kill decision
+// (mostRecentActuationIsKill) before any of the rules below apply: a
+// killed loop becomes StateKilled regardless of what it would otherwise
+// have been, since a human's kill is definitive and must win over even the
+// settled-verdict exemption (case in point — the bug this fixes: killing a
+// StateDrift loop left it showing ✗ DRIFT forever, because the exemption
+// below meant nothing ever re-examined it once "settled"). Absent a kill,
+// the pre-existing rules apply:
 //   - StateIdle (finished its turn, then the process went away) → dropped
 //     entirely: the loop ended cleanly, it's not part of the fleet anymore.
 //   - StateDone / StateDrift (the oracle already rendered a verdict this
@@ -253,7 +262,13 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 // which real path is "the" real one is genuinely ambiguous, so healing is
 // skipped entirely for it: Cwd stays the lossy decode and CwdVerified stays
 // false, rather than risk silently healing to the WRONG one of the two.
-func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.Loop {
+//
+// historyDir/now/within are threaded through purely for
+// mostRecentActuationIsKill — only consulted for loops that reach this
+// function's "presumed dead" branch (idxs[k:] below), never for the whole
+// fleet every scan (the review's efficiency ask): a loop with a live
+// process backing it never needs its history checked at all.
+func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir string, now time.Time, within time.Duration) []domain.Loop {
 	if !ok {
 		return loops // probe failed — do not reclassify the fleet on no data (P1-2)
 	}
@@ -289,6 +304,11 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.L
 			continue // enough live processes for every loop sharing this dir
 		}
 		for _, i := range idxs[k:] {
+			if mostRecentActuationIsKill(historyDir, loops[i].SessionID, now, within) {
+				loops[i].State = domain.StateKilled
+				loops[i].Stall = domain.StallNone
+				continue // wins over every rule below — see doc
+			}
 			switch loops[i].State {
 			case domain.StateIdle:
 				drop[i] = true
@@ -311,6 +331,41 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.L
 		}
 	}
 	return out
+}
+
+// mostRecentActuationIsKill reports whether sessionID's most recent
+// actor=human actuation event within `within` of now was a kill attempt
+// (logActuationEvent's "kill <tier> ok|failed: ..." detail format — see
+// internal/tui). Deliberately the MOST RECENT one, not "was there ever a
+// kill": if a kill was followed by a later successful resume/inject
+// actuation (reviving the session before this fix landed, or via a race),
+// that later actuation — not the stale kill — is what should win. events.Read
+// is scoped to just this one session (not internal/events.ReadAll's
+// whole-directory scan), so this stays cheap even called once per
+// process-gone candidate loop per scan.
+func mostRecentActuationIsKill(historyDir, sessionID string, now time.Time, within time.Duration) bool {
+	evs, err := events.Read(historyDir, sessionID)
+	if err != nil {
+		return false
+	}
+	// within<=0 means "no window" (DiscoverLoops' own "0 = keep all"
+	// convention) — MinInt64 so every event passes rather than every event
+	// being (wrongly) treated as expired.
+	cutoff := int64(math.MinInt64)
+	if within > 0 {
+		cutoff = now.Add(-within).UnixNano()
+	}
+	var lastActuation *events.Event
+	for i := range evs {
+		ev := &evs[i]
+		if ev.Trigger != events.TriggerActuation || ev.Actor != events.ActorHuman || ev.TS < cutoff {
+			continue
+		}
+		if lastActuation == nil || ev.TS > lastActuation.TS {
+			lastActuation = ev
+		}
+	}
+	return lastActuation != nil && strings.HasPrefix(lastActuation.Detail, "kill ")
 }
 
 // isHiddenProjectDir reports whether an encoded project dir contains a
@@ -839,6 +894,170 @@ func assistantMessageText(entry map[string]any) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// LastError scans path's tail (widened if needed — same fallback as
+// LastAssistantText/LastAssistantTextFull) for the most recent ERROR entry:
+// an assistant text block mentioning an API error/429/rate-limit body, or
+// the last tool_result with is_error=true. Returns the RAW error text
+// (council hard rule for feat/detail-panel-v2's LAST ERROR block: rendered
+// verbatim, never paraphrased) and the entry's own timestamp (parsed from
+// its "timestamp" field, RFC3339 — zero time if missing/unparseable).
+// ok=false when no error entry is found at all (even in the widened tail).
+func LastError(path string) (text string, ts time.Time, ok bool) {
+	if buf, readOK := readTail(path, tailBytes); readOK {
+		if e, found := extractLastError(buf); found {
+			return e.text, e.ts, true
+		}
+	}
+	buf, readOK := readTail(path, lastTextTailBytes)
+	if !readOK {
+		return "", time.Time{}, false
+	}
+	e, found := extractLastError(buf)
+	return e.text, e.ts, found
+}
+
+// errorEntry is extractLastError's intermediate result — kept as a small
+// struct (rather than two bare returns threaded through every helper) so
+// the "keep scanning, remember the LAST match" loop in extractLastError
+// reads as one assignment, not a pair of parallel variables that could
+// drift out of sync.
+type errorEntry struct {
+	text string
+	ts   time.Time
+}
+
+// errorSubstrings are what makes an assistant text block "an error", per
+// the task's own examples — a generic substring match rather than a strict
+// schema, since the exact shape Claude Code uses for a failed API call
+// isn't independently verified in this codebase (documented judgment call,
+// see feat/detail-panel-v2's PR body).
+var errorSubstrings = []string{"api error", "429", "rate limit"}
+
+// extractLastError is LastError's buffer-only core: walks every parseable
+// JSONL line (tolerating a truncated first line, same as every other tail
+// scanner in this file) and keeps the LAST matching error entry — either an
+// assistant text block containing one of errorSubstrings, or a user
+// tool_result block with is_error=true.
+func extractLastError(buf []byte) (errorEntry, bool) {
+	var last errorEntry
+	found := false
+	for _, line := range strings.Split(string(buf), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		switch entry["type"] {
+		case "assistant":
+			if text, isErr := assistantErrorText(entry); isErr {
+				last = errorEntry{text, entryTimestamp(entry)}
+				found = true
+			}
+		case "user":
+			if text, isErr := userToolResultError(entry); isErr {
+				last = errorEntry{text, entryTimestamp(entry)}
+				found = true
+			}
+		}
+	}
+	return last, found
+}
+
+// assistantErrorText reports whether an assistant entry's text content
+// mentions an API error (case-insensitive substring match against
+// errorSubstrings), returning that raw text if so.
+func assistantErrorText(entry map[string]any) (string, bool) {
+	text, ok := assistantMessageText(entry)
+	if !ok {
+		return "", false
+	}
+	lower := strings.ToLower(text)
+	for _, s := range errorSubstrings {
+		if strings.Contains(lower, s) {
+			return text, true
+		}
+	}
+	return "", false
+}
+
+// userToolResultError reports whether a user entry's message.content
+// carries a tool_result block with is_error=true, returning that block's
+// raw content text if so (the LAST such block in the entry, mirroring
+// userMessageText's "last text block wins" tolerance).
+func userToolResultError(entry map[string]any) (string, bool) {
+	msg, ok := entry["message"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return "", false
+	}
+	text, found := "", false
+	for _, block := range content {
+		b, ok := block.(map[string]any)
+		if !ok || b["type"] != "tool_result" {
+			continue
+		}
+		isErr, _ := b["is_error"].(bool)
+		if !isErr {
+			continue
+		}
+		if t, ok := toolResultText(b["content"]); ok {
+			text, found = t, true
+		}
+	}
+	return text, found
+}
+
+// toolResultText extracts a tool_result block's content as plain text —
+// either a bare string, or (per the Messages API) an array of content
+// blocks with "type":"text".
+func toolResultText(content any) (string, bool) {
+	switch c := content.(type) {
+	case string:
+		return c, c != ""
+	case []any:
+		for _, block := range c {
+			b, ok := block.(map[string]any)
+			if !ok || b["type"] != "text" {
+				continue
+			}
+			if text, ok := b["text"].(string); ok && text != "" {
+				return text, true
+			}
+		}
+	}
+	return "", false
+}
+
+// entryTimestamp parses a transcript entry's "timestamp" field — RFC3339
+// with fractional seconds, e.g. "2026-07-16T14:15:54.953Z". VERIFIED
+// (review fix, P2) against a real session file on this machine
+// (~/.claude/projects/-Users-imac-IdeaProjects-missionctl/*.jsonl,
+// 2026-07-17): both "user" and "assistant" entries carry exactly this
+// shape, and time.Parse(time.RFC3339, s) parses it correctly despite
+// time.RFC3339's layout constant not showing fractional digits — Go's
+// RFC3339 parsing special-cases optional fractional seconds in the input
+// even though the layout string itself doesn't spell them out. Zero time
+// for anything missing/unparseable, never a panic — and see
+// internal/tui.isErrorStale's doc for why callers must treat that zero
+// value as "fail open" (NOT stale / show it), not "infinitely old".
+func entryTimestamp(entry map[string]any) time.Time {
+	s, ok := entry["timestamp"].(string)
+	if !ok {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // summarizeTailText collapses newlines to spaces and caps length, yielding a
