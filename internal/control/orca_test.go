@@ -1,6 +1,55 @@
 package control
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestOrcaEnvelopeErr_OKFalse_ReturnsDescriptiveError(t *testing.T) {
+	// verified live: `orca terminal create` exits 0 with this exact shape
+	// when cwd isn't a worktree Orca knows about.
+	fixture := []byte(`{"ok":false,"error":{"code":"selector_not_found"}}`)
+
+	err := orcaEnvelopeErr(fixture, "/Users/imac/IdeaProjects/unregistered")
+	if err == nil {
+		t.Fatal("expected a non-nil error for an ok:false envelope")
+	}
+	want := "orca: selector_not_found — /Users/imac/IdeaProjects/unregistered is not a worktree registered in Orca (open the repo in Orca first, or select a loop that lives in one)"
+	if err.Error() != want {
+		t.Errorf("got %q, want %q", err.Error(), want)
+	}
+}
+
+func TestOrcaEnvelopeErr_OKFalse_MissingCode_FallsBackToUnknown(t *testing.T) {
+	fixture := []byte(`{"ok":false}`)
+	err := orcaEnvelopeErr(fixture, "/x")
+	if err == nil {
+		t.Fatal("expected a non-nil error")
+	}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("got %q, want it to mention \"unknown\" for a missing error code", err.Error())
+	}
+}
+
+func TestOrcaEnvelopeErr_OKTrue_ReturnsNil(t *testing.T) {
+	if err := orcaEnvelopeErr([]byte(`{"ok":true,"result":{}}`), "/x"); err != nil {
+		t.Errorf("got %v, want nil for ok:true", err)
+	}
+}
+
+func TestOrcaEnvelopeErr_NoOKField_ReturnsNil(t *testing.T) {
+	// e.g. `terminal list`'s bare (non-envelope) shape — no "ok" field at all.
+	if err := orcaEnvelopeErr([]byte(`{"terminals":[]}`), "/x"); err != nil {
+		t.Errorf("got %v, want nil when there's no explicit ok:false", err)
+	}
+}
+
+func TestOrcaEnvelopeErr_GarbageJSON_ReturnsNil(t *testing.T) {
+	// falls through to the caller's own "could not parse..." error instead.
+	if err := orcaEnvelopeErr([]byte(`not json`), "/x"); err != nil {
+		t.Errorf("got %v, want nil (caller handles the parse failure itself)", err)
+	}
+}
 
 func TestOrcaResumeCmd(t *testing.T) {
 	got := orcaResumeCmd("term_abc123", "hello world")

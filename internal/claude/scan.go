@@ -114,6 +114,9 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 			continue
 		}
 		loops[i].Goal.Text = rec.Goal
+		loops[i].Goal.DoneWhen = rec.DoneCondition
+		loops[i].Goal.Oracle = rec.Oracle
+		loops[i].Goal.Challenger = rec.Challenger
 		loops[i].Goal.MaxCycles = rec.MaxCycles
 		loops[i].Goal.NoImproveLimit = rec.NoImproveLimit
 		loops[i].NoImprove = rec.NoImprove

@@ -118,6 +118,14 @@ func (orcaController) Spawn(cwd, goal string) error {
 	if err != nil {
 		return fmt.Errorf("orca terminal create: %w", err)
 	}
+	// Verified live: `orca terminal create` exits 0 with
+	// {"ok":false,"error":{"code":"selector_not_found"}} when cwd isn't a
+	// worktree Orca knows about — check the envelope BEFORE assuming a
+	// missing handle means "unparseable output" (the old, vague error this
+	// replaces).
+	if err := orcaEnvelopeErr(createOut, cwd); err != nil {
+		return err
+	}
 	handle, ok := parseOrcaCreateHandle(createOut)
 	if !ok {
 		return fmt.Errorf("orca terminal create: could not parse a terminal handle from the output")
@@ -136,6 +144,12 @@ func (orcaController) Spawn(cwd, goal string) error {
 	if err != nil {
 		return fmt.Errorf("orca terminal list: %w", err)
 	}
+	// Same envelope check on the re-locate list call — an ok:false here
+	// would otherwise silently fall through to the create-handle fallback
+	// below and mask the real failure.
+	if err := orcaEnvelopeErr(listOut, cwd); err != nil {
+		return err
+	}
 	target := Target{Backend: "orca", ID: handle, Cwd: cwd} // fallback: the create handle, in case re-locate misses
 	if terminals, ok := decodeOrcaTerminals(listOut); ok {
 		if t, ok := selectSpawnedOrcaTerminal(terminals, cwd); ok {
@@ -147,6 +161,39 @@ func (orcaController) Spawn(cwd, goal string) error {
 	ctxSend, cancelSend := context.WithTimeout(context.Background(), spawnSendTextTimeout)
 	defer cancelSend()
 	return exec.CommandContext(ctxSend, argv[0], argv[1:]...).Run()
+}
+
+// orcaErrorEnvelope is the shape an orca RPC response's failure takes:
+// {"ok":false,"error":{"code":"..."}} — shared by `terminal create` and
+// `terminal list` (same envelope convention as orcaListEnvelope/
+// orcaCreateEnvelope, just narrowed to the ok/error fields callers need to
+// surface WHY a step failed).
+type orcaErrorEnvelope struct {
+	OK    *bool `json:"ok"`
+	Error *struct {
+		Code string `json:"code"`
+	} `json:"error"`
+}
+
+// orcaEnvelopeErr inspects a raw orca RPC response for an explicit
+// {"ok":false} and returns a descriptive error naming cwd and the error
+// code. Returns nil when the envelope doesn't indicate failure (ok is true,
+// absent, or the JSON doesn't even decode as an envelope) — callers fall
+// through to their own more specific "could not parse..." error in that
+// case, this only handles the "the call itself reported failure" case.
+func orcaEnvelopeErr(jsonBytes []byte, cwd string) error {
+	var envelope orcaErrorEnvelope
+	if err := json.Unmarshal(jsonBytes, &envelope); err != nil {
+		return nil
+	}
+	if envelope.OK == nil || *envelope.OK {
+		return nil
+	}
+	code := "unknown"
+	if envelope.Error != nil && envelope.Error.Code != "" {
+		code = envelope.Error.Code
+	}
+	return fmt.Errorf("orca: %s — %s is not a worktree registered in Orca (open the repo in Orca first, or select a loop that lives in one)", code, cwd)
 }
 
 // orcaCreateEnvelope is `orca terminal create --json`'s response shape —

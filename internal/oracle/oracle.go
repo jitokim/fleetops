@@ -29,12 +29,15 @@ const judgeTimeout = 2 * time.Minute
 // judge (itself running via `claude -p` from missionctl's own cwd) can
 // wrongly reject a report for referencing paths that don't exist relative
 // to ITS cwd — a real false rejection seen live ("file location does not
-// match the current directory").
-func Judge(goal, cwd, lastAssistantText string) (domain.Verdict, error) {
+// match the current directory"). doneWhen and oracleRubric are the rest of
+// the loop's wizard-collected contract (internal/registry.BindSpec /
+// domain.Goal) — both may be "" (loop bound before the loop-contract slice,
+// or left empty by the human at spawn time).
+func Judge(goal, cwd, lastAssistantText, doneWhen, oracleRubric string) (domain.Verdict, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), judgeTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "claude", "-p", buildPrompt(goal, cwd, lastAssistantText),
+	out, err := exec.CommandContext(ctx, "claude", "-p", buildPrompt(goal, cwd, lastAssistantText, doneWhen, oracleRubric),
 		"--model", "haiku", "--output-format", "json").Output()
 	if err != nil {
 		return domain.Verdict{}, fmt.Errorf("oracle: claude -p failed: %w", err)
@@ -43,14 +46,26 @@ func Judge(goal, cwd, lastAssistantText string) (domain.Verdict, error) {
 }
 
 // buildPrompt is the oracle's strict, JSON-only instruction — it must not
-// trust the agent's own claims, only the evidence in its report.
-func buildPrompt(goal, cwd, lastAssistantText string) string {
+// trust the agent's own claims, only the evidence in its report. doneWhen
+// and oracleRubric each add their own labeled line right after GOAL when
+// non-empty — the same contract text the agent itself was given at spawn
+// time (see the tui's buildSpawnPrompt), so what the agent was told and what
+// it's judged against are the same document.
+func buildPrompt(goal, cwd, lastAssistantText, doneWhen, oracleRubric string) string {
+	var extra strings.Builder
+	if doneWhen != "" {
+		fmt.Fprintf(&extra, "\n\nCOMPLETION CONDITION (the goal counts as done ONLY if this is demonstrably met): %s", doneWhen)
+	}
+	if oracleRubric != "" {
+		fmt.Fprintf(&extra, "\n\nVERIFICATION RUBRIC (how to judge): %s", oracleRubric)
+	}
+
 	return fmt.Sprintf(`You are an independent oracle judging an autonomous coding agent's progress toward a goal. You do NOT trust the agent's own claims of success — you verify against the evidence actually shown in its report.
 
 The agent works in directory: %s. Paths under that directory ARE the agent's current directory — do not reject a report for referencing paths there as if they were somewhere else or didn't exist relative to your own working directory.
 
 GOAL:
-%s
+%s%s
 
 AGENT'S LAST REPORT:
 %s
@@ -61,7 +76,7 @@ Output ONLY a JSON object (no other text, no markdown code fences) with exactly 
 Rules:
 - "done": ONLY if the report clearly demonstrates the goal is fully achieved (e.g. tests shown passing, the described change verifiably complete). Do not accept a bare claim of completion as evidence.
 - "rejected": the agent claims the goal is done, but the report's evidence is missing, incomplete, or contradicts that claim.
-- "progress": neither of the above — real work is happening but the goal is not claimed done, nor refuted.`, cwd, goal, lastAssistantText)
+- "progress": neither of the above — real work is happening but the goal is not claimed done, nor refuted.`, cwd, goal, extra.String(), lastAssistantText)
 }
 
 // envelopeResult is the shape `claude -p --output-format json` wraps its

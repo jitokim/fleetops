@@ -13,7 +13,7 @@ import (
 func TestBind_LoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
-	if err := Bind(dir, "sess-1", "fix the flaky test"); err != nil {
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "fix the flaky test"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
@@ -24,8 +24,17 @@ func TestBind_LoadRoundTrip(t *testing.T) {
 	if rec.Goal != "fix the flaky test" {
 		t.Errorf("Goal = %q, want %q", rec.Goal, "fix the flaky test")
 	}
+	if rec.DoneCondition != "" {
+		t.Errorf("DoneCondition = %q, want empty (not supplied)", rec.DoneCondition)
+	}
+	if rec.Oracle != "" {
+		t.Errorf("Oracle = %q, want empty (not supplied)", rec.Oracle)
+	}
+	if rec.Challenger != "" {
+		t.Errorf("Challenger = %q, want empty (not supplied)", rec.Challenger)
+	}
 	if rec.MaxCycles != DefaultMaxCycles {
-		t.Errorf("MaxCycles = %d, want %d", rec.MaxCycles, DefaultMaxCycles)
+		t.Errorf("MaxCycles = %d, want %d (zero-value spec.MaxCycles falls back to the default)", rec.MaxCycles, DefaultMaxCycles)
 	}
 	if rec.NoImproveLimit != DefaultNoImproveLimit {
 		t.Errorf("NoImproveLimit = %d, want %d", rec.NoImproveLimit, DefaultNoImproveLimit)
@@ -38,6 +47,38 @@ func TestBind_LoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBind_LoadRoundTrip_FullContract(t *testing.T) {
+	dir := t.TempDir()
+	spec := BindSpec{
+		Goal:          "fix the flaky test",
+		DoneCondition: "go test ./... passes 5 times in a row",
+		Oracle:        "run go test ./... and check for PASS",
+		Challenger:    "try to break it with -race",
+		MaxCycles:     20,
+	}
+
+	if err := Bind(dir, "sess-1", spec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	rec, ok := Load(dir, "sess-1")
+	if !ok {
+		t.Fatal("expected a record to load")
+	}
+	if rec.DoneCondition != spec.DoneCondition {
+		t.Errorf("DoneCondition = %q, want %q", rec.DoneCondition, spec.DoneCondition)
+	}
+	if rec.Oracle != spec.Oracle {
+		t.Errorf("Oracle = %q, want %q", rec.Oracle, spec.Oracle)
+	}
+	if rec.Challenger != spec.Challenger {
+		t.Errorf("Challenger = %q, want %q", rec.Challenger, spec.Challenger)
+	}
+	if rec.MaxCycles != 20 {
+		t.Errorf("MaxCycles = %d, want 20 (explicit spec value must NOT be overridden by the default)", rec.MaxCycles)
+	}
+}
+
 func TestLoad_Unbound(t *testing.T) {
 	if _, ok := Load(t.TempDir(), "no-such-session"); ok {
 		t.Error("expected ok=false for an unbound session")
@@ -46,7 +87,7 @@ func TestLoad_Unbound(t *testing.T) {
 
 func TestSaveVerdict_RejectedIncrementsNoImprove(t *testing.T) {
 	dir := t.TempDir()
-	if err := Bind(dir, "sess-1", "goal"); err != nil {
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
@@ -73,7 +114,7 @@ func TestSaveVerdict_RejectedIncrementsNoImprove(t *testing.T) {
 
 func TestSaveVerdict_DoneOrProgressResetsNoImprove(t *testing.T) {
 	dir := t.TempDir()
-	if err := Bind(dir, "sess-1", "goal"); err != nil {
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected}, 1); err != nil {
@@ -101,6 +142,23 @@ func TestSaveVerdict_DoneOrProgressResetsNoImprove(t *testing.T) {
 	}
 }
 
+func TestSaveVerdict_PreservesContractFields(t *testing.T) {
+	// SaveVerdict re-reads then re-writes the record — DoneCondition/Oracle/
+	// Challenger must survive that round trip, not just Goal/caps.
+	dir := t.TempDir()
+	spec := BindSpec{Goal: "goal", DoneCondition: "tests pass", Oracle: "run tests", Challenger: "adversarial probe"}
+	if err := Bind(dir, "sess-1", spec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeProgress}, 1); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+	rec, _ := Load(dir, "sess-1")
+	if rec.DoneCondition != "tests pass" || rec.Oracle != "run tests" || rec.Challenger != "adversarial probe" {
+		t.Errorf("got %+v, want the contract fields preserved across SaveVerdict", rec)
+	}
+}
+
 func TestSaveVerdict_UnboundSessionErrors(t *testing.T) {
 	if err := SaveVerdict(t.TempDir(), "never-bound", domain.Verdict{Outcome: domain.OutcomeDone}, 1); err == nil {
 		t.Error("expected an error saving a verdict for a session with no registry record")
@@ -109,7 +167,7 @@ func TestSaveVerdict_UnboundSessionErrors(t *testing.T) {
 
 func TestWritePending_ListPendingRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	if err := WritePending(dir, "/x/aboard", "fix the bug"); err != nil {
+	if err := WritePending(dir, "/x/aboard", BindSpec{Goal: "fix the bug"}); err != nil {
 		t.Fatalf("WritePending: %v", err)
 	}
 
@@ -124,12 +182,36 @@ func TestWritePending_ListPendingRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWritePending_ListPendingRoundTrip_FullContract(t *testing.T) {
+	dir := t.TempDir()
+	spec := BindSpec{
+		Goal:          "fix the bug",
+		DoneCondition: "tests pass",
+		Oracle:        "run tests",
+		Challenger:    "try to break it",
+		MaxCycles:     7,
+	}
+	if err := WritePending(dir, "/x/aboard", spec); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+
+	pending := listPending(dir)
+	if len(pending) != 1 {
+		t.Fatalf("got %d pending, want 1", len(pending))
+	}
+	for _, p := range pending {
+		if p.DoneCondition != spec.DoneCondition || p.Oracle != spec.Oracle || p.Challenger != spec.Challenger || p.MaxCycles != spec.MaxCycles {
+			t.Errorf("got %+v, want the full contract carried through pending", p)
+		}
+	}
+}
+
 func TestBindPending_MatchesNewestUnboundSessionInCwd(t *testing.T) {
 	loopsDir, pendingDir := t.TempDir(), t.TempDir()
 	now := time.Now()
 	spawnTS := now.Add(-time.Minute)
 
-	if err := WritePending(pendingDir, "/x/aboard", "fix the bug"); err != nil {
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "fix the bug"}); err != nil {
 		t.Fatalf("WritePending: %v", err)
 	}
 	// backdate the pending file's ts to spawnTS by rewriting it directly
@@ -172,10 +254,10 @@ func TestBindPending_SkipsAlreadyBoundSessions(t *testing.T) {
 	now := time.Now()
 	spawnTS := now.Add(-time.Minute)
 
-	if err := Bind(loopsDir, "already-bound", "an earlier goal"); err != nil {
+	if err := Bind(loopsDir, "already-bound", BindSpec{Goal: "an earlier goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if err := WritePending(pendingDir, "/x/aboard", "new goal"); err != nil {
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "new goal"}); err != nil {
 		t.Fatalf("WritePending: %v", err)
 	}
 	for name := range listPending(pendingDir) {
@@ -204,7 +286,7 @@ func TestBindPending_StalePendingDropped(t *testing.T) {
 	now := time.Now()
 	staleTS := now.Add(-pendingStaleAfter - time.Minute)
 
-	if err := WritePending(pendingDir, "/x/aboard", "goal"); err != nil {
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("WritePending: %v", err)
 	}
 	for name := range listPending(pendingDir) {
@@ -230,7 +312,7 @@ func TestBindPending_NoMatchYet_PendingSurvives(t *testing.T) {
 	now := time.Now()
 	spawnTS := now.Add(-time.Second)
 
-	if err := WritePending(pendingDir, "/x/aboard", "goal"); err != nil {
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("WritePending: %v", err)
 	}
 	for name := range listPending(pendingDir) {

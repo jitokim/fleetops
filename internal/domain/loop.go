@@ -50,9 +50,16 @@ const (
 	OutcomeNeedsHuman Outcome = "needs_human"
 )
 
-// Goal is what a loop pursues, plus its hard ceilings.
+// Goal is what a loop pursues, plus its hard ceilings. DoneWhen/Oracle/
+// Challenger are the rest of the wizard's loop contract (see the tui's "n"
+// key and internal/registry.BindSpec) — DoneWhen and Oracle together are
+// also the oracle's judging rubric (internal/oracle.Judge); Challenger is
+// stored only, not executed (no challenger phase exists yet).
 type Goal struct {
 	Text           string
+	DoneWhen       string // completion condition — what evidence makes it DONE; "" = oracle judges against Text alone
+	Oracle         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
+	Challenger     string // adversarial probe description — STORED ONLY, never executed
 	MaxCycles      int
 	BudgetTokens   int
 	NoImproveLimit int

@@ -723,7 +723,7 @@ func TestEnrichFromRegistry_UnboundLoopUntouched(t *testing.T) {
 
 func TestEnrichFromRegistry_BoundLoop_SetsGoalCapsAndNoImprove(t *testing.T) {
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "fix the flaky test"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "fix the flaky test"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 2); err != nil {
@@ -750,9 +750,35 @@ func TestEnrichFromRegistry_BoundLoop_SetsGoalCapsAndNoImprove(t *testing.T) {
 	}
 }
 
+func TestEnrichFromRegistry_MapsFullContractOntoGoal(t *testing.T) {
+	dir := t.TempDir()
+	spec := registry.BindSpec{
+		Goal:          "fix the flaky test",
+		DoneCondition: "go test ./... passes 5 times in a row",
+		Oracle:        "run go test ./... and check for PASS",
+		Challenger:    "try to break it with -race",
+	}
+	if err := registry.Bind(dir, "sess-1", spec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateRunning}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].Goal.DoneWhen != spec.DoneCondition {
+		t.Errorf("Goal.DoneWhen = %q, want %q", out[0].Goal.DoneWhen, spec.DoneCondition)
+	}
+	if out[0].Goal.Oracle != spec.Oracle {
+		t.Errorf("Goal.Oracle = %q, want %q", out[0].Goal.Oracle, spec.Oracle)
+	}
+	if out[0].Goal.Challenger != spec.Challenger {
+		t.Errorf("Goal.Challenger = %q, want %q", out[0].Goal.Challenger, spec.Challenger)
+	}
+}
+
 func TestEnrichFromRegistry_DoneAtCurrentCycle_PromotesToStateDone(t *testing.T) {
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 5); err != nil {
@@ -769,7 +795,7 @@ func TestEnrichFromRegistry_DoneAtCurrentCycle_PromotesToStateDone(t *testing.T)
 
 func TestEnrichFromRegistry_RejectedAtCurrentCycle_PromotesToStateDrift(t *testing.T) {
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 5); err != nil {
@@ -786,7 +812,7 @@ func TestEnrichFromRegistry_RejectedAtCurrentCycle_PromotesToStateDrift(t *testi
 
 func TestEnrichFromRegistry_ProgressAtCurrentCycle_LeavesStateUnchanged(t *testing.T) {
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeProgress, Reason: "still working"}, 5); err != nil {
@@ -806,7 +832,7 @@ func TestEnrichFromRegistry_ProgressAtCurrentCycle_LeavesStateUnchanged(t *testi
 
 func TestEnrichFromRegistry_VerdictFromEarlierCycle_DoesNotOverrideState(t *testing.T) {
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 3); err != nil {
@@ -830,7 +856,7 @@ func TestEnrichFromRegistry_GateWinsOverDoneVerdict(t *testing.T) {
 	// P2-2: a live gate is more urgent and more current than a verdict
 	// rendered against this exact cycle — must not be clobbered by DONE/DRIFT.
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 5); err != nil {
@@ -850,7 +876,7 @@ func TestEnrichFromRegistry_GateWinsOverDoneVerdict(t *testing.T) {
 
 func TestEnrichFromRegistry_GateWinsOverRejectedVerdict(t *testing.T) {
 	dir := t.TempDir()
-	if err := registry.Bind(dir, "sess-1", "goal"); err != nil {
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 5); err != nil {

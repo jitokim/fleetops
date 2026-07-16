@@ -1,6 +1,7 @@
 package oracle
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/jitokim/missionctl/internal/domain"
@@ -63,6 +64,49 @@ func TestParseVerdict_UnrecognizedOutcomeReturnsError(t *testing.T) {
 	raw := `{"result":"{\"outcome\":\"maybe\",\"reason\":\"unsure\"}"}`
 	if _, err := parseVerdict(raw); err == nil {
 		t.Error("expected an error for an unrecognized outcome value")
+	}
+}
+
+func TestBuildPrompt_NoDoneWhenNoOracle_OmitsExtraLines(t *testing.T) {
+	prompt := buildPrompt("fix the bug", "/x/aboard", "done, tests pass", "", "")
+	if strings.Contains(prompt, "COMPLETION CONDITION") {
+		t.Error("expected no COMPLETION CONDITION line when doneWhen is empty")
+	}
+	if strings.Contains(prompt, "VERIFICATION RUBRIC") {
+		t.Error("expected no VERIFICATION RUBRIC line when oracleRubric is empty")
+	}
+	if !strings.Contains(prompt, "GOAL:\nfix the bug") {
+		t.Error("expected the GOAL line to be present and unmodified")
+	}
+}
+
+func TestBuildPrompt_WithDoneWhen_IncludesCompletionConditionLine(t *testing.T) {
+	prompt := buildPrompt("fix the bug", "/x/aboard", "report", "go test ./... passes", "")
+	if !strings.Contains(prompt, "COMPLETION CONDITION (the goal counts as done ONLY if this is demonstrably met): go test ./... passes") {
+		t.Errorf("prompt missing the completion condition line: %s", prompt)
+	}
+	if strings.Contains(prompt, "VERIFICATION RUBRIC") {
+		t.Error("expected no VERIFICATION RUBRIC line when oracleRubric is empty")
+	}
+}
+
+func TestBuildPrompt_WithOracleRubric_IncludesVerificationRubricLine(t *testing.T) {
+	prompt := buildPrompt("fix the bug", "/x/aboard", "report", "", "go test ./... must pass")
+	if !strings.Contains(prompt, "VERIFICATION RUBRIC (how to judge): go test ./... must pass") {
+		t.Errorf("prompt missing the verification rubric line: %s", prompt)
+	}
+	if strings.Contains(prompt, "COMPLETION CONDITION") {
+		t.Error("expected no COMPLETION CONDITION line when doneWhen is empty")
+	}
+}
+
+func TestBuildPrompt_WithBoth_IncludesBothLines(t *testing.T) {
+	prompt := buildPrompt("fix the bug", "/x/aboard", "report", "tests pass", "check CI output")
+	if !strings.Contains(prompt, "COMPLETION CONDITION (the goal counts as done ONLY if this is demonstrably met): tests pass") {
+		t.Errorf("prompt missing the completion condition line: %s", prompt)
+	}
+	if !strings.Contains(prompt, "VERIFICATION RUBRIC (how to judge): check CI output") {
+		t.Errorf("prompt missing the verification rubric line: %s", prompt)
 	}
 }
 

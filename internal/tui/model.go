@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -127,6 +128,21 @@ const (
 	modeFiltering
 )
 
+// wizardStep is which question of the "n" key's loop-contract wizard is
+// currently active. The wizard collects the full contract the wizard's
+// caller (spawnCmd/buildSpawnPrompt) injects into the new session AND the
+// same contract the oracle later judges against (internal/oracle.Judge) —
+// one document, told to the agent and used to verify it.
+type wizardStep int
+
+const (
+	wizardGoal       wizardStep = iota // required; empty cancels
+	wizardDoneWhen                     // optional; completion condition
+	wizardOracle                       // optional; verification rubric
+	wizardChallenger                   // optional; adversarial probe description, STORED ONLY
+	wizardMaxCycles                    // optional; empty = registry.DefaultMaxCycles
+)
+
 type Model struct {
 	loops      []domain.Loop
 	cursor     int
@@ -141,6 +157,16 @@ type Model struct {
 	input     textinput.Model
 	spawnCwd  string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
 	spawnNote string // captured alongside spawnCwd: non-empty when the selected loop's cwd wasn't verified-real and spawn fell back to os.Getwd() (see the "n" handler and P1-3's CwdVerified gating)
+
+	// spawnStep/spawnGoal/spawnDoneWhen/spawnOracle/spawnChallenger hold the
+	// "n" key wizard's in-progress answers across its 5 steps (see
+	// wizardStep) — spawnCwd/spawnNote above are captured once, before step
+	// 1, and don't change as the wizard advances.
+	spawnStep       wizardStep
+	spawnGoal       string
+	spawnDoneWhen   string
+	spawnOracle     string
+	spawnChallenger string
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
@@ -195,16 +221,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = "cancelled", statusNeutral
 				return m, nil
 			case "enter":
-				goal := strings.TrimSpace(m.input.Value())
-				cwd := m.spawnCwd
-				m.mode = modeNormal
-				m.input.Blur()
-				if goal == "" {
-					m.status, m.statusKind = "cancelled (empty goal)", statusNeutral
-					return m, nil
-				}
-				m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", cwd, m.spawnNote), statusNeutral
-				return m, spawnCmd(cwd, goal)
+				return m.advanceSpawnWizard()
 			default:
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
@@ -345,11 +362,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.spawnCwd = cwd
 			m.spawnNote = spawnNote
+			m.spawnStep = wizardGoal
+			m.spawnGoal = ""
+			m.spawnDoneWhen = ""
+			m.spawnOracle = ""
+			m.spawnChallenger = ""
 			m.mode = modePrompting
-			m.input = textinput.New()
-			m.input.Placeholder = "goal"
-			m.input.Prompt = ""
-			m.input.Focus()
+			m.input = newWizardInput()
 			return m, textinput.Blink
 		case "k":
 			sel, ok := m.selected()
@@ -544,29 +563,166 @@ func approveCmd(l domain.Loop) tea.Cmd {
 	}
 }
 
-// spawnCmd starts a brand new claude loop in cwd with the given goal, via
-// whichever multiplexer backend is available. Controller.Spawn has no way
-// to report back the new session's id (it just starts a process), so on
-// success this writes a pending record (registry.WritePending) that the
-// next scan's registry.BindPending matches to the new session once it
-// starts writing its own JSONL — that's also what picks the loop up into
-// the fleet in the first place; spawnCmd doesn't construct a domain.Loop.
-func spawnCmd(cwd, goal string) tea.Cmd {
+// newWizardInput builds a fresh, focused textinput.Model for the next
+// wizard step — each step starts with an empty input (the label carried in
+// renderNewLoopPrompt/wizardStepLabel is what tells the human which
+// question this is, not a placeholder on the input itself).
+func newWizardInput() textinput.Model {
+	input := textinput.New()
+	input.Prompt = ""
+	input.Focus()
+	return input
+}
+
+// parseMaxCycles parses the wizard's max_iteration step: "" means "use the
+// default", anything else must be a positive integer. Pulled out of
+// advanceSpawnWizard as its own pure function so the parsing/defaulting
+// behavior (incl. the non-numeric/zero/negative rejection) is directly
+// unit-testable without driving key presses through Update.
+func parseMaxCycles(value string) (int, error) {
+	if value == "" {
+		return registry.DefaultMaxCycles, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("max_iteration must be a positive number")
+	}
+	return n, nil
+}
+
+// advanceSpawnWizard handles "enter" while modePrompting: validates/stores
+// the current step's answer and moves to the next step, or — on the final
+// step (wizardMaxCycles) — submits the spawn. Returns to modeNormal only on
+// cancel (empty goal) or successful submission; a re-prompt (invalid max
+// cycles) stays in modePrompting on the same step so the human can retry.
+func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
+	value := strings.TrimSpace(m.input.Value())
+
+	switch m.spawnStep {
+	case wizardGoal:
+		if value == "" {
+			m.mode = modeNormal
+			m.input.Blur()
+			m.status, m.statusKind = "cancelled (empty goal)", statusNeutral
+			return m, nil
+		}
+		m.spawnGoal = value
+		m.spawnStep = wizardDoneWhen
+		m.input = newWizardInput()
+		return m, textinput.Blink
+
+	case wizardDoneWhen:
+		m.spawnDoneWhen = value
+		m.spawnStep = wizardOracle
+		m.input = newWizardInput()
+		return m, textinput.Blink
+
+	case wizardOracle:
+		m.spawnOracle = value
+		m.spawnStep = wizardChallenger
+		m.input = newWizardInput()
+		return m, textinput.Blink
+
+	case wizardChallenger:
+		m.spawnChallenger = value
+		m.spawnStep = wizardMaxCycles
+		m.input = newWizardInput()
+		return m, textinput.Blink
+
+	case wizardMaxCycles:
+		maxCycles, err := parseMaxCycles(value)
+		if err != nil {
+			m.status, m.statusKind = err.Error()+" — try again", statusErr
+			return m, nil // re-prompt: stay in modePrompting on this same step
+		}
+
+		m.mode = modeNormal
+		m.input.Blur()
+		note := m.spawnNote
+		if m.spawnDoneWhen == "" {
+			note += " (no done condition — oracle judges against the goal only)"
+		}
+		m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", m.spawnCwd, note), statusNeutral
+		spec := registry.BindSpec{
+			Goal:          m.spawnGoal,
+			DoneCondition: m.spawnDoneWhen,
+			Oracle:        m.spawnOracle,
+			Challenger:    m.spawnChallenger,
+			MaxCycles:     maxCycles,
+		}
+		return m, spawnCmd(m.spawnCwd, spec)
+
+	default:
+		// unreachable given wizardStep's const range, but never hang the UI
+		// in prompting mode on an impossible state.
+		m.mode = modeNormal
+		m.input.Blur()
+		m.status, m.statusKind = "cancelled (internal wizard error)", statusErr
+		return m, nil
+	}
+}
+
+// spawnCmd starts a brand new claude loop in cwd from the wizard's full
+// contract (spec), via whichever multiplexer backend is available.
+// Controller.Spawn has no way to report back the new session's id (it just
+// starts a process), so on success this writes a pending record
+// (registry.WritePending) that the next scan's registry.BindPending matches
+// to the new session once it starts writing its own JSONL — that's also
+// what picks the loop up into the fleet in the first place; spawnCmd doesn't
+// construct a domain.Loop. The prompt actually sent to the new session is
+// the composed contract block (buildSpawnPrompt), not the bare goal — the
+// registry still stores goal/doneWhen/oracle/challenger as separate fields.
+func spawnCmd(cwd string, spec registry.BindSpec) tea.Cmd {
 	return func() tea.Msg {
 		ctrl, ok := control.Resolve()
 		if !ok {
 			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
 		}
-		if err := ctrl.Spawn(cwd, goal); err != nil {
+		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+		if err := ctrl.Spawn(cwd, prompt); err != nil {
 			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
 		}
-		if err := registry.WritePending(registry.PendingDir(), cwd, goal); err != nil {
+		if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
 			// best-effort: the loop still spawned and will show up
 			// unbound — just won't get ORACLE/N-I tracking.
 			return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s (goal not recorded: %v)", cwd, ctrl.Name(), err)}
 		}
 		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
 	}
+}
+
+// buildSpawnPrompt composes the LOOP CONTRACT block sent as the new
+// session's very first prompt. This is the SAME contract the wizard
+// collected (see the "n" key) that also becomes the oracle's judging rubric
+// (internal/oracle.Judge, via doneWhen/oracleText) — what the agent is told
+// and what it's judged against are one document, not two that can drift
+// apart. maxCycles is always shown resolved (never 0) — the wizard applies
+// registry.DefaultMaxCycles before calling this. challenger's line is
+// omitted entirely when empty: there's no challenger phase yet (see
+// DESIGN.md), so an empty line naming a check that never runs would be
+// actively misleading.
+func buildSpawnPrompt(goal, doneWhen, oracleText, challenger string, maxCycles int) string {
+	done := doneWhen
+	if done == "" {
+		done = "you judge the goal fully achieved"
+	}
+	oracleLine := oracleText
+	if oracleLine == "" {
+		oracleLine = "an independent LLM judge verifies against the complete condition"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "goal: %s\n", goal)
+	fmt.Fprintf(&b, "complete condition: %s\n", done)
+	fmt.Fprintf(&b, "oracle: %s\n", oracleLine)
+	if challenger != "" {
+		fmt.Fprintf(&b, "challenger: %s\n", challenger)
+	}
+	fmt.Fprintf(&b, "max_iteration: %d\n", maxCycles)
+	b.WriteString("\nWork in cycles toward the goal. Report progress concretely each cycle.\n")
+	b.WriteString("Declare DONE only when the complete condition is met — state the evidence.\n")
+	b.WriteString("An independent oracle will verify your claim against this contract.")
+	return b.String()
 }
 
 // killCmd cleanly quits a loop's claude process by re-sending "/exit" +
@@ -657,7 +813,7 @@ func (m *Model) triggerJudgments() tea.Cmd {
 func judgeCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		lastText, _ := claude.LastAssistantTextFull(l.Path) // ok=false just means an empty report is judged as-is
-		verdict, err := judgeFn(l.Goal.Text, l.Cwd, lastText)
+		verdict, err := judgeFn(l.Goal.Text, l.Cwd, lastText, l.Goal.DoneWhen, l.Goal.Oracle)
 		if err != nil {
 			return verdictMsg{sessionID: l.SessionID, err: err}
 		}
@@ -845,7 +1001,7 @@ func (m Model) View() string {
 	b.WriteString("\n")
 	switch {
 	case m.mode == modePrompting:
-		b.WriteString(renderNewLoopPrompt(m.input))
+		b.WriteString(renderNewLoopPrompt(m.spawnStep, m.input))
 		b.WriteString("\n")
 	case m.mode == modeFiltering:
 		b.WriteString(renderFilterPrompt(m.input))
@@ -1148,6 +1304,16 @@ func renderDetail(l domain.Loop, width int) string {
 	if l.Goal.Text != "" {
 		d.WriteString(detailRow("GOAL", stInk.Render(trunc(l.Goal.Text, valueWidth))))
 		d.WriteString(detailRow("ORACLE", renderOracleDetail(l, valueWidth)))
+		// RUBRIC: the wizard's "oracle:" contract field (how completion is
+		// verified) — distinct from the ORACLE row above, which shows the
+		// oracle's rendered VERDICT, not its rubric. Abbreviated from
+		// "ORACLE-RUBRIC" to fit the pane's fixed ~8-col key width
+		// (detailRow) without breaking column alignment. Challenger is
+		// intentionally not shown yet (no challenger phase exists to
+		// surface progress against — see DESIGN.md).
+		if l.Goal.Oracle != "" {
+			d.WriteString(detailRow("RUBRIC", stDim.Render(trunc(l.Goal.Oracle, valueWidth))))
+		}
 	}
 	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(fmt.Sprintf("%s / %s (%d%%)",
 		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100))))))
@@ -1288,10 +1454,30 @@ func renderStatusLine(status string, kind statusKind) string {
 	return style.Render(status)
 }
 
-// renderNewLoopPrompt replaces the status line while the "n" key's free-text
-// goal prompt is active: "NEW LOOP ▸ goal: <input>".
-func renderNewLoopPrompt(input textinput.Model) string {
-	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ goal: ") + input.View()
+// renderNewLoopPrompt replaces the status line while the "n" key's 5-step
+// loop-contract wizard is active: "NEW LOOP ▸ <step label> <input>".
+func renderNewLoopPrompt(step wizardStep, input textinput.Model) string {
+	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ "+wizardStepLabel(step)+" ") + input.View()
+}
+
+// wizardStepLabel is each wizard step's prompt label — max_iteration's
+// carries the default inline ("[12]"), since there's no separate
+// placeholder shown on the input (see newWizardInput).
+func wizardStepLabel(step wizardStep) string {
+	switch step {
+	case wizardGoal:
+		return "goal:"
+	case wizardDoneWhen:
+		return "complete condition:"
+	case wizardOracle:
+		return "oracle:"
+	case wizardChallenger:
+		return "challenger:"
+	case wizardMaxCycles:
+		return fmt.Sprintf("max_iteration [%d]:", registry.DefaultMaxCycles)
+	default:
+		return ""
+	}
 }
 
 // renderFilterPrompt replaces the status line while the "/" key's filter

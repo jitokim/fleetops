@@ -50,6 +50,9 @@ const (
 // Record is one goal-bound loop's persisted state.
 type Record struct {
 	Goal           string
+	DoneCondition  string // completion condition from the wizard's "n" key; "" = oracle judges against Goal alone
+	Oracle         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
+	Challenger     string // adversarial probe description — STORED ONLY, never executed (no challenger phase yet)
 	BoundAt        time.Time
 	MaxCycles      int
 	NoImproveLimit int
@@ -60,11 +63,27 @@ type Record struct {
 // recordFile is Record's on-disk JSON shape.
 type recordFile struct {
 	Goal           string       `json:"goal"`
+	DoneCondition  string       `json:"doneCondition,omitempty"`
+	Oracle         string       `json:"oracle,omitempty"`
+	Challenger     string       `json:"challenger,omitempty"`
 	BoundAt        int64        `json:"boundAt"`
 	MaxCycles      int          `json:"maxCycles"`
 	NoImproveLimit int          `json:"noImproveLimit"`
 	Verdict        *verdictFile `json:"verdict,omitempty"`
 	NoImprove      int          `json:"noImprove"`
+}
+
+// BindSpec is a loop's goal-bound contract, as collected by the wizard (the
+// tui's "n" key): what to do, how completion is verified, and the cycle
+// ceiling. A small value object rather than more positional string params
+// on Bind/WritePending — Goal/DoneCondition/Oracle/Challenger are all plain
+// strings, easy to silently transpose if passed positionally.
+type BindSpec struct {
+	Goal          string
+	DoneCondition string
+	Oracle        string
+	Challenger    string
+	MaxCycles     int // 0 = DefaultMaxCycles
 }
 
 type verdictFile struct {
@@ -74,13 +93,23 @@ type verdictFile struct {
 	TS      int64  `json:"ts"`
 }
 
-// Bind creates a new registry record for sessionID with the default caps —
-// called by BindPending once it matches a pending spawn to its session.
-func Bind(dir, sessionID, goal string) error {
+// Bind creates a new registry record for sessionID from spec — called by
+// BindPending once it matches a pending spawn to its session. spec.MaxCycles
+// <= 0 falls back to DefaultMaxCycles (lets callers pass a zero-value spec
+// field to mean "use the default" rather than requiring every caller to know
+// the constant).
+func Bind(dir, sessionID string, spec BindSpec) error {
+	maxCycles := spec.MaxCycles
+	if maxCycles <= 0 {
+		maxCycles = DefaultMaxCycles
+	}
 	return writeRecordFile(dir, sessionID, recordFile{
-		Goal:           goal,
+		Goal:           spec.Goal,
+		DoneCondition:  spec.DoneCondition,
+		Oracle:         spec.Oracle,
+		Challenger:     spec.Challenger,
 		BoundAt:        time.Now().Unix(),
-		MaxCycles:      DefaultMaxCycles,
+		MaxCycles:      maxCycles,
 		NoImproveLimit: DefaultNoImproveLimit,
 	})
 }
@@ -102,6 +131,9 @@ func Load(dir, sessionID string) (Record, bool) {
 func recordFromFile(rf recordFile) Record {
 	r := Record{
 		Goal:           rf.Goal,
+		DoneCondition:  rf.DoneCondition,
+		Oracle:         rf.Oracle,
+		Challenger:     rf.Challenger,
 		BoundAt:        time.Unix(rf.BoundAt, 0),
 		MaxCycles:      rf.MaxCycles,
 		NoImproveLimit: rf.NoImproveLimit,
@@ -137,6 +169,9 @@ func SaveVerdict(dir, sessionID string, verdict domain.Verdict, atCycle int) err
 	}
 	return writeRecordFile(dir, sessionID, recordFile{
 		Goal:           rec.Goal,
+		DoneCondition:  rec.DoneCondition,
+		Oracle:         rec.Oracle,
+		Challenger:     rec.Challenger,
 		BoundAt:        rec.BoundAt.Unix(),
 		MaxCycles:      rec.MaxCycles,
 		NoImproveLimit: rec.NoImproveLimit,
@@ -163,26 +198,43 @@ func writeRecordFile(dir, sessionID string, rf recordFile) error {
 
 // PendingSpawn is a not-yet-matched spawn request.
 type PendingSpawn struct {
-	Cwd  string
-	Goal string
-	TS   time.Time
+	Cwd           string
+	Goal          string
+	DoneCondition string
+	Oracle        string
+	Challenger    string
+	MaxCycles     int
+	TS            time.Time
 }
 
 type pendingFile struct {
-	Cwd  string `json:"cwd"`
-	Goal string `json:"goal"`
-	TS   int64  `json:"ts"`
+	Cwd           string `json:"cwd"`
+	Goal          string `json:"goal"`
+	DoneCondition string `json:"doneCondition,omitempty"`
+	Oracle        string `json:"oracle,omitempty"`
+	Challenger    string `json:"challenger,omitempty"`
+	MaxCycles     int    `json:"maxCycles,omitempty"`
+	TS            int64  `json:"ts"`
 }
 
-// WritePending records a just-spawned loop's cwd+goal, to be matched to its
-// session id by the next scan (BindPending). Controller.Spawn's caller
-// (tui's spawnCmd) has no way to know the new session id directly — Spawn
-// just starts a process — so binding happens out-of-band here.
-func WritePending(dir, cwd, goal string) error {
+// WritePending records a just-spawned loop's full contract (spec) under
+// cwd, to be matched to its session id by the next scan (BindPending).
+// Controller.Spawn's caller (tui's spawnCmd) has no way to know the new
+// session id directly — Spawn just starts a process — so binding happens
+// out-of-band here.
+func WritePending(dir, cwd string, spec BindSpec) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(pendingFile{Cwd: cwd, Goal: goal, TS: time.Now().Unix()})
+	data, err := json.Marshal(pendingFile{
+		Cwd:           cwd,
+		Goal:          spec.Goal,
+		DoneCondition: spec.DoneCondition,
+		Oracle:        spec.Oracle,
+		Challenger:    spec.Challenger,
+		MaxCycles:     spec.MaxCycles,
+		TS:            time.Now().Unix(),
+	})
 	if err != nil {
 		return err
 	}
@@ -210,7 +262,15 @@ func listPending(dir string) map[string]PendingSpawn {
 		if err := json.Unmarshal(data, &pf); err != nil {
 			continue
 		}
-		out[e.Name()] = PendingSpawn{Cwd: pf.Cwd, Goal: pf.Goal, TS: time.Unix(pf.TS, 0)}
+		out[e.Name()] = PendingSpawn{
+			Cwd:           pf.Cwd,
+			Goal:          pf.Goal,
+			DoneCondition: pf.DoneCondition,
+			Oracle:        pf.Oracle,
+			Challenger:    pf.Challenger,
+			MaxCycles:     pf.MaxCycles,
+			TS:            time.Unix(pf.TS, 0),
+		}
 	}
 	return out
 }
@@ -250,7 +310,14 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 		if best == nil {
 			continue // no match yet; retry next scan (until stale)
 		}
-		if err := Bind(loopsDir, best.SessionID, p.Goal); err != nil {
+		spec := BindSpec{
+			Goal:          p.Goal,
+			DoneCondition: p.DoneCondition,
+			Oracle:        p.Oracle,
+			Challenger:    p.Challenger,
+			MaxCycles:     p.MaxCycles,
+		}
+		if err := Bind(loopsDir, best.SessionID, spec); err != nil {
 			continue // best-effort; retry next scan
 		}
 		os.Remove(filepath.Join(pendingDir, name))

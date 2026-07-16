@@ -299,26 +299,41 @@ func TestUpdate_NKey_SelectedCwdNotVerified_FallsBackWithNote(t *testing.T) {
 	}
 }
 
+// typeAndEnter types s into m's active textinput (rune by rune, as a human
+// would) then presses enter — one wizard-step answer.
+func typeAndEnter(t *testing.T, m Model, s string) (Model, tea.Cmd) {
+	t.Helper()
+	for _, r := range s {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+	return updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+}
+
 func TestUpdate_SpawnNote_SurfacesInStatusOnSubmit(t *testing.T) {
 	// the note set at "n" keypress time must actually reach the user —
 	// View() replaces the status line with the prompt the instant
 	// modePrompting is entered, so the note can only surface later, at the
-	// "enter"-submit status message.
+	// "enter"-submit status message (which fires at the END of the wizard,
+	// step 5).
 	m := New()
 	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", CwdVerified: false, State: domain.StateStalled}}
 	m.cursor = 0
 	m, _ = updateModel(t, m, runeKey('n'))
-	for _, r := range "goal" {
-		m, _ = updateModel(t, m, runeKey(r))
-	}
 
-	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = typeAndEnter(t, m, "goal") // step 1: goal
+	m, _ = typeAndEnter(t, m, "")     // step 2: done-when, skipped
+	m, _ = typeAndEnter(t, m, "")     // step 3: oracle, skipped
+	m, _ = typeAndEnter(t, m, "")     // step 4: challenger, skipped
+	m, cmd := typeAndEnter(t, m, "")  // step 5: max_iteration, default
 
 	if cmd == nil {
 		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
 	}
 	if !strings.Contains(m.status, "wasn't verified") {
 		t.Errorf("status = %q, want it to surface the spawnNote about the unverified cwd", m.status)
+	}
+	if !strings.Contains(m.status, "no done condition") {
+		t.Errorf("status = %q, want it to nudge about the missing done condition", m.status)
 	}
 }
 
@@ -342,6 +357,42 @@ func TestUpdate_Esc_CancelsPromptingMode(t *testing.T) {
 	}
 }
 
+func TestUpdate_EscAtEachWizardStep_Cancels(t *testing.T) {
+	// esc must cancel the wizard regardless of which of the 5 steps is
+	// currently active.
+	steps := []struct {
+		name    string
+		answers []string // typed+entered before esc
+	}{
+		{"step1_goal", nil},
+		{"step2_doneWhen", []string{"goal"}},
+		{"step3_oracle", []string{"goal", ""}},
+		{"step4_challenger", []string{"goal", "", ""}},
+		{"step5_maxCycles", []string{"goal", "", "", ""}},
+	}
+	for _, s := range steps {
+		t.Run(s.name, func(t *testing.T) {
+			m := modelWithOneLoop()
+			m, _ = updateModel(t, m, runeKey('n'))
+			for _, a := range s.answers {
+				m, _ = typeAndEnter(t, m, a)
+			}
+			if m.mode != modePrompting {
+				t.Fatalf("precondition failed: mode = %v, want modePrompting before esc", m.mode)
+			}
+
+			m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+			if m.mode != modeNormal {
+				t.Errorf("mode = %v, want modeNormal after esc", m.mode)
+			}
+			if cmd != nil {
+				t.Error("expected no tea.Cmd from cancelling at any step")
+			}
+		})
+	}
+}
+
 func TestUpdate_Enter_EmptyGoal_CancelsWithoutSpawning(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
@@ -359,6 +410,112 @@ func TestUpdate_Enter_EmptyGoal_CancelsWithoutSpawning(t *testing.T) {
 	}
 }
 
+func TestWizard_FullFlow_AllStepsFilled(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	m, _ = typeAndEnter(t, m, "fix the bug")                // step 1: goal
+	m, _ = typeAndEnter(t, m, "tests pass")                 // step 2: done when
+	m, _ = typeAndEnter(t, m, "run go test ./...")          // step 3: oracle
+	m, _ = typeAndEnter(t, m, "try to break it with -race") // step 4: challenger
+	m, cmd := typeAndEnter(t, m, "20")                      // step 5: max cycles
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after the full wizard", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if m.spawnGoal != "fix the bug" {
+		t.Errorf("spawnGoal = %q, want %q", m.spawnGoal, "fix the bug")
+	}
+	if m.spawnDoneWhen != "tests pass" {
+		t.Errorf("spawnDoneWhen = %q, want %q", m.spawnDoneWhen, "tests pass")
+	}
+	if m.spawnOracle != "run go test ./..." {
+		t.Errorf("spawnOracle = %q, want %q", m.spawnOracle, "run go test ./...")
+	}
+	if m.spawnChallenger != "try to break it with -race" {
+		t.Errorf("spawnChallenger = %q, want %q", m.spawnChallenger, "try to break it with -race")
+	}
+	if strings.Contains(m.status, "no done condition") {
+		t.Errorf("status = %q, want no missing-done-condition nudge (one was supplied)", m.status)
+	}
+}
+
+func TestWizard_DefaultsAtOptionalSteps(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+
+	m, _ = typeAndEnter(t, m, "fix the bug") // step 1: goal (required)
+	m, _ = typeAndEnter(t, m, "")            // step 2: done when — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 3: oracle — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 4: challenger — skipped
+
+	// each of steps 2-4 returns textinput.Blink (a non-nil cmd) to advance
+	// to the next question — only the mode/step, not cmd-nilness, indicates
+	// whether the wizard has actually submitted yet.
+	if m.mode != modePrompting || m.spawnStep != wizardMaxCycles {
+		t.Fatalf("expected to be sitting at step 5 (max cycles), got mode=%v step=%v", m.mode, m.spawnStep)
+	}
+	if m.spawnDoneWhen != "" || m.spawnOracle != "" || m.spawnChallenger != "" {
+		t.Errorf("got doneWhen=%q oracle=%q challenger=%q, want all empty (skipped)", m.spawnDoneWhen, m.spawnOracle, m.spawnChallenger)
+	}
+
+	m, cmd := typeAndEnter(t, m, "") // step 5: max cycles — default
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) once step 5 is answered")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after the wizard completes", m.mode)
+	}
+	if !strings.Contains(m.status, "no done condition") {
+		t.Errorf("status = %q, want the missing-done-condition nudge", m.status)
+	}
+}
+
+func TestUpdate_NonNumericMaxCycles_RePromptsSameStep(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+
+	m, cmd := typeAndEnter(t, m, "not-a-number")
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — invalid max_iteration must not submit")
+	}
+	if m.mode != modePrompting || m.spawnStep != wizardMaxCycles {
+		t.Errorf("got mode=%v step=%v, want to stay in modePrompting at wizardMaxCycles (re-prompt)", m.mode, m.spawnStep)
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
+	}
+	if !strings.Contains(m.status, "positive number") {
+		t.Errorf("status = %q, want it to explain the max_iteration requirement", m.status)
+	}
+}
+
+func TestUpdate_ZeroMaxCycles_RePromptsSameStep(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+
+	m, cmd := typeAndEnter(t, m, "0")
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — zero max_iteration must not submit")
+	}
+	if m.spawnStep != wizardMaxCycles {
+		t.Errorf("spawnStep = %v, want to stay at wizardMaxCycles", m.spawnStep)
+	}
+}
+
 func TestUpdate_TypeThenEnter_SubmitsSpawn(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
@@ -370,13 +527,27 @@ func TestUpdate_TypeThenEnter_SubmitsSpawn(t *testing.T) {
 		t.Fatalf("input value = %q, want %q (typing must reach the textinput while prompting)", m.input.Value(), "fix the bug")
 	}
 
-	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	// step 1 (goal) submitted — advances to step 2 (mode stays modePrompting;
+	// the returned cmd is textinput.Blink for the next question, not a spawn).
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.mode != modePrompting {
+		t.Fatalf("mode = %v, want modePrompting (4 more steps to go)", m.mode)
+	}
+	if m.spawnStep != wizardDoneWhen {
+		t.Fatalf("spawnStep = %v, want wizardDoneWhen", m.spawnStep)
+	}
+
+	// steps 2-5 all skipped/defaulted — the LAST enter must submit.
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, cmd := typeAndEnter(t, m, "")
 
 	if m.mode != modeNormal {
 		t.Errorf("mode = %v, want modeNormal after submit", m.mode)
 	}
 	if cmd == nil {
-		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) on submit with a non-empty goal")
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) once the wizard completes")
 	}
 	if !strings.Contains(m.status, "spawning") {
 		t.Errorf("status = %q, want it to mention spawning", m.status)
@@ -652,11 +823,11 @@ func TestJudgeCmd_SavesVerdictAndReportsResult(t *testing.T) {
 	origDirFn, origJudgeFn := registryDirFn, judgeFn
 	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
 	registryDirFn = func() string { return dir }
-	judgeFn = func(goal, cwd, lastText string) (domain.Verdict, error) {
+	judgeFn = func(goal, cwd, lastText, doneWhen, oracleRubric string) (domain.Verdict, error) {
 		return domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no test output shown"}, nil
 	}
 
-	if err := registry.Bind(dir, "s1", "fix the bug"); err != nil {
+	if err := registry.Bind(dir, "s1", registry.BindSpec{Goal: "fix the bug"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
@@ -691,11 +862,11 @@ func TestJudgeCmd_JudgeErrorReportedWithoutSaving(t *testing.T) {
 	origDirFn, origJudgeFn := registryDirFn, judgeFn
 	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
 	registryDirFn = func() string { return dir }
-	judgeFn = func(goal, cwd, lastText string) (domain.Verdict, error) {
+	judgeFn = func(goal, cwd, lastText, doneWhen, oracleRubric string) (domain.Verdict, error) {
 		return domain.Verdict{}, errTestJudgeFailed
 	}
 
-	if err := registry.Bind(dir, "s1", "goal"); err != nil {
+	if err := registry.Bind(dir, "s1", registry.BindSpec{Goal: "goal"}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
@@ -711,6 +882,34 @@ func TestJudgeCmd_JudgeErrorReportedWithoutSaving(t *testing.T) {
 	}
 	if rec, _ := registry.Load(dir, "s1"); rec.Verdict != nil {
 		t.Error("expected no verdict saved when judging fails")
+	}
+}
+
+func TestJudgeCmd_PassesDoneWhenAndOracleFromGoal(t *testing.T) {
+	dir := t.TempDir()
+	origDirFn, origJudgeFn := registryDirFn, judgeFn
+	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
+	registryDirFn = func() string { return dir }
+
+	var gotDoneWhen, gotOracle string
+	judgeFn = func(goal, cwd, lastText, doneWhen, oracleRubric string) (domain.Verdict, error) {
+		gotDoneWhen, gotOracle = doneWhen, oracleRubric
+		return domain.Verdict{Outcome: domain.OutcomeProgress}, nil
+	}
+
+	spec := registry.BindSpec{Goal: "fix the bug", DoneCondition: "tests pass", Oracle: "run go test ./..."}
+	if err := registry.Bind(dir, "s1", spec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "s1", Cycle: 1, Goal: domain.Goal{Text: "fix the bug", DoneWhen: "tests pass", Oracle: "run go test ./..."}}
+	judgeCmd(l)()
+
+	if gotDoneWhen != "tests pass" {
+		t.Errorf("doneWhen passed to judgeFn = %q, want %q", gotDoneWhen, "tests pass")
+	}
+	if gotOracle != "run go test ./..." {
+		t.Errorf("oracleRubric passed to judgeFn = %q, want %q", gotOracle, "run go test ./...")
 	}
 }
 
@@ -916,5 +1115,108 @@ func TestUpdate_ActionsOperateOnFilteredSelection(t *testing.T) {
 	sel, ok := m.selected()
 	if !ok || sel.SessionID != "sess-2" {
 		t.Errorf("selected() = %+v, ok=%v, want sess-2 (the filtered match at index 0)", sel, ok)
+	}
+}
+
+// ── loop-creation wizard: parseMaxCycles ────────────────────────────
+
+func TestParseMaxCycles_EmptyReturnsDefault(t *testing.T) {
+	n, err := parseMaxCycles("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != registry.DefaultMaxCycles {
+		t.Errorf("n = %d, want %d", n, registry.DefaultMaxCycles)
+	}
+}
+
+func TestParseMaxCycles_ValidPositiveNumber(t *testing.T) {
+	n, err := parseMaxCycles("20")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 20 {
+		t.Errorf("n = %d, want 20", n)
+	}
+}
+
+func TestParseMaxCycles_NonNumeric_Errors(t *testing.T) {
+	if _, err := parseMaxCycles("abc"); err == nil {
+		t.Error("expected an error for non-numeric input")
+	}
+}
+
+func TestParseMaxCycles_Zero_Errors(t *testing.T) {
+	if _, err := parseMaxCycles("0"); err == nil {
+		t.Error("expected an error for zero (not a positive number)")
+	}
+}
+
+func TestParseMaxCycles_Negative_Errors(t *testing.T) {
+	if _, err := parseMaxCycles("-5"); err == nil {
+		t.Error("expected an error for a negative number")
+	}
+}
+
+// ── loop-creation wizard: buildSpawnPrompt (the contract block) ─────
+
+func TestBuildSpawnPrompt_AllFieldsProvided(t *testing.T) {
+	got := buildSpawnPrompt("fix the bug", "tests pass", "run go test ./...", "try to break it with -race", 20)
+	want := "goal: fix the bug\n" +
+		"complete condition: tests pass\n" +
+		"oracle: run go test ./...\n" +
+		"challenger: try to break it with -race\n" +
+		"max_iteration: 20\n" +
+		"\n" +
+		"Work in cycles toward the goal. Report progress concretely each cycle.\n" +
+		"Declare DONE only when the complete condition is met — state the evidence.\n" +
+		"An independent oracle will verify your claim against this contract."
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestBuildSpawnPrompt_OptionalFieldsEmpty_UsesDefaultsAndOmitsChallenger(t *testing.T) {
+	got := buildSpawnPrompt("fix the bug", "", "", "", 12)
+	want := "goal: fix the bug\n" +
+		"complete condition: you judge the goal fully achieved\n" +
+		"oracle: an independent LLM judge verifies against the complete condition\n" +
+		"max_iteration: 12\n" +
+		"\n" +
+		"Work in cycles toward the goal. Report progress concretely each cycle.\n" +
+		"Declare DONE only when the complete condition is met — state the evidence.\n" +
+		"An independent oracle will verify your claim against this contract."
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "challenger:") {
+		t.Error("expected the challenger line to be omitted entirely when empty")
+	}
+}
+
+func TestBuildSpawnPrompt_ChallengerOnly_LineIncluded(t *testing.T) {
+	got := buildSpawnPrompt("goal", "", "", "adversarial probe", 12)
+	if !strings.Contains(got, "challenger: adversarial probe\n") {
+		t.Errorf("got:\n%s\nwant a challenger line present when non-empty", got)
+	}
+}
+
+// ── loop-creation wizard: step labels ────────────────────────────────
+
+func TestWizardStepLabel_AllSteps(t *testing.T) {
+	cases := []struct {
+		step wizardStep
+		want string
+	}{
+		{wizardGoal, "goal:"},
+		{wizardDoneWhen, "complete condition:"},
+		{wizardOracle, "oracle:"},
+		{wizardChallenger, "challenger:"},
+		{wizardMaxCycles, "max_iteration [12]:"},
+	}
+	for _, c := range cases {
+		if got := wizardStepLabel(c.step); got != c.want {
+			t.Errorf("wizardStepLabel(%v) = %q, want %q", c.step, got, c.want)
+		}
 	}
 }
