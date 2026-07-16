@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/registry"
+	runewidth "github.com/mattn/go-runewidth"
 )
 
 // runeKey builds the tea.KeyMsg bubbletea sends for a single printable
@@ -2071,5 +2072,22 @@ func TestWorktreeNameFromGoal_EmptyGoal_FallsBackToLoop(t *testing.T) {
 func TestWorktreeNameFromGoal_AllPunctuation_FallsBackToLoop(t *testing.T) {
 	if got := worktreeNameFromGoal("!!!???"); got != "mctl-loop" {
 		t.Errorf("got %q, want %q", got, "mctl-loop")
+	}
+}
+
+// Regression: CJK text is double-width in the terminal — rune-count
+// truncation overflowed the column cell and sheared the whole row
+// (captain-reported with Korean DOING snippets).
+func TestTrunc_CJKDisplayWidth(t *testing.T) {
+	got := trunc("캡틴 재설치 완료 보고합니다", 10)
+	if w := runewidth.StringWidth(got); w > 10 {
+		t.Errorf("trunc CJK display width = %d, want <= 10 (%q)", w, got)
+	}
+	if got := trunc("short", 10); got != "short" {
+		t.Errorf("ascii under width must pass through, got %q", got)
+	}
+	mixed := trunc("fix한글mix되는지123456", 12)
+	if w := runewidth.StringWidth(mixed); w > 12 {
+		t.Errorf("mixed trunc width = %d, want <= 12 (%q)", w, mixed)
 	}
 }

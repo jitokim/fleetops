@@ -21,6 +21,7 @@ import (
 	"github.com/jitokim/missionctl/internal/gate"
 	"github.com/jitokim/missionctl/internal/oracle"
 	"github.com/jitokim/missionctl/internal/registry"
+	runewidth "github.com/mattn/go-runewidth"
 )
 
 // judgeFn/registryDirFn are oracle.Judge/registry.LoopsDir by default,
@@ -2101,20 +2102,20 @@ func rel(d time.Duration) string {
 	}
 }
 
-// trunc truncates s to at most n runes — NOT bytes: multi-byte glyphs (█/░
-// in the budget bar, ⚠/✗/◆ elsewhere) are 3 bytes each in UTF-8, and a
-// byte-index slice can land mid-character, corrupting the output (seen as
-// stray "�" replacement glyphs). Truncating replaces the last kept rune
-// with an ellipsis.
+// trunc truncates s to at most n terminal COLUMNS — not bytes (multi-byte
+// glyphs like █/⚠ would corrupt into "�") and not runes either: CJK text
+// renders double-width, so a rune count under-measures by up to 2× and the
+// overflowing cell wraps, shearing every column after it (captain-reported
+// with Korean DOING/TAIL snippets). go-runewidth measures what the terminal
+// actually draws; the ellipsis is budgeted inside n.
 func trunc(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	r := []rune(s)
-	if len(r) <= n {
+	if runewidth.StringWidth(s) <= n {
 		return s
 	}
-	return string(r[:n-1]) + "…"
+	return runewidth.Truncate(s, n, "…")
 }
 
 func maxInt(a, b int) int {

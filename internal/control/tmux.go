@@ -80,6 +80,85 @@ func tmuxListPanes() (string, bool) {
 	return string(out), true
 }
 
+// LocateByTTY finds the pane whose controlling tty matches tty (as recorded
+// by the session registry, e.g. "ttys012") AND whose foreground command is
+// literally "claude" — the ADR Phase 2 tty-dispatch path (see
+// ResolveActuationTarget). tty is session-unique (unlike cwd), so this
+// deliberately does NOT apply an ambiguity refusal the way
+// selectClaudeTmuxPane does for the cwd path: at most one live pane can
+// have a given controlling tty at any moment.
+func (tmuxController) LocateByTTY(tty string) (Target, bool) {
+	out, ok := tmuxListPanesTTY()
+	if !ok {
+		return Target{}, false
+	}
+	return selectTTYPane(parseTmuxTTYPaneLines(out), tty)
+}
+
+// selectTTYPane is LocateByTTY's pure selection core, pulled out so the
+// tty-matching logic is directly unit-testable against a fixture without a
+// real tmux binary (same pattern as selectClaudeTmuxPane for the cwd path).
+// Matches the pane whose tty normalizes equal to tty AND whose foreground
+// command is literally "claude".
+func selectTTYPane(lines []tmuxTTYPaneLine, tty string) (Target, bool) {
+	want := normalizeTTY(tty)
+	for _, l := range lines {
+		if l.Command == "claude" && normalizeTTY(l.TTY) == want {
+			return Target{Backend: "tmux", ID: l.ID}, true
+		}
+	}
+	return Target{}, false
+}
+
+// tmuxListPanesTTY is LocateByTTY's own list-panes probe — a separate
+// -F format from tmuxListPanes (which is cwd-oriented and doesn't need
+// pane_tty at all).
+func tmuxListPanesTTY() (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}\t#{pane_current_command}").Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// tmuxTTYPaneLine is one parsed row of tmuxListPanesTTY's output.
+type tmuxTTYPaneLine struct {
+	TTY     string
+	ID      string
+	Command string
+}
+
+// parseTmuxTTYPaneLines parses `tmux list-panes -a -F
+// '#{pane_tty}\t#{pane_id}\t#{pane_current_command}'` output, one pane per
+// line. A line that doesn't split into exactly 3 tab-separated fields is
+// skipped, not an error — same tolerance as parseTmuxPaneLines.
+func parseTmuxTTYPaneLines(out string) []tmuxTTYPaneLine {
+	var lines []tmuxTTYPaneLine
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		lines = append(lines, tmuxTTYPaneLine{TTY: parts[0], ID: parts[1], Command: parts[2]})
+	}
+	return lines
+}
+
+// normalizeTTY strips a "/dev/" prefix so a session registry entry's tty
+// ("ttys012", from internal/sessions' `ps -o tty=`) and tmux's own
+// "#{pane_tty}" (which reports the full device path, "/dev/ttys012")
+// compare equal. Applied symmetrically to both operands in LocateByTTY, so
+// either form on either side matches.
+func normalizeTTY(tty string) string {
+	return strings.TrimPrefix(tty, "/dev/")
+}
+
 func (tmuxController) Resume(t Target, prompt string) error {
 	for _, argv := range tmuxResumeCmds(t.ID, prompt) {
 		if err := runWithTimeout(argv); err != nil {
