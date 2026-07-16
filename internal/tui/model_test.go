@@ -1232,6 +1232,141 @@ func TestSendPromptCmd_TierTwoRedriveFails_ReportsError(t *testing.T) {
 	}
 }
 
+// ── P1-2: in-flight actuation guard (m.actuating) ────────────────────
+//
+// A double-press of r/i on the SAME session must not fire two concurrent
+// sends — most acutely, two concurrent Tier-2 `claude --resume` turns, each
+// holding a 10-minute window.
+
+func TestUpdate_RKey_SecondPressWhileActuating_RefusesWithoutSecondRedrive(t *testing.T) {
+	redriveCalls := 0
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, false, false // Tier 1 never resolves — every dispatch would reach Tier 2
+		},
+		func(sessionID, prompt string) error {
+			redriveCalls++
+			return nil
+		},
+	)
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+
+	// first press: dispatches resumeCmd and marks sess-1 as actuating.
+	m, cmd1 := updateModel(t, m, runeKey('r'))
+	if cmd1 == nil {
+		t.Fatal("expected a non-nil tea.Cmd on the first press")
+	}
+	if !m.actuating["sess-1"] {
+		t.Fatal("expected sess-1 to be marked actuating after the first dispatch")
+	}
+
+	// second press, BEFORE the first cmd's result has arrived: must refuse
+	// without dispatching a second send.
+	m, cmd2 := updateModel(t, m, runeKey('r'))
+	if cmd2 != nil {
+		t.Error("expected no tea.Cmd on the second press while still actuating")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want it to mention the in-flight re-drive", m.status)
+	}
+
+	// now actually run the first (and only) dispatched cmd — redriveFn must
+	// have been invoked exactly once, never twice.
+	cmd1()
+	if redriveCalls != 1 {
+		t.Errorf("redriveFn called %d times, want exactly 1", redriveCalls)
+	}
+}
+
+func TestUpdate_IKey_SecondPressWhileActuating_Refuses(t *testing.T) {
+	m := modelWithOneLoop()
+	if m.actuating == nil {
+		m.actuating = map[string]bool{}
+	}
+	m.actuating["sess-1"] = true // simulate an in-flight send from an earlier r/i dispatch
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — sess-1 is already actuating")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (must not enter inject mode while actuating)", m.mode)
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want it to mention the in-flight re-drive", m.status)
+	}
+}
+
+func TestUpdate_InjectSubmit_SecondSubmitWhileActuating_Refuses(t *testing.T) {
+	// exercises the belt-and-suspenders re-check at the actual inject
+	// dispatch site (modeInjecting's enter handler), independent of the
+	// "i" keypress's own early guard.
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting", m.mode)
+	}
+	m.actuating = map[string]bool{"sess-1": true} // force in-flight, as if another dispatch raced in
+	for _, r := range "do the thing" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd (injectCmd) — sess-1 is already actuating")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want it to mention the in-flight re-drive", m.status)
+	}
+}
+
+func TestUpdate_ResumeResultMsg_ClearsActuatingGuard(t *testing.T) {
+	m := modelWithOneLoop()
+	m.actuating = map[string]bool{"sess-1": true}
+
+	m, _ = updateModel(t, m, resumeResultMsg{sessionID: "sess-1", ok: true, text: "resumed aboard"})
+
+	if m.actuating["sess-1"] {
+		t.Error("expected sess-1 to be cleared from m.actuating once its result arrives")
+	}
+}
+
+func TestUpdate_ResumeResultMsg_OnlyClearsMatchingSessionID(t *testing.T) {
+	m := modelWithOneLoop()
+	m.actuating = map[string]bool{"sess-1": true, "sess-2": true}
+
+	m, _ = updateModel(t, m, resumeResultMsg{sessionID: "sess-1", ok: true, text: "resumed aboard"})
+
+	if m.actuating["sess-1"] {
+		t.Error("expected sess-1 to be cleared")
+	}
+	if !m.actuating["sess-2"] {
+		t.Error("expected sess-2 to be UNAFFECTED — only the matching sessionID clears")
+	}
+}
+
+func TestUpdate_RKey_AfterActuatingCleared_CanDispatchAgain(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+	m.actuating = map[string]bool{"sess-1": true}
+
+	// clear it, as the real resumeResultMsg handler would once the first
+	// send completes.
+	m, _ = updateModel(t, m, resumeResultMsg{sessionID: "sess-1", ok: true, text: "resumed aboard"})
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd — the guard must not stick around after the result clears it")
+	}
+	if strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want a fresh resume attempt, not the in-flight refusal", m.status)
+	}
+}
+
 // fakeController is a minimal control.Controller test double — only Resume
 // is exercised by sendPromptCmd; the rest are unused stubs.
 type fakeController struct {
@@ -1365,6 +1500,34 @@ func TestRenderInjectPrompt_IdleTarget_NoMidTurnWarning(t *testing.T) {
 
 	if strings.Contains(out, "lands mid-turn") {
 		t.Errorf("rendered inject prompt = %q, want NO mid-turn warning for an idle target", out)
+	}
+}
+
+// ── P2-1: RESTART callout reflects Tier 2 redrive ────────────────────
+
+func TestRenderResumeCallout_StallGone_MentionsTier2Redrive(t *testing.T) {
+	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallGone}
+
+	out := renderResumeCallout(l, 80)
+
+	if !strings.Contains(out, "RESTART") {
+		t.Errorf("callout = %q, want the RESTART label", out)
+	}
+	if !strings.Contains(out, "re-drive headlessly (tier 2)") {
+		t.Errorf("callout = %q, want it to mention the tier-2 redrive path (r still works)", out)
+	}
+}
+
+func TestRenderResumeCallout_OtherStall_KeepsResumeWording(t *testing.T) {
+	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
+
+	out := renderResumeCallout(l, 80)
+
+	if !strings.Contains(out, "RESUME") {
+		t.Errorf("callout = %q, want the RESUME label for a non-gone stall", out)
+	}
+	if !strings.Contains(out, "re-send prompt") {
+		t.Errorf("callout = %q, want the ordinary re-send wording", out)
 	}
 }
 

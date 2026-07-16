@@ -48,10 +48,14 @@ type loopsMsg []domain.Loop
 type tickMsg time.Time
 
 // resumeResultMsg reports the outcome of a resume (r key) attempt, computed
-// off the event loop by resumeCmd so the TUI never blocks on exec.
+// off the event loop by resumeCmd so the TUI never blocks on exec. Also
+// reused by injectCmd (see sendPromptCmd's doc) — sessionID is what lets the
+// Update handler clear the right entry in m.actuating regardless of which
+// of the two dispatched it.
 type resumeResultMsg struct {
-	ok   bool
-	text string
+	sessionID string
+	ok        bool
+	text      string
 }
 
 // attachResultMsg reports the outcome of an attach (enter key) attempt,
@@ -219,6 +223,16 @@ type Model struct {
 	pendingKillAt      time.Time
 
 	judging map[string]bool // sessionID -> a judgeCmd is in flight for it (in-flight guard, see triggerJudgments)
+
+	// actuating guards against a double-press of r/i firing two concurrent
+	// sends (resumeCmd/injectCmd, both routed through sendPromptCmd) onto
+	// the SAME session — set at the r/i dispatch sites (Update), cleared in
+	// the resumeResultMsg handler once the send completes. Most acutely
+	// protects Tier 2 (control.Redrive): two concurrent `claude --resume`
+	// headless turns against the same session, each holding a 10-minute
+	// window, is unverified same-session-concurrency territory per the ADR
+	// — same in-flight-guard shape as m.judging.
+	actuating map[string]bool
 }
 
 func New() Model {
@@ -347,11 +361,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.mode = modeNormal
 				m.input.Blur()
+				// Belt-and-suspenders re-check immediately before dispatch
+				// (mirrors sendPromptCmd's own re-checks of guards the
+				// keypress-time gate already covers) — in the current call
+				// graph this can't actually flip true→false during typing
+				// (modeInjecting captures every key, so nothing else can
+				// call setActuating for this session while it's open), but
+				// checking again right at the dispatch site is the same
+				// discipline as every other actuation guard in this file.
+				if m.actuating[m.injectTarget.SessionID] {
+					m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", m.injectTarget.Project), statusNeutral
+					return m, nil
+				}
 				if m.injectTarget.Stall == domain.StallGone {
 					m.status, m.statusKind = fmt.Sprintf("re-driving %s headlessly (tier 2)... this can take a few minutes", m.injectTarget.Project), statusNeutral
 				} else {
 					m.status, m.statusKind = fmt.Sprintf("injecting into %s...", m.injectTarget.Project), statusNeutral
 				}
+				m.setActuating(m.injectTarget.SessionID)
 				return m, injectCmd(m.injectTarget, prompt)
 			default:
 				var cmd tea.Cmd
@@ -400,12 +427,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = "select a stalled or drifted loop to resume", statusNeutral
 				return m, nil
 			}
+			// In-flight guard (mirrors m.judging): a double-press of r/i on
+			// the SAME session must not fire two concurrent sends — most
+			// acutely, two concurrent Tier-2 `claude --resume` turns, each
+			// holding a 10-minute window (unverified same-session
+			// concurrency per the ADR).
+			if m.actuating[sel.SessionID] {
+				m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", sel.Project), statusNeutral
+				return m, nil
+			}
 			if sel.Stall == domain.StallGone {
 				// Goes straight to Tier 2 (headless redrive, see
 				// sendPromptCmd) — there's no terminal surface to resolve
 				// at all, so the ambiguity guard (which only protects the
 				// cwd-based surface lookup) doesn't apply here either.
 				m.status, m.statusKind = fmt.Sprintf("re-driving %s headlessly (tier 2)... this can take a few minutes", sel.Project), statusNeutral
+				m.setActuating(sel.SessionID)
 				return m, resumeCmd(sel)
 			}
 			if !m.ttyPathPlausible(sel) {
@@ -415,6 +452,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.status, m.statusKind = fmt.Sprintf("resuming %s...", sel.Project), statusNeutral
+			m.setActuating(sel.SessionID)
 			return m, resumeCmd(sel)
 		case "a":
 			sel, ok := m.selected()
@@ -448,6 +486,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// now a perfectly valid inject target, just routed headlessly.
 			if sel.State == domain.StateFailed {
 				m.status, m.statusKind = "governor stopped this loop — k kill or start a new contract, don't inject", statusErr
+				return m, nil
+			}
+			// In-flight guard, same reasoning as the r-key's: fail fast
+			// before the human types a whole prompt, rather than only
+			// discovering the refusal after they press enter.
+			if m.actuating[sel.SessionID] {
+				m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", sel.Project), statusNeutral
 				return m, nil
 			}
 			if sel.Stall != domain.StallGone && !m.ttyPathPlausible(sel) {
@@ -552,6 +597,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, interruptCmd(sel)
 		}
 	case resumeResultMsg:
+		if m.actuating != nil {
+			delete(m.actuating, msg.sessionID)
+		}
 		m.status = msg.text
 		if msg.ok {
 			m.statusKind = statusOK
@@ -651,16 +699,16 @@ func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
 		// This is policy, not capability — unlike StallGone, it applies
 		// regardless of which tier could technically reach the session.
 		if l.State == domain.StateFailed {
-			return resumeResultMsg{false, "governor stopped this loop (no improvement) — k kill or start a new contract"}
+			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "governor stopped this loop (no improvement) — k kill or start a new contract"}
 		}
 
 		if l.Stall != domain.StallGone {
 			ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 			if backendAvailable && found {
 				if err := ctrl.Resume(target, prompt); err != nil {
-					return resumeResultMsg{false, fmt.Sprintf("resume %s failed: %v", l.Project, err)}
+					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
 				}
-				return resumeResultMsg{true, fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, ctrl.Name(), note)}
+				return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, ctrl.Name(), note)}
 			}
 		}
 
@@ -668,9 +716,9 @@ func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
 		if err := redriveFn(l.SessionID, prompt); err != nil {
-			return resumeResultMsg{false, fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
+			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
-		return resumeResultMsg{true, fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)}
+		return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)}
 	}
 }
 
@@ -1214,6 +1262,16 @@ func (m Model) sameProjectDirCount(projectDir string) int {
 func (m Model) ttyPathPlausible(sel domain.Loop) bool {
 	entry, err := sessions.ReadSession(sessionsDirFn(), sel.SessionID)
 	return err == nil && entry.TTY != ""
+}
+
+// setActuating marks sessionID as having an in-flight resume/inject send —
+// see Model.actuating's doc. Lazily inits the map, same pattern as
+// triggerJudgments' m.judging.
+func (m *Model) setActuating(sessionID string) {
+	if m.actuating == nil {
+		m.actuating = make(map[string]bool)
+	}
+	m.actuating[sessionID] = true
 }
 
 // visibleLoops is what the table/cursor/actions operate on: all loops, or
@@ -1886,8 +1944,12 @@ func wrapTailText(s string, width, maxLines int) []string {
 // stall: "RESUME ▸ <why>   r re-send prompt   manual: claude --resume <id>".
 // A 429 gets the red accent instead of amber (the turn didn't complete, it
 // was rejected — a sharper signal than a generic stall). A gone process
-// gets red too, but with "restart" wording instead of "resume" — there's no
-// claude process left to re-send a prompt into (see resumeCmd's guard).
+// gets red too, but with "restart" wording instead of "resume" — since the
+// ADR Phase 2 Tier 2 redrive landed, "r" still works here: sendPromptCmd
+// skips the (correctly absent) terminal surface and re-drives the SAME
+// session headlessly via `claude --resume <id> -p <prompt>`, which is
+// exactly the restart the manual hint spells out, just without the
+// copy-paste.
 func renderResumeCallout(l domain.Loop, width int) string {
 	gone := l.Stall == domain.StallGone
 	box, accent, chip := stCalloutAmber, cAmber, stKeyChipAmber
@@ -1905,7 +1967,8 @@ func renderResumeCallout(l domain.Loop, width int) string {
 		"   " + stDim.Render("manual: "+manualResumeHint(l.SessionID))
 	if gone {
 		label = "RESTART ▸"
-		action = stDim.Render("restart: " + manualResumeHint(l.SessionID))
+		action = chip.Render("r") + stDim.Render(" re-drive headlessly (tier 2)") +
+			"   " + stDim.Render("manual: "+manualResumeHint(l.SessionID))
 	}
 
 	line := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(label) +

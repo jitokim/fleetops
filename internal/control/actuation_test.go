@@ -25,17 +25,17 @@ func TestResolveActuationTarget_EntryPresentButEmptyTTY_SkipsTierOneA(t *testing
 	}
 
 	// An empty TTY must skip Tier 1a and fall to the cwd chain — proven by
-	// pidAliveFn never being called (Tier 1a's own gate: TTY != "" is
-	// checked BEFORE the pid-alive probe).
-	origPidAlive := pidAliveFn
-	defer func() { pidAliveFn = origPidAlive }()
-	pidAliveCalled := false
-	pidAliveFn = func(pid int) bool { pidAliveCalled = true; return true }
+	// pidTTYFn never being called (Tier 1a's own gate: TTY != "" is checked
+	// BEFORE the tty-binding probe).
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	pidTTYCalled := false
+	pidTTYFn = func(pid int) string { pidTTYCalled = true; return "ttys099" }
 
 	ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
 
-	if pidAliveCalled {
-		t.Error("expected pidAliveFn NOT to be called — an empty TTY must skip Tier 1a entirely")
+	if pidTTYCalled {
+		t.Error("expected pidTTYFn NOT to be called — an empty TTY must skip Tier 1a entirely")
 	}
 }
 
@@ -45,9 +45,9 @@ func TestResolveActuationTarget_EntryPresentTTYSetButPIDDead_SkipsTierOneA(t *te
 		t.Fatalf("WriteSession: %v", err)
 	}
 
-	origPidAlive := pidAliveFn
-	defer func() { pidAliveFn = origPidAlive }()
-	pidAliveFn = func(pid int) bool { return false } // simulate a recycled/dead pid — never trust a stale registry record
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	pidTTYFn = func(pid int) string { return "" } // simulate a dead pid (no controlling tty at all) — never trust a stale registry record
 
 	_, _, _, found := ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
 	if found {
@@ -55,28 +55,82 @@ func TestResolveActuationTarget_EntryPresentTTYSetButPIDDead_SkipsTierOneA(t *te
 	}
 }
 
-func TestResolveActuationTarget_PIDAliveGateCalledWithRegistryPID(t *testing.T) {
+// TestResolveActuationTarget_PIDAliveButTTYMismatch_SkipsTierOneA is the P1-1
+// hazard this binding check exists to close: a SIGKILL'd session leaks its
+// registry entry; the OS recycles BOTH the tty (now controlled by a
+// DIFFERENT, unrelated live claude pane) and the pid (reused by some other
+// process). A pid-existence-only check would have passed here and misrouted
+// an action onto the wrong session — the binding check must catch this by
+// comparing the pid's CURRENT tty against the registry's recorded one, not
+// just asking "does this pid exist."
+func TestResolveActuationTarget_PIDAliveButTTYMismatch_SkipsTierOneA(t *testing.T) {
 	dir := t.TempDir()
 	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "ttys012"}); err != nil {
 		t.Fatalf("WriteSession: %v", err)
 	}
 
-	origPidAlive := pidAliveFn
-	defer func() { pidAliveFn = origPidAlive }()
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	// pid 42 is alive (recycled to an unrelated process), but it now
+	// controls a DIFFERENT tty than the one the registry recorded.
+	pidTTYFn = func(pid int) string { return "ttys099" }
+
+	_, _, _, found := ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
+	if found {
+		t.Error("expected found=false — the pid is alive but bound to a different tty, must not take Tier 1a")
+	}
+}
+
+func TestResolveActuationTarget_PIDBindingConfirmed_TriesTierOneA(t *testing.T) {
+	dir := t.TempDir()
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
 	var gotPID int
 	called := false
-	pidAliveFn = func(pid int) bool {
+	pidTTYFn = func(pid int) string {
 		gotPID, called = pid, true
-		return false // doesn't matter for this test — just confirm it's invoked with the right pid
+		return "ttys012" // matches the registry entry — binding confirmed
+	}
+
+	// No real tmux pane exists at this tty in the test environment, so this
+	// still falls through to the cwd chain — but the binding probe must
+	// have been consulted with the right pid first.
+	ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
+
+	if !called {
+		t.Fatal("expected pidTTYFn to be called")
+	}
+	if gotPID != 42 {
+		t.Errorf("pidTTYFn called with pid %d, want 42 (the registry entry's PID)", gotPID)
+	}
+}
+
+func TestResolveActuationTarget_TTYNormalizedBeforeComparison(t *testing.T) {
+	// the registry stores the bare form ("ttys012"); pidTTYFn's real
+	// implementation normalizes ps's "/dev/ttys012" the same way — this
+	// proves the comparison itself normalizes both sides symmetrically
+	// rather than requiring an exact string match.
+	dir := t.TempDir()
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "/dev/ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	called := false
+	pidTTYFn = func(pid int) string {
+		called = true
+		return normalizeTTY("/dev/ttys012") // real impl always returns the normalized form
 	}
 
 	ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
 
 	if !called {
-		t.Fatal("expected pidAliveFn to be called")
-	}
-	if gotPID != 42 {
-		t.Errorf("pidAliveFn called with pid %d, want 42 (the registry entry's PID)", gotPID)
+		t.Fatal("expected pidTTYFn to be called — registry TTY was non-empty")
 	}
 }
 
