@@ -176,14 +176,55 @@ func TestTailState_AssistantToolUse_StalledWhenIdle(t *testing.T) {
 
 func TestTailState_RateLimitMidTurn_StalledRateLimit(t *testing.T) {
 	// a 429 with no subsequent end_turn: the turn never completed.
+	// fix/exit-gate-ux (architecture judge item C): fixture updated to the
+	// genuine Claude-Code-synthesized "API Error:" shape (same convention
+	// internal/claude.LastError's own fixtures use) — hasRateLimitMarker no
+	// longer matches a bare "429"/"rate limit" mention without it (see its
+	// doc), so a mid-turn tail carrying only that bare phrase would no
+	// longer classify as StallRateLimit; this fixture stays REPRESENTATIVE
+	// of what a real rate-limited entry looks like.
 	path := writeJSONL(t,
 		`{"type":"user","message":{"content":"go"}}`,
-		`{"type":"assistant","message":{"content":"429 Too Many Requests: rate limit exceeded"}}`,
+		`{"type":"assistant","message":{"content":"API Error: 429 Too Many Requests: rate limit exceeded"}}`,
 	)
 
 	state, stall := tailState(path, IdleThreshold)
 	if state != domain.StateStalled || stall != domain.StallRateLimit {
 		t.Errorf("got (%v, %v), want (%v, %v)", state, stall, domain.StateStalled, domain.StallRateLimit)
+	}
+}
+
+// TestTailState_BareRateLimitMention_NotStalledRateLimit is the P2
+// regression itself (architecture judge item C, the SAME false-positive
+// class as fix/last-error-false-positive): a mid-turn tail whose only
+// "429"/"rate limit" mention is ordinary conversation — no genuine
+// synthesized API error present at all — must NOT classify as
+// StallRateLimit. Falls back to the generic StallNoOutput, same as any
+// other stalled-with-no-specific-cause tail.
+func TestTailState_BareRateLimitMention_NotStalledRateLimit(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"go"}}`,
+		`{"type":"assistant","message":{"content":"landed #24 (429 auto-redrive) — Tier 2 only, opt-in. main is green."}}`,
+	)
+
+	state, stall := tailState(path, IdleThreshold)
+	if state != domain.StateStalled || stall != domain.StallNoOutput {
+		t.Errorf("got (%v, %v), want (%v, %v) — mentioning \"429\" as a feature name is not a real rate-limit signal",
+			state, stall, domain.StateStalled, domain.StallNoOutput)
+	}
+}
+
+// TestHasRateLimitMarker_StructuredRateLimitErrorShape_MatchesWithoutAPIErrorPrefix
+// pins the OTHER genuine signal (architecture judge item C's "OR the actual
+// rate_limit_error shape"): Anthropic's real structured JSON error type
+// slug (`"type":"rate_limit_error"`) is trustworthy on its own, without
+// requiring Claude Code's "API Error:" text prefix too — it's exact JSON
+// key:value shape, not prose, so it can't coincidentally appear in ordinary
+// conversation the way a bare "429"/"rate limit" word can.
+func TestHasRateLimitMarker_StructuredRateLimitErrorShape_MatchesWithoutAPIErrorPrefix(t *testing.T) {
+	buf := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
+	if !hasRateLimitMarker(buf) {
+		t.Error("expected the structured rate_limit_error JSON shape to match on its own")
 	}
 }
 
@@ -1189,9 +1230,17 @@ func TestApplyLiveness_EncodeCwdCollision_DoesNotHealCwd(t *testing.T) {
 	// distinct real paths means it's genuinely ambiguous which one a loop
 	// with ProjectDir "-x-foo-bar" actually lives in. Healing must refuse
 	// rather than silently pick (and potentially heal to) the wrong one.
+	//
+	// State is StateRunning, not StateIdle: fix/exit-gate-ux (architecture
+	// judge item D) made the count-based guard ALSO distrust a collided
+	// ProjectDir's live count (see TestApplyLiveness_
+	// EncodeCwdCollision_CountNotTrusted_AllScrutinized), which would drop
+	// an Idle loop here entirely (out would be empty) — a side effect this
+	// test isn't about. StateRunning demotes to StallGone but stays in
+	// `out`, keeping this test focused purely on the healing guard.
 	now := time.Now()
 	loops := []domain.Loop{
-		{SessionID: "s1", ProjectDir: "-x-foo-bar", Cwd: "/x/foo-bar", State: domain.StateIdle, LastActivity: now, CwdVerified: false},
+		{SessionID: "s1", ProjectDir: "-x-foo-bar", Cwd: "/x/foo-bar", State: domain.StateRunning, LastActivity: now, CwdVerified: false},
 	}
 	live := map[string]int{
 		"/x/foo-bar": 1,
@@ -1200,11 +1249,44 @@ func TestApplyLiveness_EncodeCwdCollision_DoesNotHealCwd(t *testing.T) {
 
 	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (StateRunning must not be dropped, only demoted)", len(out))
+	}
 	if out[0].CwdVerified {
 		t.Errorf("CwdVerified = true, want false — the ProjectDir is ambiguous between two distinct real paths")
 	}
 	if out[0].Cwd != "/x/foo-bar" {
 		t.Errorf("Cwd = %q, want the original lossy decode left untouched (%q)", out[0].Cwd, "/x/foo-bar")
+	}
+}
+
+// TestApplyLiveness_EncodeCwdCollision_CountNotTrusted_AllScrutinized is
+// the architecture judge's item D: the SAME /x/foo-bar vs /x/foo.bar
+// collision as the healing test above, but checking the OTHER guard the
+// count-based drop/demote decision must ALSO respect. Two independent live
+// processes (one per colliding real dir) sum to a live count of 2 — under
+// the OLD code, "enough" to exempt BOTH loops sharing this ProjectDir from
+// any scrutiny at all, even though we have NO idea which real directory's
+// process backs which loop entry. A loop that's actually dead must not
+// escape StallGone just because an UNRELATED colliding directory happens
+// to have its own live process counted into the same sum.
+func TestApplyLiveness_EncodeCwdCollision_CountNotTrusted_AllScrutinized(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-x-foo-bar", State: domain.StateRunning, LastActivity: now},
+		{SessionID: "s2", ProjectDir: "-x-foo-bar", State: domain.StateRunning, LastActivity: now.Add(-time.Minute)},
+	}
+	live := map[string]int{
+		"/x/foo-bar": 1,
+		"/x/foo.bar": 1,
+	}
+
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	for _, l := range out {
+		if l.State != domain.StateStalled || l.Stall != domain.StallGone {
+			t.Errorf("session %s: State=%v Stall=%v, want StateStalled/StallGone — an ambiguous collided live count must not exempt ANY loop from scrutiny", l.SessionID, l.State, l.Stall)
+		}
 	}
 }
 

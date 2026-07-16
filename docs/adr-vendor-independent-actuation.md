@@ -1,6 +1,9 @@
 # ADR: vendor-independent session discovery via Claude Code hooks
 
-- status: proposed (research complete, not yet implemented)
+- status: **Phase 1 (#11, session-identity hook registry) and Phase 2
+  (#15, registry-keyed actuation + Tier 2 re-drive) landed** — §3's
+  migration steps 1–2 below. Originally proposed as research-complete-but-
+  unimplemented; both phases are now live.
 - date: 2026-07-16
 - context: two independent design reviews (opus + fable), both with live
   verification on the captain's machine — see "Verification" below
