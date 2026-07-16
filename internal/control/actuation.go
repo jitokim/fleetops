@@ -13,22 +13,41 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jitokim/missionctl/internal/sessions"
 )
 
-// pidAliveTimeout bounds the `ps -p <pid>` liveness probe.
-const pidAliveTimeout = 2 * time.Second
+// pidTTYTimeout bounds the `ps -o tty= -p <pid>` binding probe.
+const pidTTYTimeout = 2 * time.Second
 
-// pidAliveFn reports whether pid is a live process (`ps -p <pid>` exit 0).
-// A var, not a plain func, so tests can fake liveness without a real
-// process table — same injectable-seam pattern as internal/sessions'
-// ancestryStepFunc.
-var pidAliveFn = func(pid int) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), pidAliveTimeout)
+// noControllingTTY is `ps -o tty=`'s sentinel for a process with no
+// controlling terminal — same convention internal/sessions.resolveTTY
+// already relies on.
+const noControllingTTY = "??"
+
+// pidTTYFn reports pid's CURRENT controlling tty (normalized, no "/dev/"
+// prefix — see normalizeTTY), or "" if the process is dead OR has no
+// controlling terminal. A var, not a plain func, so tests can fake the OS
+// process table without a real one — same injectable-seam pattern as
+// internal/sessions' ancestryStepFunc.
+//
+// This is a BINDING check, not a liveness check: it doesn't just prove some
+// process holds pid, it proves that process CURRENTLY controls a specific
+// tty — see ResolveActuationTarget's doc for why the distinction matters.
+var pidTTYFn = func(pid int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), pidTTYTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid)).Run() == nil
+	out, err := exec.CommandContext(ctx, "ps", "-o", "tty=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return ""
+	}
+	tty := strings.TrimSpace(string(out))
+	if tty == noControllingTTY {
+		return ""
+	}
+	return normalizeTTY(tty)
 }
 
 // ResolveActuationTarget resolves where a typed/destructive action
@@ -37,10 +56,18 @@ var pidAliveFn = func(pid int) bool {
 //
 //   - Tier 1a — the session registry's tty (internal/sessions, tmux-only
 //     this slice: orca/cmux don't expose a per-terminal tty). Tried only
-//     when the registry has an entry, it carries a tty, AND the recorded
-//     pid is confirmed alive RIGHT NOW via a live `ps` (never trust a
-//     possibly-stale registry record — ttys are OS-recycled). Session-unique:
-//     no ambiguity guard applies on this path.
+//     when the registry has an entry, it carries a tty, AND a live `ps`
+//     confirms the recorded pid CURRENTLY controls that SAME tty right now
+//     (pidTTYFn) — never trust a possibly-stale registry record on its own.
+//     Proving the pid merely exists is NOT enough: ttys are OS-recycled, so
+//     a SIGKILL'd session can leak a registry entry whose tty gets
+//     reassigned to a completely different, unrelated live claude pane,
+//     and/or whose pid gets reused by any other process — pid-existence
+//     alone would pass in both cases and misroute an action onto the wrong
+//     session. Re-validating the BINDING (this exact pid ↔ this exact tty,
+//     right now) is what ADR §3 step 2 means by "re-validate tty↔pid
+//     against live ps at actuation time." Session-unique once the binding
+//     checks out: no ambiguity guard applies on this path.
 //   - Tier 1b — the existing cwd-based Resolve()+LocateClaude chain,
 //     unchanged, including its own internal ">1 match" ambiguity refusal.
 //
@@ -50,7 +77,7 @@ var pidAliveFn = func(pid int) bool {
 // message: "no unambiguous claude surface"). Callers only use ctrl/target
 // when found=true.
 func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Controller, target Target, backendAvailable, found bool) {
-	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidAliveFn(entry.PID) {
+	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
 		tmux := tmuxController{}
 		if t, ok := tmux.LocateByTTY(entry.TTY); ok {
 			return tmux, t, true, true
@@ -88,8 +115,16 @@ const redriveTimeout = 10 * time.Minute
 func Redrive(sessionID, prompt string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), redriveTimeout)
 	defer cancel()
-	if err := exec.CommandContext(ctx, "claude", "--resume", sessionID, "-p", prompt, "--output-format", "json").Run(); err != nil {
+	argv := redriveArgv(sessionID, prompt)
+	if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err != nil {
 		return fmt.Errorf("claude --resume: %w", err)
 	}
 	return nil
+}
+
+// redriveArgv builds Redrive's argv — pulled out as its own pure function
+// so the exact command shape is directly unit-testable, same pattern as
+// orcaResumeCmd/tmuxResumeCmds.
+func redriveArgv(sessionID, prompt string) []string {
+	return []string{"claude", "--resume", sessionID, "-p", prompt, "--output-format", "json"}
 }
