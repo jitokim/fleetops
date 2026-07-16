@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -432,7 +431,7 @@ func parseCmuxPsRows(out string, want map[string]bool) []cmuxProc {
 			tty:        tty,
 			pid:        pid,
 			foreground: strings.Contains(stat, "+"),
-			isClaude:   filepath.Base(comm) == "claude",
+			isClaude:   isClaudeComm(comm),
 		})
 	}
 	return procs

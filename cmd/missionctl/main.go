@@ -2,8 +2,10 @@
 //
 // No args: launch the Bubble Tea TUI (the fleet cockpit).
 // Subcommands: `hook notify|session-start|session-end` (Claude Code hook
-// entry points, see hook.go) and `hooks install|uninstall` (register/remove
-// those hooks in ~/.claude/settings.json, see hooks.go).
+// entry points, see hook.go), `hooks install|uninstall` (register/remove
+// those hooks in ~/.claude/settings.json, see hooks.go), and
+// `report --since 24h` (a plain-text summary of the append-only event
+// history, internal/events — see report.go).
 package main
 
 import (
@@ -22,6 +24,9 @@ func main() {
 			return
 		case "hooks":
 			runHooksCmd(os.Args[2:])
+			return
+		case "report":
+			runReportCmd(os.Args[2:])
 			return
 		default:
 			fmt.Fprintf(os.Stderr, "missionctl: unknown command %q\n", os.Args[1])

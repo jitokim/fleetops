@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/events"
 	"github.com/jitokim/missionctl/internal/registry"
 	"github.com/jitokim/missionctl/internal/sessions"
 	runewidth "github.com/mattn/go-runewidth"
@@ -1239,7 +1240,7 @@ func TestSendPromptCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
 	// independent of the "i"/"r" keypress guard (see its SAFETY comment).
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateFailed}
 
-	msg := sendPromptCmd(l, "do the thing", "injected into", "")()
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
 
 	rm, ok := msg.(resumeResultMsg)
 	if !ok {
@@ -1265,16 +1266,22 @@ func TestSendPromptCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
 
 // withFakeActuationSeams overrides resolveActuationTargetFn/redriveFn for
 // the duration of one test, restoring the originals on cleanup.
+// withFakeActuationSeams also overrides historyDirFn to a t.TempDir() — any
+// test that reaches a real tier dispatch (success or failure) now also
+// triggers logActuationEvent's events.Append call, which must never touch
+// the real ~/.missionctl/history during `go test`.
 func withFakeActuationSeams(t *testing.T, resolve func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool), redrive func(sessionID, prompt string) error) {
 	t.Helper()
-	origResolve, origRedrive := resolveActuationTargetFn, redriveFn
-	t.Cleanup(func() { resolveActuationTargetFn, redriveFn = origResolve, origRedrive })
+	origResolve, origRedrive, origHistoryDir := resolveActuationTargetFn, redriveFn, historyDirFn
+	t.Cleanup(func() { resolveActuationTargetFn, redriveFn, historyDirFn = origResolve, origRedrive, origHistoryDir })
 	if resolve != nil {
 		resolveActuationTargetFn = resolve
 	}
 	if redrive != nil {
 		redriveFn = redrive
 	}
+	historyDir := t.TempDir()
+	historyDirFn = func() string { return historyDir }
 }
 
 func TestSendPromptCmd_StallGone_SkipsTierOne_GoesStraightToTierTwo(t *testing.T) {
@@ -1292,7 +1299,7 @@ func TestSendPromptCmd_StallGone_SkipsTierOne_GoesStraightToTierTwo(t *testing.T
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard", Stall: domain.StallGone}
 
-	msg := sendPromptCmd(l, "do the thing", "injected into", "")()
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
 
 	if tier1Called {
 		t.Error("expected Tier 1 (resolveActuationTargetFn) NOT to be called for a StallGone loop")
@@ -1326,7 +1333,7 @@ func TestSendPromptCmd_TierOneFound_UsesTierOneNotRedrive(t *testing.T) {
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
 
-	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
 
 	if redriveCalled {
 		t.Error("expected redriveFn NOT to be called when Tier 1 already found a surface")
@@ -1356,7 +1363,7 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
 
-	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
 
 	if !redriveCalled {
 		t.Error("expected redriveFn to be called once Tier 1 fails to find a surface")
@@ -1378,7 +1385,7 @@ func TestSendPromptCmd_TierTwoRedriveFails_ReportsError(t *testing.T) {
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
 
-	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
 
 	rm, ok := msg.(resumeResultMsg)
 	if !ok {
@@ -1424,7 +1431,7 @@ func TestSendPromptCmd_TTYPlausibleButBindingFails_FallsToTierTwoNotMisrouted(t 
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
 
-	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
 
 	if !redriveCalled {
 		t.Error("expected Tier 2 (redriveFn) to run once Tier 1 fails to find an unambiguous surface")
@@ -1884,9 +1891,10 @@ func TestUpdate_VerdictMsg_ClearsInFlightGuard(t *testing.T) {
 
 func TestJudgeCmd_SavesVerdictAndReportsResult(t *testing.T) {
 	dir := t.TempDir()
-	origDirFn, origJudgeFn := registryDirFn, judgeFn
-	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
+	origDirFn, origJudgeFn, origHistoryDir := registryDirFn, judgeFn, historyDirFn
+	defer func() { registryDirFn, judgeFn, historyDirFn = origDirFn, origJudgeFn, origHistoryDir }()
 	registryDirFn = func() string { return dir }
+	historyDirFn = func() string { return t.TempDir() }
 	judgeFn = func(goal, cwd, lastText, doneWhen, oracleRubric string) (domain.Verdict, error) {
 		return domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no test output shown"}, nil
 	}
@@ -1951,9 +1959,10 @@ func TestJudgeCmd_JudgeErrorReportedWithoutSaving(t *testing.T) {
 
 func TestJudgeCmd_PassesDoneWhenAndOracleFromGoal(t *testing.T) {
 	dir := t.TempDir()
-	origDirFn, origJudgeFn := registryDirFn, judgeFn
-	defer func() { registryDirFn, judgeFn = origDirFn, origJudgeFn }()
+	origDirFn, origJudgeFn, origHistoryDir := registryDirFn, judgeFn, historyDirFn
+	defer func() { registryDirFn, judgeFn, historyDirFn = origDirFn, origJudgeFn, origHistoryDir }()
 	registryDirFn = func() string { return dir }
+	historyDirFn = func() string { return t.TempDir() }
 
 	var gotDoneWhen, gotOracle string
 	judgeFn = func(goal, cwd, lastText, doneWhen, oracleRubric string) (domain.Verdict, error) {
@@ -2687,5 +2696,438 @@ func TestTrunc_CJKDisplayWidth(t *testing.T) {
 	mixed := trunc("fix한글mix되는지123456", 12)
 	if w := runewidth.StringWidth(mixed); w > 12 {
 		t.Errorf("mixed trunc width = %d, want <= 12 (%q)", w, mixed)
+	}
+}
+
+// ── event-log-and-notify: scan-triggered transition detection ───────────
+
+func TestDetectTransitions_FirstAppearance_NoEvent(t *testing.T) {
+	m := New() // m.loops is empty — every session in newLoops is "brand new"
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 0 {
+		t.Fatalf("got %d transitions on first appearance, want 0", len(got))
+	}
+}
+
+// ── P2 review fix: restart-time re-notify for an already-open gate ───────
+
+func TestSeedFirstAppearanceGate_AlreadyGated_SeedsNotifyAndEvent(t *testing.T) {
+	// Simulates the exact restart gap the review flagged: m.loops is empty
+	// (a fresh Model, as if missionctl just started), and the very FIRST
+	// scan already shows a loop sitting in StateGate — there is no
+	// "previous scan" to diff against, yet this must still notify once.
+	m := New()
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 1 {
+		t.Fatalf("got %d transitions for an already-gated first appearance, want 1 (seeded)", len(got))
+	}
+	te := got[0]
+	if !te.notify {
+		t.Error("expected the seeded edge to be flagged for notify")
+	}
+	if te.title != notifyTitlePrefix+"missionctl · GATE" {
+		t.Errorf("title = %q, want the GATE title", te.title)
+	}
+	if !strings.Contains(te.body, "aboard") || !strings.Contains(te.body, "continue?") {
+		t.Errorf("body = %q, want it to mention the project and gate prompt", te.body)
+	}
+	if te.ev.FromState != "" {
+		t.Errorf("FromState = %q, want empty (nothing to transition from — same convention as a spawn event)", te.ev.FromState)
+	}
+	if te.ev.ToState != string(domain.StateGate) {
+		t.Errorf("ToState = %q, want %q", te.ev.ToState, domain.StateGate)
+	}
+}
+
+func TestSeedFirstAppearanceGate_DedupAppliesOnRestartWithinWindow(t *testing.T) {
+	// If a notification for this exact gate was ALREADY sent (e.g. it was
+	// open before the restart and the ledger... well, the ledger doesn't
+	// survive a restart by construction — but shouldNotify's dedup must
+	// still apply WITHIN one process's lifetime: two back-to-back "restart
+	// scans" for the same still-open gate must only notify once.
+	m := New()
+	now := time.Now()
+	loops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
+
+	first := m.detectTransitions(loops, now)
+	if len(first) != 1 || !first[0].notify {
+		t.Fatalf("first seed: got %#v, want one notify-flagged transition", first)
+	}
+
+	// m.loops is STILL empty here on purpose: this simulates detectTransitions
+	// being called again before Update ever assigns m.loops = newLoops (not
+	// how Update actually sequences it, but shouldNotify's ledger is what's
+	// under test here, not the m.loops assignment timing).
+	second := m.detectTransitions(loops, now.Add(time.Second))
+	if len(second) != 1 {
+		t.Fatalf("got %d transitions on the second identical seed, want 1 (still seeded, just not re-notified)", len(second))
+	}
+	if second[0].notify {
+		t.Error("expected the second seed within the dedup window to NOT re-notify")
+	}
+}
+
+func TestSeedFirstAppearanceGate_NonGateFirstAppearance_NotSeeded(t *testing.T) {
+	m := New()
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 0 {
+		t.Fatalf("got %d transitions for a non-gate first appearance, want 0 (only StateGate is seeded, per the review's explicit scope)", len(got))
+	}
+}
+
+func TestDetectTransitions_StateChange_EmitsOneEvent(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateIdle}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 1 {
+		t.Fatalf("got %d transitions, want 1", len(got))
+	}
+	ev := got[0].ev
+	if ev.FromState != string(domain.StateRunning) || ev.ToState != string(domain.StateIdle) {
+		t.Errorf("FromState/ToState = %q/%q, want running/idle", ev.FromState, ev.ToState)
+	}
+	if ev.Trigger != events.TriggerScan || ev.Actor != events.ActorSystem {
+		t.Errorf("Trigger/Actor = %v/%v, want scan/system", ev.Trigger, ev.Actor)
+	}
+}
+
+// TestDetectTransitions_SameStateAcrossTwoScans_OnlyOneEventTotal is the
+// task's edge-trigger acceptance bar: a real A→B transition followed by B
+// persisting unchanged on the NEXT poll must record exactly one event
+// total, never a duplicate for "still B".
+func TestDetectTransitions_SameStateAcrossTwoScans_OnlyOneEventTotal(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
+	now := time.Now()
+
+	scan2 := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}}
+	firstTransitions := m.detectTransitions(scan2, now)
+	m.loops = scan2 // simulate Update overwriting m.loops after this scan
+
+	scan3 := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}} // unchanged
+	secondTransitions := m.detectTransitions(scan3, now.Add(3*time.Second))
+
+	if len(firstTransitions) != 1 {
+		t.Fatalf("scan1→scan2: got %d transitions, want 1 (the real running→stalled edge)", len(firstTransitions))
+	}
+	if len(secondTransitions) != 0 {
+		t.Fatalf("scan2→scan3 (unchanged): got %d transitions, want 0 (edge-triggered, no re-emit)", len(secondTransitions))
+	}
+}
+
+func TestDetectTransitions_StallKindChange_SameLoopState_StillCountsAsATransition(t *testing.T) {
+	// StallNoOutput -> StallGone: both StateStalled, but this is exactly the
+	// edge the notify policy needs to catch (see stateSignature's doc).
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}}
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 1 {
+		t.Fatalf("got %d transitions for a stall-kind-only change, want 1", len(got))
+	}
+	if !got[0].notify {
+		t.Error("expected this to be flagged for notify (entering StallGone)")
+	}
+	if got[0].title != notifyTitlePrefix+"missionctl · loop gone" {
+		t.Errorf("title = %q, want the loop-gone title", got[0].title)
+	}
+	// P2 review fix regression: the PERSISTED FromState/ToState must also
+	// differ, not just the in-memory notify decision — otherwise
+	// `missionctl report`'s FromState!=ToState transition counting (and a
+	// human reading the raw history log) can't see this incident happened
+	// at all, since both sides would read the same plain "stalled".
+	if got[0].ev.FromState == got[0].ev.ToState {
+		t.Errorf("FromState == ToState == %q, want them to differ (stall kind must be encoded into the persisted state)", got[0].ev.FromState)
+	}
+	if got[0].ev.FromState != "stalled:no-output" || got[0].ev.ToState != "stalled:gone" {
+		t.Errorf("FromState/ToState = %q/%q, want stalled:no-output/stalled:gone", got[0].ev.FromState, got[0].ev.ToState)
+	}
+}
+
+func TestDetectTransitions_IntoGate_FlaggedForNotify(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 1 || !got[0].notify {
+		t.Fatalf("got %#v, want exactly one notify-flagged transition", got)
+	}
+	if got[0].title != notifyTitlePrefix+"missionctl · GATE" {
+		t.Errorf("title = %q, want the GATE title", got[0].title)
+	}
+	if !strings.Contains(got[0].body, "aboard") || !strings.Contains(got[0].body, "continue?") {
+		t.Errorf("body = %q, want it to mention the project and gate prompt", got[0].body)
+	}
+}
+
+func TestDetectTransitions_OrdinaryTransition_NotFlaggedForNotify(t *testing.T) {
+	// running -> idle is a real transition (recorded in history) but is NOT
+	// one of the two notify-worthy edges — severity floor, per the task's
+	// spec (no notify on done/drift/429 either, only gate+gone).
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateIdle}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 1 {
+		t.Fatalf("got %d transitions, want 1", len(got))
+	}
+	if got[0].notify {
+		t.Error("running->idle must not trigger a notification")
+	}
+}
+
+func TestDetectTransitions_AlreadyGated_NoRepeatNotifyFlagOnUnrelatedChange(t *testing.T) {
+	// staying in StateGate (not a fresh entry) must not re-flag notify, even
+	// if something else about the loop incidentally changed this scan.
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "old?"}}
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "old?"}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 0 {
+		t.Fatalf("got %d transitions for an unchanged gate, want 0 (same signature both scans)", len(got))
+	}
+}
+
+// ── event-log-and-notify: dedup ledger ───────────────────────────────────
+
+func TestShouldNotify_FirstCall_Allowed(t *testing.T) {
+	m := New()
+	if !m.shouldNotify("s1", "gate", time.Now()) {
+		t.Error("expected the first notify for a fresh (session, edge) to be allowed")
+	}
+}
+
+func TestShouldNotify_SecondCallWithinWindow_Refused(t *testing.T) {
+	m := New()
+	now := time.Now()
+	if !m.shouldNotify("s1", "gate", now) {
+		t.Fatal("first call should be allowed")
+	}
+	if m.shouldNotify("s1", "gate", now.Add(time.Minute)) {
+		t.Error("expected a second notify within notifyDedupWindow to be refused")
+	}
+}
+
+func TestShouldNotify_AfterWindowExpires_AllowedAgain(t *testing.T) {
+	m := New()
+	now := time.Now()
+	if !m.shouldNotify("s1", "gate", now) {
+		t.Fatal("first call should be allowed")
+	}
+	if !m.shouldNotify("s1", "gate", now.Add(notifyDedupWindow+time.Second)) {
+		t.Error("expected a notify after the dedup window elapsed to be allowed")
+	}
+}
+
+func TestShouldNotify_DifferentEdges_IndependentLedgerEntries(t *testing.T) {
+	m := New()
+	now := time.Now()
+	if !m.shouldNotify("s1", "gate", now) {
+		t.Fatal("first gate notify should be allowed")
+	}
+	if !m.shouldNotify("s1", "gone", now) {
+		t.Error("a different edge for the SAME session must have its own ledger entry")
+	}
+}
+
+func TestShouldNotify_DifferentSessions_IndependentLedgerEntries(t *testing.T) {
+	m := New()
+	now := time.Now()
+	if !m.shouldNotify("s1", "gate", now) {
+		t.Fatal("first notify should be allowed")
+	}
+	if !m.shouldNotify("s2", "gate", now) {
+		t.Error("a different session must have its own ledger entry")
+	}
+}
+
+func TestDetectTransitions_DedupAppliesAcrossScans_SecondGateEntryNotRenotified(t *testing.T) {
+	// A loop that leaves and re-enters StateGate twice within the dedup
+	// window must only be flagged for notify once — detectTransitions
+	// itself consults m.shouldNotify (not just a standalone unit).
+	m := New()
+	now := time.Now()
+
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
+	first := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}, now)
+	if len(first) != 1 || !first[0].notify {
+		t.Fatalf("first gate entry: got %#v, want one notify-flagged transition", first)
+	}
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}
+
+	// leaves the gate, then re-enters it, both within the dedup window.
+	left := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateRunning}}, now.Add(time.Second))
+	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
+	second := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p2"}}, now.Add(2*time.Second))
+
+	if len(left) != 1 {
+		t.Fatalf("leaving the gate: got %d transitions, want 1 (still a real, history-worthy transition)", len(left))
+	}
+	if len(second) != 1 {
+		t.Fatalf("re-entering the gate: got %d transitions, want 1 (still history-worthy)", len(second))
+	}
+	if second[0].notify {
+		t.Error("re-entering the gate within the dedup window must NOT re-notify")
+	}
+}
+
+// ── event-log-and-notify: emitTransitionsCmd + judgeCmd wiring ───────────
+
+func TestEmitTransitionsCmd_NilForNoTransitions(t *testing.T) {
+	if cmd := emitTransitionsCmd(nil); cmd != nil {
+		t.Error("expected a nil tea.Cmd when there's nothing to emit")
+	}
+}
+
+func TestEmitTransitionsCmd_AppendsHistoryAndSendsNotifications(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir, origNotify := historyDirFn, notifySendFn
+	defer func() { historyDirFn, notifySendFn = origHistoryDir, origNotify }()
+	historyDirFn = func() string { return historyDir }
+
+	var gotTitle, gotBody string
+	notifySendFn = func(title, body string) error {
+		gotTitle, gotBody = title, body
+		return nil
+	}
+
+	transitions := []transitionEvent{
+		{ev: events.Event{SessionID: "s1", FromState: "running", ToState: "gate", Trigger: events.TriggerScan, Actor: events.ActorSystem}, notify: true, title: "missionctl · GATE", body: "aboard: continue?"},
+		{ev: events.Event{SessionID: "s2", FromState: "running", ToState: "idle", Trigger: events.TriggerScan, Actor: events.ActorSystem}, notify: false},
+	}
+
+	cmd := emitTransitionsCmd(transitions)
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd")
+	}
+	cmd()
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got["s1"]) != 1 || len(got["s2"]) != 1 {
+		t.Fatalf("got %#v, want exactly one event per session", got)
+	}
+	if gotTitle != "missionctl · GATE" || gotBody != "aboard: continue?" {
+		t.Errorf("notify called with (%q, %q), want the flagged transition's title/body", gotTitle, gotBody)
+	}
+}
+
+func TestEmitTransitionsCmd_NotifyErrorSwallowed(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir, origNotify := historyDirFn, notifySendFn
+	defer func() { historyDirFn, notifySendFn = origHistoryDir, origNotify }()
+	historyDirFn = func() string { return historyDir }
+	notifySendFn = func(title, body string) error { return errTestJudgeFailed }
+
+	transitions := []transitionEvent{
+		{ev: events.Event{SessionID: "s1", ToState: "gate", Trigger: events.TriggerScan, Actor: events.ActorSystem}, notify: true, title: "t", body: "b"},
+	}
+	cmd := emitTransitionsCmd(transitions)
+	msg := cmd()
+	if msg != nil {
+		t.Errorf("got %v, want nil — a notify failure must not surface as a tea.Msg", msg)
+	}
+}
+
+func TestJudgeCmd_RecordsOracleHistoryEvent(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origJudgeFn, origHistoryDir := registryDirFn, judgeFn, historyDirFn
+	defer func() { registryDirFn, judgeFn, historyDirFn = origRegDir, origJudgeFn, origHistoryDir }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+	judgeFn = func(goal, cwd, lastText, doneWhen, oracleRubric string) (domain.Verdict, error) {
+		return domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, nil
+	}
+	if err := registry.Bind(registryDir, "s1", registry.BindSpec{Goal: "fix the bug"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "s1", Cycle: 3, State: domain.StateIdle, Goal: domain.Goal{Text: "fix the bug"}}
+	judgeCmd(l)()
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["s1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	ev := evs[0]
+	if ev.Trigger != events.TriggerOracle || ev.Actor != events.ActorAuto {
+		t.Errorf("Trigger/Actor = %v/%v, want oracle/auto", ev.Trigger, ev.Actor)
+	}
+	if !strings.Contains(ev.Detail, "done") || !strings.Contains(ev.Detail, "3") {
+		t.Errorf("Detail = %q, want it to carry the outcome and cycle", ev.Detail)
+	}
+}
+
+func TestSendPromptCmd_TierOneSuccess_RecordsActuationEvent(t *testing.T) {
+	fakeCtrl := &fakeController{name: "tmux"}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateStalled}
+
+	sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	ev := evs[0]
+	if ev.Trigger != events.TriggerActuation || ev.Actor != events.ActorHuman {
+		t.Errorf("Trigger/Actor = %v/%v, want actuation/human", ev.Trigger, ev.Actor)
+	}
+	if !strings.Contains(ev.Detail, "resume") || !strings.Contains(ev.Detail, "tier1") || !strings.Contains(ev.Detail, "ok") {
+		t.Errorf("Detail = %q, want it to mention the action, tier, and outcome", ev.Detail)
+	}
+}
+
+func TestSendPromptCmd_StateFailedRefusal_NoActuationEventRecorded(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateFailed}
+	sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d sessions with events, want 0 (refused before any tier was reached)", len(got))
 	}
 }

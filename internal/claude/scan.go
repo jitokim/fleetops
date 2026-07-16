@@ -16,6 +16,7 @@ import (
 
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/engine"
+	"github.com/jitokim/missionctl/internal/events"
 	"github.com/jitokim/missionctl/internal/gate"
 	"github.com/jitokim/missionctl/internal/registry"
 )
@@ -76,9 +77,10 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 		return loops[i].LastActivity.After(loops[j].LastActivity)
 	})
 
+	historyDir := events.HistoryDir()
 	loopsDir := registry.LoopsDir()
-	registry.BindPending(loopsDir, registry.PendingDir(), loops, now)
-	loops = enrichFromRegistry(loops, loopsDir)
+	registry.BindPending(loopsDir, registry.PendingDir(), loops, now, historyDir)
+	loops = enrichFromRegistry(loops, loopsDir, historyDir)
 
 	live, liveOK := LiveClaudeCwds()
 	loops = applyLiveness(loops, live, liveOK)
@@ -109,7 +111,7 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 // still shown (Last stays populated for the ORACLE column) but does not
 // override State — the loop has moved on since that judgment, and it's due
 // to be judged again (see the TUI's judge trigger policy).
-func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
+func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []domain.Loop {
 	for i := range loops {
 		rec, ok := registry.Load(loopsDir, loops[i].SessionID)
 		if !ok {
@@ -141,7 +143,7 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 			}
 		}
 
-		applyGovernor(&loops[i])
+		applyGovernor(&loops[i], historyDir)
 	}
 	return loops
 }
@@ -159,14 +161,42 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 // carve-out is explicitly spelled out by the governor spec, but both mirror
 // an already-established precedent in this file; flagged in the slice
 // report as a judgment call.
-func applyGovernor(l *domain.Loop) {
+//
+// event-log-and-notify: the Stop branch (a real promotion to StateFailed)
+// also records a events.TriggerGovernor history event — best-effort,
+// swallowed error (see internal/events package doc). This is naturally
+// edge-triggered with NO extra bookkeeping: the guard clause above already
+// makes Stop unreachable on every SUBSEQUENT scan once State is
+// StateFailed (Terminal() is true), so this fires exactly once per loop's
+// lifetime. Escalate does NOT log an event — it doesn't change State (see
+// its own case below), and would otherwise re-fire on every 3s poll for as
+// long as the annotation persists, which is exactly the re-emit-every-poll
+// noise the scanner's own transition detector (internal/tui) is designed to
+// avoid.
+func applyGovernor(l *domain.Loop, historyDir string) {
 	if l.State == domain.StateGate || l.State.Terminal() {
 		return
 	}
 	switch d := engine.Check(*l); d.Action {
 	case engine.Stop:
+		// fromState is captured via domain.StateString (not the bare
+		// string(l.State) this used before the P2 review fix) since l.Stall
+		// is untouched by this branch — a Stop out of a StateStalled loop
+		// must still record which STALL KIND it was leaving, the same
+		// "encode the kind into the persisted state" fix applied to every
+		// other emitter (see domain.Loop.StateString's doc).
+		fromStateStr := domain.StateString(l.State, l.Stall)
 		l.State = domain.StateFailed
 		l.Note = fmt.Sprintf("stopped: no improvement %d/%d", l.NoImprove, l.Goal.NoImproveLimit)
+		_ = events.Append(historyDir, events.Event{
+			TS:        time.Now().UnixNano(),
+			SessionID: l.SessionID,
+			FromState: fromStateStr,
+			ToState:   l.StateString(),
+			Trigger:   events.TriggerGovernor,
+			Detail:    l.Note,
+			Actor:     events.ActorSystem,
+		})
 	case engine.Escalate:
 		switch d.Reason {
 		case "budget exhausted":

@@ -368,6 +368,18 @@ func TestParseCmuxPsRows_FiltersTTYsAndDetectsClaudeAndForeground(t *testing.T) 
 	}
 }
 
+// TestParseCmuxPsRows_ClaudeExeDetectedAsClaude is the review fix's
+// regression: a comm of "claude.exe" (live 2026-07-17, see isClaudeComm's
+// doc) must set isClaude=true, same as a bare "claude".
+func TestParseCmuxPsRows_ClaudeExeDetectedAsClaude(t *testing.T) {
+	out := "ttys001  S+    9001 /whatever/claude.exe\n"
+	got := parseCmuxPsRows(out, map[string]bool{"ttys001": true})
+	want := []cmuxProc{{tty: "ttys001", pid: 9001, foreground: true, isClaude: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v (claude.exe must be detected as claude)", got, want)
+	}
+}
+
 func TestParseCmuxPsRows_SkipsBlankAndHeaderLikeRows(t *testing.T) {
 	out := "\n   \nttys001  S+  x  /bin/zsh\nttys001  S+  55 /bin/zsh\n"
 	got := parseCmuxPsRows(out, map[string]bool{"ttys001": true})

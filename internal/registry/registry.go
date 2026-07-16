@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/events"
 )
 
 // LoopsDir is ~/.missionctl/loops (override for tests by passing an
@@ -284,7 +285,14 @@ func listPending(dir string) map[string]PendingSpawn {
 // Matched pendings are bound (see Bind) and their pending file removed.
 // Pendings older than pendingStaleAfter are dropped unmatched — the spawn
 // presumably failed, or landed somewhere BindPending can't see.
-func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time) {
+//
+// event-log-and-notify: a successful match is also the natural, and only,
+// place to record the "spawn" actuation event (events.TriggerActuation,
+// actor=human — a human triggered the "n" key wizard that created this
+// pending spawn) — at spawn TIME (tui's spawnCmd) no session_id exists yet
+// to key an events.Append call on; this is the first moment one does. Best-
+// effort, swallowed error (see internal/events package doc).
+func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time, historyDir string) {
 	for name, p := range listPending(pendingDir) {
 		if now.Sub(p.TS) > pendingStaleAfter {
 			os.Remove(filepath.Join(pendingDir, name))
@@ -327,5 +335,28 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 			continue // best-effort; retry next scan
 		}
 		os.Remove(filepath.Join(pendingDir, name))
+		_ = events.Append(historyDir, events.Event{
+			TS:        now.UnixNano(),
+			SessionID: best.SessionID,
+			FromState: "", // brand new — nothing to transition FROM
+			ToState:   best.StateString(),
+			Trigger:   events.TriggerActuation,
+			Detail:    "spawn: " + capDetail(p.Goal),
+			Actor:     events.ActorHuman,
+		})
 	}
+}
+
+// capDetail bounds a free-text detail field's length (in RUNES, not bytes —
+// a byte-index cut can slice a multi-byte character in half, e.g. Korean
+// goal text, same hazard internal/tui.trunc's doc warns about) so one long
+// goal string can't blow up a history line unreasonably.
+const detailCap = 200
+
+func capDetail(s string) string {
+	r := []rune(s)
+	if len(r) <= detailCap {
+		return s
+	}
+	return string(r[:detailCap]) + "…"
 }

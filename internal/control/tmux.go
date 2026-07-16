@@ -103,7 +103,7 @@ func (tmuxController) LocateByTTY(tty string) (Target, bool) {
 func selectTTYPane(lines []tmuxTTYPaneLine, tty string) (Target, bool) {
 	want := normalizeTTY(tty)
 	for _, l := range lines {
-		if l.Command == "claude" && normalizeTTY(l.TTY) == want {
+		if isClaudeComm(l.Command) && normalizeTTY(l.TTY) == want {
 			return Target{Backend: "tmux", ID: l.ID}, true
 		}
 	}
@@ -300,7 +300,7 @@ func parseTmuxPanes(out string) []Target {
 func parseTmuxClaudePanes(out string) []Target {
 	var targets []Target
 	for _, l := range parseTmuxPaneLines(out) {
-		if l.Command != "claude" {
+		if !isClaudeComm(l.Command) {
 			continue
 		}
 		targets = append(targets, Target{Backend: "tmux", ID: l.ID, Cwd: l.Cwd})

@@ -4,10 +4,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/events"
 )
 
 func TestBind_LoadRoundTrip(t *testing.T) {
@@ -229,7 +232,7 @@ func TestBindPending_MatchesNewestUnboundSessionInCwd(t *testing.T) {
 		{SessionID: "other-cwd", Cwd: "/x/other", ProjectDir: "-x-other", LastActivity: spawnTS.Add(time.Second)},
 	}
 
-	BindPending(loopsDir, pendingDir, loops, now)
+	BindPending(loopsDir, pendingDir, loops, now, t.TempDir())
 
 	rec, ok := Load(loopsDir, "newer")
 	if !ok {
@@ -270,7 +273,7 @@ func TestBindPending_SkipsAlreadyBoundSessions(t *testing.T) {
 		{SessionID: "already-bound", Cwd: "/x/aboard", ProjectDir: "-x-aboard", LastActivity: spawnTS.Add(time.Second)},
 	}
 
-	BindPending(loopsDir, pendingDir, loops, now)
+	BindPending(loopsDir, pendingDir, loops, now, t.TempDir())
 
 	rec, _ := Load(loopsDir, "already-bound")
 	if rec.Goal != "an earlier goal" {
@@ -297,7 +300,7 @@ func TestBindPending_StalePendingDropped(t *testing.T) {
 
 	// even a perfectly matching session must not be bound once stale.
 	loops := []domain.Loop{{SessionID: "s1", Cwd: "/x/aboard", ProjectDir: "-x-aboard", LastActivity: staleTS.Add(time.Second)}}
-	BindPending(loopsDir, pendingDir, loops, now)
+	BindPending(loopsDir, pendingDir, loops, now, t.TempDir())
 
 	if _, ok := Load(loopsDir, "s1"); ok {
 		t.Error("expected no binding once the pending spawn is stale")
@@ -322,7 +325,7 @@ func TestBindPending_NoMatchYet_PendingSurvives(t *testing.T) {
 	}
 
 	// no loops in that cwd yet (claude hasn't written its first log line).
-	BindPending(loopsDir, pendingDir, nil, now)
+	BindPending(loopsDir, pendingDir, nil, now, t.TempDir())
 
 	if len(listPending(pendingDir)) != 1 {
 		t.Error("expected the pending file to survive when nothing matches yet")
@@ -353,12 +356,110 @@ func TestBindPending_HyphenatedWorktreePathBinds(t *testing.T) {
 		Cwd:          "/x/orca/workspaces/asre/mctl/reply/with/exactly", // lossy decode — must not matter
 		LastActivity: now.Add(time.Minute),
 	}}
-	BindPending(loopsDir, pendingDir, loops, now)
+	BindPending(loopsDir, pendingDir, loops, now, t.TempDir())
 	rec, ok := Load(loopsDir, "wt")
 	if !ok {
 		t.Fatal("hyphenated worktree loop was not bound")
 	}
 	if rec.DoneCondition != "d" || rec.MaxCycles != 2 {
 		t.Fatalf("contract fields lost: %+v", rec)
+	}
+}
+
+// ── spawn actuation history event (event-log-and-notify) ────────────────
+
+func TestBindPending_SuccessfulMatch_RecordsSpawnActuationEvent(t *testing.T) {
+	loopsDir, pendingDir, historyDir := t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Now()
+	spawnTS := now.Add(-time.Minute)
+
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "fix the bug"}); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+	for name := range listPending(pendingDir) {
+		if err := writePendingRaw(pendingDir, name, "/x/aboard", "fix the bug", spawnTS); err != nil {
+			t.Fatalf("backdate pending: %v", err)
+		}
+	}
+	loops := []domain.Loop{{SessionID: "newer", Cwd: "/x/aboard", ProjectDir: "-x-aboard", State: domain.StateRunning, LastActivity: spawnTS.Add(time.Second)}}
+
+	BindPending(loopsDir, pendingDir, loops, now, historyDir)
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["newer"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want exactly 1: %#v", len(evs), evs)
+	}
+	ev := evs[0]
+	if ev.Trigger != events.TriggerActuation {
+		t.Errorf("Trigger = %v, want TriggerActuation", ev.Trigger)
+	}
+	if ev.Actor != events.ActorHuman {
+		t.Errorf("Actor = %v, want ActorHuman (a spawn always originates from the \"n\" key)", ev.Actor)
+	}
+	if ev.FromState != "" {
+		t.Errorf("FromState = %q, want empty (brand new session, nothing to transition from)", ev.FromState)
+	}
+	if ev.ToState != string(domain.StateRunning) {
+		t.Errorf("ToState = %q, want %q", ev.ToState, domain.StateRunning)
+	}
+	if !strings.Contains(ev.Detail, "fix the bug") {
+		t.Errorf("Detail = %q, want it to carry the spawned goal", ev.Detail)
+	}
+}
+
+func TestBindPending_NoMatchYet_NoSpawnEventRecorded(t *testing.T) {
+	loopsDir, pendingDir, historyDir := t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Now()
+	spawnTS := now.Add(-time.Second)
+
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+	for name := range listPending(pendingDir) {
+		if err := writePendingRaw(pendingDir, name, "/x/aboard", "goal", spawnTS); err != nil {
+			t.Fatalf("backdate pending: %v", err)
+		}
+	}
+
+	BindPending(loopsDir, pendingDir, nil, now, historyDir)
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d sessions with events, want 0 (nothing was actually bound yet)", len(got))
+	}
+}
+
+func TestCapDetail_TruncatesLongGoal_RuneSafe(t *testing.T) {
+	long := strings.Repeat("a", detailCap+50)
+	got := capDetail(long)
+	runeCount := len([]rune(got))
+	if runeCount != detailCap+len([]rune("…")) {
+		t.Errorf("got %d runes, want %d (cap + ellipsis)", runeCount, detailCap+1)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("got %q, want a trailing ellipsis marker", got)
+	}
+}
+
+func TestCapDetail_ShortGoal_Unchanged(t *testing.T) {
+	if got := capDetail("short goal"); got != "short goal" {
+		t.Errorf("got %q, want unchanged %q", got, "short goal")
+	}
+}
+
+func TestCapDetail_MultibyteText_NeverSplitsARune(t *testing.T) {
+	// a Korean goal longer than detailCap runes — a byte-index cut would
+	// slice a multi-byte character in half and corrupt the tail.
+	long := strings.Repeat("이", detailCap+10)
+	got := capDetail(long)
+	if !utf8.ValidString(got) {
+		t.Errorf("capDetail produced invalid UTF-8: %q", got)
 	}
 }

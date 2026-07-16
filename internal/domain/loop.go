@@ -113,3 +113,47 @@ func (l Loop) BudgetFrac() float64 {
 	}
 	return f
 }
+
+// StateString encodes a loop's classified state as the string internal/tui
+// and internal/registry persist to the append-only event history
+// (internal/events.Event's FromState/ToState) — State alone is not enough:
+// a StallKind change (e.g. StallNoOutput → StallGone) with State staying
+// StateStalled throughout is a real, notify- and report-worthy incident
+// (loop-gone), but a plain string(State) comparison can't see it (both
+// sides would just read "stalled"). Every OTHER state is unaffected — only
+// StateStalled gets the stall kind appended, since State and StallKind are
+// otherwise orthogonal-in-practice (no other state carries a meaningful
+// StallKind).
+func (l Loop) StateString() string {
+	return StateString(l.State, l.Stall)
+}
+
+// StateString is StateString's free-function core, for callers building an
+// event record from state/stall values that aren't packaged into a Loop
+// (e.g. internal/claude's governor recording a PRE-transition state it
+// captured separately from the Loop it's mutating in place).
+func StateString(state LoopState, stall StallKind) string {
+	if state != StateStalled {
+		return string(state)
+	}
+	return string(state) + ":" + stallSlug(stall)
+}
+
+// stallSlug is StallKind's short, machine-stable, hyphenated form for
+// StateString — the StallKind constants themselves are full human sentences
+// ("process gone", "rate limited (429)") meant for the TUI's prose, not for
+// concatenating into a colon-delimited state key.
+func stallSlug(s StallKind) string {
+	switch s {
+	case StallTokenOut:
+		return "token-out"
+	case StallRateLimit:
+		return "rate-limit"
+	case StallNoOutput:
+		return "no-output"
+	case StallGone:
+		return "gone"
+	default:
+		return "unknown"
+	}
+}

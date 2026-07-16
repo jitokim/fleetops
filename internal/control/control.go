@@ -10,6 +10,8 @@ import (
 	"context"
 	"github.com/jitokim/missionctl/internal/domain"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -27,6 +29,24 @@ func runWithTimeout(argv []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), actuationTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+}
+
+// isClaudeComm reports whether comm (a tmux pane_current_command / ps comm
+// field) names a `claude` process — its base name is exactly "claude", or
+// exactly "claude" once a trailing ".exe" is stripped. Seen live
+// 2026-07-17: the captain's second session showed up as
+// "/whatever/claude.exe" (lsof-confirmed, origin of the binary name TBD —
+// possibly a native-build install); a strict "claude" comparison made every
+// tmux pane hosting it invisible to LocateByTTY/parseTmuxClaudePanes,
+// misrouting or refusing actuation for it. Mirrors
+// internal/claude.matchesClaudeComm exactly (duplicated rather than
+// imported — internal/control and internal/claude are siblings with no
+// existing dependency between them, and this is 2 lines). Deliberately NOT
+// loosened to a prefix match: "claude-helper" and similar must stay
+// excluded.
+func isClaudeComm(comm string) bool {
+	name := strings.TrimSuffix(filepath.Base(comm), ".exe")
+	return name == "claude"
 }
 
 // encodeCwd applies Claude Code's own project-dir encoding to a real
