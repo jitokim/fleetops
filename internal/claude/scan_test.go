@@ -890,3 +890,137 @@ func TestEnrichFromRegistry_GateWinsOverRejectedVerdict(t *testing.T) {
 		t.Errorf("State = %v, want StateGate preserved (gate wins over a same-cycle DRIFT verdict)", out[0].State)
 	}
 }
+
+// ── governor runtime enforcement (internal/engine.Check via applyGovernor) ──
+
+func TestEnrichFromRegistry_NoImproveAtLimit_BecomesStateFailedWithNote(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal", MaxCycles: 12}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	// three rejections in a row push NoImprove to the default NoImproveLimit (3).
+	for cycle := 1; cycle <= registry.DefaultNoImproveLimit; cycle++ {
+		if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, cycle); err != nil {
+			t.Fatalf("SaveVerdict: %v", err)
+		}
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateRunning, Cycle: 10}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateFailed {
+		t.Errorf("State = %v, want StateFailed once NoImprove reaches the limit", out[0].State)
+	}
+	want := fmt.Sprintf("stopped: no improvement %d/%d", registry.DefaultNoImproveLimit, registry.DefaultNoImproveLimit)
+	if out[0].Note != want {
+		t.Errorf("Note = %q, want %q", out[0].Note, want)
+	}
+}
+
+func TestEnrichFromRegistry_CycleAtMaxCycles_EscalatesWithNote_StateUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal", MaxCycles: 5}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateRunning, Cycle: 5}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateRunning {
+		t.Errorf("State = %v, want unchanged StateRunning (Escalate keeps the current State)", out[0].State)
+	}
+	if out[0].Note != "⚠ max cycles reached" {
+		t.Errorf("Note = %q, want %q", out[0].Note, "⚠ max cycles reached")
+	}
+}
+
+func TestEnrichFromRegistry_BudgetExhausted_EscalatesWithNote(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	loops := []domain.Loop{{
+		SessionID:   "sess-1",
+		State:       domain.StateIdle,
+		Goal:        domain.Goal{BudgetTokens: 1000},
+		TokensSpent: 1000,
+	}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].Note != "⚠ over budget" {
+		t.Errorf("Note = %q, want %q", out[0].Note, "⚠ over budget")
+	}
+	if out[0].State != domain.StateIdle {
+		t.Errorf("State = %v, want unchanged StateIdle", out[0].State)
+	}
+}
+
+func TestEnrichFromRegistry_UnboundLoop_GovernorNeverRuns(t *testing.T) {
+	// no registry record at all — enrichFromRegistry's early continue means
+	// applyGovernor never sees this loop, regardless of its counters.
+	loops := []domain.Loop{{
+		SessionID: "never-bound",
+		State:     domain.StateRunning,
+		NoImprove: 999,
+		Cycle:     999,
+	}}
+	out := enrichFromRegistry(loops, t.TempDir())
+
+	if out[0].State != domain.StateRunning {
+		t.Errorf("State = %v, want unchanged StateRunning (unbound loops are untouched)", out[0].State)
+	}
+	if out[0].Note != "" {
+		t.Errorf("Note = %q, want empty (unbound loops are untouched)", out[0].Note)
+	}
+}
+
+func TestEnrichFromRegistry_GateWins_GovernorSkipped(t *testing.T) {
+	// a live gate must win over the governor too — same reasoning as gate
+	// winning over a stale verdict (see TestEnrichFromRegistry_GateWinsOverDoneVerdict).
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	for cycle := 1; cycle <= 3; cycle++ {
+		if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected}, cycle); err != nil {
+			t.Fatalf("SaveVerdict: %v", err)
+		}
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateGate, GatePrompt: "approve?"}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateGate {
+		t.Errorf("State = %v, want StateGate preserved (gate wins over the governor's Stop)", out[0].State)
+	}
+	if out[0].Note != "" {
+		t.Errorf("Note = %q, want empty (governor skipped while gated)", out[0].Note)
+	}
+}
+
+func TestEnrichFromRegistry_AlreadyTerminalState_GovernorSkipped(t *testing.T) {
+	// an already-terminal loop (e.g. StateDone from this cycle's verdict)
+	// must not be re-decided by the governor even if its counters would
+	// otherwise trigger Stop/Escalate.
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeDone, Reason: "tests pass"}, 5); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	// force a synthetic NoImprove that would otherwise trigger Stop — done
+	// resets NoImprove in practice (SaveVerdict), but the governor's
+	// terminal-state guard must hold independent of that.
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle, Cycle: 5, NoImprove: 3}}
+	out := enrichFromRegistry(loops, dir)
+
+	if out[0].State != domain.StateDone {
+		t.Errorf("State = %v, want StateDone (already terminal, governor must not override it)", out[0].State)
+	}
+	if out[0].Note != "" {
+		t.Errorf("Note = %q, want empty (governor skipped once terminal)", out[0].Note)
+	}
+}

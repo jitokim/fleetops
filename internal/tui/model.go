@@ -68,6 +68,13 @@ type spawnResultMsg struct {
 	text string
 }
 
+// worktreeEligibilityMsg reports whether the resolved backend implements
+// control.WorktreeSpawner — computed off the event loop (control.Resolve
+// does real exec calls) by checkWorktreeEligibilityCmd, fired at "n"
+// keypress time so the result is (almost always) ready well before the
+// wizard reaches its final wizardWhere step.
+type worktreeEligibilityMsg bool
+
 // killResultMsg reports the outcome of a kill (k key, double-press confirm)
 // attempt, computed off the event loop by killCmd, mirroring resumeResultMsg.
 type killResultMsg struct {
@@ -141,6 +148,7 @@ const (
 	wizardOracle                       // optional; verification rubric
 	wizardChallenger                   // optional; adversarial probe description, STORED ONLY
 	wizardMaxCycles                    // optional; empty = registry.DefaultMaxCycles
+	wizardWhere                        // single-key w/d/enter; only reached when the backend supports worktree spawn — see advanceSpawnWizard
 )
 
 type Model struct {
@@ -158,15 +166,30 @@ type Model struct {
 	spawnCwd  string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
 	spawnNote string // captured alongside spawnCwd: non-empty when the selected loop's cwd wasn't verified-real and spawn fell back to os.Getwd() (see the "n" handler and P1-3's CwdVerified gating)
 
-	// spawnStep/spawnGoal/spawnDoneWhen/spawnOracle/spawnChallenger hold the
-	// "n" key wizard's in-progress answers across its 5 steps (see
-	// wizardStep) — spawnCwd/spawnNote above are captured once, before step
-	// 1, and don't change as the wizard advances.
+	// spawnStep/spawnGoal/spawnDoneWhen/spawnOracle/spawnChallenger/
+	// spawnMaxCycles hold the "n" key wizard's in-progress answers across
+	// its steps (see wizardStep) — spawnCwd/spawnNote above are captured
+	// once, before step 1, and don't change as the wizard advances.
 	spawnStep       wizardStep
 	spawnGoal       string
 	spawnDoneWhen   string
 	spawnOracle     string
 	spawnChallenger string
+	spawnMaxCycles  int
+
+	// spawnWorktreeEligible/spawnHostsClaudeRepo drive the final wizardWhere
+	// step's default and whether it's shown at all:
+	//   - spawnWorktreeEligible: does the resolved backend implement
+	//     control.WorktreeSpawner (orca only)? Computed OFF the event loop
+	//     (control.Resolve does real exec calls) by checkWorktreeEligibilityCmd,
+	//     fired at "n" keypress time — by the time a human types through 4-5
+	//     wizard steps the result has almost always arrived, but the
+	//     zero-value (false) is a safe fallback if it hasn't.
+	//   - spawnHostsClaudeRepo: true when "n" was pressed with a loop
+	//     selected (independent evidence claude has actually run in
+	//     spawnCwd) — see the "n" handler.
+	spawnWorktreeEligible bool
+	spawnHostsClaudeRepo  bool
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
@@ -214,6 +237,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.mode == modePrompting {
+			if m.spawnStep == wizardWhere {
+				// single-key step — no textinput involved, so route keys
+				// directly instead of falling into the generic
+				// m.input.Update default case below.
+				switch key {
+				case "esc":
+					m.mode = modeNormal
+					m.input.Blur()
+					m.status, m.statusKind = "cancelled", statusNeutral
+					return m, nil
+				case "w":
+					return m.submitSpawnWizard(true) // explicit: attempt worktree if the backend can do it at all
+				case "enter":
+					return m.submitSpawnWizard(m.spawnWorktreeEligible && m.spawnHostsClaudeRepo) // default
+				case "d":
+					return m.submitSpawnWizard(false)
+				}
+				return m, nil // ignore any other key at this single-key step
+			}
 			switch key {
 			case "esc":
 				m.mode = modeNormal
@@ -347,7 +389,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cwd = "."
 			}
 			spawnNote := ""
-			if sel, ok := m.selected(); ok && sel.Cwd != "" {
+			sel, selOK := m.selected()
+			hostsClaudeRepo := selOK && sel.Cwd != "" // independent evidence claude has run in sel.Cwd — see wizardWhere's default
+			if selOK && sel.Cwd != "" {
 				// Only spawn into a loop's cwd once it's been confirmed
 				// against a live process's real lsof path (see
 				// applyLiveness/CwdVerified) — a dead loop's Cwd is at best
@@ -367,9 +411,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spawnDoneWhen = ""
 			m.spawnOracle = ""
 			m.spawnChallenger = ""
+			m.spawnMaxCycles = 0
+			m.spawnWorktreeEligible = false // set once checkWorktreeEligibilityCmd's result arrives
+			m.spawnHostsClaudeRepo = hostsClaudeRepo
 			m.mode = modePrompting
 			m.input = newWizardInput()
-			return m, textinput.Blink
+			return m, tea.Batch(textinput.Blink, checkWorktreeEligibilityCmd())
 		case "k":
 			sel, ok := m.selected()
 			if !ok {
@@ -430,6 +477,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusKind = statusErr
 		}
+	case worktreeEligibilityMsg:
+		m.spawnWorktreeEligible = bool(msg)
 	case killResultMsg:
 		m.status = msg.text
 		if msg.ok {
@@ -475,6 +524,15 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 		// anything. Refuse before even resolving a backend.
 		if l.Stall == domain.StallGone {
 			return resumeResultMsg{false, "process gone — restart with: " + manualResumeHint(l.SessionID)}
+		}
+		// SAFETY: the governor stopped this loop (internal/engine.Check via
+		// applyGovernor, no-improve limit reached) — StateFailed is
+		// deliberately terminal (domain.LoopState.Terminal()). Resuming it
+		// would silently re-drive a loop the runtime already decided to
+		// fail closed on; the human must make a new decision (kill, or a
+		// fresh contract), not have "r" quietly override the governor.
+		if l.State == domain.StateFailed {
+			return resumeResultMsg{false, "governor stopped this loop (no improvement) — k kill or start a new contract"}
 		}
 		ctrl, ok := control.Resolve()
 		if !ok {
@@ -635,22 +693,17 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 			m.status, m.statusKind = err.Error()+" — try again", statusErr
 			return m, nil // re-prompt: stay in modePrompting on this same step
 		}
+		m.spawnMaxCycles = maxCycles
 
-		m.mode = modeNormal
-		m.input.Blur()
-		note := m.spawnNote
-		if m.spawnDoneWhen == "" {
-			note += " (no done condition — oracle judges against the goal only)"
+		if !m.spawnWorktreeEligible {
+			// no backend supports worktree-isolated spawn (tmux/cmux, or no
+			// backend resolved at all) — offering a choice that always
+			// degrades to the same outcome would just be confusing, so
+			// skip straight to a current-dir spawn.
+			return m.submitSpawnWizard(false)
 		}
-		m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", m.spawnCwd, note), statusNeutral
-		spec := registry.BindSpec{
-			Goal:          m.spawnGoal,
-			DoneCondition: m.spawnDoneWhen,
-			Oracle:        m.spawnOracle,
-			Challenger:    m.spawnChallenger,
-			MaxCycles:     maxCycles,
-		}
-		return m, spawnCmd(m.spawnCwd, spec)
+		m.spawnStep = wizardWhere
+		return m, textinput.Blink
 
 	default:
 		// unreachable given wizardStep's const range, but never hang the UI
@@ -662,23 +715,115 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 	}
 }
 
-// spawnCmd starts a brand new claude loop in cwd from the wizard's full
-// contract (spec), via whichever multiplexer backend is available.
-// Controller.Spawn has no way to report back the new session's id (it just
-// starts a process), so on success this writes a pending record
+// submitSpawnWizard finishes the wizard (from either wizardMaxCycles, when
+// worktree spawn isn't eligible at all, or wizardWhere's w/d/enter) and
+// dispatches spawnCmd. useWorktree is the wizard's resolved choice — spawnCmd
+// re-checks WorktreeSpawner support itself before actually branching (ctrl is
+// re-resolved at spawn time, not reused from the earlier eligibility check,
+// in case availability changed in between).
+func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
+	m.mode = modeNormal
+	m.input.Blur()
+	note := m.spawnNote
+	if m.spawnDoneWhen == "" {
+		note += " (no done condition — oracle judges against the goal only)"
+	}
+	if useWorktree {
+		m.status, m.statusKind = fmt.Sprintf("spawning loop in a new worktree...%s", note), statusNeutral
+	} else {
+		m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", m.spawnCwd, note), statusNeutral
+	}
+	spec := registry.BindSpec{
+		Goal:          m.spawnGoal,
+		DoneCondition: m.spawnDoneWhen,
+		Oracle:        m.spawnOracle,
+		Challenger:    m.spawnChallenger,
+		MaxCycles:     m.spawnMaxCycles,
+	}
+	return m, spawnCmd(m.spawnCwd, spec, useWorktree)
+}
+
+// checkWorktreeEligibilityCmd resolves the current backend and reports
+// whether it implements control.WorktreeSpawner — run off the event loop
+// (control.Resolve/Available do real exec calls) and fired at "n" keypress
+// time, well before the wizard reaches wizardWhere (see
+// worktreeEligibilityMsg).
+func checkWorktreeEligibilityCmd() tea.Cmd {
+	return func() tea.Msg {
+		ctrl, ok := control.Resolve()
+		if !ok {
+			return worktreeEligibilityMsg(false)
+		}
+		_, supports := ctrl.(control.WorktreeSpawner)
+		return worktreeEligibilityMsg(supports)
+	}
+}
+
+// spawnCmd starts a brand new claude loop from the wizard's full contract
+// (spec), via whichever multiplexer backend is available. Controller.Spawn
+// (and SpawnWorktree) have no way to report back the new session's id (they
+// just start a process), so on success this writes a pending record
 // (registry.WritePending) that the next scan's registry.BindPending matches
 // to the new session once it starts writing its own JSONL — that's also
 // what picks the loop up into the fleet in the first place; spawnCmd doesn't
 // construct a domain.Loop. The prompt actually sent to the new session is
 // the composed contract block (buildSpawnPrompt), not the bare goal — the
 // registry still stores goal/doneWhen/oracle/challenger as separate fields.
-func spawnCmd(cwd string, spec registry.BindSpec) tea.Cmd {
+//
+// useWorktree requests the worktree-isolated branch (Part 1 of the
+// worktree-spawn slice): when the resolved controller implements
+// control.WorktreeSpawner, cwd is treated as the REPO to branch a fresh
+// worktree from (SpawnWorktree also sends the contract prompt itself, as
+// part of orca's one-shot --agent launch — no separate Resume/send step,
+// verified live). If useWorktree is false, or the backend doesn't implement
+// WorktreeSpawner at all (tmux/cmux — a structural fallback, not a
+// preference), this falls through to the ordinary current-dir Spawn path
+// unchanged.
+//
+// SHARED-WORKSPACE CAVEAT (verified live, see SpawnWorktree's doc): for a
+// path-registered ("folder") repo, Orca doesn't isolate at all — the
+// returned worktreePath comes back EQUAL to cwd. The spawn still fully
+// works, so this is detected here (comparing the two paths) purely to tell
+// the human the truth in the status line, not treated as any kind of
+// failure.
+func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 	return func() tea.Msg {
 		ctrl, ok := control.Resolve()
 		if !ok {
 			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
 		}
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+
+		if spawner, supports := ctrl.(control.WorktreeSpawner); useWorktree && supports {
+			name := worktreeNameFromGoal(spec.Goal)
+			worktreePath, err := spawner.SpawnWorktree(cwd, name, prompt)
+			if err != nil {
+				return spawnResultMsg{false, fmt.Sprintf("spawn worktree failed: %v", err)}
+			}
+			pendingCwd := worktreePath
+			bindNote := ""
+			if pendingCwd == "" {
+				// SpawnWorktree succeeded but the (unverified) response
+				// shape didn't yield a path — best-effort pending record
+				// keyed by the repo cwd; BindPending's existing
+				// newest-unbound-wins matching still applies, it just has
+				// less certainty which session is "the" new one (same as
+				// the shared-workspace case just below).
+				pendingCwd = cwd
+				bindNote = " (binding may miss — worktree path unknown)"
+			}
+			if err := registry.WritePending(registry.PendingDir(), pendingCwd, spec); err != nil {
+				return spawnResultMsg{true, fmt.Sprintf("spawned loop in new worktree %s via %s (goal not recorded: %v)", name, ctrl.Name(), err)}
+			}
+			if worktreePath != "" && worktreePath == cwd {
+				// folder repo — no isolated checkout was actually created
+				// (see SpawnWorktree's shared-workspace caveat). Say so
+				// plainly rather than claiming isolation that didn't happen.
+				return spawnResultMsg{true, fmt.Sprintf("spawned in shared workspace %s (no isolated checkout — folder repo)", name)}
+			}
+			return spawnResultMsg{true, fmt.Sprintf("spawned loop in new worktree %s via %s%s", name, ctrl.Name(), bindNote)}
+		}
+
 		if err := ctrl.Spawn(cwd, prompt); err != nil {
 			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
 		}
@@ -689,6 +834,34 @@ func spawnCmd(cwd string, spec registry.BindSpec) tea.Cmd {
 		}
 		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
 	}
+}
+
+// worktreeNameFromGoal builds the `orca worktree create --name` value from
+// the wizard's goal: "mctl-" + a lowercase [a-z0-9-] slug of the goal's
+// first ~24 runes. Pure function so the slugging is directly testable.
+func worktreeNameFromGoal(goal string) string {
+	const maxRunes = 24
+	runes := []rune(strings.ToLower(goal))
+	if len(runes) > maxRunes {
+		runes = runes[:maxRunes]
+	}
+	var b strings.Builder
+	prevDash := false
+	for _, r := range runes {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		case !prevDash && b.Len() > 0:
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	slug := strings.TrimRight(b.String(), "-")
+	if slug == "" {
+		slug = "loop"
+	}
+	return "mctl-" + slug
 }
 
 // buildSpawnPrompt composes the LOOP CONTRACT block sent as the new
@@ -1001,7 +1174,7 @@ func (m Model) View() string {
 	b.WriteString("\n")
 	switch {
 	case m.mode == modePrompting:
-		b.WriteString(renderNewLoopPrompt(m.spawnStep, m.input))
+		b.WriteString(renderNewLoopPrompt(m))
 		b.WriteString("\n")
 	case m.mode == modeFiltering:
 		b.WriteString(renderFilterPrompt(m.input))
@@ -1199,13 +1372,7 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudge
 		markerStyle = lipgloss.NewStyle().Foreground(cAccent)
 	}
 	st := stateStyle(l)
-	note := ""
-	switch {
-	case l.Stall != domain.StallNone:
-		note = "⚠ " + string(l.Stall)
-	case l.State == domain.StateDrift && l.Last != nil:
-		note = "✗ " + l.Last.Reason
-	}
+	note, noteSt := noteForRow(l)
 	label := l.Project
 	if dup {
 		label += "·" + shortID(l.SessionID)
@@ -1230,7 +1397,7 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudge
 	}
 	cells = append(cells, stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))))
 	if wNote > 0 {
-		cells = append(cells, st.Width(wNote).Render(trunc(note, wNote-1)))
+		cells = append(cells, noteSt.Width(wNote).Render(trunc(note, wNote-1)))
 	}
 	row := "  " + lipgloss.JoinHorizontal(lipgloss.Top, cells...)
 	if sel {
@@ -1239,6 +1406,29 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudge
 		row = stSelRow.Render(padToWidth(row, totalWidth))
 	}
 	return row
+}
+
+// noteForRow decides the NOTE column's text and color. A governor-set
+// l.Note (internal/engine.Check via the scanner's applyGovernor) always
+// wins when set — it's either an "over budget"/"max cycles reached"
+// escalation (amber, State otherwise unchanged) or a "stopped: no
+// improvement" note paired with StateFailed (red, matching FAILED's own
+// state color) — over the older stall/drift-derived text, which falls back
+// to matching the row's overall state color (st) as before.
+func noteForRow(l domain.Loop) (string, lipgloss.Style) {
+	if l.Note != "" {
+		if l.State == domain.StateFailed {
+			return l.Note, lipgloss.NewStyle().Foreground(cRed)
+		}
+		return l.Note, lipgloss.NewStyle().Foreground(cAmber)
+	}
+	switch {
+	case l.Stall != domain.StallNone:
+		return "⚠ " + string(l.Stall), stateStyle(l)
+	case l.State == domain.StateDrift && l.Last != nil:
+		return "✗ " + l.Last.Reason, stateStyle(l)
+	}
+	return "", stateStyle(l)
 }
 
 // cycleLabel: plain count ("6"), or "6/12" once a per-loop MaxCycles exists.
@@ -1454,15 +1644,22 @@ func renderStatusLine(status string, kind statusKind) string {
 	return style.Render(status)
 }
 
-// renderNewLoopPrompt replaces the status line while the "n" key's 5-step
-// loop-contract wizard is active: "NEW LOOP ▸ <step label> <input>".
-func renderNewLoopPrompt(step wizardStep, input textinput.Model) string {
-	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ "+wizardStepLabel(step)+" ") + input.View()
+// renderNewLoopPrompt replaces the status line while the "n" key's
+// loop-contract wizard is active: "NEW LOOP ▸ <step label> <input>". The
+// final wizardWhere step is single-key (no free-text input), so it's
+// special-cased to render just the label — see whereStepLabel, which needs
+// Model context (fleet/eligibility) that a plain wizardStep can't carry.
+func renderNewLoopPrompt(m Model) string {
+	if m.spawnStep == wizardWhere {
+		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.whereStepLabel())
+	}
+	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ "+wizardStepLabel(m.spawnStep)+" ") + m.input.View()
 }
 
-// wizardStepLabel is each wizard step's prompt label — max_iteration's
-// carries the default inline ("[12]"), since there's no separate
-// placeholder shown on the input (see newWizardInput).
+// wizardStepLabel is each free-text wizard step's prompt label —
+// max_iteration's carries the default inline ("[12]"), since there's no
+// separate placeholder shown on the input (see newWizardInput). Does not
+// cover wizardWhere (see whereStepLabel).
 func wizardStepLabel(step wizardStep) string {
 	switch step {
 	case wizardGoal:
@@ -1478,6 +1675,31 @@ func wizardStepLabel(step wizardStep) string {
 	default:
 		return ""
 	}
+}
+
+// whereStepLabel builds the wizard's final "where to spawn" prompt, with a
+// busy-directory nudge appended when the target directory already hosts
+// >=1 fleet loop (independent of — and a stronger UX nudge than —
+// spawnHostsClaudeRepo, which only gates the w/enter default).
+func (m Model) whereStepLabel() string {
+	label := "where? [w] new worktree · [d] this dir:"
+	if m.spawnDirBusyCount() >= 1 {
+		label += " (dir busy — worktree recommended)"
+	}
+	return label
+}
+
+// spawnDirBusyCount counts loops in the CURRENT fleet whose Cwd matches the
+// wizard's spawn target directory — used only for whereStepLabel's nudge
+// text (pure, no exec, safe to call on every render).
+func (m Model) spawnDirBusyCount() int {
+	n := 0
+	for _, l := range m.loops {
+		if l.Cwd == m.spawnCwd {
+			n++
+		}
+	}
+	return n
 }
 
 // renderFilterPrompt replaces the status line while the "/" key's filter

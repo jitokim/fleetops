@@ -7,6 +7,7 @@ package claude
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/engine"
 	"github.com/jitokim/missionctl/internal/gate"
 	"github.com/jitokim/missionctl/internal/registry"
 )
@@ -138,8 +140,43 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir string) []domain.Loop {
 				loops[i].Stall = domain.StallNone
 			}
 		}
+
+		applyGovernor(&loops[i])
 	}
 	return loops
+}
+
+// applyGovernor enforces a bound loop's hard ceilings via
+// internal/engine.Check — DESIGN.md §3: budget/max-cycles/no-improve must
+// live in the runtime, not just as advisory numbers a human has to notice.
+// Runs AFTER the verdict mapping above, so Check sees this cycle's final
+// State/NoImprove.
+//
+// A live gate always wins (same reasoning as the verdict-vs-gate guard just
+// above: a human decision pending RIGHT NOW outranks a governor verdict) and
+// an already-terminal loop (done/failed/killed) is left alone — there's
+// nothing left to enforce once a loop is conclusively finished. Neither
+// carve-out is explicitly spelled out by the governor spec, but both mirror
+// an already-established precedent in this file; flagged in the slice
+// report as a judgment call.
+func applyGovernor(l *domain.Loop) {
+	if l.State == domain.StateGate || l.State.Terminal() {
+		return
+	}
+	switch d := engine.Check(*l); d.Action {
+	case engine.Stop:
+		l.State = domain.StateFailed
+		l.Note = fmt.Sprintf("stopped: no improvement %d/%d", l.NoImprove, l.Goal.NoImproveLimit)
+	case engine.Escalate:
+		switch d.Reason {
+		case "budget exhausted":
+			l.Note = "⚠ over budget"
+		case "max cycles reached":
+			l.Note = "⚠ max cycles reached"
+		default:
+			l.Note = "⚠ " + d.Reason
+		}
+	}
 }
 
 // applyLiveness cross-checks each loop against live `claude` CLI processes
@@ -464,8 +501,7 @@ func decodeCwd(dir string) string {
 // exactly against a loop's ProjectDir, which is why applyLiveness uses this
 // instead of decoding ProjectDir and fuzzy-matching against a live path.
 func encodeCwd(realPath string) string {
-	encoded := strings.ReplaceAll(realPath, "/", "-")
-	return strings.ReplaceAll(encoded, ".", "-")
+	return domain.EncodeCwd(realPath)
 }
 
 // LastUserPrompt returns the text of the last user message in a Claude Code

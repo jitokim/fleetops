@@ -163,6 +163,115 @@ func (orcaController) Spawn(cwd, goal string) error {
 	return exec.CommandContext(ctxSend, argv[0], argv[1:]...).Run()
 }
 
+// spawnWorktreeTimeout bounds the one-shot `orca worktree create --agent`
+// call. Unlike plain Spawn (create + wait + re-locate + send, several
+// exchanges), --agent/--prompt makes worktree create a single-shot agent
+// launch that also sends the prompt (verified from the orca CLI spec) — one
+// exec is enough.
+const spawnWorktreeTimeout = 15 * time.Second
+
+// SpawnWorktree creates a brand new Orca-managed worktree under repoCwd's
+// repo, launches a claude agent in it, and sends prompt — all in one
+// `orca worktree create --repo path:<repoCwd> --name <name> --agent claude
+// --prompt <prompt> --json` call. Verified LIVE (captain's machine):
+// --agent/--prompt turns worktree create into a genuine one-shot launch —
+// the agent comes up with prompt already injected as its first user
+// message, no separate wait/locate/send needed (unlike plain Spawn).
+//
+// SHARED-WORKSPACE CAVEAT (verified live): for a path-registered ("folder")
+// repo, Orca does NOT create an isolated checkout — the returned path comes
+// back EQUAL to repoCwd (branch/head empty, id containing "::workspace:").
+// Isolation only happens for Orca-managed checkouts. The spawn still fully
+// works either way (agent launched, prompt injected) — callers just need to
+// tell the human it landed in a SHARED directory, not a fresh isolated one
+// (see the tui's spawnCmd, which compares the returned path against
+// repoCwd to decide the status message).
+func (orcaController) SpawnWorktree(repoCwd, name, prompt string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), spawnWorktreeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "orca", "worktree", "create",
+		"--repo", "path:"+repoCwd, "--name", name, "--agent", "claude", "--prompt", prompt, "--json").Output()
+	if err != nil {
+		return "", fmt.Errorf("orca worktree create: %w", err)
+	}
+	// Same ok/error envelope convention as terminal create/list (see
+	// orcaEnvelopeErr) — a selector_not_found here means repoCwd isn't a
+	// worktree-capable repo Orca knows about, same friendly error as Spawn.
+	if err := orcaEnvelopeErr(out, repoCwd); err != nil {
+		return "", err
+	}
+	return extractWorktreePath(out), nil
+}
+
+// worktreePathKeys is the fixed priority order walkForWorktreePath's
+// tolerant fallback checks at each object level before recursing into
+// children — deterministic despite Go's randomized map iteration order.
+var worktreePathKeys = []string{"path", "worktreePath", "checkoutPath"}
+
+// orcaWorktreeCreateResult is `orca worktree create --json`'s VERIFIED
+// result shape (captain's live probe): {"result":{"worktree":{"path":"...",
+// ...}}}. extractWorktreePath decodes this directly first — the primary,
+// confirmed path — and only falls back to the tolerant walk
+// (walkForWorktreePath) for older/differing runtimes that don't match it.
+type orcaWorktreeCreateResult struct {
+	Result *struct {
+		Worktree struct {
+			Path string `json:"path"`
+		} `json:"worktree"`
+	} `json:"result"`
+}
+
+// extractWorktreePath extracts the new worktree's path from `orca worktree
+// create --json`'s output: result.worktree.path first (verified live —
+// see orcaWorktreeCreateResult), falling back to a tolerant walk of the
+// whole "result" object for path/worktreePath/checkoutPath-keyed strings
+// that look like an absolute path, in case an older/differing runtime
+// doesn't match the verified shape. Returns "" when nothing matching is
+// found, or the JSON doesn't even decode — never an error (see
+// SpawnWorktree's doc: an empty path is a degraded-but-successful spawn,
+// not a failure).
+func extractWorktreePath(jsonBytes []byte) string {
+	var typed orcaWorktreeCreateResult
+	if err := json.Unmarshal(jsonBytes, &typed); err == nil &&
+		typed.Result != nil && strings.HasPrefix(typed.Result.Worktree.Path, "/") {
+		return typed.Result.Worktree.Path
+	}
+
+	var envelope struct {
+		Result any `json:"result"`
+	}
+	if err := json.Unmarshal(jsonBytes, &envelope); err != nil {
+		return ""
+	}
+	return walkForWorktreePath(envelope.Result)
+}
+
+// walkForWorktreePath is extractWorktreePath's recursive core: at each
+// object level, checks worktreePathKeys in fixed priority order (so the
+// "first" match is deterministic) before descending into child values.
+func walkForWorktreePath(node any) string {
+	switch v := node.(type) {
+	case map[string]any:
+		for _, key := range worktreePathKeys {
+			if s, ok := v[key].(string); ok && strings.HasPrefix(s, "/") {
+				return s
+			}
+		}
+		for _, child := range v {
+			if p := walkForWorktreePath(child); p != "" {
+				return p
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if p := walkForWorktreePath(item); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
 // orcaErrorEnvelope is the shape an orca RPC response's failure takes:
 // {"ok":false,"error":{"code":"..."}} — shared by `terminal create` and
 // `terminal list` (same envelope convention as orcaListEnvelope/

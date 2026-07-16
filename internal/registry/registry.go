@@ -294,7 +294,13 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 		var best *domain.Loop
 		for i := range loops {
 			l := &loops[i]
-			if l.Cwd != p.Cwd {
+			// Match in the lossless direction (real path → encoded), never
+			// against l.Cwd: the decoded Cwd is lossy and may not be healed
+			// yet when BindPending runs (scan order: bind → enrich →
+			// liveness). A hyphenated worktree dir (mctl-...) never
+			// string-matches its decode — this exact bug shipped once (live
+			// worktree e2e caught it).
+			if domain.EncodeCwd(p.Cwd) != l.ProjectDir {
 				continue
 			}
 			if !l.LastActivity.After(p.TS) {

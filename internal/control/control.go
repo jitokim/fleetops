@@ -8,8 +8,8 @@ package control
 
 import (
 	"context"
+	"github.com/jitokim/missionctl/internal/domain"
 	"os/exec"
-	"strings"
 	"time"
 )
 
@@ -42,8 +42,7 @@ func runWithTimeout(argv []string) error {
 // "~/.claude-mem/...") actuate via a matched surface instead of always
 // degrading to a manual hint.
 func encodeCwd(realPath string) string {
-	encoded := strings.ReplaceAll(realPath, "/", "-")
-	return strings.ReplaceAll(encoded, ".", "-")
+	return domain.EncodeCwd(realPath)
 }
 
 // Target is a controllable terminal surface hosting a loop.
@@ -80,6 +79,20 @@ type Controller interface {
 	Approve(t Target) error               // accept the default option at a gate (bare Enter)
 	Spawn(cwd, goal string) error         // start a brand new claude loop in cwd
 	Interrupt(t Target) error             // stop the current turn (Esc) without killing the process
+}
+
+// WorktreeSpawner is an OPTIONAL capability a Controller may additionally
+// implement — spawning a loop into a fresh, isolated worktree rather than an
+// existing directory. This is orca-specific (verified against its CLI's
+// one-shot `worktree create --agent` contract — see orca.go's SpawnWorktree)
+// with no tmux/cmux equivalent, so it's a separate, narrow interface rather
+// than a new Controller method: widening Controller for one backend's
+// capability would bloat every other implementation with a stub (review
+// debt P2-5 — don't bloat the interface). Callers type-assert
+// (ctrl.(WorktreeSpawner)) and fall back to the ordinary Spawn/current-dir
+// path when a backend doesn't implement it.
+type WorktreeSpawner interface {
+	SpawnWorktree(repoCwd, name, prompt string) (worktreePath string, err error)
 }
 
 // Resolve returns the first available controller: orca preferred (the

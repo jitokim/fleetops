@@ -689,6 +689,41 @@ func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
 	}
 }
 
+func TestUpdate_RKey_StateFailed_BlockedByKeyGuard(t *testing.T) {
+	// the "r" keypress guard only allows StateStalled/StateDrift — a
+	// governor-failed loop must never even reach resumeCmd via this path.
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateFailed
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — StateFailed is not resumable via the r key")
+	}
+	if !strings.Contains(m.status, "stalled or drifted") {
+		t.Errorf("status = %q, want the r-key guard's usual message", m.status)
+	}
+}
+
+func TestResumeCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
+	// belt-and-suspenders: resumeCmd itself must refuse on StateFailed too,
+	// independent of the "r" keypress guard (see resumeCmd's SAFETY comment).
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateFailed}
+
+	msg := resumeCmd(l)()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("expected ok=false")
+	}
+	if !strings.Contains(rm.text, "governor stopped this loop") {
+		t.Errorf("text = %q, want it to mention the governor stopped the loop", rm.text)
+	}
+}
+
 func TestUpdate_AKey_AmbiguousSharedDir_Refuses(t *testing.T) {
 	m := modelWithTwoLoopsSharingDir()
 	m.loops[0].State = domain.StateGate
@@ -940,6 +975,51 @@ func TestNoImproveLabel(t *testing.T) {
 	bound := domain.Loop{Goal: domain.Goal{Text: "x", NoImproveLimit: 3}, NoImprove: 1}
 	if got := noImproveLabel(bound); got != "1/3" {
 		t.Errorf("bound: got %q, want %q", got, "1/3")
+	}
+}
+
+func TestNoteForRow_GovernorNotePreferredOverStall(t *testing.T) {
+	l := domain.Loop{State: domain.StateRunning, Note: "⚠ over budget", Stall: domain.StallNoOutput}
+	note, style := noteForRow(l)
+	if note != "⚠ over budget" {
+		t.Errorf("note = %q, want the governor note, not the stall text", note)
+	}
+	if style.GetForeground() != cAmber {
+		t.Errorf("style foreground = %v, want cAmber for a non-failed governor note", style.GetForeground())
+	}
+}
+
+func TestNoteForRow_GovernorNote_FailedStateIsRed(t *testing.T) {
+	l := domain.Loop{State: domain.StateFailed, Note: "stopped: no improvement 3/3"}
+	note, style := noteForRow(l)
+	if note != "stopped: no improvement 3/3" {
+		t.Errorf("note = %q, want the governor's stop note", note)
+	}
+	if style.GetForeground() != cRed {
+		t.Errorf("style foreground = %v, want cRed for a StateFailed governor note", style.GetForeground())
+	}
+}
+
+func TestNoteForRow_NoGovernorNote_FallsBackToStallText(t *testing.T) {
+	l := domain.Loop{State: domain.StateStalled, Stall: domain.StallNoOutput}
+	note, _ := noteForRow(l)
+	if note != "⚠ no output" {
+		t.Errorf("note = %q, want the stall-derived text", note)
+	}
+}
+
+func TestNoteForRow_NoGovernorNote_FallsBackToDriftReason(t *testing.T) {
+	l := domain.Loop{State: domain.StateDrift, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence shown"}}
+	note, _ := noteForRow(l)
+	if note != "✗ no evidence shown" {
+		t.Errorf("note = %q, want the drift reason", note)
+	}
+}
+
+func TestNoteForRow_NeitherGovernorNorStallNorDrift_Empty(t *testing.T) {
+	note, _ := noteForRow(domain.Loop{State: domain.StateRunning})
+	if note != "" {
+		t.Errorf("note = %q, want empty", note)
 	}
 }
 
@@ -1218,5 +1298,219 @@ func TestWizardStepLabel_AllSteps(t *testing.T) {
 		if got := wizardStepLabel(c.step); got != c.want {
 			t.Errorf("wizardStepLabel(%v) = %q, want %q", c.step, got, c.want)
 		}
+	}
+}
+
+// ── worktree spawn: wizardWhere step ─────────────────────────────────
+
+// reachWizardWhere drives the wizard from a fresh "n" keypress through all
+// 5 free-text steps (goal filled, the rest left empty/default) with
+// worktree eligibility forced true, landing at wizardWhere. Used by every
+// wizardWhere test below so each one only has to exercise the final step.
+func reachWizardWhere(t *testing.T, m Model) Model {
+	t.Helper()
+	m, _ = updateModel(t, m, runeKey('n'))
+	m.spawnWorktreeEligible = true // simulate checkWorktreeEligibilityCmd's async result having already arrived
+	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Fatalf("precondition failed: mode=%v step=%v, want modePrompting at wizardWhere", m.mode, m.spawnStep)
+	}
+	return m
+}
+
+func TestWizard_SkipsWhereStep_WhenNotEligible(t *testing.T) {
+	// the zero-value default (spawnWorktreeEligible=false, e.g. no backend
+	// resolved, or tmux/cmux) — the wizard must submit directly from
+	// wizardMaxCycles rather than showing a choice that always degrades.
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, cmd := typeAndEnter(t, m, "")
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (wizardWhere skipped)", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) — submits directly when ineligible")
+	}
+	if strings.Contains(m.status, "new worktree") {
+		t.Errorf("status = %q, want the current-dir spawn message", m.status)
+	}
+}
+
+func TestWizard_ReachesWhereStep_WhenEligible(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+	if !strings.Contains(m.whereStepLabel(), "new worktree") {
+		t.Errorf("whereStepLabel() = %q, want it to mention the worktree option", m.whereStepLabel())
+	}
+}
+
+func TestUpdate_WizardWhere_DKey_SubmitsCurrentDirSpawn(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, runeKey('d'))
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if strings.Contains(m.status, "new worktree") {
+		t.Errorf("status = %q, want the current-dir spawn message, not worktree", m.status)
+	}
+}
+
+func TestUpdate_WizardWhere_WKey_SubmitsWorktreeSpawn(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, runeKey('w'))
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if !strings.Contains(m.status, "new worktree") {
+		t.Errorf("status = %q, want the worktree spawn message", m.status)
+	}
+}
+
+func TestUpdate_WizardWhere_EnterKey_DefaultsToWorktree_WhenHostsClaudeRepo(t *testing.T) {
+	// modelWithOneLoop selects a loop with Cwd set, so spawnHostsClaudeRepo
+	// is true — combined with the forced-eligible backend, enter's default
+	// must resolve to worktree.
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if !strings.Contains(m.status, "new worktree") {
+		t.Errorf("status = %q, want the worktree default (eligible AND hosts a claude repo)", m.status)
+	}
+}
+
+func TestUpdate_WizardWhere_EnterKey_DefaultsToCurrentDir_WhenNoRepoEvidence(t *testing.T) {
+	// no loop selected ("n" pressed with nothing to select) — no evidence
+	// spawnCwd is a real claude repo, so enter's default must NOT assume
+	// worktree even though the backend is eligible.
+	m := reachWizardWhere(t, New())
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if strings.Contains(m.status, "new worktree") {
+		t.Errorf("status = %q, want the current-dir default (no evidence this cwd is a claude repo)", m.status)
+	}
+}
+
+func TestUpdate_WizardWhere_Esc_Cancels(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd from cancelling")
+	}
+}
+
+func TestUpdate_WizardWhere_IgnoresUnrelatedKeys(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, runeKey('x'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an unrelated key")
+	}
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Errorf("got mode=%v step=%v, want to remain at wizardWhere", m.mode, m.spawnStep)
+	}
+}
+
+func TestWhereStepLabel_BusyDirNudge(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", State: domain.StateRunning}}
+	m.spawnCwd = "/x/aboard"
+
+	if !strings.Contains(m.whereStepLabel(), "dir busy") {
+		t.Errorf("whereStepLabel() = %q, want the busy-dir nudge (a fleet loop shares spawnCwd)", m.whereStepLabel())
+	}
+}
+
+func TestWhereStepLabel_NoBusyNudge_WhenDirEmpty(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/other", State: domain.StateRunning}}
+	m.spawnCwd = "/x/aboard"
+
+	if strings.Contains(m.whereStepLabel(), "dir busy") {
+		t.Errorf("whereStepLabel() = %q, want no busy nudge (no loop shares spawnCwd)", m.whereStepLabel())
+	}
+}
+
+func TestSpawnDirBusyCount(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{SessionID: "s1", Cwd: "/x/aboard"},
+		{SessionID: "s2", Cwd: "/x/aboard"},
+		{SessionID: "s3", Cwd: "/x/other"},
+	}
+	m.spawnCwd = "/x/aboard"
+
+	if got := m.spawnDirBusyCount(); got != 2 {
+		t.Errorf("got %d, want 2", got)
+	}
+}
+
+// ── worktree spawn: worktreeNameFromGoal ─────────────────────────────
+
+func TestWorktreeNameFromGoal_BasicSlug(t *testing.T) {
+	got := worktreeNameFromGoal("Fix the flaky test")
+	want := "mctl-fix-the-flaky-test"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestWorktreeNameFromGoal_TruncatesTo24Runes(t *testing.T) {
+	goal := strings.Repeat("a", 40)
+	got := worktreeNameFromGoal(goal)
+	want := "mctl-" + strings.Repeat("a", 24)
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestWorktreeNameFromGoal_NonAlnumCollapsesToSingleDash(t *testing.T) {
+	got := worktreeNameFromGoal("fix: bug #123!!")
+	want := "mctl-fix-bug-123"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestWorktreeNameFromGoal_EmptyGoal_FallsBackToLoop(t *testing.T) {
+	if got := worktreeNameFromGoal(""); got != "mctl-loop" {
+		t.Errorf("got %q, want %q", got, "mctl-loop")
+	}
+}
+
+func TestWorktreeNameFromGoal_AllPunctuation_FallsBackToLoop(t *testing.T) {
+	if got := worktreeNameFromGoal("!!!???"); got != "mctl-loop" {
+		t.Errorf("got %q, want %q", got, "mctl-loop")
 	}
 }

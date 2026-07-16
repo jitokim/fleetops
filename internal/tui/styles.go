@@ -59,7 +59,7 @@ var (
 func stateStyle(l domain.Loop) lipgloss.Style {
 	s := lipgloss.NewStyle().Foreground(stateColor(l))
 	switch l.State {
-	case domain.StateStalled, domain.StateGate, domain.StateRunning, domain.StateDone, domain.StateDrift:
+	case domain.StateStalled, domain.StateGate, domain.StateRunning, domain.StateDone, domain.StateDrift, domain.StateFailed:
 		s = s.Bold(true)
 	}
 	return s
@@ -79,6 +79,8 @@ func stateColor(l domain.Loop) lipgloss.Color {
 	case domain.StateDone:
 		return cGreen
 	case domain.StateDrift:
+		return cRed
+	case domain.StateFailed:
 		return cRed
 	default:
 		return cDim
@@ -105,6 +107,8 @@ func stateLabel(l domain.Loop) string {
 		return "✓ DONE"
 	case domain.StateDrift:
 		return "✗ DRIFT"
+	case domain.StateFailed:
+		return "✗ FAILED"
 	default:
 		return string(l.State)
 	}

@@ -414,3 +414,99 @@ func TestSelectSpawnedOrcaTerminal_NoMatch(t *testing.T) {
 		t.Error("expected ok=false when no terminal matches cwd")
 	}
 }
+
+// realWorktreeCreateFixture is the VERIFIED live response captured from the
+// captain's machine (`orca worktree create --repo "path:/Users/imac/IdeaProjects/aboard"
+// --name mctl-wt-probe --agent claude --prompt "..." --json`) — result.worktree.path
+// is the confirmed, primary source extractWorktreePath must use.
+const realWorktreeCreateFixture = `{
+	"id": "c30a6466-...",
+	"ok": true,
+	"result": {
+		"worktree": {
+			"id": "2727286c-...::/Users/imac/IdeaProjects/aboard::workspace:592cd765-...",
+			"instanceId": "592cd765-...",
+			"repoId": "2727286c-...",
+			"hostId": "local",
+			"path": "/Users/imac/IdeaProjects/aboard",
+			"head": "",
+			"branch": "",
+			"isBare": false,
+			"isMainWorktree": false,
+			"displayName": "mctl-wt-probe",
+			"createdWithAgent": "claude",
+			"workspaceStatus": "in-progress"
+		}
+	}
+}`
+
+func TestExtractWorktreePath_RealLiveFixture_SharedWorkspace(t *testing.T) {
+	// the shared-workspace case: a path-registered ("folder") repo — path
+	// comes back equal to the repo cwd, branch/head empty. Still a valid,
+	// confirmed path — extractWorktreePath doesn't itself decide
+	// shared-vs-isolated (that's the tui's spawnCmd, comparing against
+	// repoCwd), it just needs to extract this path correctly.
+	got := extractWorktreePath([]byte(realWorktreeCreateFixture))
+	want := "/Users/imac/IdeaProjects/aboard"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractWorktreePath_PlausibleFixture_WorktreePathKey(t *testing.T) {
+	fixture := []byte(`{"ok":true,"result":{"agentTerminalHandle":"term_new123","worktree":{"worktreePath":"/Users/imac/orca/worktrees/mctl-fix-the-bug"}}}`)
+	got := extractWorktreePath(fixture)
+	want := "/Users/imac/orca/worktrees/mctl-fix-the-bug"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractWorktreePath_PlausibleFixture_PlainPathKey(t *testing.T) {
+	fixture := []byte(`{"ok":true,"result":{"path":"/Users/imac/orca/worktrees/mctl-fix-the-bug","startupTerminal":{"handle":"term_old456"}}}`)
+	got := extractWorktreePath(fixture)
+	want := "/Users/imac/orca/worktrees/mctl-fix-the-bug"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractWorktreePath_NestedCheckoutPathKey(t *testing.T) {
+	fixture := []byte(`{"ok":true,"result":{"worktree":{"repo":{"checkoutPath":"/Users/imac/orca/worktrees/mctl-fix-the-bug"}}}}`)
+	got := extractWorktreePath(fixture)
+	want := "/Users/imac/orca/worktrees/mctl-fix-the-bug"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExtractWorktreePath_ShapelessFixture_ReturnsEmpty(t *testing.T) {
+	// no key resembling path/worktreePath/checkoutPath anywhere, and no
+	// value looks like an absolute path — spawn still succeeded, just no
+	// path could be extracted.
+	fixture := []byte(`{"ok":true,"result":{"agentTerminalHandle":"term_new123","status":"launched"}}`)
+	got := extractWorktreePath(fixture)
+	if got != "" {
+		t.Errorf("got %q, want empty (no plausible path found)", got)
+	}
+}
+
+func TestExtractWorktreePath_RelativeLookingValueRejected(t *testing.T) {
+	// a "path"-keyed value that doesn't look absolute must not be returned.
+	fixture := []byte(`{"ok":true,"result":{"path":"relative/not/absolute"}}`)
+	if got := extractWorktreePath(fixture); got != "" {
+		t.Errorf("got %q, want empty (value doesn't look like an absolute path)", got)
+	}
+}
+
+func TestExtractWorktreePath_GarbageJSON_ReturnsEmpty(t *testing.T) {
+	if got := extractWorktreePath([]byte("not json")); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestExtractWorktreePath_NoResultField_ReturnsEmpty(t *testing.T) {
+	if got := extractWorktreePath([]byte(`{"ok":true}`)); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}

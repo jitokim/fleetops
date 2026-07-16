@@ -224,9 +224,9 @@ func TestBindPending_MatchesNewestUnboundSessionInCwd(t *testing.T) {
 	}
 
 	loops := []domain.Loop{
-		{SessionID: "older", Cwd: "/x/aboard", LastActivity: spawnTS.Add(-time.Hour)}, // pre-existing, before the spawn — must NOT match
-		{SessionID: "newer", Cwd: "/x/aboard", LastActivity: spawnTS.Add(time.Second)},
-		{SessionID: "other-cwd", Cwd: "/x/other", LastActivity: spawnTS.Add(time.Second)},
+		{SessionID: "older", Cwd: "/x/aboard", ProjectDir: "-x-aboard", LastActivity: spawnTS.Add(-time.Hour)}, // pre-existing, before the spawn — must NOT match
+		{SessionID: "newer", Cwd: "/x/aboard", ProjectDir: "-x-aboard", LastActivity: spawnTS.Add(time.Second)},
+		{SessionID: "other-cwd", Cwd: "/x/other", ProjectDir: "-x-other", LastActivity: spawnTS.Add(time.Second)},
 	}
 
 	BindPending(loopsDir, pendingDir, loops, now)
@@ -267,7 +267,7 @@ func TestBindPending_SkipsAlreadyBoundSessions(t *testing.T) {
 	}
 
 	loops := []domain.Loop{
-		{SessionID: "already-bound", Cwd: "/x/aboard", LastActivity: spawnTS.Add(time.Second)},
+		{SessionID: "already-bound", Cwd: "/x/aboard", ProjectDir: "-x-aboard", LastActivity: spawnTS.Add(time.Second)},
 	}
 
 	BindPending(loopsDir, pendingDir, loops, now)
@@ -296,7 +296,7 @@ func TestBindPending_StalePendingDropped(t *testing.T) {
 	}
 
 	// even a perfectly matching session must not be bound once stale.
-	loops := []domain.Loop{{SessionID: "s1", Cwd: "/x/aboard", LastActivity: staleTS.Add(time.Second)}}
+	loops := []domain.Loop{{SessionID: "s1", Cwd: "/x/aboard", ProjectDir: "-x-aboard", LastActivity: staleTS.Add(time.Second)}}
 	BindPending(loopsDir, pendingDir, loops, now)
 
 	if _, ok := Load(loopsDir, "s1"); ok {
@@ -335,4 +335,30 @@ func TestBindPending_NoMatchYet_PendingSurvives(t *testing.T) {
 func writePendingRaw(dir, name, cwd, goal string, ts time.Time) error {
 	data := []byte(`{"cwd":"` + cwd + `","goal":"` + goal + `","ts":` + strconv.FormatInt(ts.Unix(), 10) + `}`)
 	return os.WriteFile(filepath.Join(dir, name), data, 0o644)
+}
+
+// Regression: a hyphenated worktree path (mctl-...) must bind even though
+// its decoded Cwd is lossy — matching goes real-path→encoded vs ProjectDir
+// (the live worktree e2e caught pending records never binding).
+func TestBindPending_HyphenatedWorktreePathBinds(t *testing.T) {
+	loopsDir, pendingDir := t.TempDir(), t.TempDir()
+	now := time.Now()
+	real := "/x/orca/workspaces/asre/mctl-reply-with-exactly"
+	if err := WritePending(pendingDir, real, BindSpec{Goal: "g", DoneCondition: "d", MaxCycles: 2}); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+	loops := []domain.Loop{{
+		SessionID:    "wt",
+		ProjectDir:   "-x-orca-workspaces-asre-mctl-reply-with-exactly",
+		Cwd:          "/x/orca/workspaces/asre/mctl/reply/with/exactly", // lossy decode — must not matter
+		LastActivity: now.Add(time.Minute),
+	}}
+	BindPending(loopsDir, pendingDir, loops, now)
+	rec, ok := Load(loopsDir, "wt")
+	if !ok {
+		t.Fatal("hyphenated worktree loop was not bound")
+	}
+	if rec.DoneCondition != "d" || rec.MaxCycles != 2 {
+		t.Fatalf("contract fields lost: %+v", rec)
+	}
 }
