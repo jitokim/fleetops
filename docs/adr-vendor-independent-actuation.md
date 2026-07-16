@@ -197,15 +197,67 @@ capability tier does this session get."
 
 ## 5. Alternatives considered and rejected
 
-- **Add a 4th (IntelliJ) vendor integration.** Rejected: no automation API
-  exists to build against; would repeat the cmux reverse-engineering cost
-  for strictly worse ROI, and still wouldn't cover the 5th, 6th terminal.
+- **Add a 4th (IntelliJ) vendor integration.** Rejected: IntelliJ's terminal
+  API is **plugin-only** — no externally-callable automation surface exists
+  (confirmed against the JetBrains Platform SDK; same story for VS Code's
+  `vscode.Terminal.sendText()`, which is extension-host-only per Microsoft's
+  own maintainers, [vscode#115162](https://github.com/microsoft/vscode/issues/115162)).
+  A real integration would mean writing and shipping our own IDE plugin —
+  repeats the cmux reverse-engineering cost for strictly worse ROI, and
+  still wouldn't cover the 5th, 6th terminal.
 - **Drop orca/cmux actuation entirely, tmux-only.** Rejected as premature:
   the P0-prone part was discovery, which the registry removes. Their
   remaining actuation verb surface is small and stable; dropping working
-  code isn't justified once the fragile part is gone.
+  code isn't justified once the fragile part is gone. (Also: this is the
+  ecosystem's default convention — see §6 — but missionctl's own preferred
+  environment is orca, so full tmux-only isn't actually on the table here.)
 - **missionctl-owned pty for all sessions (Direction C, generalized).**
   Rejected as the near-term fix: doesn't help a session a human already
   started in IntelliJ. Correct as the engine's long-term model for
   loops missionctl itself spawns (VISION.md), not a substitute for
   discovery+Tier 0/2 on human-started sessions.
+- **A 4th actuation tier via terminal-emulator-native remote-control APIs**
+  (kitty's documented RPC protocol, WezTerm's `cli send-text`, iTerm2's
+  Python API — all real, externally-callable, no TIOCSTI-style hackery
+  needed). Deferred, not rejected: technically sound and would extend
+  in-place actuation to users of those terminals, but today's missionctl
+  users are on orca/cmux/tmux, not kitty/WezTerm/iTerm2. Gate this behind
+  actual user demand rather than building speculatively (simplicity-first).
+  Alacritty/Ghostty/Windows Terminal/Terminal.app either have no comparable
+  API or only ad-hoc AppleScript-level text injection, not worth chasing.
+
+## 6. Prior art
+
+- **[Fleet](https://github.com/nicknisi/fleet)** (a tmux dashboard shipped
+  as a Claude Code plugin) independently converged on the same core idiom
+  this ADR proposes: install Claude Code hooks (`Notification`,
+  `PreToolUse`, `Stop`, `SubagentStop`, `SessionEnd`) that fire on every
+  event and write identity+state to a status file, discovered passively
+  rather than requiring sessions to be launched through the tool itself.
+  This is real external validation — "hook as ground-truth identity
+  source, filesystem as registry" is a sound idiom arrived at
+  independently, not a missionctl-specific idea. Fleet's registry key is
+  the **tmux pane id**, though, not pid/tty — it solves discovery *within*
+  one tmux server, not across heterogeneous terminal hosts, which is
+  exactly the generalization §2.1's `ppid→pid→tty` chain is for. Fleet also
+  keeps a `ps`-table fallback mapping known agent binaries back to tmux
+  panes for zero-install discovery — independent confirmation that this
+  ADR's §3 "bridge for pre-existing sessions" `ps`+`lsof` backfill is a
+  sound pattern, not a hack.
+- **[ccmanager](https://github.com/kbwo/ccmanager)** sidesteps discovery
+  entirely by owning its own pty end to end ("no tmux dependency") — but
+  only works because it IS the thing that spawns every session; it can't
+  see a session a human started organically elsewhere. This is exactly
+  §5's rejected "Direction C, generalized," independently arrived at and
+  independently hitting the same limitation.
+- **The ecosystem convention is "pick tmux, full stop."** claude-squad,
+  agent-of-empires, amux, dmux, muxtree, Tmux-Orchestrator,
+  tmux-agent-status — all tmux-only, and (except Fleet) all require
+  sessions be spawned through the tool's own wrapper rather than
+  discovering pre-existing ones. Outside the AI-agent niche,
+  overmind/tmuxinator/teamocil show the identical convention. **No other
+  project attempts an N-way multiplexer abstraction like missionctl's
+  orca/cmux/tmux layer** — most don't even reach for it. This ADR's Tier
+  0/1/2 design is more ambitious than the field, not merely consistent
+  with it; worth staying honest with ourselves about that added surface
+  area every time a vendor's CLI shifts under us again.
