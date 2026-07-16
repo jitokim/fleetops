@@ -583,7 +583,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // sendPromptCmd is the shared, prompt-agnostic core behind both resumeCmd
-// (re-send the last prompt) and injectCmd (send an arbitrary captain-typed
+// (re-send the last prompt) and injectCmd (send an arbitrary human-typed
 // prompt): the two SAFETY guards (StallGone/StateFailed) + backend Resolve +
 // LocateClaude + Resume mechanics, with the prompt passed IN rather than
 // looked up internally. Keeping the guards in exactly ONE place is a
@@ -646,7 +646,7 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 	}
 }
 
-// injectCmd sends an arbitrary, captain-typed prompt into loop l's confirmed
+// injectCmd sends an arbitrary, human-typed prompt into loop l's confirmed
 // claude surface and submits it — the "command the fleet from the dashboard"
 // action (the "i" key). Thin wrapper over sendPromptCmd, the same shared core
 // resumeCmd uses, so the StallGone/StateFailed safety guards live in exactly
@@ -1110,7 +1110,7 @@ func pagerCmd(path string) []string {
 	// -M shows the LONG prompt on the bottom line at all times, and -PM sets
 	// that long prompt's text. The attached -P form matters: with
 	// `--prompt=log:...` less eats the first character ("l") as the
-	// prompt-type selector and the hint never renders (captain-reported).
+	// prompt-type selector and the hint never renders (user-reported).
 	return []string{"less", "-R", "+G", "-M", "-PMmissionctl log — q to return (%pB\\%)", path}
 }
 

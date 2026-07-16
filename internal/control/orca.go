@@ -10,7 +10,7 @@ import (
 )
 
 // orcaController drives an Orca (stablyai/orca) terminal via the orca CLI —
-// the captain's own environment, so it's the preferred backend (see Resolve).
+// the user's own environment, so it's the preferred backend (see Resolve).
 type orcaController struct{}
 
 func (orcaController) Name() string { return "orca" }
@@ -173,7 +173,7 @@ const spawnWorktreeTimeout = 15 * time.Second
 // SpawnWorktree creates a brand new Orca-managed worktree under repoCwd's
 // repo, launches a claude agent in it, and sends prompt — all in one
 // `orca worktree create --repo path:<repoCwd> --name <name> --agent claude
-// --prompt <prompt> --json` call. Verified LIVE (captain's machine):
+// --prompt <prompt> --json` call. Verified LIVE (real machine):
 // --agent/--prompt turns worktree create into a genuine one-shot launch —
 // the agent comes up with prompt already injected as its first user
 // message, no separate wait/locate/send needed (unlike plain Spawn).
@@ -209,7 +209,7 @@ func (orcaController) SpawnWorktree(repoCwd, name, prompt string) (string, error
 var worktreePathKeys = []string{"path", "worktreePath", "checkoutPath"}
 
 // orcaWorktreeCreateResult is `orca worktree create --json`'s VERIFIED
-// result shape (captain's live probe): {"result":{"worktree":{"path":"...",
+// result shape (real-machine live probe): {"result":{"worktree":{"path":"...",
 // ...}}}. extractWorktreePath decodes this directly first — the primary,
 // confirmed path — and only falls back to the tolerant walk
 // (walkForWorktreePath) for older/differing runtimes that don't match it.

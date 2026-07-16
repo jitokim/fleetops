@@ -105,7 +105,7 @@ type WorktreeSpawner interface {
 }
 
 // Resolve returns the first available controller: orca preferred (the
-// captain's own environment), cmux then tmux as fallbacks; ok is false if
+// user's own environment), cmux then tmux as fallbacks; ok is false if
 // none of the three backends is available.
 func Resolve() (Controller, bool) {
 	for _, c := range []Controller{orcaController{}, cmuxController{}, tmuxController{}} {
