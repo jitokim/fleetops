@@ -124,15 +124,16 @@ const (
 )
 
 // mode distinguishes normal fleet-navigation input from the "n" key's
-// free-text goal prompt and the "/" key's filter query, so arrow/letter
-// keys route to the text input instead of moving the cursor or triggering
-// actions while typing.
+// free-text goal prompt, the "/" key's filter query, and the "i" key's
+// arbitrary-prompt injection, so arrow/letter keys route to the text input
+// instead of moving the cursor or triggering actions while typing.
 type mode int
 
 const (
 	modeNormal mode = iota
 	modePrompting
 	modeFiltering
+	modeInjecting
 )
 
 // wizardStep is which question of the "n" key's loop-contract wizard is
@@ -192,6 +193,15 @@ type Model struct {
 	spawnHostsClaudeRepo  bool
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
+
+	// injectTarget is the loop a modeInjecting prompt will be sent to,
+	// snapshotted at "i" keypress time — NOT re-resolved from m.selected() at
+	// submit time, because the fleet list can rescan (and reorder) while the
+	// human is mid-typing, which would silently retarget the injection (same
+	// staleness hazard the "n" wizard's spawnCwd capture guards against). The
+	// whole Loop is captured so injectCmd has ProjectDir/SessionID plus the
+	// Stall/State fields sendPromptCmd's guards re-check.
+	injectTarget domain.Loop
 
 	pendingKillSession string // non-empty while awaiting the confirming second "k"
 	pendingKillAt      time.Time
@@ -306,6 +316,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.mode == modeInjecting {
+			switch key {
+			case "esc":
+				m.mode = modeNormal
+				m.input.Blur()
+				m.status, m.statusKind = "cancelled", statusNeutral
+				return m, nil
+			case "enter":
+				prompt := strings.TrimSpace(m.input.Value())
+				if prompt == "" {
+					// empty prompt cancels — same convention as the "n"
+					// wizard's empty-goal cancel (see advanceSpawnWizard).
+					m.mode = modeNormal
+					m.input.Blur()
+					m.status, m.statusKind = "cancelled (empty prompt)", statusNeutral
+					return m, nil
+				}
+				m.mode = modeNormal
+				m.input.Blur()
+				m.status, m.statusKind = fmt.Sprintf("injecting into %s...", m.injectTarget.Project), statusNeutral
+				return m, injectCmd(m.injectTarget, prompt)
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -364,6 +402,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.status, m.statusKind = fmt.Sprintf("approving %s...", sel.Project), statusNeutral
 			return m, approveCmd(sel)
+		case "i":
+			sel, ok := m.selected()
+			if !ok {
+				m.status, m.statusKind = "select a loop to send a prompt to", statusNeutral
+				return m, nil
+			}
+			// Keypress-time state gate mirroring sendPromptCmd's own guards, so
+			// the human doesn't type a whole prompt only to have it silently
+			// refused after Enter (fail fast, before they invest typing effort).
+			// These are the SAME two conditions sendPromptCmd itself re-checks —
+			// surfaced early here (belt-and-suspenders, like the r-key guard).
+			// Unlike "r", injection is deliberately NOT restricted to
+			// stalled/drifted loops: idle/running/gated loops are all valid
+			// targets — flexibility is the point of the feature.
+			if sel.Stall == domain.StallGone {
+				m.status, m.statusKind = "process gone — restart, don't inject into a bare shell", statusErr
+				return m, nil
+			}
+			if sel.State == domain.StateFailed {
+				m.status, m.statusKind = "governor stopped this loop — k kill or start a new contract, don't inject", statusErr
+				return m, nil
+			}
+			if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+				m.status, m.statusKind = msg, statusErr
+				return m, nil
+			}
+			m.injectTarget = sel
+			m.mode = modeInjecting
+			m.input = textinput.New()
+			m.input.Prompt = ""
+			m.input.Focus()
+			return m, textinput.Blink
 		case "enter":
 			sel, ok := m.selected()
 			if !ok {
@@ -512,11 +582,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// resumeCmd re-sends a stalled loop's last prompt to the terminal surface
-// hosting it, via whichever multiplexer backend (orca/cmux/tmux) is
-// available. Runs off the event loop — exec calls belong in a tea.Cmd, never
-// in Update.
-func resumeCmd(l domain.Loop) tea.Cmd {
+// sendPromptCmd is the shared, prompt-agnostic core behind both resumeCmd
+// (re-send the last prompt) and injectCmd (send an arbitrary captain-typed
+// prompt): the two SAFETY guards (StallGone/StateFailed) + backend Resolve +
+// LocateClaude + Resume mechanics, with the prompt passed IN rather than
+// looked up internally. Keeping the guards in exactly ONE place is a
+// safety-invariant-single-source-of-truth move — duplicating them across two
+// send functions is exactly the drift-prone hazard LocateClaude's own
+// ambiguity-refusal comments warn about. successVerb/note only shape the
+// happy-path status text ("resumed X" vs "injected into X"); every guard and
+// failure message is shared verbatim. Runs off the event loop — exec calls
+// belong in a tea.Cmd, never in Update.
+func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
 	return func() tea.Msg {
 		// SAFETY: a StallGone loop's claude process is gone — the terminal
 		// surface (if any) is now a bare shell. Sending the prompt into it
@@ -530,7 +607,7 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 		// deliberately terminal (domain.LoopState.Terminal()). Resuming it
 		// would silently re-drive a loop the runtime already decided to
 		// fail closed on; the human must make a new decision (kill, or a
-		// fresh contract), not have "r" quietly override the governor.
+		// fresh contract), not have "r"/"i" quietly override the governor.
 		if l.State == domain.StateFailed {
 			return resumeResultMsg{false, "governor stopped this loop (no improvement) — k kill or start a new contract"}
 		}
@@ -538,23 +615,51 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 		if !ok {
 			return resumeResultMsg{false, "no orca/tmux/cmux — resume manually: " + manualResumeHint(l.SessionID)}
 		}
-		// LocateClaude (not Locate): resuming must land on a CONFIRMED claude
+		// LocateClaude (not Locate): sending must land on a CONFIRMED claude
 		// surface, never a bare shell sharing the same directory — see
 		// Controller.LocateClaude and the P0-3 hardening rationale.
 		target, ok := ctrl.LocateClaude(l.ProjectDir)
 		if !ok {
 			return resumeResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: " + manualResumeHint(l.SessionID)}
 		}
+		if err := ctrl.Resume(target, prompt); err != nil {
+			return resumeResultMsg{false, fmt.Sprintf("resume %s failed: %v", l.Project, err)}
+		}
+		return resumeResultMsg{true, fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, ctrl.Name(), note)}
+	}
+}
+
+// resumeCmd re-sends a stalled loop's LAST USER PROMPT to the terminal surface
+// hosting it, via whichever multiplexer backend (orca/cmux/tmux) is available.
+// It's a thin wrapper over sendPromptCmd: its only prompt-specific work is
+// looking up claude.LastUserPrompt — kept INSIDE the returned closure (off the
+// event loop) because it reads/parses the session JSONL, which must not block
+// Update.
+func resumeCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
 		prompt, ok := claude.LastUserPrompt(l.Path)
 		note := ""
 		if !ok {
 			note = " (no prior prompt found — sent Enter only)"
 		}
-		if err := ctrl.Resume(target, prompt); err != nil {
-			return resumeResultMsg{false, fmt.Sprintf("resume %s failed: %v", l.Project, err)}
-		}
-		return resumeResultMsg{true, fmt.Sprintf("resumed %s via %s%s", l.Project, ctrl.Name(), note)}
+		return sendPromptCmd(l, prompt, "resumed", note)()
 	}
+}
+
+// injectCmd sends an arbitrary, captain-typed prompt into loop l's confirmed
+// claude surface and submits it — the "command the fleet from the dashboard"
+// action (the "i" key). Thin wrapper over sendPromptCmd, the same shared core
+// resumeCmd uses, so the StallGone/StateFailed safety guards live in exactly
+// ONE place.
+//
+// It reuses resumeResultMsg (rather than a parallel injectResultMsg) on
+// PURPOSE: from the runtime's perspective an inject IS a resume — "send this
+// text to the surface and press Enter" — so the status-line handling in
+// Update is byte-for-byte identical. A separate message type + Update case
+// would be pure duplication for zero behavioral gain, not a copy-paste
+// oversight.
+func injectCmd(l domain.Loop, prompt string) tea.Cmd {
+	return sendPromptCmd(l, prompt, "injected into", "")
 }
 
 // manualResumeHint is the copy-pasteable fallback for bare terminals (no
@@ -1170,7 +1275,8 @@ func (m Model) View() string {
 	}
 
 	// status line (its own line, above the keybar) — replaced by the
-	// new-loop / filter prompt while in modePrompting/modeFiltering — + keybar.
+	// new-loop / filter / inject prompt while in
+	// modePrompting/modeFiltering/modeInjecting — + keybar.
 	b.WriteString("\n")
 	switch {
 	case m.mode == modePrompting:
@@ -1178,6 +1284,9 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	case m.mode == modeFiltering:
 		b.WriteString(renderFilterPrompt(m.input))
+		b.WriteString("\n")
+	case m.mode == modeInjecting:
+		b.WriteString(renderInjectPrompt(m))
 		b.WriteString("\n")
 	default:
 		if line := renderStatusLine(m.status, m.statusKind); line != "" {
@@ -1708,6 +1817,22 @@ func renderFilterPrompt(input textinput.Model) string {
 	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("FILTER ▸ ") + input.View()
 }
 
+// renderInjectPrompt replaces the status line while the "i" key's arbitrary
+// prompt is being typed: "INJECT ▸ <project> ◂ <input>", so the human always
+// sees WHICH loop the text is bound for (it was snapshotted at keypress time
+// and can't change under them). When the target is StateRunning the text will
+// land mid-turn at an unpredictable point in claude's input — not a blocker
+// (that would defeat the feature), but a real footgun, so an amber nudge is
+// appended rather than pretending it's risk-free.
+func renderInjectPrompt(m Model) string {
+	head := lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("INJECT ▸ " + m.injectTarget.Project + " ◂ ")
+	line := head + m.input.View()
+	if m.injectTarget.State == domain.StateRunning {
+		line += "  " + lipgloss.NewStyle().Foreground(cAmber).Render("(running — lands mid-turn)")
+	}
+	return line
+}
+
 // renderKeybar: only keys that actually do something today.
 func renderKeybar(loopCount int, width int) string {
 	keys := []string{
@@ -1716,6 +1841,7 @@ func renderKeybar(loopCount int, width int) string {
 		stKey.Render("↵") + stDim.Render(" attach"),
 		stKey.Render("a") + stDim.Render(" approve"),
 		stKey.Render("r") + stDim.Render(" resume"),
+		stKey.Render("i") + stDim.Render(" inject"),
 		stKey.Render("p") + stDim.Render(" stop"),
 		stKey.Render("k") + stDim.Render(" kill"),
 		stKey.Render("n") + stDim.Render(" new"),
