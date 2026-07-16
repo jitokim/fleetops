@@ -409,7 +409,124 @@ func TestView_NoLineExceedsTerminalWidth(t *testing.T) {
 	}
 }
 
-// TestView_SelectedRowVisibleInFleetPanel: with more loops than fit in the
+// detailPanelV2RegressionLoop builds a loop whose DETAIL panel actually
+// exercises every feat/detail-panel-v2 block — LAST ERROR (a REAL
+// transcript file with a long verbatim 429 body, including one long
+// UNBROKEN token — no spaces at all — to stress wrapTailText's hard-break
+// path, not just its ordinary word-wrap), VERDICTS (oracle events),
+// EVENTS (actuation + scan events), and the STALLED callout's flap counter
+// (3 stall transitions within the last hour) — none of which
+// viewRegressionLoops exercises (its Path/history are fake/absent, so
+// those blocks render empty in the standing sweep above). Review fix (P2):
+// the width/height regression sweep must ALSO cover these blocks, not just
+// the pre-v2 key-value rows.
+func detailPanelV2RegressionLoop(t *testing.T, historyDir string) domain.Loop {
+	t.Helper()
+	now := time.Now()
+
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	longToken := strings.Repeat("x", 220) // one unbroken 220-char token — no spaces at all
+	errLine := fmt.Sprintf(
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 Too Many Requests — request id %s retry after 30s"}]},"timestamp":%q}`,
+		longToken, now.Format(time.RFC3339))
+	if err := os.WriteFile(transcriptPath, []byte(errLine+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	evs := []events.Event{
+		{TS: now.Add(-50 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "", ToState: "running", Trigger: events.TriggerActuation, Detail: "spawn: fix the flaky auth test", Actor: events.ActorHuman},
+		{TS: now.Add(-40 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "stalled:rate-limit", Trigger: events.TriggerScan, Detail: "rate-limit", Actor: events.ActorSystem},
+		{TS: now.Add(-39 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "stalled:rate-limit", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman},
+		{TS: now.Add(-25 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "stalled:rate-limit", Trigger: events.TriggerScan, Detail: "rate-limit", Actor: events.ActorSystem},
+		{TS: now.Add(-24 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "stalled:rate-limit", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman},
+		{TS: now.Add(-15 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "idle", Trigger: events.TriggerScan, Actor: events.ActorSystem},
+		{TS: now.Add(-14 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "idle", ToState: "idle", Trigger: events.TriggerOracle, Detail: "progress at cycle 3: made partial progress, one test still failing intermittently under load", Actor: events.ActorAuto},
+		{TS: now.Add(-5 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "idle", ToState: "running", Trigger: events.TriggerScan, Actor: events.ActorSystem},
+		{TS: now.UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "stalled:rate-limit", Trigger: events.TriggerScan, Detail: "rate-limit", Actor: events.ActorSystem}, // 3rd stall within the hour — flap counter
+	}
+	for _, ev := range evs {
+		if err := events.Append(historyDir, ev); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	return domain.Loop{
+		Project: "v2-regress", SessionID: "v2-regress", ProjectDir: "-x-v2",
+		Cwd: "/Users/imac/IdeaProjects/v2-regress", Path: transcriptPath, CwdVerified: true,
+		State: domain.StateStalled, Stall: domain.StallRateLimit, Cycle: 3,
+		Goal:         domain.Goal{Text: "fix the flaky auth test", MaxCycles: 12, BudgetTokens: 2_000_000},
+		TokensSpent:  1_200_000,
+		Last:         &domain.Verdict{Outcome: domain.OutcomeProgress, Reason: "made partial progress, one test still failing intermittently under load"},
+		LastActivity: now,
+		LastText:     "still working on stabilizing the flaky test",
+		BoundAt:      now.Add(-50 * time.Minute),
+	}
+}
+
+// TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks is the P2 review
+// fix's regression: the standing width/height sweep above must ALSO
+// exercise LAST ERROR/VERDICTS/EVENTS/the flap counter, not just render
+// them empty — same acceptance bar (every line <= width, total lines <=
+// height), same width/height matrix, but with a fixture whose DETAIL panel
+// actually populates every feat/detail-panel-v2 block.
+func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	l := detailPanelV2RegressionLoop(t, historyDir)
+
+	for _, width := range []int{45, 65, 70, 90, 120, 175} {
+		for _, height := range []int{18, 24, 40, 60} {
+			t.Run(fmt.Sprintf("width=%d/height=%d", width, height), func(t *testing.T) {
+				m := New()
+				m.w, m.h = width, height
+				m.loops = []domain.Loop{l}
+				m.cursor = 0
+
+				out := m.View()
+				lines := strings.Split(out, "\n")
+				for i, line := range lines {
+					if got := lipgloss.Width(line); got > width {
+						t.Errorf("width=%d: line %d is %d cols wide, want <= %d: %q", width, i, got, width, line)
+					}
+				}
+				if got := len(lines); got > height {
+					t.Errorf("height=%d: rendered frame is %d lines, want <= %d", height, got, height)
+				}
+			})
+		}
+	}
+}
+
+// TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered
+// is a sanity check for the test above: at a generous width/height, the
+// v2 blocks (LAST ERROR/VERDICTS/EVENTS/flap counter) must actually
+// APPEAR — otherwise the width/height sweep above would be silently
+// testing nothing new (an empty panel trivially satisfies both
+// invariants).
+func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	l := detailPanelV2RegressionLoop(t, historyDir)
+
+	m := New()
+	m.w, m.h = 120, 45
+	m.loops = []domain.Loop{l}
+	m.cursor = 0
+	out := m.View()
+
+	for _, want := range []string{"LAST ERROR", "VERDICTS", "EVENTS", "stall in"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the rendered frame to contain %q (the block this regression test exists to exercise), got:\n%s", want, out)
+		}
+	}
+}
+
 // FLEET panel's rows, moving the cursor deep into the list must scroll the
 // panel (visibleWindow) so the selected loop's row is still on screen — not
 // require any NEW keybinding, just keep the existing ↑/↓/g/G-driven cursor
@@ -2803,6 +2920,22 @@ func TestIsErrorStale_NoRecoveryEventAtAll_NotStale(t *testing.T) {
 	}
 }
 
+// TestIsErrorStale_ZeroTimestamp_FailsOpen is the P2 review fix's
+// regression: an unparseable transcript timestamp (claude.LastError /
+// entryTimestamp return the zero time.Time) must NOT be treated as
+// "infinitely old" — that would silently suppress a possibly-LIVE error
+// any time there's ANY healthy transition on record, with no visible
+// symptom other than "LAST ERROR never shows up". Fail open: show it.
+func TestIsErrorStale_ZeroTimestamp_FailsOpen(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "running"},
+	}
+	if isErrorStale(time.Time{}, evs) {
+		t.Error("expected NOT stale for a zero errorTS, even with a healthy transition on record — must fail open")
+	}
+}
+
 func TestIsErrorStale_IdleAlsoCountsAsHealthy(t *testing.T) {
 	now := time.Now()
 	errTS := now.Add(-10 * time.Minute)
@@ -4320,6 +4453,73 @@ func TestUpdate_AutoRedriveScheduledMsg_NowGateOrFailed_SkipsFiring(t *testing.T
 	}
 }
 
+// ── P1 review fix: auto-redrive joins the m.actuating interlock ─────────
+
+func TestUpdate_AutoRedriveScheduledMsg_ManualRedriveInFlight_Skips(t *testing.T) {
+	// A manual "r"/"i" resume already in flight for this session (e.g. the
+	// human pressed r just before the scheduled tick fired) must make the
+	// auto-redrive skip — not race a second concurrent Tier-2 send.
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+	m.actuating = map[string]bool{"s1": true} // simulates a manual resume already dispatched
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd != nil {
+		t.Error("expected nil — a manual actuation is already in flight for this session")
+	}
+	if m.autoRedriveAttempts["s1"] != 0 {
+		t.Errorf("autoRedriveAttempts[s1] = %d, want 0 — the skipped attempt must not count against the ceiling", m.autoRedriveAttempts["s1"])
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_Fires_SetsActuating(t *testing.T) {
+	withFakeActuationSeams(t, nil, func(sessionID, prompt string) error { return nil })
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd")
+	}
+	if !m.actuating["s1"] {
+		t.Error("expected s1 to be marked actuating once the auto-redrive is dispatched")
+	}
+}
+
+// TestUpdate_RKey_AutoRedriveInFlight_ManualResumeRefuses proves the
+// interlock works in the OTHER direction: once an auto-redrive has set
+// m.actuating, the EXISTING manual "r"-key guard (which already checks
+// m.actuating before dispatching resumeCmd) now sees it and refuses — no
+// change needed to that guard itself, just to what sets the flag.
+func TestUpdate_RKey_AutoRedriveInFlight_ManualResumeRefuses(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+	m.loops[0].Stall = domain.StallRateLimit
+	m.actuating = map[string]bool{"sess-1": true} // simulates an auto-redrive already dispatched
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — an auto-redrive is already in flight for this session")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want the already-re-driving message", m.status)
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_ClearsActuatingInterlock(t *testing.T) {
+	m := New()
+	m.actuating = map[string]bool{"s1": true}
+
+	m, _ = updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: 1, ok: true})
+
+	if m.actuating["s1"] {
+		t.Error("expected s1's actuating flag cleared once the auto-redrive result arrives")
+	}
+}
+
 // ── autoRedrive429Cmd: event emission + exhausted notification ───────────
 
 func TestAutoRedrive429Cmd_RecordsEventWithActorAuto(t *testing.T) {
@@ -4354,11 +4554,85 @@ func TestAutoRedrive429Cmd_RecordsEventWithActorAuto(t *testing.T) {
 	}
 }
 
-func TestAutoRedrive429Cmd_ThirdAttemptFailure_SendsExhaustedNotification(t *testing.T) {
+// TestAutoRedrive429Cmd_NeverSendsNotificationDirectly is the P2 review
+// fix's structural regression: the exhaustion-notification DECISION moved
+// to Update's autoRedriveResultMsg handler (keyed on the ceiling, via the
+// shouldNotify dedup ledger, which only a Model method can mutate) —
+// autoRedrive429Cmd itself must never call notifySendFn, regardless of
+// attempt number or outcome.
+func TestAutoRedrive429Cmd_NeverSendsNotificationDirectly(t *testing.T) {
 	historyDirFn = func() string { return t.TempDir() }
 	origRedrive := redriveFn
 	defer func() { redriveFn = origRedrive }()
-	redriveFn = func(sessionID, prompt string) error { return errTestJudgeFailed }
+	origNotify := notifySendFn
+	defer func() { notifySendFn = origNotify }()
+	notifyCalled := false
+	notifySendFn = func(title, body string) error { notifyCalled = true; return nil }
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	for _, outcome := range []error{nil, errTestJudgeFailed} {
+		redriveFn = func(sessionID, prompt string) error { return outcome }
+		for attempt := 1; attempt <= autoRedriveMaxAttempts; attempt++ {
+			autoRedrive429Cmd(l, attempt)()
+		}
+	}
+	if notifyCalled {
+		t.Error("autoRedrive429Cmd must never call notifySendFn directly, at any attempt or outcome")
+	}
+}
+
+// ── autoRedriveResultMsg: exhaustion keyed on the ceiling, not err ────────
+
+func TestUpdate_AutoRedriveResultMsg_FinalAttemptSuccess_StillNotifiesExhausted(t *testing.T) {
+	// The P2 review fix's core case: the common exhaustion scenario is the
+	// FINAL attempt sending just fine (ok=true) and the loop simply
+	// staying rate-limited — the old err!=nil-only check left this
+	// completely silent. Deliberately does NOT invoke the returned cmd —
+	// that would call the real notify.Send (osascript) unless overridden;
+	// TestAutoRedriveExhaustedNotifyCmd_SendsCorrectTitleAndBody already
+	// covers the cmd's own behavior with notifySendFn properly stubbed.
+	m := New()
+	_, cmd := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: true})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (autoRedriveExhaustedNotifyCmd) even though the final attempt succeeded")
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_FinalAttemptFailure_NotifiesExhausted(t *testing.T) {
+	m := New()
+	_, cmd := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: false})
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (autoRedriveExhaustedNotifyCmd)")
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_NonFinalAttempt_NoNotification(t *testing.T) {
+	m := New()
+	_, cmd1 := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: 1, ok: false})
+	if cmd1 != nil {
+		t.Error("expected nil — attempt 1 of 3 is not the ceiling, no exhaustion yet")
+	}
+	m2 := New()
+	_, cmd2 := updateModel(t, m2, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: 1, ok: true})
+	if cmd2 != nil {
+		t.Error("expected nil — attempt 1 of 3, even on success, is not the ceiling")
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_DedupedNotifyOnlyOnce(t *testing.T) {
+	m := New()
+	m, cmd1 := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: false})
+	if cmd1 == nil {
+		t.Fatal("expected the first exhaustion to notify")
+	}
+	_, cmd2 := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: false})
+	if cmd2 != nil {
+		t.Error("expected nil — a second exhaustion report for the SAME session must not re-notify (shouldNotify's dedup ledger)")
+	}
+}
+
+func TestAutoRedriveExhaustedNotifyCmd_SendsCorrectTitleAndBody(t *testing.T) {
 	origNotify := notifySendFn
 	defer func() { notifySendFn = origNotify }()
 	var gotTitle, gotBody string
@@ -4367,53 +4641,12 @@ func TestAutoRedrive429Cmd_ThirdAttemptFailure_SendsExhaustedNotification(t *tes
 		return nil
 	}
 
-	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
-	autoRedrive429Cmd(l, autoRedriveMaxAttempts)()
+	autoRedriveExhaustedNotifyCmd("aboard")()
 
 	if gotTitle != notifyTitlePrefix+"missionctl · auto-redrive exhausted" {
-		t.Errorf("notify title = %q, want the exhausted title", gotTitle)
+		t.Errorf("title = %q, want the exhausted title", gotTitle)
 	}
 	if gotBody != "aboard" {
-		t.Errorf("notify body = %q, want the project label", gotBody)
-	}
-}
-
-func TestAutoRedrive429Cmd_FirstAttemptFailure_NoNotificationYet(t *testing.T) {
-	historyDirFn = func() string { return t.TempDir() }
-	origRedrive := redriveFn
-	defer func() { redriveFn = origRedrive }()
-	redriveFn = func(sessionID, prompt string) error { return errTestJudgeFailed }
-	origNotify := notifySendFn
-	defer func() { notifySendFn = origNotify }()
-	notifyCalled := false
-	notifySendFn = func(title, body string) error { notifyCalled = true; return nil }
-
-	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
-	autoRedrive429Cmd(l, 1)()
-
-	if notifyCalled {
-		t.Error("expected NO notification — not yet the final attempt")
-	}
-}
-
-func TestAutoRedrive429Cmd_Success_NoNotification(t *testing.T) {
-	historyDirFn = func() string { return t.TempDir() }
-	origRedrive := redriveFn
-	defer func() { redriveFn = origRedrive }()
-	redriveFn = func(sessionID, prompt string) error { return nil }
-	origNotify := notifySendFn
-	defer func() { notifySendFn = origNotify }()
-	notifyCalled := false
-	notifySendFn = func(title, body string) error { notifyCalled = true; return nil }
-
-	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
-	msg := autoRedrive429Cmd(l, autoRedriveMaxAttempts)()
-
-	if notifyCalled {
-		t.Error("expected NO notification — the final attempt SUCCEEDED")
-	}
-	rm, ok := msg.(autoRedriveResultMsg)
-	if !ok || !rm.ok {
-		t.Fatalf("got %+v, want a successful autoRedriveResultMsg", msg)
+		t.Errorf("body = %q, want the project label", gotBody)
 	}
 }

@@ -351,14 +351,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !found || l.State != domain.StateStalled || l.Stall != domain.StallRateLimit {
 			return m, nil
 		}
+		// Review fix (P1): auto-redrive now joins the SAME m.actuating
+		// interlock the manual r/i actuations already use — a manual
+		// resume/inject already in flight for this session must not race
+		// against an auto-redrive firing at the same time (most acutely,
+		// two concurrent Tier-2 `claude --resume` headless turns). If
+		// something is already in flight, skip silently: the next 429
+		// scan edge (if the loop is still rate-limited once the manual
+		// action completes) will reschedule.
+		if m.actuating[l.SessionID] {
+			return m, nil
+		}
 		attempt := m.autoRedriveAttemptCount(l.SessionID) + 1
 		m.autoRedriveAttempts[l.SessionID] = attempt
+		m.setActuating(l.SessionID)
 		return m, autoRedrive429Cmd(l, attempt)
 	case autoRedriveResultMsg:
+		// Review fix (P1): clear the SAME interlock set when
+		// autoRedrive429Cmd was dispatched — mirrors resumeResultMsg's own
+		// clear exactly, so a manual r/i press right after an auto-redrive
+		// completes is never wrongly refused as "already re-driving".
+		if m.actuating != nil {
+			delete(m.actuating, msg.sessionID)
+		}
 		if msg.ok {
 			m.status, m.statusKind = fmt.Sprintf("auto-redrive %s: attempt %d/%d sent", msg.project, msg.attempt, autoRedriveMaxAttempts), statusNeutral
 		} else {
 			m.status, m.statusKind = fmt.Sprintf("auto-redrive %s: attempt %d/%d failed", msg.project, msg.attempt, autoRedriveMaxAttempts), statusErr
+		}
+		// Review fix (P2): the exhaustion notification is keyed on
+		// REACHING THE CEILING, not on the redrive's own transport error —
+		// the common exhaustion case is the 3rd attempt sending just fine
+		// (ok=true) and the loop simply staying rate-limited (the API
+		// itself is still saying no), which the old err!=nil-only check
+		// left completely silent. Deduped via the SAME notify ledger
+		// mechanism as the gate/gone edges (shouldNotify), keyed
+		// "auto-exhausted" so it only ever fires once per session.
+		if msg.attempt >= autoRedriveMaxAttempts && m.shouldNotify(msg.sessionID, "auto-exhausted", time.Now()) {
+			return m, autoRedriveExhaustedNotifyCmd(msg.project)
 		}
 		return m, nil
 	case tickMsg:
@@ -1556,6 +1586,9 @@ const notifyTitlePrefix = "🚀 "
 //     force-redriven.
 //   - a hard lifetime ceiling (3 attempts) and a per-session dedup window,
 //     both enforced before ever scheduling.
+//   - joins the SAME m.actuating interlock manual r/i actuations use
+//     (review fix, P1): a manual resume/inject already in flight skips the
+//     auto-redrive rather than racing it, and vice versa.
 
 // autoRedriveEnabledFn checks the opt-in env var — a func var (not a bare
 // os.Getenv call) so tests don't need to mutate a real process
@@ -1689,12 +1722,18 @@ type autoRedriveResultMsg struct {
 // ONLY — see this section's doc) and records the attempt as a history
 // event regardless of outcome. actor=auto (per the task's explicit
 // wording) — distinct from every OTHER actuation event in this codebase
-// (always actor=human): this one really is unattended. On the FINAL
-// (autoRedriveMaxAttempts-th) attempt failing, also sends the "exhausted"
-// desktop notification and stops (there's nothing more to schedule — the
-// ceiling in maybeScheduleAutoRedrive429 already prevents a 4th attempt,
-// this notification is purely so the human isn't left wondering why the
-// loop is still 429-stalled).
+// (always actor=human): this one really is unattended. The FINAL
+// (autoRedriveMaxAttempts-th) attempt always triggers the "exhausted"
+// desktop notification (see autoRedriveResultMsg's handler) regardless of
+// whether THIS attempt's transport call itself errored — there's nothing
+// more to schedule either way (the ceiling in maybeScheduleAutoRedrive429
+// already prevents a 4th attempt), so the human needs to know automated
+// retries are done, whether the last one technically "succeeded" (sent
+// fine, API still says no) or not.
+// Review fix (P2): the exhausted-notification DECISION moved to Update's
+// autoRedriveResultMsg handler (keyed on attempt==ceiling, not on err) —
+// see that handler's doc for why, and autoRedriveExhaustedNotifyCmd for the
+// actual (still async) notify.Send call.
 func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
 	return func() tea.Msg {
 		prompt, _ := claude.LastUserPrompt(l.Path) // an empty/absent prior prompt still redrives — same tolerance as resumeCmd
@@ -1708,10 +1747,22 @@ func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
 			Detail:    fmt.Sprintf("%s%d/%d", autoRedriveDetailPrefix, attempt, autoRedriveMaxAttempts),
 			Actor:     events.ActorAuto,
 		})
-		if err != nil && attempt >= autoRedriveMaxAttempts {
-			_ = notifySendFn(notifyTitlePrefix+"missionctl · auto-redrive exhausted", l.Project)
-		}
 		return autoRedriveResultMsg{sessionID: l.SessionID, project: l.Project, attempt: attempt, ok: err == nil}
+	}
+}
+
+// autoRedriveExhaustedNotifyCmd sends the "auto-redrive exhausted" desktop
+// notification off the event loop. Split out from autoRedrive429Cmd
+// (review fix, P2) because the DECISION to notify needs Model.notifiedAt's
+// dedup ledger (shouldNotify), which only a pointer-receiver method on
+// Model can mutate — autoRedrive429Cmd itself has no Model access, matching
+// this codebase's established shape for actuation cmds (they close over a
+// Loop, never a Model). The actual notify.Send call stays async here, same
+// discipline as every other notification in this codebase.
+func autoRedriveExhaustedNotifyCmd(project string) tea.Cmd {
+	return func() tea.Msg {
+		_ = notifySendFn(notifyTitlePrefix+"missionctl · auto-redrive exhausted", project)
+		return nil
 	}
 }
 
@@ -3019,7 +3070,22 @@ func lastErrorForDetail(l domain.Loop, data detailData) (string, time.Time, bool
 // recent scan-triggered transition into StateRunning or StateIdle — i.e.
 // the loop recovered AFTER this error was recorded, so it's stale news, not
 // a live incident.
+// Review fix (P2): a zero errorTS (claude.LastError couldn't parse the
+// transcript entry's timestamp — see entryTimestamp's doc) must FAIL OPEN
+// (treated as NOT stale, i.e. shown) rather than silently suppressing a
+// possibly-live error. The old code compared errorTS.UnixNano() directly —
+// the zero time.Time's UnixNano() is a huge NEGATIVE number, which is
+// "less than" any real lastHealthy timestamp, so an unparseable timestamp
+// was ALWAYS judged older than the last recovery and the block simply
+// never showed, with no visible symptom other than "LAST ERROR never
+// appears" — exactly the failure mode a "fail open" default exists to
+// avoid: if the transcript's timestamp format ever drifts from what
+// entryTimestamp expects, this must not become a silent, permanent blind
+// spot.
 func isErrorStale(errorTS time.Time, evs []events.Event) bool {
+	if errorTS.IsZero() {
+		return false
+	}
 	var lastHealthy int64
 	for _, ev := range evs {
 		if ev.Trigger != events.TriggerScan {
