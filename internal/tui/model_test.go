@@ -770,6 +770,263 @@ func TestUpdate_KKey_AmbiguousSharedDir_ConfirmingPressRefuses(t *testing.T) {
 	}
 }
 
+// ── "i" inject arbitrary prompt ───────────────────────────────────
+//
+// The "i" key snapshots the selected loop and drops into modeInjecting so the
+// human can type a brand-new prompt to send into it — without attaching
+// first. It mirrors the r-key/sendPromptCmd double-guard: a keypress-time
+// state gate (StallGone/StateFailed refused early, before typing) PLUS the
+// same guard re-checked inside sendPromptCmd (belt-and-suspenders).
+
+func TestUpdate_IKey_EntersInjectingModeWithSelectedLoop(t *testing.T) {
+	m := modelWithOneLoop() // one StateRunning loop, unambiguous dir
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if m.mode != modeInjecting {
+		t.Fatalf("mode = %v, want modeInjecting", m.mode)
+	}
+	if m.injectTarget.SessionID != "sess-1" {
+		t.Errorf("injectTarget.SessionID = %q, want the selected loop's %q", m.injectTarget.SessionID, "sess-1")
+	}
+	if !m.input.Focused() {
+		t.Error("expected the text input to be focused after entering inject mode")
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (textinput.Blink) on entering inject mode")
+	}
+}
+
+func TestUpdate_IKey_NoSelection_ShowsStatus(t *testing.T) {
+	m := New() // no loops, nothing selected
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (no selection must not enter inject mode)", m.mode)
+	}
+	if !strings.Contains(m.status, "select a loop to send a prompt to") {
+		t.Errorf("status = %q, want the select-a-loop prompt", m.status)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd when there's nothing selected")
+	}
+}
+
+func TestUpdate_IKey_AmbiguousSharedDir_Refuses(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — ambiguous target must refuse before entering inject mode")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (ambiguous target must not enter inject mode)", m.mode)
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
+	}
+	if !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q, want it to mention the ambiguity", m.status)
+	}
+}
+
+func TestUpdate_IKey_StallGone_BlockedByKeyGuard(t *testing.T) {
+	// the "i" keypress guard must refuse a StallGone loop early — before the
+	// human types anything — so it never even reaches inject mode.
+	m := modelWithOneLoop()
+	m.loops[0].Stall = domain.StallGone
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — StallGone is not injectable via the i key")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (StallGone must not enter inject mode)", m.mode)
+	}
+	if !strings.Contains(m.status, "process gone") {
+		t.Errorf("status = %q, want it to mention the process is gone", m.status)
+	}
+}
+
+func TestUpdate_IKey_StateFailed_BlockedByKeyGuard(t *testing.T) {
+	// the "i" keypress guard must refuse a governor-failed loop early, so it
+	// never reaches inject mode (mirrors resumeCmd's StateFailed guard).
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateFailed
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — StateFailed is not injectable via the i key")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (StateFailed must not enter inject mode)", m.mode)
+	}
+	if !strings.Contains(m.status, "governor stopped this loop") {
+		t.Errorf("status = %q, want the governor-stopped message", m.status)
+	}
+}
+
+func TestSendPromptCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
+	// belt-and-suspenders: sendPromptCmd itself must refuse on StateFailed too,
+	// independent of the "i"/"r" keypress guard (see its SAFETY comment).
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateFailed}
+
+	msg := sendPromptCmd(l, "do the thing", "injected into", "")()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("expected ok=false")
+	}
+	if !strings.Contains(rm.text, "governor stopped this loop") {
+		t.Errorf("text = %q, want it to mention the governor stopped the loop", rm.text)
+	}
+}
+
+func TestSendPromptCmd_StallGone_RefusesWithRestartHint(t *testing.T) {
+	// belt-and-suspenders: sendPromptCmd itself must refuse on StallGone too,
+	// pointing at a restart (a StallGone surface is a bare shell — the prompt
+	// would be typed as a shell command).
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", Stall: domain.StallGone}
+
+	msg := sendPromptCmd(l, "do the thing", "injected into", "")()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("expected ok=false")
+	}
+	if !strings.Contains(rm.text, "process gone") {
+		t.Errorf("text = %q, want it to mention the process is gone", rm.text)
+	}
+	if !strings.Contains(rm.text, "claude --resume sess-1") {
+		t.Errorf("text = %q, want it to carry the restart hint", rm.text)
+	}
+}
+
+func TestUpdate_ArrowKeysWhileInjecting_RouteToInputNotCursor(t *testing.T) {
+	// two loops (distinct dirs so "i" isn't refused as ambiguous) — cursor
+	// movement would be observable if the down arrow were (wrongly) still
+	// handled by normal navigation while injecting.
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "a", SessionID: "s1", ProjectDir: "-x-a", State: domain.StateRunning},
+		{Project: "b", SessionID: "s2", ProjectDir: "-x-b", State: domain.StateRunning},
+	}
+	m.cursor = 0
+	m, _ = updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting", m.mode)
+	}
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	if m.cursor != 0 {
+		t.Errorf("cursor = %d, want unchanged at 0 (down arrow must route to the text input while injecting)", m.cursor)
+	}
+}
+
+func TestUpdate_IKey_EmptyPrompt_CancelsWithoutInjecting(t *testing.T) {
+	// empty prompt on enter cancels — same convention as the wizard's empty
+	// goal (TestUpdate_Enter_EmptyGoal_CancelsWithoutSpawning).
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting", m.mode)
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after an empty-prompt enter", m.mode)
+	}
+	if !strings.Contains(m.status, "empty prompt") {
+		t.Errorf("status = %q, want it to mention the empty prompt", m.status)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an empty prompt (inject must not be triggered)")
+	}
+}
+
+func TestUpdate_IKey_EnterWithText_DispatchesInjectCmd(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('i'))
+
+	m, cmd := typeAndEnter(t, m, "run the tests again")
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after submitting the prompt", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (injectCmd) after typing a prompt and pressing enter")
+	}
+	if !strings.Contains(m.status, "injecting into aboard") {
+		t.Errorf("status = %q, want it to mention injecting into the target", m.status)
+	}
+}
+
+func TestUpdate_IKey_TargetSnapshottedAtKeypress_SurvivesRescan(t *testing.T) {
+	// the injection target is captured at "i" keypress time, NOT re-resolved
+	// at submit time — a mid-typing rescan (loopsMsg) that reorders/removes
+	// loops must not retarget the pending injection.
+	m := modelWithOneLoop() // selects "aboard"/sess-1
+	m, _ = updateModel(t, m, runeKey('i'))
+	if m.injectTarget.SessionID != "sess-1" {
+		t.Fatalf("precondition failed: injectTarget = %q, want sess-1", m.injectTarget.SessionID)
+	}
+
+	// fleet rescans mid-typing: "aboard" is gone, a different loop is now at
+	// cursor 0.
+	m, _ = updateModel(t, m, loopsMsg([]domain.Loop{
+		{Project: "other", SessionID: "sess-9", ProjectDir: "-x-other", State: domain.StateRunning},
+	}))
+
+	if m.injectTarget.SessionID != "sess-1" {
+		t.Errorf("injectTarget.SessionID = %q, want it to STAY the snapshotted sess-1 after a rescan", m.injectTarget.SessionID)
+	}
+	if m.injectTarget.Project != "aboard" {
+		t.Errorf("injectTarget.Project = %q, want the snapshotted %q", m.injectTarget.Project, "aboard")
+	}
+}
+
+func TestRenderInjectPrompt_RunningTarget_ShowsMidTurnWarning(t *testing.T) {
+	// injecting into a StateRunning loop lands mid-turn — the prompt line must
+	// surface a plain warning rather than pretend it's risk-free.
+	m := modelWithOneLoop() // StateRunning
+	m, _ = updateModel(t, m, runeKey('i'))
+
+	out := renderInjectPrompt(m)
+
+	if !strings.Contains(out, "aboard") {
+		t.Errorf("rendered inject prompt = %q, want it to name the target loop", out)
+	}
+	if !strings.Contains(out, "lands mid-turn") {
+		t.Errorf("rendered inject prompt = %q, want the mid-turn warning for a running target", out)
+	}
+}
+
+func TestRenderInjectPrompt_IdleTarget_NoMidTurnWarning(t *testing.T) {
+	// a non-running target has no mid-turn footgun — no warning.
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", ProjectDir: "-x-aboard", State: domain.StateIdle}}
+	m.cursor = 0
+	m, _ = updateModel(t, m, runeKey('i'))
+
+	out := renderInjectPrompt(m)
+
+	if strings.Contains(out, "lands mid-turn") {
+		t.Errorf("rendered inject prompt = %q, want NO mid-turn warning for an idle target", out)
+	}
+}
+
 // ── oracle judge trigger policy ────────────────────────────────────
 
 func TestTriggerJudgments_FiresForBoundIdleLoopNeverJudged(t *testing.T) {
