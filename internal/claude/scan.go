@@ -1036,9 +1036,18 @@ func toolResultText(content any) (string, bool) {
 	return "", false
 }
 
-// entryTimestamp parses a transcript entry's "timestamp" field (RFC3339,
-// Claude Code's own transcript format) — zero time for anything
-// missing/unparseable, never a panic.
+// entryTimestamp parses a transcript entry's "timestamp" field — RFC3339
+// with fractional seconds, e.g. "2026-07-16T14:15:54.953Z". VERIFIED
+// (review fix, P2) against a real session file on this machine
+// (~/.claude/projects/-Users-imac-IdeaProjects-missionctl/*.jsonl,
+// 2026-07-17): both "user" and "assistant" entries carry exactly this
+// shape, and time.Parse(time.RFC3339, s) parses it correctly despite
+// time.RFC3339's layout constant not showing fractional digits — Go's
+// RFC3339 parsing special-cases optional fractional seconds in the input
+// even though the layout string itself doesn't spell them out. Zero time
+// for anything missing/unparseable, never a panic — and see
+// internal/tui.isErrorStale's doc for why callers must treat that zero
+// value as "fail open" (NOT stale / show it), not "infinitely old".
 func entryTimestamp(entry map[string]any) time.Time {
 	s, ok := entry["timestamp"].(string)
 	if !ok {

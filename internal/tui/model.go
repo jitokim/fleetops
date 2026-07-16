@@ -281,6 +281,19 @@ type Model struct {
 	// computed yet" or "not a git repo" — STAGE omits the file/± portion
 	// either way (see renderStageRow).
 	gitStats map[string]gitStatsResult
+
+	// autoRedriveAttempts/autoRedriveScheduledAt back feat/auto-redrive-429
+	// — the opt-in 429 auto-redrive policy (see
+	// maybeScheduleAutoRedrive429). autoRedriveAttempts is sessionID ->
+	// LIFETIME attempt count (capped at autoRedriveMaxAttempts), lazily
+	// seeded from the event log on first need per session (see
+	// autoRedriveAttemptCount) so a missionctl restart doesn't reset the
+	// ceiling. autoRedriveScheduledAt is sessionID -> when an auto-redrive
+	// was last SCHEDULED — the dedup window that keeps a second
+	// rate-limit edge for the same session, within autoRedriveDelay of the
+	// last one, from scheduling another.
+	autoRedriveAttempts    map[string]int
+	autoRedriveScheduledAt map[string]time.Time
 }
 
 func New() Model {
@@ -308,7 +321,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case loopsMsg:
 		newLoops := []domain.Loop(msg)
 		now := time.Now()
-		transitions := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
+		transitions, autoRedriveCmds := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
 		m.loops = newLoops
 		if m.cursor >= len(m.visibleLoops()) {
 			m.cursor = maxInt(0, len(m.visibleLoops())-1)
@@ -321,12 +334,62 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if sel, ok := m.selected(); ok {
 			gitCmd = gitStatsCmd(sel)
 		}
-		return m, tea.Batch(m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd)
+		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd}, autoRedriveCmds...)
+		return m, tea.Batch(cmds...)
 	case gitStatsMsg:
 		if m.gitStats == nil {
 			m.gitStats = make(map[string]gitStatsResult)
 		}
 		m.gitStats[msg.sessionID] = msg.stats
+		return m, nil
+	case autoRedriveScheduledMsg:
+		// Re-check the CURRENT (latest scan) state before firing — a loop
+		// that recovered (or aged out of the fleet) during the 5-minute
+		// delay is silently skipped, per the task ("just don't fire", no
+		// skipped event logged).
+		l, found := m.loopBySessionID(msg.sessionID)
+		if !found || l.State != domain.StateStalled || l.Stall != domain.StallRateLimit {
+			return m, nil
+		}
+		// Review fix (P1): auto-redrive now joins the SAME m.actuating
+		// interlock the manual r/i actuations already use — a manual
+		// resume/inject already in flight for this session must not race
+		// against an auto-redrive firing at the same time (most acutely,
+		// two concurrent Tier-2 `claude --resume` headless turns). If
+		// something is already in flight, skip silently: the next 429
+		// scan edge (if the loop is still rate-limited once the manual
+		// action completes) will reschedule.
+		if m.actuating[l.SessionID] {
+			return m, nil
+		}
+		attempt := m.autoRedriveAttemptCount(l.SessionID) + 1
+		m.autoRedriveAttempts[l.SessionID] = attempt
+		m.setActuating(l.SessionID)
+		return m, autoRedrive429Cmd(l, attempt)
+	case autoRedriveResultMsg:
+		// Review fix (P1): clear the SAME interlock set when
+		// autoRedrive429Cmd was dispatched — mirrors resumeResultMsg's own
+		// clear exactly, so a manual r/i press right after an auto-redrive
+		// completes is never wrongly refused as "already re-driving".
+		if m.actuating != nil {
+			delete(m.actuating, msg.sessionID)
+		}
+		if msg.ok {
+			m.status, m.statusKind = fmt.Sprintf("auto-redrive %s: attempt %d/%d sent", msg.project, msg.attempt, autoRedriveMaxAttempts), statusNeutral
+		} else {
+			m.status, m.statusKind = fmt.Sprintf("auto-redrive %s: attempt %d/%d failed", msg.project, msg.attempt, autoRedriveMaxAttempts), statusErr
+		}
+		// Review fix (P2): the exhaustion notification is keyed on
+		// REACHING THE CEILING, not on the redrive's own transport error —
+		// the common exhaustion case is the 3rd attempt sending just fine
+		// (ok=true) and the loop simply staying rate-limited (the API
+		// itself is still saying no), which the old err!=nil-only check
+		// left completely silent. Deduped via the SAME notify ledger
+		// mechanism as the gate/gone edges (shouldNotify), keyed
+		// "auto-exhausted" so it only ever fires once per session.
+		if msg.attempt >= autoRedriveMaxAttempts && m.shouldNotify(msg.sessionID, "auto-exhausted", time.Now()) {
+			return m, autoRedriveExhaustedNotifyCmd(msg.project)
+		}
 		return m, nil
 	case tickMsg:
 		return m, tea.Batch(scan, tick())
@@ -1507,6 +1570,202 @@ const notifyDedupWindow = 10 * time.Minute
 // Center at a glance, without needing an icon at all.
 const notifyTitlePrefix = "🚀 "
 
+// ── feat/auto-redrive-429: opt-in 429 auto-redrive ───────────────────────
+//
+// The FIRST piece of automation this codebase ships — every condition
+// below is a hard gate, not a preference, per the council's "safety bar is
+// maximal" constraint:
+//   - opt-in only, off by default (autoRedriveEnabledFn — env
+//     MISSIONCTL_AUTO_REDRIVE_429=1; unset it to disable entirely, no
+//     in-app toggle this slice).
+//   - Tier 2 ONLY (redriveFn, the headless `claude --resume -p` path) —
+//     never types into a terminal, sidestepping the wrong-surface hazard
+//     entirely for an automated (unattended) action.
+//   - re-checked at fire time against the CURRENT scan snapshot — a loop
+//     that recovered during the 5-minute delay is silently skipped, not
+//     force-redriven.
+//   - a hard lifetime ceiling (3 attempts) and a per-session dedup window,
+//     both enforced before ever scheduling.
+//   - joins the SAME m.actuating interlock manual r/i actuations use
+//     (review fix, P1): a manual resume/inject already in flight skips the
+//     auto-redrive rather than racing it, and vice versa.
+
+// autoRedriveEnabledFn checks the opt-in env var — a func var (not a bare
+// os.Getenv call) so tests don't need to mutate a real process
+// environment variable.
+var autoRedriveEnabledFn = func() bool {
+	return os.Getenv("MISSIONCTL_AUTO_REDRIVE_429") == "1"
+}
+
+const (
+	// autoRedriveDelay is BOTH the schedule-to-fire delay AND the
+	// per-session dedup window (see maybeScheduleAutoRedrive429) — one
+	// constant, since "no auto-redrive attempted in the last 5 minutes"
+	// and "wait 5 minutes before firing" are the same 5 minutes: you can't
+	// schedule a NEW one while the previous one's delay hasn't elapsed.
+	autoRedriveDelay = 5 * time.Minute
+	// autoRedriveMaxAttempts is the LIFETIME cap on auto-redrive attempts
+	// per session (not per day/window) — recounted from the event log on
+	// restart (autoRedriveAttemptCount), never reset.
+	autoRedriveMaxAttempts = 3
+)
+
+// autoRedriveDetailPrefix is the exact detail-field prefix every
+// auto-redrive attempt event carries ("auto-redrive-429 attempt N/3" — the
+// task's own literal wording) — autoRedriveAttemptCount matches on this
+// prefix to recount attempts from the event log.
+const autoRedriveDetailPrefix = "auto-redrive-429 attempt "
+
+// autoRedriveScheduledMsg fires autoRedriveDelay after
+// maybeScheduleAutoRedrive429 schedules it — see scheduleAutoRedrive429Cmd.
+type autoRedriveScheduledMsg struct {
+	sessionID string
+}
+
+// scheduleAutoRedrive429Cmd is a delayed, one-shot tea.Tick — "must
+// survive nothing" per the task: if the TUI quits before this fires, the
+// pending retry is simply lost. Honest and safe (no on-disk "pending
+// retry" record to leak or double-fire on the next launch).
+func scheduleAutoRedrive429Cmd(sessionID string) tea.Cmd {
+	return tea.Tick(autoRedriveDelay, func(time.Time) tea.Msg {
+		return autoRedriveScheduledMsg{sessionID: sessionID}
+	})
+}
+
+// maybeScheduleAutoRedrive429 is the edge-triggered policy gate — called
+// from detectTransitions for every loop whose scan-detected transition
+// might be "entering StallRateLimit" (enteredRateLimit), the exact same
+// edge notify's gate/gone triggers hook into. Returns nil (schedule
+// nothing) unless EVERY condition holds:
+//  1. enteredRateLimit is true (a real edge THIS scan, not "still
+//     rate-limited from before").
+//  2. autoRedriveEnabledFn() — the opt-in kill switch.
+//  3. l.State is neither StateFailed nor StateGate — structurally
+//     unreachable here (l.State is StateStalled by construction of the
+//     rate-limit edge), but checked explicitly per the task's own wording
+//     (defense in depth, matching this codebase's belt-and-suspenders
+//     style elsewhere).
+//  4. no auto-redrive scheduled for this session within the last
+//     autoRedriveDelay (dedup).
+//  5. fewer than autoRedriveMaxAttempts lifetime attempts so far.
+//
+// On success: records the schedule time (closing the dedup window),
+// updates the status line ("auto: re-driving <label> in 5m (attempt
+// N/3)"), and returns scheduleAutoRedrive429Cmd's tea.Tick.
+func (m *Model) maybeScheduleAutoRedrive429(l domain.Loop, enteredRateLimit bool, now time.Time) tea.Cmd {
+	if !enteredRateLimit || !autoRedriveEnabledFn() {
+		return nil
+	}
+	if l.State == domain.StateFailed || l.State == domain.StateGate {
+		return nil
+	}
+	if last, ok := m.autoRedriveScheduledAt[l.SessionID]; ok && now.Sub(last) < autoRedriveDelay {
+		return nil
+	}
+	attempts := m.autoRedriveAttemptCount(l.SessionID)
+	if attempts >= autoRedriveMaxAttempts {
+		return nil
+	}
+	if m.autoRedriveScheduledAt == nil {
+		m.autoRedriveScheduledAt = make(map[string]time.Time)
+	}
+	m.autoRedriveScheduledAt[l.SessionID] = now
+	m.status, m.statusKind = fmt.Sprintf("auto: re-driving %s in 5m (attempt %d/%d)", l.Project, attempts+1, autoRedriveMaxAttempts), statusNeutral
+	return scheduleAutoRedrive429Cmd(l.SessionID)
+}
+
+// autoRedriveAttemptCount returns sessionID's lifetime auto-redrive
+// attempt count, lazily seeding Model.autoRedriveAttempts from the event
+// log (counting TriggerActuation events whose Detail has
+// autoRedriveDetailPrefix) the FIRST time it's asked about a given
+// session — so a missionctl restart recounts from disk instead of
+// silently resetting the ceiling to 0.
+func (m *Model) autoRedriveAttemptCount(sessionID string) int {
+	if m.autoRedriveAttempts == nil {
+		m.autoRedriveAttempts = make(map[string]int)
+	}
+	if n, ok := m.autoRedriveAttempts[sessionID]; ok {
+		return n
+	}
+	evs, _ := events.Read(historyDirFn(), sessionID)
+	n := 0
+	for _, ev := range evs {
+		if ev.Trigger == events.TriggerActuation && strings.HasPrefix(ev.Detail, autoRedriveDetailPrefix) {
+			n++
+		}
+	}
+	m.autoRedriveAttempts[sessionID] = n
+	return n
+}
+
+// loopBySessionID finds sessionID in m.loops — used by
+// autoRedriveScheduledMsg's handler to re-check the CURRENT (latest scan)
+// state before firing a delayed auto-redrive.
+func (m Model) loopBySessionID(sessionID string) (domain.Loop, bool) {
+	for _, l := range m.loops {
+		if l.SessionID == sessionID {
+			return l, true
+		}
+	}
+	return domain.Loop{}, false
+}
+
+// autoRedriveResultMsg reports one auto-redrive attempt's outcome.
+type autoRedriveResultMsg struct {
+	sessionID string
+	project   string
+	attempt   int
+	ok        bool
+}
+
+// autoRedrive429Cmd fires attempt N's headless Tier-2 redrive (Tier 2
+// ONLY — see this section's doc) and records the attempt as a history
+// event regardless of outcome. actor=auto (per the task's explicit
+// wording) — distinct from every OTHER actuation event in this codebase
+// (always actor=human): this one really is unattended. The FINAL
+// (autoRedriveMaxAttempts-th) attempt always triggers the "exhausted"
+// desktop notification (see autoRedriveResultMsg's handler) regardless of
+// whether THIS attempt's transport call itself errored — there's nothing
+// more to schedule either way (the ceiling in maybeScheduleAutoRedrive429
+// already prevents a 4th attempt), so the human needs to know automated
+// retries are done, whether the last one technically "succeeded" (sent
+// fine, API still says no) or not.
+// Review fix (P2): the exhausted-notification DECISION moved to Update's
+// autoRedriveResultMsg handler (keyed on attempt==ceiling, not on err) —
+// see that handler's doc for why, and autoRedriveExhaustedNotifyCmd for the
+// actual (still async) notify.Send call.
+func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
+	return func() tea.Msg {
+		prompt, _ := claude.LastUserPrompt(l.Path) // an empty/absent prior prompt still redrives — same tolerance as resumeCmd
+		err := redriveFn(l.SessionID, prompt)
+		_ = events.Append(historyDirFn(), events.Event{
+			TS:        time.Now().UnixNano(),
+			SessionID: l.SessionID,
+			FromState: l.StateString(),
+			ToState:   l.StateString(),
+			Trigger:   events.TriggerActuation,
+			Detail:    fmt.Sprintf("%s%d/%d", autoRedriveDetailPrefix, attempt, autoRedriveMaxAttempts),
+			Actor:     events.ActorAuto,
+		})
+		return autoRedriveResultMsg{sessionID: l.SessionID, project: l.Project, attempt: attempt, ok: err == nil}
+	}
+}
+
+// autoRedriveExhaustedNotifyCmd sends the "auto-redrive exhausted" desktop
+// notification off the event loop. Split out from autoRedrive429Cmd
+// (review fix, P2) because the DECISION to notify needs Model.notifiedAt's
+// dedup ledger (shouldNotify), which only a pointer-receiver method on
+// Model can mutate — autoRedrive429Cmd itself has no Model access, matching
+// this codebase's established shape for actuation cmds (they close over a
+// Loop, never a Model). The actual notify.Send call stays async here, same
+// discipline as every other notification in this codebase.
+func autoRedriveExhaustedNotifyCmd(project string) tea.Cmd {
+	return func() tea.Msg {
+		_ = notifySendFn(notifyTitlePrefix+"missionctl · auto-redrive exhausted", project)
+		return nil
+	}
+}
+
 // shouldNotify applies the dedup ledger for sessionID's edge ("gate" or
 // "gone"), recording now as the edge's last-notified time whenever it
 // allows a notification through — pointer receiver so the decision (and the
@@ -1539,13 +1798,14 @@ func (m *Model) shouldNotify(sessionID, edge string, now time.Time) bool {
 // INTO StateGate or INTO StallGone, each independently dedup-gated via
 // shouldNotify. Severity floor: nothing else notifies yet (done/drift/429
 // are explicitly out of scope for this slice).
-func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []transitionEvent {
+func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) ([]transitionEvent, []tea.Cmd) {
 	prev := make(map[string]domain.Loop, len(m.loops))
 	for _, l := range m.loops {
 		prev[l.SessionID] = l
 	}
 
 	var out []transitionEvent
+	var cmds []tea.Cmd
 	for _, l := range newLoops {
 		before, ok := prev[l.SessionID]
 		if !ok {
@@ -1571,6 +1831,11 @@ func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []trans
 		enteredGate := before.State != domain.StateGate && l.State == domain.StateGate
 		enteredGone := l.State == domain.StateStalled && l.Stall == domain.StallGone &&
 			!(before.State == domain.StateStalled && before.Stall == domain.StallGone)
+		// feat/auto-redrive-429: the SAME edge notify's gate/gone triggers
+		// hook into — see maybeScheduleAutoRedrive429's doc for the full
+		// policy gate (opt-in, ceiling, dedup).
+		enteredRateLimit := l.State == domain.StateStalled && l.Stall == domain.StallRateLimit &&
+			!(before.State == domain.StateStalled && before.Stall == domain.StallRateLimit)
 		switch {
 		case enteredGate && m.shouldNotify(l.SessionID, "gate", now):
 			te.notify = true
@@ -1581,9 +1846,12 @@ func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []trans
 			te.title = notifyTitlePrefix + "missionctl · loop gone"
 			te.body = l.Project
 		}
+		if cmd := m.maybeScheduleAutoRedrive429(l, enteredRateLimit, now); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		out = append(out, te)
 	}
-	return out
+	return out, cmds
 }
 
 // seedFirstAppearanceGate is the review fix (P2) for a restart-timing gap:
@@ -2802,7 +3070,22 @@ func lastErrorForDetail(l domain.Loop, data detailData) (string, time.Time, bool
 // recent scan-triggered transition into StateRunning or StateIdle — i.e.
 // the loop recovered AFTER this error was recorded, so it's stale news, not
 // a live incident.
+// Review fix (P2): a zero errorTS (claude.LastError couldn't parse the
+// transcript entry's timestamp — see entryTimestamp's doc) must FAIL OPEN
+// (treated as NOT stale, i.e. shown) rather than silently suppressing a
+// possibly-live error. The old code compared errorTS.UnixNano() directly —
+// the zero time.Time's UnixNano() is a huge NEGATIVE number, which is
+// "less than" any real lastHealthy timestamp, so an unparseable timestamp
+// was ALWAYS judged older than the last recovery and the block simply
+// never showed, with no visible symptom other than "LAST ERROR never
+// appears" — exactly the failure mode a "fail open" default exists to
+// avoid: if the transcript's timestamp format ever drifts from what
+// entryTimestamp expects, this must not become a silent, permanent blind
+// spot.
 func isErrorStale(errorTS time.Time, evs []events.Event) bool {
+	if errorTS.IsZero() {
+		return false
+	}
 	var lastHealthy int64
 	for _, ev := range evs {
 		if ev.Trigger != events.TriggerScan {
