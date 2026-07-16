@@ -199,8 +199,8 @@ func TestValidSessionID(t *testing.T) {
 		{"7666c9ac-fc6a-4824-8c33-cb2a7d810f99", true}, // real-shaped UUID
 		{"sess-1", true},
 		{"", false},
-		{"..", true},           // harmless once ".json" is appended ("...json")
-		{".", true},            // harmless once ".json" is appended ("..json")
+		{"..", true},         // harmless once ".json" is appended ("...json")
+		{".", true},          // harmless once ".json" is appended ("..json")
 		{"../canary", false}, // the actual escape vector
 		{"a/b", false},
 		{"a\\b", true}, // NOT a traversal on this tool's target platforms (macOS/Linux):
