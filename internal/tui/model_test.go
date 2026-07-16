@@ -159,199 +159,140 @@ func TestPadToWidth_AlreadyAtOrOverWidth(t *testing.T) {
 	}
 }
 
-func TestColumnWidths_DropsNoteBelowThreshold(t *testing.T) {
-	if _, _, _, _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
-		t.Errorf("at width %d, wNote = %d, want 0 (NOTE column dropped)", minWidthForNote-1, wNote)
-	}
-	// F1: NOTE is no longer guaranteed to survive exactly AT
-	// minWidthForNote — the cascade may ALSO drop it there if the other
-	// threshold-gated columns don't leave enough real room once the true
-	// fixed cost (marker/state/last/indent/nameFloor) is counted. That's
-	// the actual bug this fixes: showing everything the naive thresholds
-	// nominally allowed could overflow. It's still guaranteed to survive at
-	// a comfortably wide, mainstream terminal.
-	if _, _, _, _, _, _, wNote := columnWidths(120); wNote == 0 {
-		t.Error("at width 120, wNote = 0, want > 0 (NOTE column kept at a mainstream width)")
-	}
-}
+// ── two-pane layout (feat/two-pane-cockpit) ──────────────────────────────
 
-// sampleLoopForWidth builds a loop whose NAME/DOING/NOTE text all overflow any
-// column, so every rendered cell is padded/truncated to exactly its column
-// width — the worst case for total row width.
-func sampleLoopForWidth() domain.Loop {
-	return domain.Loop{
-		Project: "IdeaProjects-very-long-label", SessionID: "abcd1234",
-		State: domain.StateRunning, Cycle: 6,
-		Goal:         domain.Goal{Text: "add pagination to the search results endpoint and cache it", MaxCycles: 12, BudgetTokens: 200000},
-		TokensSpent:  64000,
-		LastActivity: time.Now().Add(-30 * time.Second),
-		Note:         "⚠ over budget please look",
+func TestLayoutModeFor(t *testing.T) {
+	cases := []struct {
+		width int
+		want  layoutMode
+	}{
+		{49, layoutListOnly},
+		{50, layoutStacked},
+		{79, layoutStacked},
+		{80, layoutWide},
+		{200, layoutWide},
 	}
-}
-
-// renderedRowWidth is the true on-screen width of a row (ANSI-stripped, wide
-// runes counted) — the ground truth for "does the row fit / would it wrap?".
-// sel=false so padToWidth doesn't pad the row out to the terminal width and
-// mask an overflow.
-func renderedRowWidth(l domain.Loop, width int) int {
-	wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
-	row := renderRow(l, false, false, wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, width)
-	return lipgloss.Width(row)
-}
-
-// TestColumnWidths_RowNeverOverflowsWhenDoingShown is the core anti-regression
-// property: whenever DOING is rendered (wDoing > 0), the row must fit within
-// the terminal width — otherwise it soft-wraps onto a second physical line and
-// the selection highlight stops covering it. This is exactly the class of bug
-// the fixed-width DOING introduced at 120 cols; a wide sweep guards it.
-func TestColumnWidths_RowNeverOverflowsWhenDoingShown(t *testing.T) {
-	l := sampleLoopForWidth()
-	for width := 40; width <= 260; width++ {
-		_, wDoing, _, _, _, _, _ := columnWidths(width)
-		if wDoing == 0 {
-			continue // DOING hidden — narrow regime, pre-existing NAME-only behaviour
-		}
-		if got := renderedRowWidth(l, width); got > width {
-			t.Errorf("width=%d: rendered row is %d cols wide (DOING shown, wDoing=%d) — overflows, would wrap", width, got, wDoing)
+	for _, c := range cases {
+		if got := layoutModeFor(c.width); got != c.want {
+			t.Errorf("layoutModeFor(%d) = %v, want %v", c.width, got, c.want)
 		}
 	}
 }
 
-// TestColumnWidths_RowFitsAtCommonWidths pins the mainstream terminal sizes the
-// human actually uses: the full table (DOING included where it fits) must
-// render within the width, no wrapping. 100 is the lowest width the fixed
-// columns themselves fit in; below it the pre-existing narrow overflow applies
-// (and DOING is hidden, so it isn't DOING's doing) — see the hidden-widths test.
-func TestColumnWidths_RowFitsAtCommonWidths(t *testing.T) {
-	l := sampleLoopForWidth()
-	for _, width := range []int{100, 118, 120, 130, 140, 160, 200} {
-		if got := renderedRowWidth(l, width); got > width {
-			t.Errorf("width=%d: rendered row is %d cols wide, want <= %d", width, got, width)
+// TestListRowWidths_NeverOverflows: for every inner width from the narrowest
+// this layout ever hands the FLEET panel up to a very wide one, the row's
+// fixed columns (marker+NAME+STATE[+LAST]) must sum to <= innerWidth — the
+// same "prove it fits, don't just assume the thresholds line up" guarantee
+// F1 established for the old columnWidths.
+// TestListRowWidths_NeverOverflows sweeps from wMarker+wState (the
+// structural floor this row format needs — marker+STATE alone, see
+// listRowWidths' doc) up to a very wide panel: the row must never exceed
+// innerWidth. Below that floor marker+STATE alone already overflow no
+// matter what listRowWidths returns for NAME — an acknowledged edge, not a
+// guaranteed one (same spirit as F1's own "not fully guaranteed under ~40
+// cols" caveat for the old columnWidths).
+func TestListRowWidths_NeverOverflows(t *testing.T) {
+	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
+		wName, showLast := listRowWidths(innerWidth)
+		sum := wMarker + wName + wState
+		if showLast {
+			sum += wLast
+		}
+		if sum > innerWidth {
+			t.Errorf("innerWidth=%d: wMarker+wName(%d)+wState+wLast(shown=%v) = %d, want <= %d", innerWidth, wName, showLast, sum, innerWidth)
 		}
 	}
 }
 
-// TestColumnWidths_DoingHiddenWhenNoRoom: below the width that can seat both
-// text columns' floors alongside the fixed columns, DOING is hidden entirely
-// (never a squeezed sub-floor fragment), so it adds nothing to — and can't
-// overflow — the pre-existing narrow layout.
-func TestColumnWidths_DoingHiddenWhenNoRoom(t *testing.T) {
-	for _, width := range []int{40, 60, 80, 100, 110, 115} {
-		if _, wDoing, _, _, _, _, _ := columnWidths(width); wDoing != 0 {
-			t.Errorf("width=%d: wDoing=%d, want 0 (hidden — not enough room for both text columns)", width, wDoing)
+func TestListRowWidths_DropsLastWhenNoRoom(t *testing.T) {
+	_, showLast := listRowWidths(wMarker + wState + listNameFloor - 1)
+	if showLast {
+		t.Error("showLast = true with no room for it, want false (LAST dropped)")
+	}
+	_, showLast = listRowWidths(wMarker + wState + wLast + listNameFloor)
+	if !showLast {
+		t.Error("showLast = false with enough room, want true (LAST kept)")
+	}
+}
+
+// TestListRowWidths_NameWithinBounds: NAME never exceeds its cap, and never
+// goes below listNameFloor once there's actually enough room for it (at
+// innerWidth=1 there manifestly isn't — see TestListRowWidths_NeverOverflows'
+// doc on the structural floor this row format needs).
+func TestListRowWidths_NameWithinBounds(t *testing.T) {
+	for _, innerWidth := range []int{wMarker + wState + listNameFloor, 40, 100, 300} {
+		wName, _ := listRowWidths(innerWidth)
+		if wName < listNameFloor {
+			t.Errorf("innerWidth=%d: wName=%d, want >= listNameFloor (%d)", innerWidth, wName, listNameFloor)
+		}
+		if wName > nameCapWidth {
+			t.Errorf("innerWidth=%d: wName=%d, want <= nameCapWidth (%d)", innerWidth, wName, nameCapWidth)
 		}
 	}
 }
 
-// TestColumnWidths_DoingShownAndReadableWhenWide: at mainstream+ widths DOING
-// is shown and never below its floor (a readable phrase, not a fragment).
-func TestColumnWidths_DoingShownAndReadableWhenWide(t *testing.T) {
-	for _, width := range []int{120, 130, 140, 160, 200} {
-		_, wDoing, _, _, _, _, _ := columnWidths(width)
-		if wDoing < doingFloorWidth {
-			t.Errorf("width=%d: wDoing=%d, want >= doingFloorWidth (%d) — a shown column must be readable", width, wDoing, doingFloorWidth)
+func TestVisibleWindow_TotalFitsWithinMaxRows_ReturnsWholeRange(t *testing.T) {
+	start, end := visibleWindow(3, 1, 10)
+	if start != 0 || end != 3 {
+		t.Errorf("got [%d,%d), want [0,3)", start, end)
+	}
+}
+
+func TestVisibleWindow_ScrollsToKeepCursorVisible(t *testing.T) {
+	// 20 items, a 5-row window, cursor near the end: the window must have
+	// scrolled so idx=17 actually falls in [start,end).
+	start, end := visibleWindow(20, 17, 5)
+	if 17 < start || 17 >= end {
+		t.Errorf("cursor 17 not in window [%d,%d)", start, end)
+	}
+	if end-start != 5 {
+		t.Errorf("window size = %d, want 5", end-start)
+	}
+}
+
+func TestVisibleWindow_ClampsAtStart(t *testing.T) {
+	start, end := visibleWindow(20, 0, 5)
+	if start != 0 || end != 5 {
+		t.Errorf("got [%d,%d), want [0,5) (cursor at the very start)", start, end)
+	}
+}
+
+func TestVisibleWindow_ClampsAtEnd(t *testing.T) {
+	start, end := visibleWindow(20, 19, 5)
+	if start != 15 || end != 20 {
+		t.Errorf("got [%d,%d), want [15,20) (cursor at the very end)", start, end)
+	}
+}
+
+func TestPadLines_PadsShortSlices(t *testing.T) {
+	out := padLines([]string{"a", "b"}, 4)
+	if len(out) != 4 {
+		t.Fatalf("len = %d, want 4", len(out))
+	}
+	if out[0] != "a" || out[1] != "b" || out[2] != "" || out[3] != "" {
+		t.Errorf("got %#v, want [a b \"\" \"\"]", out)
+	}
+}
+
+func TestPadLines_TruncatesLongSlices(t *testing.T) {
+	out := padLines([]string{"a", "b", "c"}, 2)
+	if len(out) != 2 || out[0] != "a" || out[1] != "b" {
+		t.Errorf("got %#v, want [a b]", out)
+	}
+}
+
+// TestRenderPanel_NeverExceedsOuterWidth: the bordered panel (border+title+
+// rule+content) must never render a line wider than the outer width it was
+// asked for, across a spread of widths and content lengths.
+func TestRenderPanel_NeverExceedsOuterWidth(t *testing.T) {
+	for _, width := range []int{10, 30, 50, 80, 120} {
+		lines := []string{strings.Repeat("x", 500), "short"}
+		out := renderPanel("A VERY LONG PANEL TITLE THAT MIGHT OVERFLOW", lines, width)
+		for i, line := range strings.Split(out, "\n") {
+			if got := lipgloss.Width(line); got > width {
+				t.Errorf("width=%d: panel line %d is %d cols wide, want <= %d: %q", width, i, got, width, line)
+			}
 		}
-	}
-}
-
-// TestColumnWidths_NameAndDoingReachCapsWhenWide: on a very wide terminal both
-// text columns cap out and the leftover flows to NOTE (unchanged behaviour).
-func TestColumnWidths_NameAndDoingReachCapsWhenWide(t *testing.T) {
-	wName, wDoing, _, _, _, _, wNote := columnWidths(240)
-	if wName != nameCapWidth {
-		t.Errorf("wName=%d at width 240, want cap %d", wName, nameCapWidth)
-	}
-	if wDoing != doingCapWidth {
-		t.Errorf("wDoing=%d at width 240, want cap %d", wDoing, doingCapWidth)
-	}
-	if wNote <= 24 {
-		t.Errorf("wNote=%d at width 240, want > 24 (spare beyond both caps flows to NOTE)", wNote)
-	}
-}
-
-// TestFlexNameDoing_InvariantAndBounds: the split must conserve the budget
-// (wName+wDoing+spare == remaining — this is what makes the row fit) and keep
-// each column within [floor, cap], with non-negative spare, at every budget.
-func TestFlexNameDoing_InvariantAndBounds(t *testing.T) {
-	for remaining := nameFloorWidth + doingFloorWidth; remaining <= 320; remaining++ {
-		wName, wDoing, spare := flexNameDoing(remaining)
-		if wName+wDoing+spare != remaining {
-			t.Fatalf("remaining=%d: wName(%d)+wDoing(%d)+spare(%d) != remaining", remaining, wName, wDoing, spare)
-		}
-		if wName < nameFloorWidth || wName > nameCapWidth {
-			t.Errorf("remaining=%d: wName=%d out of [%d,%d]", remaining, wName, nameFloorWidth, nameCapWidth)
-		}
-		if wDoing < doingFloorWidth || wDoing > doingCapWidth {
-			t.Errorf("remaining=%d: wDoing=%d out of [%d,%d]", remaining, wDoing, doingFloorWidth, doingCapWidth)
-		}
-		if spare < 0 {
-			t.Errorf("remaining=%d: spare=%d is negative", remaining, spare)
-		}
-	}
-}
-
-func TestColumnWidths_DropsNIBelowThreshold(t *testing.T) {
-	if _, _, _, _, _, wNI, _ := columnWidths(minWidthForNI - 1); wNI != 0 {
-		t.Errorf("at width %d, wNI = %d, want 0 (N/I column dropped)", minWidthForNI-1, wNI)
-	}
-	// F1: see TestColumnWidths_DropsNoteBelowThreshold — the cascade may
-	// drop N/I too, exactly at its nominal threshold, if the true fixed
-	// cost doesn't leave enough real room. Guaranteed at a mainstream width.
-	if _, _, _, _, _, wNI, _ := columnWidths(120); wNI == 0 {
-		t.Error("at width 120, wNI = 0, want > 0 (N/I column kept at a mainstream width)")
-	}
-}
-
-func TestColumnWidths_DropsOracleBelowThreshold(t *testing.T) {
-	if _, _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle - 1); wOracle != 0 {
-		t.Errorf("at width %d, wOracle = %d, want 0 (ORACLE column dropped)", minWidthForOracle-1, wOracle)
-	}
-	// F1: see TestColumnWidths_DropsNoteBelowThreshold — same reasoning.
-	if _, _, _, wOracle, _, _, _ := columnWidths(120); wOracle == 0 {
-		t.Error("at width 120, wOracle = 0, want > 0 (ORACLE column kept at a mainstream width)")
-	}
-}
-
-func TestColumnWidths_DropsBudgetBelowThreshold(t *testing.T) {
-	if _, _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget - 1); wBudget != 0 {
-		t.Errorf("at width %d, wBudget = %d, want 0 (BUDGET column dropped)", minWidthForBudget-1, wBudget)
-	}
-	if _, _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget); wBudget == 0 {
-		t.Errorf("at width %d, wBudget = 0, want > 0 (BUDGET column kept)", minWidthForBudget)
-	}
-}
-
-func TestColumnWidths_DropsCycleBelowThreshold(t *testing.T) {
-	if _, _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle - 1); wCycle != 0 {
-		t.Errorf("at width %d, wCycle = %d, want 0 (CYCLE column dropped)", minWidthForCycle-1, wCycle)
-	}
-	if _, _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle); wCycle == 0 {
-		t.Errorf("at width %d, wCycle = 0, want > 0 (CYCLE column kept)", minWidthForCycle)
-	}
-}
-
-func TestColumnWidths_DegradationOrder(t *testing.T) {
-	// NOTE must drop before N/I, before ORACLE, before BUDGET, before CYCLE, as
-	// width shrinks — never any other order. (NAME and DOING aren't in this
-	// order; they flex to share the leftover — see the row-fit / flex tests.)
-	if minWidthForNote <= minWidthForNI {
-		t.Errorf("minWidthForNote (%d) must be > minWidthForNI (%d)", minWidthForNote, minWidthForNI)
-	}
-	if minWidthForNI <= minWidthForOracle {
-		t.Errorf("minWidthForNI (%d) must be > minWidthForOracle (%d)", minWidthForNI, minWidthForOracle)
-	}
-	if minWidthForOracle <= minWidthForBudget {
-		t.Errorf("minWidthForOracle (%d) must be > minWidthForBudget (%d)", minWidthForOracle, minWidthForBudget)
-	}
-	if minWidthForBudget <= minWidthForCycle {
-		t.Errorf("minWidthForBudget (%d) must be > minWidthForCycle (%d)", minWidthForBudget, minWidthForCycle)
-	}
-}
-
-func TestColumnWidths_NameNeverBelowMinimum(t *testing.T) {
-	wName, _, _, _, _, _, _ := columnWidths(20)
-	if wName < 10 {
-		t.Errorf("wName = %d at a very narrow width, want >= 10 (usable minimum)", wName)
 	}
 }
 
@@ -361,7 +302,7 @@ func TestColumnWidths_NameNeverBelowMinimum(t *testing.T) {
 // regression: a running loop with a long name/goal/note, a gate with a
 // Korean prompt (the callout path), a drifted loop with a long rejection
 // reason, and a plain idle loop — exercising every row/callout/detail-pane
-// path renderRow, renderGateCallout, and renderDetail can take.
+// path renderListRow, renderGateCallout, and renderDetail can take.
 func viewRegressionLoops() []domain.Loop {
 	now := time.Now()
 	return []domain.Loop{
@@ -414,22 +355,135 @@ func viewRegressionLoops() []domain.Loop {
 // lipgloss.Width. This is the regression test for the live-measured
 // overflow (w=90 rendering 100 cols, w=45 header rendering 65 cols) and
 // must keep passing through any future layout change.
+// TestView_NoLineExceedsTerminalWidth is F1's original acceptance bar,
+// extended by feat/two-pane-cockpit with a height-budget check: at every
+// (width, height) combination, every line must fit within the width AND the
+// total rendered line count must fit within the height — required because
+// cmd/missionctl/main.go runs in tea.WithAltScreen() mode, where content
+// beyond the terminal height is genuinely invisible, not just visually
+// awkward. 18 is the lowest height this checks: it's the exact break-even
+// where layoutStacked's two-bordered-panel floor (stackedPanelHeightFloor)
+// stops needing to override the requested height — below it the floor
+// intentionally wins over the exact budget (same spirit as the pre-existing
+// "not fully guaranteed under ~40 cols" width caveat; see panelHeightFloor/
+// stackedPanelHeightFloor's docs).
 func TestView_NoLineExceedsTerminalWidth(t *testing.T) {
 	for _, width := range []int{45, 65, 90, 120, 175} {
+		for _, height := range []int{18, 24, 40, 60} {
+			t.Run(fmt.Sprintf("width=%d/height=%d", width, height), func(t *testing.T) {
+				m := New()
+				m.w, m.h = width, height
+				m.loops = viewRegressionLoops()
+				m.cursor = 0
+
+				out := m.View()
+				lines := strings.Split(out, "\n")
+				for i, line := range lines {
+					if got := lipgloss.Width(line); got > width {
+						t.Errorf("width=%d: line %d is %d cols wide, want <= %d: %q", width, i, got, width, line)
+					}
+				}
+				if got := len(lines); got > height {
+					t.Errorf("height=%d: rendered frame is %d lines, want <= %d", height, got, height)
+				}
+			})
+		}
+	}
+}
+
+// TestView_SelectedRowVisibleInFleetPanel: with more loops than fit in the
+// FLEET panel's rows, moving the cursor deep into the list must scroll the
+// panel (visibleWindow) so the selected loop's row is still on screen — not
+// require any NEW keybinding, just keep the existing ↑/↓/g/G-driven cursor
+// visible.
+func TestView_SelectedRowVisibleInFleetPanel(t *testing.T) {
+	for _, width := range []int{45, 65, 90} {
 		t.Run(fmt.Sprintf("width=%d", width), func(t *testing.T) {
 			m := New()
-			m.w, m.h = width, 40
-			m.loops = viewRegressionLoops()
-			m.cursor = 0
+			m.w, m.h = width, 24
+			m.loops = manyLoopsForScrollTest(50)
+			m.cursor = 37
 
 			out := m.View()
-			for i, line := range strings.Split(out, "\n") {
-				if got := lipgloss.Width(line); got > width {
-					t.Errorf("width=%d: line %d is %d cols wide, want <= %d: %q", width, i, got, width, line)
-				}
+			want := m.loops[m.cursor].Project
+			if !strings.Contains(out, want) {
+				t.Errorf("selected loop %q not visible in rendered frame (scrolled off screen):\n%s", want, out)
 			}
 		})
 	}
+}
+
+// manyLoopsForScrollTest builds n distinct, uniquely-named loops — enough to
+// force the FLEET panel to scroll at any of this layout's widths.
+func manyLoopsForScrollTest(n int) []domain.Loop {
+	now := time.Now()
+	out := make([]domain.Loop, n)
+	for i := 0; i < n; i++ {
+		out[i] = domain.Loop{
+			Project:      fmt.Sprintf("loop-%03d", i),
+			SessionID:    fmt.Sprintf("sess%04d", i),
+			State:        domain.StateIdle,
+			LastActivity: now.Add(-time.Duration(i) * time.Minute),
+		}
+	}
+	return out
+}
+
+// TestView_FallbackThresholds_TriggerCorrectLayout is the task's fallback
+// acceptance bar: <80 stacked (FLEET above DETAIL), <50 list-only (no
+// DETAIL panel at all).
+func TestView_FallbackThresholds_TriggerCorrectLayout(t *testing.T) {
+	m := New()
+	m.h = 30
+	m.loops = viewRegressionLoops()
+	m.cursor = 0
+
+	t.Run("width<50 is list-only (no DETAIL panel)", func(t *testing.T) {
+		m.w = 49
+		out := m.View()
+		if strings.Contains(out, "DETAIL") {
+			t.Errorf("list-only layout (w=49) must not show a DETAIL panel:\n%s", out)
+		}
+	})
+
+	t.Run("50<=width<80 is stacked (FLEET above DETAIL, not side by side)", func(t *testing.T) {
+		m.w = 65
+		out := m.View()
+		lines := strings.Split(out, "\n")
+		fleetLine, detailLine := -1, -1
+		for i, l := range lines {
+			if strings.Contains(l, "FLEET (") {
+				fleetLine = i
+			}
+			if strings.Contains(l, "DETAIL") && detailLine == -1 {
+				detailLine = i
+			}
+		}
+		if fleetLine == -1 || detailLine == -1 {
+			t.Fatalf("expected both FLEET and DETAIL panels in stacked layout, got fleetLine=%d detailLine=%d", fleetLine, detailLine)
+		}
+		if fleetLine >= detailLine {
+			t.Errorf("stacked layout: FLEET title (line %d) must come before DETAIL title (line %d)", fleetLine, detailLine)
+		}
+		if strings.Contains(lines[fleetLine], "DETAIL") {
+			t.Errorf("stacked layout: FLEET and DETAIL must not share a line (not side by side): %q", lines[fleetLine])
+		}
+	})
+
+	t.Run("width>=80 is wide (FLEET and DETAIL side by side)", func(t *testing.T) {
+		m.w = 90
+		out := m.View()
+		found := false
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, "FLEET (") && strings.Contains(l, "DETAIL") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("wide layout (w=90): expected a line containing both FLEET and DETAIL (side by side):\n%s", out)
+		}
+	})
 }
 
 func TestBudgetBar_Boundaries(t *testing.T) {
@@ -1995,62 +2049,6 @@ func TestNoteForRow_NeitherGovernorNorStallNorDrift_Empty(t *testing.T) {
 	note, _ := noteForRow(domain.Loop{State: domain.StateRunning})
 	if note != "" {
 		t.Errorf("note = %q, want empty", note)
-	}
-}
-
-// ── DOING column (doingForRow) ──────────────────────────────────────
-
-func TestDoingForRow_GoalTextPreferredOverLastText(t *testing.T) {
-	// a goal-bound loop: Goal.Text is the ideal "what is this for", and wins
-	// even when LastText is also present.
-	l := domain.Loop{Goal: domain.Goal{Text: "refactor the scanner"}, LastText: "ran go test, 3 failing"}
-	if got := doingForRow(l); got != "refactor the scanner" {
-		t.Errorf("got %q, want the goal text (preferred over LastText)", got)
-	}
-}
-
-func TestDoingForRow_FallsBackToLastText(t *testing.T) {
-	// the majority case: a plain claude session missionctl only observes has no
-	// Goal.Text, so its last assistant tail is what it's "doing".
-	l := domain.Loop{LastText: "running go test ./..."}
-	if got := doingForRow(l); got != "running go test ./..." {
-		t.Errorf("got %q, want the LastText fallback", got)
-	}
-}
-
-func TestDoingForRow_NeitherGoalNorLastText_Empty(t *testing.T) {
-	if got := doingForRow(domain.Loop{}); got != "" {
-		t.Errorf("got %q, want empty (a just-started loop with no goal and no tail yet)", got)
-	}
-}
-
-func TestDoingForRow_TruncatedToColumnWidth(t *testing.T) {
-	// doingForRow returns the raw text; the caller truncates it to the column
-	// width with trunc — verify that path caps a long goal at the column and
-	// marks it with an ellipsis.
-	long := strings.Repeat("x", doingCapWidth+20)
-	got := trunc(doingForRow(domain.Loop{Goal: domain.Goal{Text: long}}), doingCapWidth-1)
-	if n := len([]rune(got)); n != doingCapWidth-1 {
-		t.Errorf("truncated length = %d runes, want %d (column width - 1)", n, doingCapWidth-1)
-	}
-	if !strings.HasSuffix(got, "…") {
-		t.Errorf("got %q, want a trailing ellipsis when truncated", got)
-	}
-}
-
-func TestDoingForRow_CapBumpDoesNotChangeRenderedOutput(t *testing.T) {
-	// Bumping LastText's cap (120→800 in internal/claude.summarizeTailText) must
-	// be a no-op for DOING: DOING hard-truncates LastText to its own column
-	// (doingCapWidth=30), far below either cap, so only the first ~30 runes ever
-	// reach the screen. Two LastTexts that agree on their first 120 runes but
-	// differ beyond it must render identically in DOING.
-	prefix := strings.Repeat("a", 120)
-	asIfCappedAt120 := prefix
-	asIfCappedAt800 := prefix + strings.Repeat("b", 680)
-	got120 := trunc(doingForRow(domain.Loop{LastText: asIfCappedAt120}), doingCapWidth)
-	got800 := trunc(doingForRow(domain.Loop{LastText: asIfCappedAt800}), doingCapWidth)
-	if got120 != got800 {
-		t.Errorf("DOING render changed after cap bump: 120-cap=%q 800-cap=%q", got120, got800)
 	}
 }
 

@@ -1335,6 +1335,17 @@ func (m Model) termWidth() int {
 	return m.w
 }
 
+// termHeight is the usable render height, guarding against 0 before the
+// first tea.WindowSizeMsg arrives (matches termWidth's guard) — the default
+// (24) is the traditional terminal height, a reasonable frame to size tests
+// and any pre-WindowSizeMsg render against.
+func (m Model) termHeight() int {
+	if m.h <= 0 {
+		return 24
+	}
+	return m.h
+}
+
 // counts tallies loop states, total spend, and oracle judgment share for the
 // summary band and keybar. judged/good are over bound loops that have been
 // judged at least once (Last != nil): good counts a latest outcome of
@@ -1364,8 +1375,21 @@ func (m Model) counts() (total, running, stalled, idle, gated, totalTokens, judg
 	return
 }
 
+// View composes the fleet cockpit's two-pane layout ("layout B"): a bordered
+// FLEET list panel (compact identity+state — see renderListRow) and, at
+// wide-enough widths, a bordered DETAIL panel showing everything about the
+// SELECTED loop (renderDetail — GOAL/ORACLE/RUBRIC/BUDGET/N-I/LAST/CWD/LOG/
+// TAIL/callout, i.e. every column that used to live in the old flat table's
+// wide columns before this redesign). Three width-driven layouts (see
+// layoutModeFor): wide (side-by-side), stacked (list above detail), and
+// list-only (no detail pane at all). The whole frame is height-bounded to
+// m.termHeight() — required because cmd/missionctl/main.go runs in
+// tea.WithAltScreen() mode, where content beyond the terminal height is
+// genuinely invisible (no scrollback), not just visually inconvenient — see
+// panelHeight below and TestView_NoLineExceedsTerminalWidth's height checks.
 func (m Model) View() string {
 	width := m.termWidth()
+	height := m.termHeight()
 	var b strings.Builder
 
 	b.WriteString(renderHeaderRow(m, width))
@@ -1386,52 +1410,57 @@ func (m Model) View() string {
 	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good, bandFilter, width))
 	b.WriteString("\n\n")
 
-	b.WriteString(stFaint.Render("LOOPS"))
-	b.WriteString("\n")
-
-	wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
-	b.WriteString(renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote))
-	b.WriteString("\n")
-	visible := m.visibleLoops()
-	switch {
-	case len(m.loops) == 0:
-		b.WriteString(stFaint.Render("  no active Claude Code loops in the window.\n"))
-	case len(visible) == 0:
-		b.WriteString(stFaint.Render(fmt.Sprintf("  no loops match filter %q.\n", m.filterQuery)))
+	// Chrome accounted for above (header+rule+band+blank = topChromeLines)
+	// and below (blank+bottomLine+keybar = bottomChromeLines) is a FIXED
+	// line count regardless of content — renderBottomLine always returns
+	// exactly one line (even if blank), which is what makes this budget a
+	// real guarantee rather than an estimate. Whatever's left goes to the
+	// panel area, floored so the UI never collapses to nothing at an
+	// absurdly short terminal — layoutStacked needs a taller floor than the
+	// other two modes since it renders two bordered panels, not one (see
+	// stackedPanelHeightFloor).
+	mode := layoutModeFor(width)
+	floor := panelHeightFloor
+	if mode == layoutStacked {
+		floor = stackedPanelHeightFloor
 	}
-	dupLabels := duplicateLabels(visible)
-	for i, l := range visible {
-		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, width))
-		b.WriteString("\n")
-	}
-
-	// detail
-	if sel, ok := m.selected(); ok {
-		b.WriteString(renderDetail(sel, width))
+	panelHeight := height - topChromeLines - bottomChromeLines
+	if panelHeight < floor {
+		panelHeight = floor
 	}
 
-	// status line (its own line, above the keybar) — replaced by the
-	// new-loop / filter / inject prompt while in
-	// modePrompting/modeFiltering/modeInjecting — + keybar.
-	b.WriteString("\n")
-	switch {
-	case m.mode == modePrompting:
-		b.WriteString(renderNewLoopPrompt(m))
-		b.WriteString("\n")
-	case m.mode == modeFiltering:
-		b.WriteString(renderFilterPrompt(m.input))
-		b.WriteString("\n")
-	case m.mode == modeInjecting:
-		b.WriteString(renderInjectPrompt(m))
-		b.WriteString("\n")
+	switch mode {
+	case layoutWide:
+		b.WriteString(m.renderWide(width, panelHeight))
+	case layoutStacked:
+		b.WriteString(m.renderStacked(width, panelHeight))
 	default:
-		if line := renderStatusLine(m.status, m.statusKind); line != "" {
-			b.WriteString(line)
-			b.WriteString("\n")
-		}
+		b.WriteString(m.renderListOnly(width, panelHeight))
 	}
+	b.WriteString("\n\n")
+	b.WriteString(m.renderBottomLine())
+	b.WriteString("\n")
 	b.WriteString(renderKeybar(len(m.loops), width))
 	return b.String()
+}
+
+// renderBottomLine is the mode-dependent line just above the keybar: the
+// active wizard/filter/inject prompt, or (in modeNormal) the last action's
+// status. ALWAYS exactly one line, blank when there's nothing to show —
+// unlike the pre-two-pane View, which omitted the line entirely when status
+// was "", this keeps the bottom chrome's line count a fixed constant
+// (bottomChromeLines) instead of one that depends on frame content.
+func (m Model) renderBottomLine() string {
+	switch m.mode {
+	case modePrompting:
+		return renderNewLoopPrompt(m)
+	case modeFiltering:
+		return renderFilterPrompt(m.input)
+	case modeInjecting:
+		return renderInjectPrompt(m)
+	default:
+		return renderStatusLine(m.status, m.statusKind)
+	}
 }
 
 // ── header / band / rule ────────────────────────────────────
@@ -1500,7 +1529,16 @@ func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged
 	return padBetween(left, right, width)
 }
 
-// ── row rendering ──────────────────────────────────────────
+// ── two-pane layout (layout B) ───────────────────────────────
+//
+// feat/two-pane-cockpit replaced the old flat single-table row (NAME+DOING+
+// STATE+CYCLE+ORACLE+BUDGET+N-I+LAST+NOTE, sized by the since-removed
+// columnWidths/flexNameDoing/renderTableHeader/renderRow — see git history
+// if you need the F1-era column-width cascade) with a k9s-style
+// master-detail split: a compact FLEET list panel (marker+NAME+STATE[+LAST],
+// see listRowWidths/renderListRow) and a DETAIL panel carrying everything
+// that used to be a "wide" column (renderDetail, unchanged in content, now
+// rendered inside its own bordered box instead of below a flat table).
 
 const (
 	wMarker = 2
@@ -1508,208 +1546,350 @@ const (
 	wLast   = 14
 )
 
+// nameFloorWidth/nameCapWidth bound the FLEET panel's NAME column: below the
+// floor a name is a noise-y fragment, so listRowWidths never shrinks it
+// further (see listNameFloor for the panel's ABSOLUTE floor, used only when
+// even NAME's ideal floor can't be honored); above the cap NAME stops
+// growing even in a very wide left panel — extra room is just left blank
+// (there's no NOTE-style column left in the list to hand the spare to).
 const (
-	cycleColWidth  = 6
-	oracleColWidth = 12
-	budgetColWidth = 13
-	niColWidth     = 5
+	nameFloorWidth = 10
+	nameCapWidth   = 28
 )
 
-// NAME and DOING are the two flexible text columns: they SHARE whatever width
-// is left after the fixed columns, each growing from a floor toward a cap.
-//   - floor: below it the text is a noise-y fragment (a 10-char DOING snippet
-//     is closer to noise than signal), so the column is hidden entirely rather
-//     than shown squeezed — the same all-or-nothing a fixed column does at its
-//     threshold, but here the trigger is "the leftover can't seat both floors".
-//   - cap: so neither column runs away on a very wide terminal (the mockup
-//     keeps the table compact); spare beyond both caps goes to NOTE.
-//
-// Keeping NAME+DOING inside the leftover budget is exactly what guarantees the
-// row never exceeds the terminal width — and so never soft-wraps onto a second
-// physical line — whenever DOING is shown. (An earlier fixed-width DOING broke
-// this: a 30-wide column that "survived" down to a 55-col threshold couldn't
-// actually fit until ~130 cols, so mainstream widths like 120 wrapped.)
+// listNameFloor is listRowWidths' absolute last resort — smaller than
+// nameFloorWidth — so the FLEET panel keeps showing SOMETHING for NAME even
+// in the narrowest panel this layout ever hands it (list-only mode's floor,
+// see panelHeightFloor/layoutModeFor's thresholds).
+const listNameFloor = 6
+
+// wideMinWidth/stackedMinWidth are the layout-mode thresholds (the task's
+// "essentials": <80 stacked, <50 list-only). See layoutModeFor.
 const (
-	nameFloorWidth  = 10
-	nameCapWidth    = 28
-	doingFloorWidth = 16
-	doingCapWidth   = 30
+	wideMinWidth    = 80
+	stackedMinWidth = 50
 )
 
-// minWidthForNote/NI/Oracle/Budget/Cycle: below these terminal widths the
-// corresponding fixed column is dropped entirely (not just truncated), in this
-// degradation order as width shrinks: NOTE first (least essential — the state
-// label already hints at "why"), then N/I, then ORACLE, then BUDGET, then
-// CYCLE (most essential — kept the longest). Each threshold is strictly less
-// than the last so that order actually holds. NAME and DOING are NOT in this
-// list: they don't hard-drop at a fixed width, they flex to share the leftover
-// budget (see the nameFloorWidth/doingFloorWidth block and columnWidths), so
-// DOING fades by shrinking-then-hiding rather than snapping off at a threshold.
+// topChromeLines/bottomChromeLines/panelHeightFloor: the fixed vertical
+// budget View() reserves outside the panel area — see View's comment. Kept
+// as named constants (not recomputed from rendered output) so the budget is
+// provably constant instead of an estimate that content could quietly grow
+// past.
 const (
-	minWidthForNote   = 70
-	minWidthForNI     = 68
-	minWidthForOracle = 64
-	minWidthForBudget = 60
-	minWidthForCycle  = 50
+	topChromeLines = 4 // header + rule + summary band + blank
+	// bottomChromeLines: blank + bottom line (prompt/status) + keybar.
+	// keybar counts as 2 lines, not 1 — stKeybar (styles.go) sets
+	// BorderTop(true), so renderKeybar's own output is a rule line plus its
+	// content line (confirmed empirically: without this the frame rendered
+	// one line taller than the height budget said it should).
+	bottomChromeLines = 4
+	panelHeightFloor  = 5 // border(2) + title + rule(2) + >=1 content row
+
+	// stackedPanelHeightFloor is layoutStacked's floor: it renders TWO
+	// bordered panels sharing panelHeight, each needing at least
+	// panelHeightFloor of its own (see renderStacked) — so the pair needs
+	// twice that to honor both without either panel silently pushing the
+	// whole frame past the height budget.
+	stackedPanelHeightFloor = 2 * panelHeightFloor
 )
 
-// rowIndent is the ONLY actual inter-cell gap in a rendered row/header: the
-// literal "  " prefixed before lipgloss.JoinHorizontal in both
-// renderTableHeader and renderRow. JoinHorizontal itself adds no spacing of
-// its own — each cell is already padded to its own .Width(), so cells sit
-// directly adjacent. (F1: the old "gaps := 4" fudge factor wasn't the actual
-// bug — see columnWidths' cascade below for what was.)
-const rowIndent = 2
+type layoutMode int
 
-// columnWidths sizes NAME/DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
-// width. CYCLE/ORACLE/BUDGET/N-I/NOTE start from the minWidthForNote/NI/
-// Oracle/Budget/Cycle thresholds (a cheap first guess, correct in the
-// mainstream case), but F1 found those thresholds don't actually guarantee
-// enough room is left over: at w=90, ALL five pass their threshold, yet
-// marker+name-floor+state+those five+last+indent sums to more than 90 —
-// columnWidths' OWN "remaining" math correctly detected that and forced
-// wDoing to 0, but it still unconditionally handed NAME its floor width
-// regardless of whether the FIXED columns alone already exceeded the
-// terminal — an unconditional floor is not a guarantee. Fixed here by
-// cascading: after the threshold guess, actually PROVE
-// alwaysFixed+wCycle+wOracle+wBudget+wNI+wNote+nameFloorWidth fits width,
-// dropping columns one at a time (NOTE first/least essential ... CYCLE
-// last/most essential — the same priority order the thresholds already
-// encoded) until it does. This makes "sum ≤ width" a real, checked
-// invariant instead of resting on the threshold constants being perfectly
-// hand-tuned against the full render-layer cost — exactly the kind of
-// drift that let this bug in when DOING was added.
-//
-// NAME and DOING are the two flexible text columns: they SHARE whatever
-// width is left after the (now width-verified) fixed columns (see
-// flexNameDoing), each bounded by a floor and a cap, with any width beyond
-// both caps handed to NOTE (as it was before DOING existed). Because
-// NAME+DOING are always sized from a `remaining` that's guaranteed
-// non-negative post-cascade, the row's total width never exceeds the
-// terminal width — it can't soft-wrap onto a second line (there is no
-// viewport/clip in this TUI; padToWidth only pads, never truncates the
-// whole row).
-func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) {
-	if width >= minWidthForCycle {
-		wCycle = cycleColWidth
-	}
-	if width >= minWidthForOracle {
-		wOracle = oracleColWidth
-	}
-	if width >= minWidthForBudget {
-		wBudget = budgetColWidth
-	}
-	if width >= minWidthForNI {
-		wNI = niColWidth
-	}
-	if width >= minWidthForNote {
-		wNote = 24
-	}
+const (
+	layoutWide layoutMode = iota
+	layoutStacked
+	layoutListOnly
+)
 
-	alwaysFixed := wMarker + wState + wLast + rowIndent
-	fits := func() bool {
-		return alwaysFixed+wCycle+wOracle+wBudget+wNI+wNote+nameFloorWidth <= width
+// layoutModeFor picks the width-driven layout: wide (side-by-side FLEET +
+// DETAIL), stacked (FLEET above DETAIL, both full width), or list-only (no
+// DETAIL panel at all) — the task's fallback thresholds.
+func layoutModeFor(width int) layoutMode {
+	switch {
+	case width >= wideMinWidth:
+		return layoutWide
+	case width >= stackedMinWidth:
+		return layoutStacked
+	default:
+		return layoutListOnly
 	}
-	// Drop order matches the documented degradation priority: NOTE first
-	// (least essential — the state label already hints at "why"), then
-	// N/I, ORACLE, BUDGET, CYCLE last (most essential). Each step is a
-	// no-op if that column was never shown in the first place.
-	if !fits() {
-		wNote = 0
-	}
-	if !fits() {
-		wNI = 0
-	}
-	if !fits() {
-		wOracle = 0
-	}
-	if !fits() {
-		wBudget = 0
-	}
-	if !fits() {
-		wCycle = 0
-	}
-
-	fixed := alwaysFixed + wCycle + wOracle + wBudget + wNI + wNote
-	remaining := width - fixed // the width budget NAME and DOING share
-
-	if remaining >= nameFloorWidth+doingFloorWidth {
-		var spare int
-		wName, wDoing, spare = flexNameDoing(remaining)
-		if spare > 0 && wNote > 0 {
-			wNote += spare
-		}
-		return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
-	}
-
-	// Not enough room for both floors: DOING steps aside (wDoing stays 0) and
-	// NAME flexes alone. Thanks to the cascade above, remaining is guaranteed
-	// >= nameFloorWidth here (fits() required exactly that), so this clamp is
-	// defense-in-depth, not the load-bearing guarantee it used to be — it
-	// only still matters at the ABSOLUTE floor (width so small that even
-	// alwaysFixed+nameFloorWidth alone exceeds it, i.e. width < ~40), which
-	// remains the one pre-existing edge this fix doesn't claim to cover.
-	wName = remaining
-	if wName < nameFloorWidth {
-		wName = nameFloorWidth
-	}
-	return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
 }
 
-// flexNameDoing splits the leftover width budget shared by NAME and DOING,
-// given it's already known both floors fit (remaining >= nameFloorWidth +
-// doingFloorWidth). Each column grows from its floor toward its cap in
-// proportion to its headroom; whatever is left once both are capped is
-// returned as spare for the caller to hand to NOTE. The invariant callers rely
-// on for the no-overflow guarantee: wName + wDoing + spare == remaining, so the
-// two flex columns plus NOTE's bonus never exceed the budget they were given.
-func flexNameDoing(remaining int) (wName, wDoing, spare int) {
-	pool := remaining - nameFloorWidth - doingFloorWidth
-	nameHeadroom := nameCapWidth - nameFloorWidth
-	doingHeadroom := doingCapWidth - doingFloorWidth
-	nameGain := pool * nameHeadroom / (nameHeadroom + doingHeadroom)
-	if nameGain > nameHeadroom {
-		nameGain = nameHeadroom
+// renderWide lays FLEET and DETAIL out side by side. The left (FLEET) panel
+// gets a fixed-ish share of the width — just enough for its compact columns
+// (see listRowWidths) — everything else goes to DETAIL, which benefits most
+// from extra room (GOAL/TAIL wrap wider). Both panels are pre-sized to the
+// SAME outer height so lipgloss.JoinHorizontal's own top-alignment padding
+// is never needed (see renderPanel's doc — a panel shorter than its sibling
+// would otherwise show its bottom border floating above blank filler).
+func (m Model) renderWide(width, panelHeight int) string {
+	leftWidth := width * 2 / 5
+	if leftWidth < wideLeftFloor {
+		leftWidth = wideLeftFloor
 	}
-	doingGain := pool - nameGain
-	if doingGain > doingHeadroom {
-		doingGain = doingHeadroom
+	if leftWidth > wideLeftCap {
+		leftWidth = wideLeftCap
 	}
-	return nameFloorWidth + nameGain, doingFloorWidth + doingGain, pool - nameGain - doingGain
+	rightWidth := width - leftWidth
+
+	rows := panelContentRows(panelHeight)
+	left := renderPanel(fleetTitle(m), padLines(m.fleetPanelLines(panelInnerWidth(leftWidth), rows), rows), leftWidth)
+	right := renderPanel(detailTitle(m), padLines(m.detailPanelLines(panelInnerWidth(rightWidth), rows), rows), rightWidth)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
-func renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) string {
+// wideLeftFloor/wideLeftCap bound the FLEET panel's share of the width in
+// renderWide: the floor is enough room for marker+NAME(floor)+STATE+LAST
+// plus the border (2+10+12+14+2=40), the cap keeps the list from wasting a
+// huge share of a very wide terminal that DETAIL would put to better use.
+const (
+	wideLeftFloor = 40
+	wideLeftCap   = 60
+)
+
+// renderStacked puts FLEET above DETAIL, both spanning the full width,
+// splitting the available panel height between them (FLEET gets a smaller
+// share — it's a scoped-down list, DETAIL needs more room for its many
+// rows).
+func (m Model) renderStacked(width, panelHeight int) string {
+	// listHeight+detailHeight must sum to EXACTLY panelHeight — two
+	// independent floors (each clamped up without the other giving room
+	// back) would let the pair exceed the height budget View() computed.
+	// View() guarantees panelHeight >= stackedPanelHeightFloor (2×
+	// panelHeightFloor) precisely so both floors below can be honored
+	// without needing to violate that invariant.
+	//
+	// FLEET gets the LARGER share (3/5, not the more even split an earlier
+	// version of this used) — its whole purpose is the at-a-glance
+	// multi-loop overview, so starving it down to 1-2 visible rows at a
+	// common height (24) defeated that; DETAIL degrades more gracefully
+	// under a tight budget since detailPanelLines clips it top-down and
+	// renderDetail already orders its rows by priority (STATE/NOTE/CYCLE/
+	// GOAL first, CWD/LOG/TAIL last), so losing its tail rows first is the
+	// closest a clip can get to spending the pane's own priority order.
+	listHeight := panelHeight * 3 / 5
+	if listHeight < panelHeightFloor {
+		listHeight = panelHeightFloor
+	}
+	detailHeight := panelHeight - listHeight
+	if detailHeight < panelHeightFloor {
+		detailHeight = panelHeightFloor
+		listHeight = panelHeight - detailHeight
+	}
+
+	listRows := panelContentRows(listHeight)
+	detailRows := panelContentRows(detailHeight)
+	inner := panelInnerWidth(width)
+	top := renderPanel(fleetTitle(m), padLines(m.fleetPanelLines(inner, listRows), listRows), width)
+	bottom := renderPanel(detailTitle(m), padLines(m.detailPanelLines(inner, detailRows), detailRows), width)
+	return lipgloss.JoinVertical(lipgloss.Left, top, bottom)
+}
+
+// renderListOnly shows just the FLEET panel, spanning the full width and the
+// full panel height — no DETAIL pane at all (width < stackedMinWidth).
+func (m Model) renderListOnly(width, panelHeight int) string {
+	rows := panelContentRows(panelHeight)
+	return renderPanel(fleetTitle(m), padLines(m.fleetPanelLines(panelInnerWidth(width), rows), rows), width)
+}
+
+// fleetTitle/detailTitle are the panels' bordered titles — FLEET carries the
+// visible-loop count (post-filter, matching the mockup's "LOOPS" label this
+// replaces); DETAIL names the selected loop so it's obvious which loop the
+// panel describes, or a plain "DETAIL" placeholder when nothing is
+// selected.
+func fleetTitle(m Model) string {
+	return fmt.Sprintf("FLEET (%d)", len(m.visibleLoops()))
+}
+
+func detailTitle(m Model) string {
+	if sel, ok := m.selected(); ok {
+		return "DETAIL ▸ " + sel.Project
+	}
+	return "DETAIL"
+}
+
+// panelInnerWidth/panelContentRows: how much CONTENT width/height a bordered
+// panel of the given OUTER width/height has room for, after its rounded
+// border (1 col/row each side) and its baked-in title+rule (2 lines — see
+// renderPanel).
+func panelInnerWidth(outerWidth int) int {
+	w := outerWidth - 2
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+func panelContentRows(outerHeight int) int {
+	h := outerHeight - 4 // border top/bottom(2) + title(1) + rule(1)
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+// renderPanel wraps already-height-fitted content lines (exactly
+// panelContentRows(outerHeight) of them — callers pad/clip via padLines) in
+// a rounded border with a bold title baked in as the box's first line and a
+// thin rule underneath. lipgloss's Border()+Width() pads a SHORT line but
+// does not clip a TALL block of content, so callers own sizing the line
+// count themselves; renderPanel only adds the fixed title+rule+border
+// chrome around whatever it's given.
+func renderPanel(title string, lines []string, outerWidth int) string {
+	inner := panelInnerWidth(outerWidth)
+	var body strings.Builder
+	body.WriteString(fitWithin(stTitle.Render(title), inner))
+	body.WriteString("\n")
+	body.WriteString(lipgloss.NewStyle().Foreground(cLine).Render(strings.Repeat("─", inner)))
+	for _, l := range lines {
+		body.WriteString("\n")
+		body.WriteString(fitWithin(l, inner))
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cLine).
+		Width(inner).
+		Render(body.String())
+}
+
+// visibleWindow computes [start,end) into a total-item range so index idx
+// stays visible within a window of at most maxRows items, scrolling the
+// minimum needed and centering idx when there's room — the FLEET panel's
+// scroll behavior (no new keybindings: existing ↑/↓/g/G cursor movement
+// drives idx, this just keeps it on screen). total<=maxRows returns the
+// whole range unscrolled.
+func visibleWindow(total, idx, maxRows int) (start, end int) {
+	if maxRows <= 0 || total <= maxRows {
+		return 0, total
+	}
+	start = idx - maxRows/2
+	if start < 0 {
+		start = 0
+	}
+	end = start + maxRows
+	if end > total {
+		end = total
+		start = end - maxRows
+	}
+	return start, end
+}
+
+// padLines pads (with blank lines) or truncates lines to exactly n entries,
+// so a panel's content always occupies exactly its allotted height — the
+// bordered box's bottom border lands in the same place regardless of how
+// few rows/detail lines are actually present this frame.
+func padLines(lines []string, n int) []string {
+	if len(lines) >= n {
+		return lines[:n]
+	}
+	out := make([]string, n)
+	copy(out, lines)
+	return out
+}
+
+// listRowWidths computes the compact FLEET row's NAME width for a panel of
+// the given inner content width, dropping the LAST column first if there
+// isn't room for it — the same self-verifying "never return a layout that
+// doesn't fit" cascade the old columnWidths used, scoped down to this
+// layout's much smaller column set (marker+NAME+STATE[+LAST] — DOING/CYCLE/
+// ORACLE/BUDGET/N-I/NOTE all moved to the DETAIL panel, see renderDetail).
+// Unlike an earlier version of this function, wName is never clamped UP to
+// listNameFloor when there isn't room — an unconditional floor is not a
+// guarantee (the exact class of bug F1 fixed in the old columnWidths): at a
+// small enough innerWidth, honoring the floor would make
+// wMarker+wName+wState overflow innerWidth. The one edge this still doesn't
+// claim to cover is innerWidth < wMarker+wState (marker+STATE alone already
+// exceed it) — same spirit as F1's own acknowledged "not fully guaranteed
+// under ~40 cols" edge in the old system.
+func listRowWidths(innerWidth int) (wName int, showLast bool) {
+	showLast = innerWidth-(wMarker+wState+wLast) >= listNameFloor
+	fixed := wMarker + wState
+	if showLast {
+		fixed += wLast
+	}
+	wName = innerWidth - fixed
+	if wName < 0 {
+		wName = 0
+	}
+	if wName > nameCapWidth {
+		wName = nameCapWidth
+	}
+	return wName, showLast
+}
+
+// renderListRow renders one FLEET panel row: marker+NAME+STATE[+LAST] — no
+// DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE (see renderDetail for those). Selection
+// highlight and duplicate-label disambiguation match the old renderRow.
+func renderListRow(l domain.Loop, sel, dup bool, wName int, showLast bool, totalWidth int) string {
+	marker := " "
+	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
+	if sel {
+		marker = "▸"
+		markerStyle = lipgloss.NewStyle().Foreground(cAccent)
+	}
+	label := l.Project
+	if dup {
+		label += "·" + shortID(l.SessionID)
+	}
 	cells := []string{
-		stHeader.Width(wMarker).Render(""),
-		stHeader.Width(wName).Render("NAME"),
+		markerStyle.Width(wMarker).Render(marker),
+		stInk.Width(wName).Render(trunc(label, wName-1)),
+		stateStyle(l).Width(wState).Render(stateLabel(l)),
 	}
-	if wDoing > 0 {
-		cells = append(cells, stHeader.Width(wDoing).Render("DOING"))
+	if showLast {
+		cells = append(cells, stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))))
 	}
-	cells = append(cells, stHeader.Width(wState).Render("STATE"))
-	if wCycle > 0 {
-		cells = append(cells, stHeader.Width(wCycle).Render("CYCLE"))
+	row := lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+	if sel {
+		row = stSelRow.Render(padToWidth(row, totalWidth))
 	}
-	if wOracle > 0 {
-		cells = append(cells, stHeader.Width(wOracle).Render("ORACLE"))
+	return row
+}
+
+// fleetPanelLines builds the FLEET panel's content lines, scrolled (see
+// visibleWindow) so the cursor row stays visible within innerHeight rows.
+// Callers pad/clip the result to exactly innerHeight via padLines.
+func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
+	visible := m.visibleLoops()
+	switch {
+	case len(m.loops) == 0:
+		return []string{stFaint.Render("no active Claude Code loops in the window.")}
+	case len(visible) == 0:
+		return []string{stFaint.Render(fmt.Sprintf("no loops match filter %q.", m.filterQuery))}
 	}
-	if wBudget > 0 {
-		cells = append(cells, stHeader.Width(wBudget).Render("BUDGET"))
+	wName, showLast := listRowWidths(innerWidth)
+	dupLabels := duplicateLabels(visible)
+	start, end := visibleWindow(len(visible), m.cursor, innerHeight)
+	rows := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		l := visible[i]
+		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.Project], wName, showLast, innerWidth))
 	}
-	if wNI > 0 {
-		cells = append(cells, stHeader.Width(wNI).Render("N/I"))
+	return rows
+}
+
+// detailPanelLines builds the DETAIL panel's content: the selected loop's
+// full renderDetail output, clipped to innerHeight lines (simple top-down
+// clipping, not a scrollable viewport — adding detail-pane scroll keys
+// would be new behavior the task's "behavior unchanged" doesn't ask for; see
+// the PR description's judgment-call note). A placeholder stands in when
+// nothing is selected.
+func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
+	sel, ok := m.selected()
+	if !ok {
+		return []string{stFaint.Render("select a loop to see its detail.")}
 	}
-	cells = append(cells, stHeader.Width(wLast).Render("LAST"))
-	if wNote > 0 {
-		cells = append(cells, stHeader.Width(wNote).Render("NOTE"))
+	lines := strings.Split(renderDetail(sel, innerWidth), "\n")
+	if len(lines) > innerHeight {
+		lines = lines[:innerHeight]
 	}
-	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+	return lines
 }
 
 // duplicateLabels reports, for each project label shared by 2+ loops in the
-// current fleet, whether renderRow must disambiguate it with a session-id
-// suffix (many loops sharing "sessions"/"IdeaProjects" are otherwise
-// indistinguishable in the table).
+// current fleet, whether renderListRow must disambiguate it with a
+// session-id suffix (many loops sharing "sessions"/"IdeaProjects" are
+// otherwise indistinguishable in the FLEET panel).
 func duplicateLabels(loops []domain.Loop) map[string]bool {
 	counts := make(map[string]int, len(loops))
 	for _, l := range loops {
@@ -1722,62 +1902,18 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 	return dup
 }
 
-func renderRow(l domain.Loop, sel bool, dup bool, wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, totalWidth int) string {
-	marker := " "
-	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
-	if sel {
-		marker = "▸"
-		markerStyle = lipgloss.NewStyle().Foreground(cAccent)
-	}
-	st := stateStyle(l)
-	note, noteSt := noteForRow(l)
-	label := l.Project
-	if dup {
-		label += "·" + shortID(l.SessionID)
-	}
-	cells := []string{
-		markerStyle.Width(wMarker).Render(marker),
-		stInk.Width(wName).Render(trunc(label, wName-1)),
-	}
-	if wDoing > 0 {
-		// dim (stDim): DOING is background context, kept visually secondary to
-		// NOTE's warning colors (cRed/cAmber).
-		cells = append(cells, stDim.Width(wDoing).Render(trunc(doingForRow(l), wDoing-1)))
-	}
-	cells = append(cells, st.Width(wState).Render(stateLabel(l)))
-	if wCycle > 0 {
-		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
-	}
-	if wOracle > 0 {
-		cells = append(cells, oracleStyle(l).Width(wOracle).Render(trunc(oracleLabel(l), wOracle-1)))
-	}
-	if wBudget > 0 {
-		bar := budgetBar(l.BudgetFrac(), 7)
-		cells = append(cells, budgetStyle(l).Width(wBudget).Render(trunc(bar, wBudget-1)))
-	}
-	if wNI > 0 {
-		cells = append(cells, noImproveStyle(l).Width(wNI).Render(noImproveLabel(l)))
-	}
-	cells = append(cells, stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))))
-	if wNote > 0 {
-		cells = append(cells, noteSt.Width(wNote).Render(trunc(note, wNote-1)))
-	}
-	row := "  " + lipgloss.JoinHorizontal(lipgloss.Top, cells...)
-	if sel {
-		// pad to the full table width first so the selection background
-		// spans the whole row, like the mockup's .tr.sel.
-		row = stSelRow.Render(padToWidth(row, totalWidth))
-	}
-	return row
-}
-
-// noteForRow decides the NOTE column's text and color. A governor-set
+// noteForRow decides the DETAIL panel's NOTE row text and color (moved here
+// from the old flat table's NOTE column — see renderDetail). A governor-set
 // l.Note (internal/engine.Check via the scanner's applyGovernor) always
 // wins when set — it's either an "over budget"/"max cycles reached"
 // escalation (amber, State otherwise unchanged) or a "stopped: no
 // improvement" note paired with StateFailed (red, matching FAILED's own
 // state color) — over the older stall/drift-derived text, which falls back
-// to matching the row's overall state color (st) as before.
+// to matching the row's overall state color as before. The stall/drift
+// fallback text duplicates what renderResumeCallout/renderDriftCallout
+// already show in their own callout box for those states — intentionally:
+// this row is what keeps a StateFailed loop's governor note (the one case
+// with no callout of its own) visible at all now that it's off the list.
 func noteForRow(l domain.Loop) (string, lipgloss.Style) {
 	if l.Note != "" {
 		if l.State == domain.StateFailed {
@@ -1792,25 +1928,6 @@ func noteForRow(l domain.Loop) (string, lipgloss.Style) {
 		return "✗ " + l.Last.Reason, stateStyle(l)
 	}
 	return "", stateStyle(l)
-}
-
-// doingForRow decides the DOING column's text — a background/context column
-// answering "what is this loop actually working on?", distinct from NOTE's
-// alert channel (which stays untouched). A goal-bound loop (spawned via the
-// tui's "n" key) carries the human-written Goal.Text, the ideal answer; loops
-// missionctl merely observes (the majority — plain claude sessions) fall back
-// to LastText, the last assistant message's tail, already single-line and
-// length-capped (tailTextCap, 800 chars) by internal/claude.summarizeTailText
-// (the same text feeding the detail pane's TAIL row, which re-wraps it across
-// several lines). "" when a loop has neither yet (e.g. a
-// just-started unbound loop with no assistant output). Unlike noteForRow the
-// style is invariant (always dim, applied by the caller), so only the text is
-// returned. The caller truncates it to the column width.
-func doingForRow(l domain.Loop) string {
-	if l.Goal.Text != "" {
-		return l.Goal.Text
-	}
-	return l.LastText
 }
 
 // cycleLabel: plain count ("6"), or "6/12" once a per-loop MaxCycles exists.
@@ -1884,6 +2001,14 @@ func renderDetail(l domain.Loop, width int) string {
 	d.WriteString("  " + stFaint.Render(l.SessionID))
 	d.WriteString("\n")
 	d.WriteString(detailRow("STATE", stateStyle(l).Render(stateLabel(l))))
+	// NOTE: moved here from the old flat table's NOTE column (see
+	// noteForRow) — the ONLY place a StateFailed loop's governor note is
+	// visible now that the list no longer shows it (StateStalled/Gate/Drift
+	// keep their own callout box below; StateFailed has none, so this row
+	// is its sole surface).
+	if note, noteSt := noteForRow(l); note != "" {
+		d.WriteString(detailRow("NOTE", noteSt.Render(trunc(note, valueWidth))))
+	}
 	d.WriteString(detailRow("CYCLE", stInk.Render(cycleLabel(l))))
 	if l.Goal.Text != "" {
 		d.WriteString(detailRow("GOAL", stInk.Render(trunc(l.Goal.Text, valueWidth))))
@@ -1923,7 +2048,11 @@ func renderDetail(l domain.Loop, width int) string {
 	case domain.StateDrift:
 		d.WriteString(renderDriftCallout(l, width))
 	}
-	return stDetail.Width(width).Render(strings.TrimRight(d.String(), "\n"))
+	// No border/padding here (unlike the pre-two-pane stDetail wrap this
+	// used to return): renderDetail's output now lives INSIDE the DETAIL
+	// panel's own bordered box (see renderPanel), which already supplies
+	// the border — wrapping it again here would nest two borders.
+	return strings.TrimRight(d.String(), "\n")
 }
 
 // renderOracleDetail is the ORACLE row's value: icon + the verdict's actual
