@@ -7,8 +7,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/registry"
+	"github.com/jitokim/missionctl/internal/sessions"
 	runewidth "github.com/mattn/go-runewidth"
 )
 
@@ -807,6 +809,91 @@ func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
 	}
 }
 
+// ── ttyPathPlausible: skip the ambiguity guard when a registry tty could
+// resolve this session uniquely (ADR Phase 2, §2.2/§3 step 2) ────────
+
+// withSessionsDir points sessionsDirFn at a fresh temp dir for the duration
+// of one test, restoring the original on cleanup.
+func withSessionsDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := sessionsDirFn
+	t.Cleanup(func() { sessionsDirFn = orig })
+	sessionsDirFn = func() string { return dir }
+	return dir
+}
+
+func TestTtyPathPlausible_EntryWithTTY_True(t *testing.T) {
+	dir := withSessionsDir(t)
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+
+	m := New()
+	if !m.ttyPathPlausible(domain.Loop{SessionID: "sess-1"}) {
+		t.Error("expected true — a registry entry with a non-empty tty exists")
+	}
+}
+
+func TestTtyPathPlausible_EntryWithEmptyTTY_False(t *testing.T) {
+	dir := withSessionsDir(t)
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{TTY: ""}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+
+	m := New()
+	if m.ttyPathPlausible(domain.Loop{SessionID: "sess-1"}) {
+		t.Error("expected false — the registry entry has no tty (headless/-p session)")
+	}
+}
+
+func TestTtyPathPlausible_NoEntry_False(t *testing.T) {
+	withSessionsDir(t)
+
+	m := New()
+	if m.ttyPathPlausible(domain.Loop{SessionID: "never-registered"}) {
+		t.Error("expected false — no registry entry at all")
+	}
+}
+
+func TestUpdate_RKey_AmbiguousSharedDir_ButTTYPlausible_Proceeds(t *testing.T) {
+	// the whole point of Tier 1a: two loops sharing a directory are no
+	// longer ambiguous once the selected one has a known tty — the
+	// keypress-time guard must not refuse just because ANOTHER loop happens
+	// to share the same cwd.
+	dir := withSessionsDir(t)
+	m := modelWithTwoLoopsSharingDir()
+	if err := sessions.WriteSession(dir, m.loops[0].SessionID, sessions.SessionEntry{TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (resumeCmd) — the tty path makes this unambiguous")
+	}
+	if m.statusKind == statusErr {
+		t.Errorf("statusKind = %v, want not statusErr", m.statusKind)
+	}
+}
+
+func TestUpdate_IKey_AmbiguousSharedDir_ButTTYPlausible_EntersInjectingMode(t *testing.T) {
+	dir := withSessionsDir(t)
+	m := modelWithTwoLoopsSharingDir()
+	if err := sessions.WriteSession(dir, m.loops[0].SessionID, sessions.SessionEntry{TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if m.mode != modeInjecting {
+		t.Errorf("mode = %v, want modeInjecting (the tty path makes this unambiguous)", m.mode)
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (textinput.Blink)")
+	}
+}
+
 func TestUpdate_RKey_StateFailed_BlockedByKeyGuard(t *testing.T) {
 	// the "r" keypress guard only allows StateStalled/StateDrift — a
 	// governor-failed loop must never even reach resumeCmd via this path.
@@ -950,22 +1037,21 @@ func TestUpdate_IKey_AmbiguousSharedDir_Refuses(t *testing.T) {
 	}
 }
 
-func TestUpdate_IKey_StallGone_BlockedByKeyGuard(t *testing.T) {
-	// the "i" keypress guard must refuse a StallGone loop early — before the
-	// human types anything — so it never even reaches inject mode.
+func TestUpdate_IKey_StallGone_EntersInjectingMode(t *testing.T) {
+	// StallGone no longer refuses at the "i" keypress guard — the ADR Phase
+	// 2 Tier 2 redrive path means it's now a perfectly valid inject target
+	// (routed headlessly once submitted), so it must reach inject mode like
+	// any other loop.
 	m := modelWithOneLoop()
 	m.loops[0].Stall = domain.StallGone
 
 	m, cmd := updateModel(t, m, runeKey('i'))
 
-	if cmd != nil {
-		t.Error("expected no tea.Cmd — StallGone is not injectable via the i key")
+	if m.mode != modeInjecting {
+		t.Fatalf("mode = %v, want modeInjecting (StallGone is now a valid inject target)", m.mode)
 	}
-	if m.mode != modeNormal {
-		t.Errorf("mode = %v, want modeNormal (StallGone must not enter inject mode)", m.mode)
-	}
-	if !strings.Contains(m.status, "process gone") {
-		t.Errorf("status = %q, want it to mention the process is gone", m.status)
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (textinput.Blink)")
 	}
 }
 
@@ -1007,13 +1093,132 @@ func TestSendPromptCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
 	}
 }
 
-func TestSendPromptCmd_StallGone_RefusesWithRestartHint(t *testing.T) {
-	// belt-and-suspenders: sendPromptCmd itself must refuse on StallGone too,
-	// pointing at a restart (a StallGone surface is a bare shell — the prompt
-	// would be typed as a shell command).
+// ── ADR Phase 2 tier policy (tty → cwd → headless redrive) ───────────
+//
+// sendPromptCmd/approveCmd/interruptCmd/killCmd all resolve a surface via
+// resolveActuationTargetFn (control.ResolveActuationTarget by default,
+// overridable here) — Tier 1. sendPromptCmd additionally falls to redriveFn
+// (control.Redrive by default) — Tier 2 — when Tier 1 doesn't resolve a
+// surface, or immediately (skipping Tier 1 outright) for a StallGone loop.
+// These seams let the whole state machine be exercised without touching a
+// real ~/.missionctl/sessions or shelling out to tmux/claude.
+
+// withFakeActuationSeams overrides resolveActuationTargetFn/redriveFn for
+// the duration of one test, restoring the originals on cleanup.
+func withFakeActuationSeams(t *testing.T, resolve func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool), redrive func(sessionID, prompt string) error) {
+	t.Helper()
+	origResolve, origRedrive := resolveActuationTargetFn, redriveFn
+	t.Cleanup(func() { resolveActuationTargetFn, redriveFn = origResolve, origRedrive })
+	if resolve != nil {
+		resolveActuationTargetFn = resolve
+	}
+	if redrive != nil {
+		redriveFn = redrive
+	}
+}
+
+func TestSendPromptCmd_StallGone_SkipsTierOne_GoesStraightToTierTwo(t *testing.T) {
+	tier1Called := false
+	var gotSessionID, gotPrompt string
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			tier1Called = true
+			return nil, control.Target{}, true, true // would succeed if tried — must NOT be tried
+		},
+		func(sessionID, prompt string) error {
+			gotSessionID, gotPrompt = sessionID, prompt
+			return nil
+		},
+	)
 	l := domain.Loop{SessionID: "sess-1", Project: "aboard", Stall: domain.StallGone}
 
 	msg := sendPromptCmd(l, "do the thing", "injected into", "")()
+
+	if tier1Called {
+		t.Error("expected Tier 1 (resolveActuationTargetFn) NOT to be called for a StallGone loop")
+	}
+	if gotSessionID != "sess-1" || gotPrompt != "do the thing" {
+		t.Errorf("redriveFn called with (%q, %q), want (sess-1, do the thing)", gotSessionID, gotPrompt)
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if !rm.ok {
+		t.Errorf("expected ok=true, got text %q", rm.text)
+	}
+	if !strings.Contains(rm.text, "headlessly (tier 2)") {
+		t.Errorf("text = %q, want it to mention the tier-2 redrive", rm.text)
+	}
+}
+
+func TestSendPromptCmd_TierOneFound_UsesTierOneNotRedrive(t *testing.T) {
+	redriveCalled := false
+	fakeCtrl := &fakeController{name: "tmux"}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		},
+		func(sessionID, prompt string) error {
+			redriveCalled = true
+			return nil
+		},
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
+
+	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+
+	if redriveCalled {
+		t.Error("expected redriveFn NOT to be called when Tier 1 already found a surface")
+	}
+	if !fakeCtrl.resumeCalled {
+		t.Error("expected ctrl.Resume to be called with the Tier 1 target")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+	if !strings.Contains(rm.text, "via tmux") {
+		t.Errorf("text = %q, want it to mention the Tier 1 backend", rm.text)
+	}
+}
+
+func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
+	redriveCalled := false
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false // backend resolved, but no surface located
+		},
+		func(sessionID, prompt string) error {
+			redriveCalled = true
+			return nil
+		},
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
+
+	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
+
+	if !redriveCalled {
+		t.Error("expected redriveFn to be called once Tier 1 fails to find a surface")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+}
+
+func TestSendPromptCmd_TierTwoRedriveFails_ReportsError(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, false, false
+		},
+		func(sessionID, prompt string) error {
+			return errTestJudgeFailed
+		},
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard"}
+
+	msg := sendPromptCmd(l, "do the thing", "resumed", "")()
 
 	rm, ok := msg.(resumeResultMsg)
 	if !ok {
@@ -1022,12 +1227,30 @@ func TestSendPromptCmd_StallGone_RefusesWithRestartHint(t *testing.T) {
 	if rm.ok {
 		t.Error("expected ok=false")
 	}
-	if !strings.Contains(rm.text, "process gone") {
-		t.Errorf("text = %q, want it to mention the process is gone", rm.text)
+	if !strings.Contains(rm.text, "re-drive") {
+		t.Errorf("text = %q, want it to mention the failed re-drive", rm.text)
 	}
-	if !strings.Contains(rm.text, "claude --resume sess-1") {
-		t.Errorf("text = %q, want it to carry the restart hint", rm.text)
-	}
+}
+
+// fakeController is a minimal control.Controller test double — only Resume
+// is exercised by sendPromptCmd; the rest are unused stubs.
+type fakeController struct {
+	name         string
+	resumeCalled bool
+	resumeErr    error
+}
+
+func (f *fakeController) Name() string                               { return f.name }
+func (f *fakeController) Available() bool                            { return true }
+func (f *fakeController) Locate(string) (control.Target, bool)       { return control.Target{}, false }
+func (f *fakeController) LocateClaude(string) (control.Target, bool) { return control.Target{}, false }
+func (f *fakeController) Approve(control.Target) error               { return nil }
+func (f *fakeController) Focus(control.Target) error                 { return nil }
+func (f *fakeController) Interrupt(control.Target) error             { return nil }
+func (f *fakeController) Spawn(string, string) error                 { return nil }
+func (f *fakeController) Resume(t control.Target, prompt string) error {
+	f.resumeCalled = true
+	return f.resumeErr
 }
 
 func TestUpdate_ArrowKeysWhileInjecting_RouteToInputNotCursor(t *testing.T) {

@@ -88,8 +88,16 @@ const redriveTimeout = 10 * time.Minute
 func Redrive(sessionID, prompt string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), redriveTimeout)
 	defer cancel()
-	if err := exec.CommandContext(ctx, "claude", "--resume", sessionID, "-p", prompt, "--output-format", "json").Run(); err != nil {
+	argv := redriveArgv(sessionID, prompt)
+	if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err != nil {
 		return fmt.Errorf("claude --resume: %w", err)
 	}
 	return nil
+}
+
+// redriveArgv builds Redrive's argv — pulled out as its own pure function
+// so the exact command shape is directly unit-testable, same pattern as
+// orcaResumeCmd/tmuxResumeCmds.
+func redriveArgv(sessionID, prompt string) []string {
+	return []string{"claude", "--resume", sessionID, "-p", prompt, "--output-format", "json"}
 }

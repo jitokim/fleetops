@@ -127,6 +127,33 @@ that backend.
 `internal/control.Resolve()` picks the first available backend in that order
 (orca → cmux → tmux).
 
+### Capability tiers (session identity, not just backend)
+
+Since the session-identity registry (`missionctl hooks install`'s
+`SessionStart`/`SessionEnd` hooks), which terminal/backend hosts a session
+matters less than what missionctl actually *knows* about it. Every typed
+action (resume/approve/stop/kill/inject) now resolves in tiers, falling
+through automatically:
+
+1. **Tier 1a — registry tty (tmux only).** If the session registry has a
+   live tty for the loop (written at `SessionStart`, re-validated against a
+   live `ps` at actuation time), missionctl dispatches straight to that tmux
+   pane by tty — session-unique, so two loops sharing a project directory
+   are no longer ambiguous to each other.
+2. **Tier 1b — cwd-based match (orca/cmux/tmux).** The existing
+   `Locate`/`LocateClaude` chain, unchanged — still guarded against
+   ambiguity when more than one loop shares a directory.
+3. **Tier 2 — headless re-drive (every backend, every host).**
+   `claude --resume <id> -p "<prompt>"` continues the SAME session as a
+   fresh background turn, appending to the SAME transcript the cockpit
+   already tails. No terminal surface needed at all — this is what makes a
+   loop whose terminal died (`process gone`) resumable again, and it's the
+   only path available for a session with no multiplexer backend (a bare
+   terminal, an IDE-hosted shell, etc.) once Tier 1 can't find a surface.
+
+See `docs/adr-vendor-independent-actuation.md` for the full design and
+verification notes.
+
 ## Limitations
 
 - **No goal, no oracle.** A session missionctl didn't spawn has no recorded
