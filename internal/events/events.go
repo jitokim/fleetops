@@ -267,3 +267,22 @@ func readEventFile(path string) ([]Event, error) {
 	}
 	return out, nil
 }
+
+// ParseOracleDetail splits a TriggerOracle event's Detail field —
+// "<outcome> at cycle <n>: <reason>" (see internal/tui's judgeCmd, the sole
+// emitter) — into its outcome and verbatim reason. feat/detail-panel-v2's
+// VERDICTS block needs the reason text verbatim (council hard rule: never
+// paraphrased); cmd/missionctl's report command only ever needed the
+// outcome (its own local, unchanged parser). Tolerant of an unexpected
+// shape: outcome falls back to the whole string, reason to "".
+func ParseOracleDetail(detail string) (outcome, reason string) {
+	i := strings.Index(detail, " at cycle")
+	if i < 0 {
+		return detail, ""
+	}
+	outcome = detail[:i]
+	if j := strings.Index(detail, ": "); j >= 0 {
+		reason = detail[j+2:]
+	}
+	return outcome, reason
+}

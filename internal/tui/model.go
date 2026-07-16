@@ -4,10 +4,12 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -261,6 +263,16 @@ type Model struct {
 	// notification for a still-open gate is a fine trade against
 	// persisting this ledger to disk for a purely cosmetic dedup window.
 	notifiedAt map[string]time.Time
+
+	// gitStats caches the selected loop's working-tree diff stats (files
+	// changed, +/- lines — feat/detail-panel-v2's STAGE row), keyed by
+	// SessionID. Populated by gitStatsCmd, dispatched once per scan tick
+	// (loopsMsg) for ONLY the currently-selected loop — no other loop's
+	// stats are ever rendered, so computing them for the whole fleet would
+	// be pure waste. A zero-value entry (ok=false) simply means "not
+	// computed yet" or "not a git repo" — STAGE omits the file/± portion
+	// either way (see renderStageRow).
+	gitStats map[string]gitStatsResult
 }
 
 func New() Model {
@@ -294,7 +306,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = maxInt(0, len(m.visibleLoops())-1)
 		}
 		m.lastScan = now
-		return m, tea.Batch(m.triggerJudgments(), emitTransitionsCmd(transitions))
+		// feat/detail-panel-v2: refresh the SELECTED loop's git stats once
+		// per scan tick — never the whole fleet's (no other loop's stats
+		// are ever rendered, so that would be pure waste).
+		var gitCmd tea.Cmd
+		if sel, ok := m.selected(); ok {
+			gitCmd = gitStatsCmd(sel)
+		}
+		return m, tea.Batch(m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd)
+	case gitStatsMsg:
+		if m.gitStats == nil {
+			m.gitStats = make(map[string]gitStatsResult)
+		}
+		m.gitStats[msg.sessionID] = msg.stats
+		return m, nil
 	case tickMsg:
 		return m, tea.Batch(scan, tick())
 	case tea.KeyMsg:
@@ -1313,8 +1338,13 @@ func judgeCmd(l domain.Loop) tea.Cmd {
 			FromState: l.StateString(),
 			ToState:   l.StateString(),
 			Trigger:   events.TriggerOracle,
-			Detail:    fmt.Sprintf("%s at cycle %d", verdict.Outcome, l.Cycle),
-			Actor:     events.ActorAuto,
+			// feat/detail-panel-v2: the reason is appended verbatim (council
+			// hard rule: never paraphrased) — see events.ParseOracleDetail,
+			// which the VERDICTS block uses to pull it back out. Backward
+			// compatible with report.go's existing outcome-only parser
+			// (still splits on " at cycle", unaffected by anything after).
+			Detail: fmt.Sprintf("%s at cycle %d: %s", verdict.Outcome, l.Cycle, verdict.Reason),
+			Actor:  events.ActorAuto,
 		})
 		return verdictMsg{sessionID: l.SessionID, verdict: verdict}
 	}
@@ -2234,12 +2264,24 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 // would be new behavior the task's "behavior unchanged" doesn't ask for; see
 // the PR description's judgment-call note). A placeholder stands in when
 // nothing is selected.
+//
+// feat/detail-panel-v2: also gathers detailData here — the session's event
+// history (a couple of small local file reads via events.Read, cheap enough
+// to do synchronously in View()) and the cached git stats (gitStatsCmd,
+// computed asynchronously per scan tick — see Model.gitStats' doc) — so
+// renderDetail itself stays a pure function over already-known data.
 func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
 	sel, ok := m.selected()
 	if !ok {
 		return []string{stFaint.Render("select a loop to see its detail.")}
 	}
-	lines := strings.Split(renderDetail(sel, innerWidth), "\n")
+	evs, _ := events.Read(historyDirFn(), sel.SessionID) // best-effort; nil on error is fine (every consumer tolerates an empty slice)
+	data := detailData{
+		now:    time.Now(),
+		events: evs,
+		git:    m.gitStats[sel.SessionID],
+	}
+	lines := strings.Split(renderDetail(sel, innerWidth, innerHeight, data), "\n")
 	if len(lines) > innerHeight {
 		lines = lines[:innerHeight]
 	}
@@ -2334,21 +2376,140 @@ func shortID(id string) string {
 	return id[:4]
 }
 
+// ── git working-tree stats (feat/detail-panel-v2's STAGE row) ───────────
+//
+// Computing `git diff`/`git status` is real exec work (unlike reading the
+// event log, a couple of small local file reads) — doing it synchronously
+// inside View() would risk blocking the whole TUI on a wedged git process.
+// So it follows the SAME tea.Cmd/Msg pattern as judgeCmd/verdictMsg: fired
+// once per scan (loopsMsg), only for the currently-selected loop (the only
+// one ever rendered), result cached in Model.gitStats keyed by SessionID.
+
+// gitStatsResult is one loop's working-tree diff snapshot. ok=false means
+// "not a git repo, CwdVerified is false, or the git commands failed/timed
+// out" — STAGE simply omits the file/± portion in that case, never an
+// error shown to the human (this is a nice-to-have annotation, not fleet
+// state).
+type gitStatsResult struct {
+	files, plus, minus int
+	ok                 bool
+}
+
+// gitStatsMsg reports gitStatsCmd's result for sessionID.
+type gitStatsMsg struct {
+	sessionID string
+	stats     gitStatsResult
+}
+
+// gitStatsTimeout bounds each of the two git subprocess calls — a wedged
+// git (e.g. an NFS-mounted repo) must not hang the fleet loop.
+const gitStatsTimeout = 2 * time.Second
+
+// gitStatsCmd computes l's working-tree diff stats off the event loop.
+// CwdVerified is required (same "don't trust a lossy decoded path" guard
+// used elsewhere — see domain.Loop.CwdVerified's doc) — an unverified Cwd
+// isn't safe to run git commands against at all.
+func gitStatsCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		if !l.CwdVerified {
+			return gitStatsMsg{l.SessionID, gitStatsResult{}}
+		}
+		files, plus, minus, ok := computeGitStats(l.Cwd)
+		return gitStatsMsg{l.SessionID, gitStatsResult{files: files, plus: plus, minus: minus, ok: ok}}
+	}
+}
+
+// computeGitStats runs `git diff --shortstat` (tracked-file changes: file
+// count + insertions/deletions) and `git status --porcelain` (adds
+// untracked files to the file count — diff alone can't see them) in cwd.
+// ok=false if the FIRST command fails (not a git repo, or git itself
+// missing) — the second command's failure is tolerated (still returns the
+// diff-only numbers) since a status failure doesn't invalidate the diff.
+func computeGitStats(cwd string) (files, plus, minus int, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitStatsTimeout)
+	defer cancel()
+	diffOut, err := exec.CommandContext(ctx, "git", "-C", cwd, "diff", "--shortstat").Output()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	files, plus, minus = parseShortstat(string(diffOut))
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), gitStatsTimeout)
+	defer cancel2()
+	statusOut, err := exec.CommandContext(ctx2, "git", "-C", cwd, "status", "--porcelain").Output()
+	if err == nil {
+		files += countUntrackedFiles(string(statusOut))
+	}
+	return files, plus, minus, true
+}
+
+// shortstatRe parses `git diff --shortstat`'s summary line, e.g.
+// " 2 files changed, 47 insertions(+), 9 deletions(-)" — any of the three
+// clauses may be absent (e.g. a diff with only deletions omits
+// "insertions").
+var shortstatRe = regexp.MustCompile(`(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?`)
+
+func parseShortstat(s string) (files, plus, minus int) {
+	m := shortstatRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, 0, 0
+	}
+	files, _ = strconv.Atoi(m[1])
+	if m[2] != "" {
+		plus, _ = strconv.Atoi(m[2])
+	}
+	if m[3] != "" {
+		minus, _ = strconv.Atoi(m[3])
+	}
+	return files, plus, minus
+}
+
+// countUntrackedFiles counts `git status --porcelain` lines for an
+// untracked file ("??" prefix) — these never show up in `git diff`, which
+// only ever compares tracked content.
+func countUntrackedFiles(porcelain string) int {
+	n := 0
+	for _, line := range strings.Split(porcelain, "\n") {
+		if strings.HasPrefix(line, "??") {
+			n++
+		}
+	}
+	return n
+}
+
 // ── detail pane ──────────────────────────────────────────────
 
-// maxTailLines caps how many wrapped lines the detail pane's TAIL row shows —
-// a readability ceiling on the last assistant message (the captain floated
-// 5–10; 6 is the middle). Content beyond it is truncated with an ellipsis
-// marker; the full report lives in the pager / oracle, not here. It's a single
-// named constant so widening/narrowing the TAIL row is a one-line change.
-const maxTailLines = 6
+// tailMaxLines caps how many wrapped lines the detail pane's TAIL row shows.
+// feat/detail-panel-v2 (council: TAIL must not grow into a transcript
+// viewer — that's what ↵ attach is for) shrank this from 6 to 4 to make
+// room for the new LAST ERROR/VERDICTS/EVENTS blocks; the full report lives
+// in the pager / oracle / EVENTS block, not here.
+const tailMaxLines = 4
 
 // detailKeyWidth is the fixed column width of a detail row's KEY (see
 // detailRow). TAIL's wrapped continuation lines indent by exactly this much so
 // their text aligns under the value column instead of the label.
 const detailKeyWidth = 8
 
-func renderDetail(l domain.Loop, width int) string {
+// detailData bundles everything renderDetail needs beyond the Loop itself —
+// data that's either expensive (git stats) or requires "now"/the event log
+// for time-relative computations (STAGE elapsed, burn-rate ETA, LAST ERROR
+// staleness, VERDICTS, EVENTS, the STALLED callout's flap counter).
+// Gathered once by the caller (detailPanelLines) so renderDetail itself
+// stays a pure rendering function over already-known data — directly
+// testable without a real event-log dir or git repo.
+type detailData struct {
+	now    time.Time
+	events []events.Event // this session's history, oldest-first (events.Read's contract)
+	git    gitStatsResult
+}
+
+// eventsMinRows is the EVENTS block's floor: below this many rows available
+// (title line + at least 2 data rows), the whole block is omitted rather
+// than rendering a cramped, barely-useful sliver.
+const eventsMinRows = 3
+
+func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	// leave room for the ~8-col key + its gap before truncating long values
 	// (paths) so nothing overflows the terminal width.
 	valueWidth := width - 10
@@ -2383,36 +2544,364 @@ func renderDetail(l domain.Loop, width int) string {
 		if l.Goal.Oracle != "" {
 			d.WriteString(detailRow("RUBRIC", stDim.Render(trunc(l.Goal.Oracle, valueWidth))))
 		}
+		if stage, ok := renderStageRow(l, data); ok {
+			d.WriteString(detailRow("STAGE", stInk.Render(trunc(stage, valueWidth))))
+		}
 	}
-	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(fmt.Sprintf("%s / %s (%d%%)",
-		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100))))))
+	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(trunc(budgetLine(l), valueWidth))))
 	if l.Goal.Text != "" {
 		d.WriteString(detailRow("N/I", noImproveStyle(l).Render(noImproveLabel(l))))
 	}
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
-	if l.LastText != "" {
-		wrapped := wrapTailText(l.LastText, valueWidth, maxTailLines)
-		for i := range wrapped {
-			wrapped[i] = stDim.Render(wrapped[i])
-		}
-		d.WriteString(detailRowMultiline("TAIL", wrapped))
-	}
 
 	switch l.State {
 	case domain.StateStalled:
-		d.WriteString(renderResumeCallout(l, width))
+		d.WriteString(renderResumeCallout(l, width, data.events, data.now))
 	case domain.StateGate:
 		d.WriteString(renderGateCallout(l, width))
 	case domain.StateDrift:
 		d.WriteString(renderDriftCallout(l, width))
 	}
+
+	if errText, errTS, ok := lastErrorForDetail(l, data); ok {
+		d.WriteString(renderLastErrorBlock(errText, errTS, valueWidth))
+	}
+
+	if l.Goal.Text != "" {
+		if lines := renderVerdictsBlock(data.events, valueWidth); lines != "" {
+			d.WriteString(lines)
+		}
+	}
+
+	top := strings.TrimRight(d.String(), "\n")
+
+	var tail string
+	if l.LastText != "" {
+		wrapped := wrapTailText(l.LastText, valueWidth, tailMaxLines)
+		for i := range wrapped {
+			wrapped[i] = stDim.Render(wrapped[i])
+		}
+		tail = strings.TrimRight(detailRowMultiline("TAIL", wrapped), "\n")
+	}
+
+	// EVENTS absorbs whatever height is left after everything else
+	// (including TAIL, capped at tailMaxLines, and the top block above) —
+	// see eventsMinRows' doc for the floor below which it's omitted
+	// entirely rather than rendered cramped.
+	used := strings.Count(top, "\n") + 1
+	if tail != "" {
+		used += strings.Count(tail, "\n") + 1
+	}
+	remaining := height - used
+	eventsBlock := ""
+	if remaining >= eventsMinRows {
+		eventsBlock = renderEventsBlock(data.events, valueWidth, remaining)
+	}
+
+	var out strings.Builder
+	out.WriteString(top)
+	if eventsBlock != "" {
+		out.WriteString("\n")
+		out.WriteString(eventsBlock)
+	}
+	if tail != "" {
+		out.WriteString("\n")
+		out.WriteString(tail)
+	}
 	// No border/padding here (unlike the pre-two-pane stDetail wrap this
 	// used to return): renderDetail's output now lives INSIDE the DETAIL
 	// panel's own bordered box (see renderPanel), which already supplies
 	// the border — wrapping it again here would nest two borders.
-	return strings.TrimRight(d.String(), "\n")
+	return out.String()
+}
+
+// budgetLine is the BUDGET row's value: the existing "<spent> / <cap>
+// (P%)" plus, when computable, an inline burn rate + ETA cycle —
+// "3.9M / 2.0M · ~4.1k/cyc · cap ~c483" (rate = TokensSpent/Cycle; ETA
+// cycle = the cycle number at which the budget is projected to run out,
+// current cycle + remaining budget / rate). Omitted for an unbound loop,
+// before cycle 2 (not enough data for a meaningful rate), or once already
+// over budget (no future ETA to report — judgment call, see PR body).
+func budgetLine(l domain.Loop) string {
+	base := fmt.Sprintf("%s / %s (%d%%)",
+		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100)))
+	suffix := budgetBurnRateSuffix(l)
+	return base + suffix
+}
+
+func budgetBurnRateSuffix(l domain.Loop) string {
+	if l.Goal.Text == "" || l.Goal.BudgetTokens <= 0 || l.Cycle < 2 {
+		return ""
+	}
+	rate := float64(l.TokensSpent) / float64(l.Cycle)
+	if rate <= 0 {
+		return ""
+	}
+	remaining := float64(l.Goal.BudgetTokens - l.TokensSpent)
+	if remaining <= 0 {
+		return ""
+	}
+	etaCycle := l.Cycle + int(math.Round(remaining/rate))
+	return fmt.Sprintf(" · ~%s/cyc · cap ~c%d", prettyTokens(int(math.Round(rate))), etaCycle)
+}
+
+// plural: "" for n==1, "s" otherwise — the STAGE row's "N file(s)" wording.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// renderStageRow builds the STAGE row's value — "6/12 · elapsed 04:12 ·
+// 2 files +47 −9" — omitting the elapsed segment's SOURCE data entirely
+// (ok=false, the whole row is skipped by the caller) when neither BoundAt
+// nor the event log's first entry is available. The git file/± segment is
+// independently optional (silently omitted when not a git repo /
+// CwdVerified false — see gitStatsResult).
+func renderStageRow(l domain.Loop, data detailData) (string, bool) {
+	elapsed, ok := stageElapsed(l, data)
+	if !ok {
+		return "", false
+	}
+	line := fmt.Sprintf("%s · elapsed %s", cycleLabel(l), formatUptime(elapsed))
+	if g := data.git; g.ok && (g.files > 0 || g.plus > 0 || g.minus > 0) {
+		line += fmt.Sprintf(" · %d file%s +%d −%d", g.files, plural(g.files), g.plus, g.minus)
+	}
+	return line, true
+}
+
+// stageElapsed prefers BoundAt (when the loop is bound and its registry
+// record actually carries one); falling back to the event log's earliest
+// entry for this session (oldest-first, per events.Read's contract) —
+// "elapsed since we first knew about this loop" either way. ok=false when
+// NEITHER source is available.
+func stageElapsed(l domain.Loop, data detailData) (time.Duration, bool) {
+	if !l.BoundAt.IsZero() {
+		return data.now.Sub(l.BoundAt), true
+	}
+	if len(data.events) == 0 {
+		return 0, false
+	}
+	return data.now.Sub(time.Unix(0, data.events[0].TS)), true
+}
+
+// lastErrorForDetail extracts the loop's most recent transcript error
+// (internal/claude.LastError) and applies the staleness suppression rule:
+// don't show a stale error on a loop that has since recovered — compare
+// against the event log's last transition INTO a healthy state (running or
+// idle). ok=false when there's no error, or it's older than that recovery.
+func lastErrorForDetail(l domain.Loop, data detailData) (string, time.Time, bool) {
+	text, ts, ok := claude.LastError(l.Path)
+	if !ok {
+		return "", time.Time{}, false
+	}
+	if isErrorStale(ts, data.events) {
+		return "", time.Time{}, false
+	}
+	return text, ts, true
+}
+
+// isErrorStale reports whether errorTS predates the event log's most
+// recent scan-triggered transition into StateRunning or StateIdle — i.e.
+// the loop recovered AFTER this error was recorded, so it's stale news, not
+// a live incident.
+func isErrorStale(errorTS time.Time, evs []events.Event) bool {
+	var lastHealthy int64
+	for _, ev := range evs {
+		if ev.Trigger != events.TriggerScan {
+			continue
+		}
+		if ev.ToState != string(domain.StateRunning) && ev.ToState != string(domain.StateIdle) {
+			continue
+		}
+		if ev.TS > lastHealthy {
+			lastHealthy = ev.TS
+		}
+	}
+	return lastHealthy > 0 && errorTS.UnixNano() < lastHealthy
+}
+
+// lastErrorMaxLines caps the LAST ERROR block's wrapped, head-truncated
+// display — "max ~5 lines" per the task; content beyond it is marked with
+// an ellipsis (via wrapTailText, the same word-wrap+cap machinery TAIL
+// uses) rather than shown unbounded (a single giant stack trace must not
+// swallow the whole panel).
+const lastErrorMaxLines = 5
+
+// renderLastErrorBlock renders the "LAST ERROR (hh:mm:ss · verbatim)"
+// section: a bold red label carrying the entry's own timestamp, then the
+// RAW error text (council hard rule: never paraphrased), word-wrapped and
+// capped.
+func renderLastErrorBlock(text string, ts time.Time, width int) string {
+	var b strings.Builder
+	b.WriteString("\n")
+	label := fmt.Sprintf("LAST ERROR (%s · verbatim)", ts.Format("15:04:05"))
+	b.WriteString(lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(label))
+	b.WriteString("\n")
+	for _, line := range wrapTailText(text, width, lastErrorMaxLines) {
+		b.WriteString(stInk.Render(line))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderVerdictsBlock renders "VERDICTS (N/I n)" — the newest 3 oracle
+// verdicts from the event log, each "hh:mm ✓/✗ \"<reason verbatim>\"".
+// Falls back to the loop's current registry verdict (l.Last) alone when
+// the event log has none yet (e.g. history predates this feature, or was
+// pruned) — but that fallback needs the Loop itself, which this function
+// doesn't receive; see its caller in renderDetail, which only calls this
+// when data.events actually has oracle entries, and separately renders
+// l.Last via the existing ORACLE row when it doesn't. Returns "" (render
+// nothing) when there are no verdicts at all.
+func renderVerdictsBlock(evs []events.Event, width int) string {
+	var oracleEvs []events.Event
+	for _, ev := range evs {
+		if ev.Trigger == events.TriggerOracle {
+			oracleEvs = append(oracleEvs, ev)
+		}
+	}
+	if len(oracleEvs) == 0 {
+		return ""
+	}
+	// newest first, top 3 — oracleEvs is a sub-slice of evs, which
+	// events.Read guarantees oldest-first.
+	start := len(oracleEvs) - 3
+	if start < 0 {
+		start = 0
+	}
+	newest := oracleEvs[start:]
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(stFaint.Render(fmt.Sprintf("VERDICTS (%d)", len(oracleEvs))))
+	for i := len(newest) - 1; i >= 0; i-- {
+		ev := newest[i]
+		outcome, reason := events.ParseOracleDetail(ev.Detail)
+		icon, style := "✓", lipgloss.NewStyle().Foreground(cGreen)
+		if outcome == string(domain.OutcomeRejected) {
+			icon, style = "✗", lipgloss.NewStyle().Foreground(cRed)
+		}
+		t := time.Unix(0, ev.TS).Format("15:04")
+		line := fmt.Sprintf("%s %s %q", t, icon, reason)
+		b.WriteString("\n")
+		b.WriteString(style.Render(trunc(line, width)))
+	}
+	return b.String()
+}
+
+// eventActorGlyph: ☺ human, ⎇ auto, blank (2 spaces, for column alignment)
+// for system/scan-triggered events — the task's own glyph legend.
+func eventActorGlyph(a events.Actor) string {
+	switch a {
+	case events.ActorHuman:
+		return "☺ "
+	case events.ActorAuto:
+		return "⎇ "
+	default:
+		return "  "
+	}
+}
+
+// eventBody renders one event's from→to/action/verdict payload — the part
+// after the timestamp+glyph — varying by Trigger:
+//   - scan/governor: "<from>→<to>", plus Detail if any (e.g. a stall kind).
+//   - actuation: Detail verbatim (already a compact "<action> <tier>
+//     ok|failed: ..." string — see logActuationEvent).
+//   - oracle: "<outcome> \"<reason>\"" (verbatim reason, council hard rule).
+func eventBody(ev events.Event) string {
+	switch ev.Trigger {
+	case events.TriggerActuation:
+		return ev.Detail
+	case events.TriggerOracle:
+		outcome, reason := events.ParseOracleDetail(ev.Detail)
+		if reason != "" {
+			return fmt.Sprintf("%s %q", outcome, reason)
+		}
+		return outcome
+	default: // scan, governor
+		from := ev.FromState
+		if from == "" {
+			from = "—"
+		}
+		body := from + "→" + ev.ToState
+		if ev.Detail != "" {
+			body += " " + ev.Detail
+		}
+		return body
+	}
+}
+
+// renderEventsBlock renders the EVENTS section: the loop's history
+// newest-first, filling maxRows total lines (including its own "EVENTS"
+// title line — so maxRows-1 actual event lines). Never coalesces repeated
+// transitions (flapping IS the signal, per the task) — a session that
+// bounced stalled→running→stalled 5 times shows all 5 lines.
+func renderEventsBlock(evs []events.Event, width, maxRows int) string {
+	if len(evs) == 0 || maxRows < eventsMinRows {
+		return ""
+	}
+	dataRows := maxRows - 1 // one row spent on the title
+	var b strings.Builder
+	b.WriteString(stFaint.Render("EVENTS"))
+	shown := 0
+	for i := len(evs) - 1; i >= 0 && shown < dataRows; i-- {
+		ev := evs[i]
+		t := time.Unix(0, ev.TS).Format("15:04")
+		line := fmt.Sprintf("%s %s%s", t, eventActorGlyph(ev.Actor), eventBody(ev))
+		b.WriteString("\n")
+		b.WriteString(stDim.Render(trunc(line, width)))
+		shown++
+	}
+	return b.String()
+}
+
+// ordinal renders 1→"1st", 2→"2nd", 3→"3rd", 4→"4th", ... (English
+// ordinal suffix rules — the flap counter's "3rd stall in 20m" wording).
+func ordinal(n int) string {
+	if n%100 >= 11 && n%100 <= 13 {
+		return fmt.Sprintf("%dth", n)
+	}
+	switch n % 10 {
+	case 1:
+		return fmt.Sprintf("%dst", n)
+	case 2:
+		return fmt.Sprintf("%dnd", n)
+	case 3:
+		return fmt.Sprintf("%drd", n)
+	default:
+		return fmt.Sprintf("%dth", n)
+	}
+}
+
+// flapCounter counts scan-triggered transitions INTO any stalled state
+// within the last hour of now — the STALLED/429 callout's "(3rd stall in
+// 20m)" annotation. ok=false when count<=1 (nothing to call out — nobody
+// cares that a loop stalled exactly once). span is the time from the
+// EARLIEST counted stall to now, matching "Nth stall in <span>" — how long
+// this flapping pattern has been going on.
+func flapCounter(evs []events.Event, now time.Time) (count int, span time.Duration, ok bool) {
+	cutoff := now.Add(-time.Hour).UnixNano()
+	var first int64
+	for _, ev := range evs {
+		if ev.Trigger != events.TriggerScan || ev.TS < cutoff {
+			continue
+		}
+		if !strings.HasPrefix(ev.ToState, string(domain.StateStalled)) {
+			continue
+		}
+		count++
+		if first == 0 || ev.TS < first {
+			first = ev.TS
+		}
+	}
+	if count <= 1 {
+		return count, 0, false
+	}
+	return count, now.Sub(time.Unix(0, first)), true
 }
 
 // renderOracleDetail is the ORACLE row's value: icon + the verdict's actual
@@ -2502,7 +2991,12 @@ func wrapTailText(s string, width, maxLines int) []string {
 // session headlessly via `claude --resume <id> -p <prompt>`, which is
 // exactly the restart the manual hint spells out, just without the
 // copy-paste.
-func renderResumeCallout(l domain.Loop, width int) string {
+// renderResumeCallout's evs/now (feat/detail-panel-v2) drive the flap
+// counter — "(3rd stall in 20m)" appended to the stall-kind text when this
+// loop has stalled more than once in the last hour (flapCounter). Every
+// existing caller in this codebase now must pass the session's event
+// history; renderDetail is the only one, via data.events/data.now.
+func renderResumeCallout(l domain.Loop, width int, evs []events.Event, now time.Time) string {
 	gone := l.Stall == domain.StallGone
 	box, accent, chip := stCalloutAmber, cAmber, stKeyChipAmber
 	if l.Stall == domain.StallRateLimit || gone {
@@ -2523,8 +3017,13 @@ func renderResumeCallout(l domain.Loop, width int) string {
 			"   " + stDim.Render("manual: "+manualResumeHint(l.SessionID))
 	}
 
+	stallText := string(l.Stall)
+	if count, span, ok := flapCounter(evs, now); ok {
+		stallText += fmt.Sprintf("  (%s stall in %s)", ordinal(count), formatUptime(span))
+	}
+
 	line := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(label) +
-		" " + stInk.Render(string(l.Stall)) +
+		" " + stInk.Render(stallText) +
 		"   " + action
 	return "\n" + box.Width(contentWidth).Render(line)
 }

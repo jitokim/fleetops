@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,21 @@ import (
 	"github.com/jitokim/missionctl/internal/sessions"
 	runewidth "github.com/mattn/go-runewidth"
 )
+
+// TestMain is this package's safety net against the real
+// ~/.missionctl/history: feat/detail-panel-v2's detailPanelLines reads it
+// (via events.Read) on EVERY m.View() call, and this file has many tests
+// that call View() without any reason to care about history data at all.
+// Defaulting historyDirFn to a deliberately-nonexistent path here means
+// every such test is hermetic by default — reads simply find nothing
+// (events.Read tolerates a missing file, same as a missing dir) — while
+// tests that DO need specific history data still override historyDirFn
+// themselves (see withFakeActuationSeams and others), same
+// save-then-restore pattern as always.
+func TestMain(m *testing.M) {
+	historyDirFn = func() string { return filepath.Join(os.TempDir(), "missionctl-tui-tests-unused-history") }
+	os.Exit(m.Run())
+}
 
 // runeKey builds the tea.KeyMsg bubbletea sends for a single printable
 // character keypress (msg.String() == string(r)).
@@ -1957,7 +1974,7 @@ func TestRenderInjectPrompt_IdleTarget_NoMidTurnWarning(t *testing.T) {
 func TestRenderResumeCallout_StallGone_MentionsTier2Redrive(t *testing.T) {
 	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallGone}
 
-	out := renderResumeCallout(l, 80)
+	out := renderResumeCallout(l, 80, nil, time.Now())
 
 	if !strings.Contains(out, "RESTART") {
 		t.Errorf("callout = %q, want the RESTART label", out)
@@ -1970,7 +1987,7 @@ func TestRenderResumeCallout_StallGone_MentionsTier2Redrive(t *testing.T) {
 func TestRenderResumeCallout_OtherStall_KeepsResumeWording(t *testing.T) {
 	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
 
-	out := renderResumeCallout(l, 80)
+	out := renderResumeCallout(l, 80, nil, time.Now())
 
 	if !strings.Contains(out, "RESUME") {
 		t.Errorf("callout = %q, want the RESUME label for a non-gone stall", out)
@@ -2238,8 +2255,8 @@ func TestNoteForRow_NeitherGovernorNorStallNorDrift_Empty(t *testing.T) {
 // ── detail pane TAIL row (wrapTailText / detailRowMultiline) ────────
 
 func TestWrapTailText_WrapsToExpectedLineCount(t *testing.T) {
-	// three 5-col lines, all under maxTailLines → returned verbatim, no marker.
-	got := wrapTailText("aa bb cc dd ee ff", 5, maxTailLines)
+	// three 5-col lines, all under tailMaxLines → returned verbatim, no marker.
+	got := wrapTailText("aa bb cc dd ee ff", 5, tailMaxLines)
 	want := []string{"aa bb", "cc dd", "ee ff"}
 	if len(got) != len(want) {
 		t.Fatalf("got %d lines %q, want %d %q", len(got), got, len(want), want)
@@ -2282,7 +2299,7 @@ func TestWrapTailText_FullWidthLastLineMarkerStaysWithinWidth(t *testing.T) {
 }
 
 func TestWrapTailText_ShortTextNoMarkerNoBlanks(t *testing.T) {
-	got := wrapTailText("short text", 40, maxTailLines)
+	got := wrapTailText("short text", 40, tailMaxLines)
 	if len(got) != 1 {
 		t.Fatalf("got %d lines %q, want 1", len(got), got)
 	}
@@ -2300,7 +2317,7 @@ func TestWrapTailText_ShortTextNoMarkerNoBlanks(t *testing.T) {
 }
 
 func TestWrapTailText_NonPositiveArgsReturnNil(t *testing.T) {
-	if got := wrapTailText("anything", 0, maxTailLines); got != nil {
+	if got := wrapTailText("anything", 0, tailMaxLines); got != nil {
 		t.Errorf("width 0: got %q, want nil", got)
 	}
 	if got := wrapTailText("anything", 40, 0); got != nil {
@@ -2339,14 +2356,14 @@ func TestDetailRowMultiline_EmptyLinesRendersNothing(t *testing.T) {
 
 func TestRenderDetail_EmptyLastText_NoTailRow(t *testing.T) {
 	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cwd: "/x", Path: "/x/s1.jsonl"}
-	out := renderDetail(l, 80)
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
 	if strings.Contains(out, "TAIL") {
 		t.Errorf("detail pane should have NO TAIL row when LastText is empty:\n%s", out)
 	}
 }
 
 func TestRenderDetail_LongLastText_ShowsWrappedTruncatedTailRow(t *testing.T) {
-	// long enough to overflow maxTailLines at the pane width → wrapped + marked.
+	// long enough to overflow tailMaxLines at the pane width → wrapped + marked.
 	l := domain.Loop{
 		Project:   "aboard",
 		SessionID: "s1",
@@ -2355,12 +2372,472 @@ func TestRenderDetail_LongLastText_ShowsWrappedTruncatedTailRow(t *testing.T) {
 		Path:      "/x/s1.jsonl",
 		LastText:  strings.Repeat("lorem ipsum dolor sit amet ", 60),
 	}
-	out := renderDetail(l, 80)
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
 	if !strings.Contains(out, "TAIL") {
 		t.Errorf("detail pane should show a TAIL row when LastText is present:\n%s", out)
 	}
 	if !strings.Contains(out, "…") {
 		t.Errorf("an overflowing TAIL should carry a truncation marker:\n%s", out)
+	}
+}
+
+// ── feat/detail-panel-v2 ──────────────────────────────────────────────────
+
+// ── burn rate / ETA math ──────────────────────────────────────────────────
+
+func TestBudgetBurnRateSuffix_UnboundLoop_Omitted(t *testing.T) {
+	l := domain.Loop{Cycle: 5, TokensSpent: 100, Goal: domain.Goal{BudgetTokens: 1000}} // no Goal.Text — unbound
+	if got := budgetBurnRateSuffix(l); got != "" {
+		t.Errorf("got %q, want empty (unbound loop)", got)
+	}
+}
+
+func TestBudgetBurnRateSuffix_CycleBelowTwo_Omitted(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 1000}, Cycle: 1, TokensSpent: 100}
+	if got := budgetBurnRateSuffix(l); got != "" {
+		t.Errorf("got %q, want empty (cycle < 2)", got)
+	}
+}
+
+func TestBudgetBurnRateSuffix_AlreadyOverBudget_Omitted(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 1000}, Cycle: 5, TokensSpent: 1500}
+	if got := budgetBurnRateSuffix(l); got != "" {
+		t.Errorf("got %q, want empty (already over budget, no future ETA)", got)
+	}
+}
+
+func TestBudgetBurnRateSuffix_ComputesRateAndETACycle(t *testing.T) {
+	// rate = 1,800,000/6 = 300,000/cyc; remaining = 200,000; cyclesLeft =
+	// round(200,000/300,000) = 1; etaCycle = 6+1 = 7.
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 2_000_000}, Cycle: 6, TokensSpent: 1_800_000}
+	got := budgetBurnRateSuffix(l)
+	if !strings.Contains(got, "300k/cyc") {
+		t.Errorf("got %q, want it to mention the ~300k/cyc rate", got)
+	}
+	if !strings.Contains(got, "cap ~c7") {
+		t.Errorf("got %q, want it to mention the ETA cycle ~c7", got)
+	}
+}
+
+func TestBudgetLine_UnboundLoop_NoSuffixButBaseStillRenders(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{BudgetTokens: 1000}, TokensSpent: 500}
+	got := budgetLine(l)
+	if !strings.Contains(got, "500") {
+		t.Errorf("got %q, want the base spent/cap text present regardless of the suffix", got)
+	}
+	if strings.Contains(got, "/cyc") {
+		t.Errorf("got %q, want no burn-rate suffix for an unbound loop", got)
+	}
+}
+
+// ── STAGE row ──────────────────────────────────────────────────────────────
+
+func TestStageElapsed_PrefersBoundAt(t *testing.T) {
+	now := time.Now()
+	l := domain.Loop{BoundAt: now.Add(-90 * time.Second)}
+	got, ok := stageElapsed(l, detailData{now: now})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != 90*time.Second {
+		t.Errorf("got %v, want 90s", got)
+	}
+}
+
+func TestStageElapsed_FallsBackToFirstEventTS(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-5 * time.Minute).UnixNano(), SessionID: "s1", ToState: "running"},
+		{TS: now.Add(-3 * time.Minute).UnixNano(), SessionID: "s1", ToState: "idle"},
+	}
+	got, ok := stageElapsed(domain.Loop{}, detailData{now: now, events: evs})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != 5*time.Minute {
+		t.Errorf("got %v, want 5m (from the FIRST/oldest event)", got)
+	}
+}
+
+func TestStageElapsed_NeitherSource_Omitted(t *testing.T) {
+	if _, ok := stageElapsed(domain.Loop{}, detailData{now: time.Now()}); ok {
+		t.Error("expected ok=false — no BoundAt and no event history at all")
+	}
+}
+
+func TestRenderStageRow_OmittedWithoutElapsedSource(t *testing.T) {
+	if _, ok := renderStageRow(domain.Loop{Cycle: 3}, detailData{now: time.Now()}); ok {
+		t.Error("expected ok=false — STAGE has nothing to compute elapsed from")
+	}
+}
+
+func TestRenderStageRow_GitSegmentOmittedWhenNotOK(t *testing.T) {
+	l := domain.Loop{Cycle: 3, BoundAt: time.Now().Add(-time.Minute)}
+	got, ok := renderStageRow(l, detailData{now: time.Now(), git: gitStatsResult{ok: false}})
+	if !ok {
+		t.Fatal("expected ok=true (elapsed is computable)")
+	}
+	if strings.Contains(got, "file") {
+		t.Errorf("got %q, want no file/± segment when git stats aren't ok", got)
+	}
+}
+
+func TestRenderStageRow_IncludesGitSegmentWhenOK(t *testing.T) {
+	l := domain.Loop{Cycle: 3, BoundAt: time.Now().Add(-time.Minute)}
+	got, ok := renderStageRow(l, detailData{now: time.Now(), git: gitStatsResult{files: 2, plus: 47, minus: 9, ok: true}})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(got, "2 files +47 −9") {
+		t.Errorf("got %q, want the git file/± segment", got)
+	}
+}
+
+func TestRenderDetail_StageRowAbsentForUnboundLoop(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, BoundAt: time.Now().Add(-time.Minute)}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "STAGE") {
+		t.Errorf("STAGE must not render for an unbound loop even with a valid BoundAt:\n%s", out)
+	}
+}
+
+func TestRenderDetail_StageRowPresentForBoundLoop(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cycle: 3,
+		Goal: domain.Goal{Text: "fix it", MaxCycles: 12}, BoundAt: time.Now().Add(-4 * time.Minute)}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "STAGE") {
+		t.Errorf("STAGE should render for a bound loop with a valid elapsed source:\n%s", out)
+	}
+}
+
+// ── LAST ERROR extraction + staleness ───────────────────────────────────────
+
+func TestIsErrorStale_ErrorBeforeRecovery_Stale(t *testing.T) {
+	now := time.Now()
+	errTS := now.Add(-10 * time.Minute)
+	evs := []events.Event{
+		{TS: now.Add(-9 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "running"}, // recovered AFTER the error
+	}
+	if !isErrorStale(errTS, evs) {
+		t.Error("expected the error to be stale — the loop recovered after it")
+	}
+}
+
+func TestIsErrorStale_ErrorAfterRecovery_NotStale(t *testing.T) {
+	now := time.Now()
+	errTS := now.Add(-1 * time.Minute)
+	evs := []events.Event{
+		{TS: now.Add(-9 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "running"}, // recovery predates the error
+	}
+	if isErrorStale(errTS, evs) {
+		t.Error("expected the error to be current — it happened AFTER the last recovery")
+	}
+}
+
+func TestIsErrorStale_NoRecoveryEventAtAll_NotStale(t *testing.T) {
+	if isErrorStale(time.Now(), nil) {
+		t.Error("expected not stale — nothing to compare against, so don't suppress")
+	}
+}
+
+func TestIsErrorStale_IdleAlsoCountsAsHealthy(t *testing.T) {
+	now := time.Now()
+	errTS := now.Add(-10 * time.Minute)
+	evs := []events.Event{
+		{TS: now.Add(-9 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "idle"},
+	}
+	if !isErrorStale(errTS, evs) {
+		t.Error("expected stale — idle counts as a healthy recovery state too")
+	}
+}
+
+func TestRenderDetail_LastErrorBlock_ShownWhenCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateStalled, Stall: domain.StallRateLimit, Path: path}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected a LAST ERROR block:\n%s", out)
+	}
+	if !strings.Contains(out, "API Error: 429 rate limited") {
+		t.Errorf("expected the VERBATIM error text:\n%s", out)
+	}
+}
+
+func TestRenderDetail_LastErrorBlock_SuppressedWhenStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	oldTS := time.Now().Add(-time.Hour)
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + oldTS.Format(time.RFC3339) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: path}
+	evs := []events.Event{
+		{TS: time.Now().Add(-30 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "idle"}, // recovered since the error
+	}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), events: evs})
+	if strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected NO LAST ERROR block — the loop recovered since this error:\n%s", out)
+	}
+}
+
+func TestRenderDetail_NoErrorAtAll_NoBlock(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: "/no/such/file.jsonl"}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected no LAST ERROR block when there's no transcript error:\n%s", out)
+	}
+}
+
+// ── VERDICTS block ───────────────────────────────────────────────────────
+
+func TestRenderVerdictsBlock_NoOracleEvents_Empty(t *testing.T) {
+	if got := renderVerdictsBlock(nil, 80); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestRenderVerdictsBlock_ShowsNewestThreeInDescendingOrder(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-4 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "progress at cycle 1: first"},
+		{TS: now.Add(-3 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "progress at cycle 2: second"},
+		{TS: now.Add(-2 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "rejected at cycle 3: third"},
+		{TS: now.Add(-1 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "done at cycle 4: fourth"},
+	}
+	got := renderVerdictsBlock(evs, 80)
+	if strings.Contains(got, "\"first\"") {
+		t.Errorf("got %q, want only the newest 3 (the oldest, \"first\", must be excluded)", got)
+	}
+	newestIdx := strings.Index(got, "\"fourth\"")
+	middleIdx := strings.Index(got, "\"third\"")
+	oldestIdx := strings.Index(got, "\"second\"")
+	if newestIdx == -1 || middleIdx == -1 || oldestIdx == -1 {
+		t.Fatalf("got %q, want second/third/fourth all present", got)
+	}
+	if !(newestIdx < middleIdx && middleIdx < oldestIdx) {
+		t.Errorf("got %q, want newest-first ordering", got)
+	}
+	if !strings.Contains(got, "VERDICTS (4)") {
+		t.Errorf("got %q, want the VERDICTS(4) header — the TOTAL oracle event count, not just the 3 shown", got)
+	}
+}
+
+func TestRenderVerdictsBlock_DoneShowsCheckmark_RejectedShowsCross(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"},
+		{TS: 2, Trigger: events.TriggerOracle, Detail: "rejected at cycle 2: not ok"},
+	}
+	got := renderVerdictsBlock(evs, 80)
+	if !strings.Contains(got, "✓") {
+		t.Errorf("got %q, want a ✓ for the done verdict", got)
+	}
+	if !strings.Contains(got, "✗") {
+		t.Errorf("got %q, want a ✗ for the rejected verdict", got)
+	}
+}
+
+func TestRenderVerdictsBlock_ReasonRenderedVerbatim(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerOracle, Detail: `done at cycle 1: the exact, unparaphrased reason text`},
+	}
+	got := renderVerdictsBlock(evs, 200)
+	if !strings.Contains(got, `"the exact, unparaphrased reason text"`) {
+		t.Errorf("got %q, want the verbatim reason quoted", got)
+	}
+}
+
+func TestRenderDetail_VerdictsBlockAbsentForUnboundLoop(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
+	evs := []events.Event{{TS: 1, Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"}}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), events: evs})
+	if strings.Contains(out, "VERDICTS") {
+		t.Errorf("VERDICTS must not render for an unbound loop:\n%s", out)
+	}
+}
+
+// ── EVENTS block: height budgeting + actor glyphs ───────────────────────────
+
+func TestEventActorGlyph(t *testing.T) {
+	cases := []struct {
+		actor events.Actor
+		want  string
+	}{
+		{events.ActorHuman, "☺ "},
+		{events.ActorAuto, "⎇ "},
+		{events.ActorSystem, "  "},
+	}
+	for _, c := range cases {
+		if got := eventActorGlyph(c.actor); got != c.want {
+			t.Errorf("eventActorGlyph(%v) = %q, want %q", c.actor, got, c.want)
+		}
+	}
+}
+
+func TestRenderEventsBlock_BelowMinRows_Empty(t *testing.T) {
+	evs := []events.Event{{TS: 1, Trigger: events.TriggerScan, ToState: "running"}}
+	if got := renderEventsBlock(evs, 80, eventsMinRows-1); got != "" {
+		t.Errorf("got %q, want empty below eventsMinRows", got)
+	}
+}
+
+func TestRenderEventsBlock_NoEvents_Empty(t *testing.T) {
+	if got := renderEventsBlock(nil, 80, 10); got != "" {
+		t.Errorf("got %q, want empty with no history at all", got)
+	}
+}
+
+func TestRenderEventsBlock_FillsExactlyMaxRows(t *testing.T) {
+	var evs []events.Event
+	for i := 0; i < 20; i++ {
+		evs = append(evs, events.Event{TS: int64(i), Trigger: events.TriggerScan, FromState: "running", ToState: "idle"})
+	}
+	for _, maxRows := range []int{eventsMinRows, 5, 10} {
+		got := renderEventsBlock(evs, 80, maxRows)
+		lines := strings.Split(got, "\n")
+		if len(lines) != maxRows {
+			t.Errorf("maxRows=%d: got %d lines, want exactly %d", maxRows, len(lines), maxRows)
+		}
+	}
+}
+
+func TestRenderEventsBlock_NewestFirst_NeverCoalesced(t *testing.T) {
+	// Three identical stalled->running->stalled flaps must all render as
+	// separate lines — "flapping IS the signal" (never coalesced) — even
+	// though every transition is the identical running<->stalled pair.
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-3 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "running", ToState: "stalled:no-output", Detail: "first"},
+		{TS: now.Add(-2 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "stalled:no-output", ToState: "running", Detail: "second"},
+		{TS: now.Add(-1 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "running", ToState: "stalled:no-output", Detail: "third"},
+	}
+	got := renderEventsBlock(evs, 80, 10)
+	if strings.Count(got, "→") != 3 {
+		t.Errorf("got %q, want all 3 transitions rendered separately (not coalesced)", got)
+	}
+	firstIdx := strings.Index(got, "first")
+	secondIdx := strings.Index(got, "second")
+	thirdIdx := strings.Index(got, "third")
+	if firstIdx == -1 || secondIdx == -1 || thirdIdx == -1 {
+		t.Fatalf("got %q, want all three distinct events present", got)
+	}
+	if !(thirdIdx < secondIdx && secondIdx < firstIdx) {
+		t.Errorf("got %q, want newest-first ordering (third, then second, then first)", got)
+	}
+}
+
+func TestRenderEventsBlock_ActuationEventShowsDetailVerbatim(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman},
+	}
+	got := renderEventsBlock(evs, 80, 10)
+	if !strings.Contains(got, "☺") {
+		t.Errorf("got %q, want the human actor glyph", got)
+	}
+	if !strings.Contains(got, "kill tier1 ok") {
+		t.Errorf("got %q, want the actuation detail verbatim", got)
+	}
+}
+
+func TestRenderDetail_EventsBlockAbsentWhenTooLittleHeight(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerScan, FromState: "running", ToState: "idle"},
+	}
+	// A very small height budget must simply omit EVENTS, not error/panic.
+	out := renderDetail(l, 80, 6, detailData{now: time.Now(), events: evs})
+	if strings.Contains(out, "EVENTS") {
+		t.Errorf("EVENTS should be omitted at a too-small height budget:\n%s", out)
+	}
+}
+
+func TestRenderDetail_EventsBlockPresentWithEnoughHeight(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
+	var evs []events.Event
+	for i := 0; i < 10; i++ {
+		evs = append(evs, events.Event{TS: int64(i), Trigger: events.TriggerScan, FromState: "running", ToState: "idle"})
+	}
+	out := renderDetail(l, 80, 60, detailData{now: time.Now(), events: evs})
+	if !strings.Contains(out, "EVENTS") {
+		t.Errorf("expected an EVENTS block with a generous height budget:\n%s", out)
+	}
+}
+
+// ── flap counter ─────────────────────────────────────────────────────────
+
+func TestOrdinal(t *testing.T) {
+	cases := map[int]string{1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 11: "11th", 12: "12th", 13: "13th", 21: "21st", 22: "22nd", 23: "23rd", 111: "111th"}
+	for n, want := range cases {
+		if got := ordinal(n); got != want {
+			t.Errorf("ordinal(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestFlapCounter_SingleStall_NotFlagged(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-10 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+	}
+	if _, _, ok := flapCounter(evs, now); ok {
+		t.Error("expected ok=false — a single stall isn't a flap")
+	}
+}
+
+func TestFlapCounter_ThreeStallsWithinHour_Flagged(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-20 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+		{TS: now.Add(-15 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:rate-limit"},
+		{TS: now.Add(-5 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:gone"},
+	}
+	count, span, ok := flapCounter(evs, now)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
+	}
+	if span != 20*time.Minute {
+		t.Errorf("span = %v, want 20m (from the earliest counted stall)", span)
+	}
+}
+
+func TestFlapCounter_StallOutsideWindow_Ignored(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-2 * time.Hour).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"}, // outside the 1h window
+		{TS: now.Add(-5 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:gone"},
+	}
+	if _, _, ok := flapCounter(evs, now); ok {
+		t.Error("expected ok=false — only 1 stall within the window")
+	}
+}
+
+func TestRenderResumeCallout_FlapCounterAppendedWhenFlapping(t *testing.T) {
+	now := time.Now()
+	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
+	evs := []events.Event{
+		{TS: now.Add(-20 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+		{TS: now.Add(-15 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:rate-limit"},
+		{TS: now.Add(-5 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+	}
+	out := renderResumeCallout(l, 80, evs, now)
+	if !strings.Contains(out, "3rd stall in 20:00") {
+		t.Errorf("got %q, want the flap counter annotation (formatUptime's mm:ss form)", out)
+	}
+}
+
+func TestRenderResumeCallout_NoFlap_NoAnnotation(t *testing.T) {
+	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
+	out := renderResumeCallout(l, 80, nil, time.Now())
+	if strings.Contains(out, "stall in") {
+		t.Errorf("got %q, want no flap annotation with no flap history", out)
 	}
 }
 

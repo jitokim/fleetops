@@ -1645,3 +1645,96 @@ func TestApplyGovernor_GateOrTerminalSkip_NoEventRecorded(t *testing.T) {
 		t.Fatalf("got %d events while gated, want 0 (governor must not run at all)", len(got["sess-1"]))
 	}
 }
+
+// ── LastError (feat/detail-panel-v2) ─────────────────────────────────────
+
+func TestLastError_ApiErrorInAssistantText(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"user","message":{"role":"user","content":"do the thing"},"timestamp":"2026-01-01T10:00:00Z"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 Too Many Requests — rate limit exceeded, retry after 30s"}]},"timestamp":"2026-01-01T10:00:05Z"}`,
+	)
+	text, ts, ok := LastError(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(text, "429 Too Many Requests") {
+		t.Errorf("text = %q, want the verbatim API error text", text)
+	}
+	if text != "API Error: 429 Too Many Requests — rate limit exceeded, retry after 30s" {
+		t.Errorf("text = %q, must be VERBATIM (council hard rule), not paraphrased", text)
+	}
+	want := time.Date(2026, 1, 1, 10, 0, 5, 0, time.UTC)
+	if !ts.Equal(want) {
+		t.Errorf("ts = %v, want %v", ts, want)
+	}
+}
+
+func TestLastError_IsErrorToolResult(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"command failed: exit status 1: permission denied"}]},"timestamp":"2026-01-01T11:30:00Z"}`,
+	)
+	text, ts, ok := LastError(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if text != "command failed: exit status 1: permission denied" {
+		t.Errorf("text = %q, want the verbatim tool_result error content", text)
+	}
+	want := time.Date(2026, 1, 1, 11, 30, 0, 0, time.UTC)
+	if !ts.Equal(want) {
+		t.Errorf("ts = %v, want %v", ts, want)
+	}
+}
+
+func TestLastError_ToolResultNotAnError_Ignored(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"success"}]}}`,
+	)
+	if _, _, ok := LastError(path); ok {
+		t.Error("expected ok=false — a successful tool_result must not be treated as an error")
+	}
+}
+
+func TestLastError_NoErrorAtAll_ReturnsFalse(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"all tests pass"}]}}`,
+	)
+	if _, _, ok := LastError(path); ok {
+		t.Error("expected ok=false — no error entry present")
+	}
+}
+
+func TestLastError_ReturnsTheMostRecentOfTwoErrors(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 first"}]},"timestamp":"2026-01-01T10:00:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"retry"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 second"}]},"timestamp":"2026-01-01T10:05:00Z"}`,
+	)
+	text, _, ok := LastError(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if text != "API Error: 429 second" {
+		t.Errorf("text = %q, want the SECOND (most recent) error", text)
+	}
+}
+
+func TestLastError_MissingFile_ReturnsFalse(t *testing.T) {
+	if _, _, ok := LastError(filepath.Join(t.TempDir(), "does-not-exist.jsonl")); ok {
+		t.Error("expected ok=false for a missing file")
+	}
+}
+
+func TestLastError_MalformedTimestamp_ZeroTime(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429"}]},"timestamp":"not-a-timestamp"}`,
+	)
+	_, ts, ok := LastError(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !ts.IsZero() {
+		t.Errorf("ts = %v, want the zero value for an unparseable timestamp", ts)
+	}
+}
