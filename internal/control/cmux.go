@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // availabilityTimeout bounds liveness/listing probes so the TUI never hangs
@@ -28,30 +31,28 @@ func (cmuxController) Available() bool {
 }
 
 func (cmuxController) Locate(projectDir string) (Target, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "cmux", "tree", "--json").Output()
+	out, err := cmuxTreeJSON()
 	if err != nil {
 		return Target{}, false
 	}
-	for _, t := range parseCmuxTree(out) {
-		if encodeCwd(t.Cwd) == projectDir {
-			return t, true
-		}
-	}
-	return Target{}, false
+	return locateCmux(out, projectDir, liveResolveCmuxTTYs)
 }
 
-// LocateClaude always returns not-found. cmux's `tree --json` shape is
-// unverified (see parseCmuxTree's TODO) and carries no per-surface
-// running-command field, so there is no way to confirm a surface is
-// actually running claude (vs. a bare shell) — degrading to Locate's
-// permissive cwd-only match here would reintroduce exactly the
-// wrong-terminal actuation hazard LocateClaude exists to prevent. Typed
-// actions on cmux fall back to the TUI's manual resume hint instead (see
-// DESIGN.md's graceful-degrade path).
+// LocateClaude returns a cmux surface confirmed to be running `claude` — now
+// IMPLEMENTED (it previously always returned not-found, before cmux's tree
+// shape and the tty→cwd cross-reference were verified). cmux's `tree --json`
+// carries no running-command field (nor any cwd), so confirmation is done
+// out-of-band: each terminal surface's tty is cross-referenced against the OS
+// process table for a live claude process (see liveResolveCmuxTTYs). Returns
+// the SOLE claude surface matching projectDir, refusing on genuine ambiguity
+// — the same wrong-terminal backstop selectClaudeOrcaTerminal enforces for
+// orca (see locateCmuxClaude and Controller.LocateClaude).
 func (cmuxController) LocateClaude(projectDir string) (Target, bool) {
-	return Target{}, false
+	out, err := cmuxTreeJSON()
+	if err != nil {
+		return Target{}, false
+	}
+	return locateCmuxClaude(out, projectDir, liveResolveCmuxTTYs)
 }
 
 func (cmuxController) Resume(t Target, prompt string) error {
@@ -68,8 +69,11 @@ func cmuxResumeCmd(surfaceRef, prompt string) []string {
 // a bare Enter key (distinct from Resume's `send`, which types literal
 // text) targeted at the surface.
 //
-// TODO: verify cmux's send-key subcommand shape on a machine with the cmux
-// CLI — unverified, same caveat as parseCmuxTree.
+// Verified on cmux 0.64.15: `send-key --surface <ref> <key>` is a real
+// subcommand and `enter` is a documented key token (`cmux send-key --help`
+// shows `cmux send-key enter`). NOT exercised end-to-end against a live
+// claude-in-cmux gate (none available to drive safely), so the semantic
+// effect — Enter accepts the default — is contract-level, not runtime-tested.
 func (cmuxController) Approve(t Target) error {
 	return runWithTimeout(cmuxApproveCmd(t.ID))
 }
@@ -99,8 +103,11 @@ func (cmuxController) Spawn(cwd, goal string) error {
 
 // Interrupt stops the current turn without killing claude — a bare Escape.
 //
-// TODO: verify cmux's send-key escape convention on a machine with the cmux
-// CLI — unverified, same caveat as parseCmuxTree/Approve.
+// Verified on cmux 0.64.15: `send-key --surface <ref> <key>` exists (see
+// Approve). The `escape` key TOKEN is by convention — cmux's `send-key --help`
+// examples show `enter`/`ctrl+c` but not `escape` — and no live claude-in-cmux
+// turn was available to confirm Esc interrupts (rather than kills), so this
+// remains assumed, not runtime-tested.
 func (cmuxController) Interrupt(t Target) error {
 	return runWithTimeout(cmuxInterruptCmd(t.ID))
 }
@@ -110,27 +117,131 @@ func cmuxInterruptCmd(surfaceRef string) []string {
 	return []string{"cmux", "send-key", "--surface", surfaceRef, "escape"}
 }
 
-// parseCmuxTree tolerantly walks `cmux tree --json` output, collecting every
-// node that looks like a surface (a surface-id-like key) paired with a
-// cwd-like key. Unknown shape → empty slice, never panics.
+// cmuxTreeJSON runs `cmux tree --json`, bounded by availabilityTimeout so a
+// wedged cmux never hangs a keypress.
+func cmuxTreeJSON() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "cmux", "tree", "--json").Output()
+}
+
+// cmuxSurface is one terminal-type surface from `cmux tree --json`: its stable
+// ref ("surface:<n>") and the tty it is attached to ("ttys008"). cmux's tree
+// carries NO cwd anywhere (verified against the full 26KB dump on cmux
+// 0.64.15 — zero cwd/path-like keys), so a surface's cwd is resolved
+// out-of-band from the OS by tty (see liveResolveCmuxTTYs), not read here.
+type cmuxSurface struct {
+	ref string
+	tty string
+}
+
+// ttyResolution is one tty's OS-derived facts: the representative cwd of the
+// surface attached to it, and whether a live `claude` process is attached.
+type ttyResolution struct {
+	cwd       string
+	hasClaude bool
+}
+
+// ttyResolver maps a set of ttys to their resolutions. Injected into the
+// tree-join logic (locateCmux/locateCmuxClaude) so that logic is unit-testable
+// against a fixture without shelling out to ps/lsof — the live implementation
+// is liveResolveCmuxTTYs.
+type ttyResolver func(ttys []string) map[string]ttyResolution
+
+// locateCmux returns the first terminal surface whose OS-resolved cwd encodes
+// to projectDir — permissive (a bare shell in the right dir is a fine attach
+// target), the same tier split orca's Locate uses. Typed/destructive
+// actuation must use locateCmuxClaude instead.
+func locateCmux(jsonBytes []byte, projectDir string, resolve ttyResolver) (Target, bool) {
+	surfaces := parseCmuxTree(jsonBytes)
+	res := resolve(ttysOfSurfaces(surfaces))
+	for _, s := range surfaces {
+		r, ok := res[s.tty]
+		if !ok || r.cwd == "" {
+			continue
+		}
+		if encodeCwd(r.cwd) == projectDir {
+			return Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd}, true
+		}
+	}
+	return Target{}, false
+}
+
+// locateCmuxClaude returns the SOLE surface confirmed to be running claude (a
+// live claude process attached to its tty) whose cwd encodes to projectDir.
+// Ambiguity is counted by distinct TTY, not by surface ref: cmux can list the
+// same terminal as more than one surface sharing a tty (verified live: two
+// distinct surface refs on ttys012), and every ref on one tty drives the SAME
+// pty — so that is NOT the wrong-terminal hazard. TWO DISTINCT ttys matching,
+// though, is genuinely ambiguous (no way to know which the human meant), so
+// ok=false — the authoritative backstop behind the TUI's fleet-ambiguity
+// guard, mirroring selectClaudeOrcaTerminal (see Controller.LocateClaude).
+func locateCmuxClaude(jsonBytes []byte, projectDir string, resolve ttyResolver) (Target, bool) {
+	surfaces := parseCmuxTree(jsonBytes)
+	res := resolve(ttysOfSurfaces(surfaces))
+	firstByTTY := map[string]Target{}
+	for _, s := range surfaces {
+		r, ok := res[s.tty]
+		if !ok || !r.hasClaude || r.cwd == "" {
+			continue
+		}
+		if encodeCwd(r.cwd) != projectDir {
+			continue
+		}
+		if _, seen := firstByTTY[s.tty]; !seen {
+			firstByTTY[s.tty] = Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd}
+		}
+	}
+	if len(firstByTTY) != 1 {
+		return Target{}, false // 0 matches, or >1 distinct tty (ambiguous)
+	}
+	for _, t := range firstByTTY {
+		return t, true
+	}
+	return Target{}, false
+}
+
+// ttysOfSurfaces returns the distinct ttys across surfaces — the input a
+// ttyResolver scopes its ps/lsof pass to, so resolution touches only the ttys
+// cmux actually reported.
+func ttysOfSurfaces(surfaces []cmuxSurface) []string {
+	seen := map[string]bool{}
+	var ttys []string
+	for _, s := range surfaces {
+		if s.tty != "" && !seen[s.tty] {
+			seen[s.tty] = true
+			ttys = append(ttys, s.tty)
+		}
+	}
+	return ttys
+}
+
+// parseCmuxTree tolerantly walks `cmux tree --json`, collecting every
+// terminal-type surface as {ref, tty}. Unknown shape → empty slice, never
+// panics (every type assertion is comma-ok).
 //
-// TODO: verify cmux tree --json shape on a machine with the cmux CLI; parser
-// is intentionally tolerant.
-func parseCmuxTree(jsonBytes []byte) []Target {
+// Verified against the REAL cmux 0.64.15 CLI on this machine (only — not all
+// cmux versions): a surface's identity is its "ref" key ("surface:<n>"),
+// terminal surfaces carry "type":"terminal" + "tty":"ttys<NNN>", browser
+// surfaces carry "type":"browser" + "tty":null, and the structure is
+// windows[].workspaces[].panes[].surfaces[]. The older guessed id keys
+// (surfaceId/surface_id/id) are still accepted as fallbacks (see
+// cmuxSurfaceID) so a differing shape degrades rather than regresses.
+func parseCmuxTree(jsonBytes []byte) []cmuxSurface {
 	var root any
 	if err := json.Unmarshal(jsonBytes, &root); err != nil {
 		return nil
 	}
-	var targets []Target
-	walkCmuxNode(root, &targets)
-	return targets
+	var surfaces []cmuxSurface
+	walkCmuxNode(root, &surfaces)
+	return surfaces
 }
 
-func walkCmuxNode(node any, out *[]Target) {
+func walkCmuxNode(node any, out *[]cmuxSurface) {
 	switch v := node.(type) {
 	case map[string]any:
-		if t, ok := cmuxTargetFromNode(v); ok {
-			*out = append(*out, t)
+		if s, ok := cmuxSurfaceFromNode(v); ok {
+			*out = append(*out, s)
 		}
 		for _, child := range v {
 			walkCmuxNode(child, out)
@@ -142,28 +253,40 @@ func walkCmuxNode(node any, out *[]Target) {
 	}
 }
 
-func cmuxTargetFromNode(m map[string]any) (Target, bool) {
-	id, ok := cmuxSurfaceID(m)
+// cmuxSurfaceFromNode extracts a terminal surface (ref + tty) from a node, or
+// ok=false when the node isn't a terminal surface: no surface ref, not
+// type:"terminal", or no tty (a browser surface's tty is null).
+func cmuxSurfaceFromNode(m map[string]any) (cmuxSurface, bool) {
+	ref, ok := cmuxSurfaceID(m)
 	if !ok {
-		return Target{}, false
+		return cmuxSurface{}, false
 	}
-	cwd, ok := cmuxCwd(m)
+	tty, ok := cmuxSurfaceTTY(m)
 	if !ok {
-		return Target{}, false
+		return cmuxSurface{}, false
 	}
-	return Target{Backend: "cmux", ID: id, Cwd: cwd}, true
+	return cmuxSurface{ref: ref, tty: tty}, true
 }
 
-// cmuxSurfaceID looks for a surface-id-like key, preferring a "surface:<n>"
-// ref; falls back to any id when a sibling "kind":"surface" confirms intent.
+// cmuxSurfaceIDKeys is the priority order cmuxSurfaceID checks for a surface's
+// ref: real cmux 0.64.15's "ref" first, then the older guessed keys as
+// tolerant fallbacks.
+var cmuxSurfaceIDKeys = []string{"ref", "surfaceId", "surface_id", "id"}
+
+// cmuxSurfaceID returns a node's surface ref. Real cmux 0.64.15 keys it under
+// "ref" ("surface:<n>"); the guessed keys (surfaceId/surface_id/id) are kept
+// as fallbacks so a differing cmux shape still parses. Non-surface refs
+// (pane:/workspace:/window:, which also use "ref") are rejected by the
+// "surface:" prefix guard; a sibling "kind":"surface" additionally confirms
+// intent for a bare, unprefixed id.
 func cmuxSurfaceID(m map[string]any) (string, bool) {
-	for _, key := range []string{"surfaceId", "surface_id", "id"} {
+	for _, key := range cmuxSurfaceIDKeys {
 		if s, ok := m[key].(string); ok && strings.HasPrefix(s, "surface:") {
 			return s, true
 		}
 	}
 	if kind, _ := m["kind"].(string); kind == "surface" {
-		for _, key := range []string{"surfaceId", "surface_id", "id"} {
+		for _, key := range cmuxSurfaceIDKeys {
 			if s, ok := m[key].(string); ok && s != "" {
 				return s, true
 			}
@@ -172,11 +295,207 @@ func cmuxSurfaceID(m map[string]any) (string, bool) {
 	return "", false
 }
 
-func cmuxCwd(m map[string]any) (string, bool) {
-	for _, key := range []string{"cwd", "workingDirectory", "working_directory"} {
-		if s, ok := m[key].(string); ok && s != "" {
-			return s, true
+// cmuxSurfaceTTY returns a terminal surface's tty ("ttys<NNN>", no /dev/
+// prefix — the exact token `ps` prints in its TTY column). ok=false for any
+// non-terminal surface (a browser surface's "tty" is null), so browser tabs
+// are never treated as controllable claude surfaces.
+func cmuxSurfaceTTY(m map[string]any) (string, bool) {
+	if t, _ := m["type"].(string); t != "terminal" {
+		return "", false
+	}
+	tty, ok := m["tty"].(string)
+	if !ok || tty == "" {
+		return "", false
+	}
+	return tty, true
+}
+
+// cmuxProc is one process attached to a tty, from `ps axo tty,stat,pid,comm`.
+type cmuxProc struct {
+	tty        string
+	pid        int
+	foreground bool // "+" in the stat column: the tty's foreground process group
+	isClaude   bool
+}
+
+// liveResolveCmuxTTYs is the production ttyResolver: it cross-references the OS
+// for each tty's cwd, since cmux's tree carries none. One `ps` pass over the
+// process table (kept only for the wanted ttys) then one batched `lsof` for
+// those pids' cwds — the SAME ps→lsof pattern internal/claude/procs.go uses,
+// deliberately DUPLICATED here (not imported) to keep internal/control a
+// zero-internal-package pure actuation layer (same rationale documented on
+// encodeCwd in control.go). Both calls share one availabilityTimeout deadline
+// so the whole resolve stays inside the per-keypress budget; any probe failure
+// degrades to "no cwd" (not-found), never a hang.
+func liveResolveCmuxTTYs(ttys []string) map[string]ttyResolution {
+	want := map[string]bool{}
+	for _, t := range ttys {
+		if t != "" {
+			want[t] = true
 		}
 	}
-	return "", false
+	if len(want) == 0 {
+		return map[string]ttyResolution{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
+	defer cancel()
+	psOut, err := exec.CommandContext(ctx, "ps", "axo", "tty=,stat=,pid=,comm=").Output()
+	if err != nil {
+		return map[string]ttyResolution{}
+	}
+	procs := parseCmuxPsRows(string(psOut), want)
+	if len(procs) == 0 {
+		return map[string]ttyResolution{}
+	}
+	// lsof exits NON-ZERO when ANY queried pid is inaccessible or exited
+	// between the ps snapshot and here, yet still prints valid cwd records for
+	// the rest — so parse its stdout regardless of exit status (Output()
+	// returns the stdout it buffered even on an *exec.ExitError). This is why
+	// this can't naively mirror internal/claude's "err → bail": that path only
+	// ever queries a few user-owned claude pids and so rarely trips a partial
+	// error, whereas a tty's full process set routinely includes one. A real
+	// spawn/timeout failure yields empty output → empty map → graceful
+	// not-found, never a hang.
+	lsofOut, _ := exec.CommandContext(ctx, "lsof", "-a", "-p", pidCSV(procs), "-d", "cwd", "-Fpn").Output()
+	return foldTTYResolutions(procs, parseLsofPidCwds(string(lsofOut)))
+}
+
+// parseCmuxPsRows parses `ps axo tty=,stat=,pid=,comm=` output into the
+// processes on the wanted ttys. Columns: tty, stat, pid, comm — comm may
+// itself contain spaces (kept whole, matched on filepath.Base, exactly like
+// internal/claude.parsePsClaudePids). Rows on other ttys, on no tty ("??"),
+// and unparseable rows are skipped, not treated as errors.
+func parseCmuxPsRows(out string, want map[string]bool) []cmuxProc {
+	var procs []cmuxProc
+	for _, raw := range strings.Split(out, "\n") {
+		tty, rest, ok := cutField(raw)
+		if !ok || !want[tty] {
+			continue
+		}
+		stat, rest, ok := cutField(rest)
+		if !ok {
+			continue
+		}
+		pidField, comm, ok := cutField(rest)
+		if !ok {
+			continue
+		}
+		pid, err := strconv.Atoi(pidField)
+		if err != nil {
+			continue
+		}
+		procs = append(procs, cmuxProc{
+			tty:        tty,
+			pid:        pid,
+			foreground: strings.Contains(stat, "+"),
+			isClaude:   filepath.Base(comm) == "claude",
+		})
+	}
+	return procs
+}
+
+// cutField trims leading whitespace and splits off the first
+// whitespace-delimited field, returning it plus the trimmed remainder.
+// ok=false for a blank line. Used to walk fixed-column ps output left to
+// right while leaving the trailing field (comm) — which may contain spaces —
+// intact.
+func cutField(line string) (field, rest string, ok bool) {
+	line = strings.TrimLeft(line, " \t")
+	if line == "" {
+		return "", "", false
+	}
+	idx := strings.IndexFunc(line, unicode.IsSpace)
+	if idx < 0 {
+		return line, "", true
+	}
+	return line[:idx], strings.TrimLeft(line[idx:], " \t"), true
+}
+
+// parseLsofPidCwds parses `lsof -a -p <pids> -d cwd -Fpn` output — interleaved
+// "p<pid>" / "fcwd" / "n<path>" lines — into pid → cwd. The current pid comes
+// from the most recent "p" line; each "n" line sets that pid's cwd. Same
+// field-prefixed format internal/claude.parseLsofCwds reads, extended to keep
+// the pid association ("-Fpn" adds the "p" field).
+func parseLsofPidCwds(out string) map[int]string {
+	cwds := map[int]string{}
+	pid, have := 0, false
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			n, err := strconv.Atoi(line[1:])
+			have = err == nil
+			if have {
+				pid = n
+			}
+		case 'n':
+			if have {
+				cwds[pid] = line[1:]
+			}
+		}
+	}
+	return cwds
+}
+
+// foldTTYResolutions groups procs by tty and resolves each tty to one cwd +
+// hasClaude (see resolveOneTTY).
+func foldTTYResolutions(procs []cmuxProc, cwds map[int]string) map[string]ttyResolution {
+	grouped := map[string][]cmuxProc{}
+	for _, p := range procs {
+		grouped[p.tty] = append(grouped[p.tty], p)
+	}
+	out := make(map[string]ttyResolution, len(grouped))
+	for tty, ps := range grouped {
+		out[tty] = resolveOneTTY(ps, cwds)
+	}
+	return out
+}
+
+// resolveOneTTY picks a tty's representative cwd and claude-attachment. The cwd
+// prefers the claude process's own cwd (the loop's project dir is exactly
+// where claude runs), then the foreground process's (a bare shell surface's
+// current dir), then any process with a known cwd. hasClaude is true whenever
+// ANY attached process is claude — not only when it holds the foreground — so
+// a momentary tool subprocess owning the foreground can't flip a real claude
+// surface to unconfirmed on a keypress.
+func resolveOneTTY(procs []cmuxProc, cwds map[int]string) ttyResolution {
+	var claudeCwd, fgCwd, anyCwd string
+	hasClaude := false
+	for _, p := range procs {
+		cwd := cwds[p.pid]
+		if p.isClaude {
+			hasClaude = true
+			if claudeCwd == "" && cwd != "" {
+				claudeCwd = cwd
+			}
+		}
+		if fgCwd == "" && p.foreground && cwd != "" {
+			fgCwd = cwd
+		}
+		if anyCwd == "" && cwd != "" {
+			anyCwd = cwd
+		}
+	}
+	return ttyResolution{cwd: firstNonEmpty(claudeCwd, fgCwd, anyCwd), hasClaude: hasClaude}
+}
+
+// firstNonEmpty returns the first non-empty string, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// pidCSV joins procs' pids into the comma-separated form `lsof -p` accepts.
+func pidCSV(procs []cmuxProc) string {
+	ids := make([]string, len(procs))
+	for i, p := range procs {
+		ids[i] = strconv.Itoa(p.pid)
+	}
+	return strings.Join(ids, ",")
 }

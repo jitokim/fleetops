@@ -88,7 +88,7 @@ reflect actual work done.
 |---|---|---|---|
 | **orca** | ✅ | ✅ | Verified live against the real CLI; preferred when available. |
 | **tmux** | ✅ | ✅ | Verified against tmux's documented command contract. |
-| **cmux** | ✅ (send/focus/approve/interrupt) | ❌ | Adapter present, but the `tree --json` shape it parses is **unverified** — no cmux CLI was available to test against. Marked with `TODO` in the code. |
+| **cmux** | ✅ (locate/send/focus/approve/interrupt) | ❌ | Verified against real **cmux 0.64.15**: `tree --json` shape, and `send`/`send-key`/`focus-panel` subcommands. Its tree carries no cwd, so surface→dir matching cross-references the OS by tty (`ps`+`lsof`). Spawn is still unsupported (no verified create-surface command). |
 | **bare terminal** (none of the above) | manual hint only | manual hint only | Observation still works fully; actions print a copy-pasteable command (`claude --resume <id>`, `cd <dir>`, etc.) instead of silently failing. |
 
 `internal/control.Resolve()` picks the first available backend in that order
@@ -99,9 +99,17 @@ reflect actual work done.
 - **No goal, no oracle.** A session missionctl didn't spawn has no recorded
   goal, so it can never show `DONE`/`DRIFT`/`N-I` — only the tail-based
   state (`run`/`idle`/`stalled`/etc).
-- **cmux is unverified.** Its surface-tree JSON parser is intentionally
-  tolerant (walks unknown shapes rather than failing), but was never tested
-  against a real cmux install. Treat it as best-effort.
+- **cmux: verified shape, partially-verified actuation.** The `tree --json`
+  parser was verified against real cmux **0.64.15** (surface identity is the
+  `ref` key; terminal surfaces carry `type:"terminal"` + `tty`; browser tabs
+  carry `tty:null`), and the parser stays tolerant of unknown shapes. Because
+  the tree has no cwd field, a surface's directory is resolved by
+  cross-referencing its tty against the OS process table (`ps`+`lsof`), the
+  same pattern `internal/claude` uses. `send`/`send-key`/`focus-panel` and the
+  `enter` key token are verified from the CLI's own help; the `escape` (Esc /
+  interrupt) key token and the end-to-end effect of Resume/Approve on a live
+  claude gate are still assumed (no live claude-in-cmux session was safe to
+  drive). Verified on this cmux version only, not all cmux releases.
 - **macOS-first.** Process liveness (`internal/claude`'s liveness pass) shells
   out to `ps axo pid,comm` and `lsof`; it hasn't been adapted for Linux's
   `/proc` or other platforms.

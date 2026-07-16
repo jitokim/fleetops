@@ -1,0 +1,65 @@
+{
+  "active": {"is_browser_surface": false, "pane_ref": "pane:13", "surface_ref": "surface:15", "surface_type": "terminal", "tab_ref": "tab:15", "window_ref": "window:1", "workspace_ref": "workspace:9"},
+  "windows": [
+    {
+      "active": true,
+      "ref": "window:1",
+      "workspaces": [
+        {
+          "ref": "workspace:9",
+          "title": "bifrost",
+          "panes": [
+            {
+              "ref": "pane:13",
+              "surface_refs": ["surface:15"],
+              "surfaces": [
+                {"ref": "surface:15", "title": "✳ team", "tty": "ttys008", "type": "terminal", "url": null, "focused": true, "selected": true, "active": false}
+              ]
+            },
+            {
+              "ref": "pane:14",
+              "surface_refs": ["surface:18", "surface:23"],
+              "surfaces": [
+                {"ref": "surface:18", "title": "PR #819", "tty": null, "type": "browser", "url": "https://github.com/x/y/pull/819"},
+                {"ref": "surface:23", "title": "PR #1746", "tty": null, "type": "browser", "url": "https://github.com/x/y/pull/1746"}
+              ]
+            },
+            {
+              "ref": "pane:15",
+              "surface_refs": ["surface:22"],
+              "surfaces": [
+                {"ref": "surface:22", "title": "✳ aux", "tty": "ttys009", "type": "terminal", "url": null, "focused": false}
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "active": false,
+      "ref": "window:2",
+      "workspaces": [
+        {
+          "ref": "workspace:23",
+          "title": "team",
+          "panes": [
+            {
+              "ref": "pane:33",
+              "surface_refs": ["surface:50"],
+              "surfaces": [
+                {"ref": "surface:50", "title": "✳ team", "tty": "ttys012", "type": "terminal", "url": null, "focused": true}
+              ]
+            },
+            {
+              "ref": "pane:7",
+              "surface_refs": ["surface:9"],
+              "surfaces": [
+                {"ref": "surface:9", "title": "✳ team (mirror)", "tty": "ttys012", "type": "terminal", "url": null, "focused": false}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
