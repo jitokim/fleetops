@@ -138,53 +138,63 @@ func TestPadToWidth_AlreadyAtOrOverWidth(t *testing.T) {
 }
 
 func TestColumnWidths_DropsNoteBelowThreshold(t *testing.T) {
-	if _, _, _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
+	if _, _, _, _, _, _, wNote := columnWidths(minWidthForNote - 1); wNote != 0 {
 		t.Errorf("at width %d, wNote = %d, want 0 (NOTE column dropped)", minWidthForNote-1, wNote)
 	}
-	if _, _, _, _, _, wNote := columnWidths(minWidthForNote); wNote == 0 {
+	if _, _, _, _, _, _, wNote := columnWidths(minWidthForNote); wNote == 0 {
 		t.Errorf("at width %d, wNote = 0, want > 0 (NOTE column kept)", minWidthForNote)
 	}
 }
 
+func TestColumnWidths_DropsDoingBelowThreshold(t *testing.T) {
+	if _, wDoing, _, _, _, _, _ := columnWidths(minWidthForDoing - 1); wDoing != 0 {
+		t.Errorf("at width %d, wDoing = %d, want 0 (DOING column dropped)", minWidthForDoing-1, wDoing)
+	}
+	if _, wDoing, _, _, _, _, _ := columnWidths(minWidthForDoing); wDoing == 0 {
+		t.Errorf("at width %d, wDoing = 0, want > 0 (DOING column kept)", minWidthForDoing)
+	}
+}
+
 func TestColumnWidths_DropsNIBelowThreshold(t *testing.T) {
-	if _, _, _, _, wNI, _ := columnWidths(minWidthForNI - 1); wNI != 0 {
+	if _, _, _, _, _, wNI, _ := columnWidths(minWidthForNI - 1); wNI != 0 {
 		t.Errorf("at width %d, wNI = %d, want 0 (N/I column dropped)", minWidthForNI-1, wNI)
 	}
-	if _, _, _, _, wNI, _ := columnWidths(minWidthForNI); wNI == 0 {
+	if _, _, _, _, _, wNI, _ := columnWidths(minWidthForNI); wNI == 0 {
 		t.Errorf("at width %d, wNI = 0, want > 0 (N/I column kept)", minWidthForNI)
 	}
 }
 
 func TestColumnWidths_DropsOracleBelowThreshold(t *testing.T) {
-	if _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle - 1); wOracle != 0 {
+	if _, _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle - 1); wOracle != 0 {
 		t.Errorf("at width %d, wOracle = %d, want 0 (ORACLE column dropped)", minWidthForOracle-1, wOracle)
 	}
-	if _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle); wOracle == 0 {
+	if _, _, _, wOracle, _, _, _ := columnWidths(minWidthForOracle); wOracle == 0 {
 		t.Errorf("at width %d, wOracle = 0, want > 0 (ORACLE column kept)", minWidthForOracle)
 	}
 }
 
 func TestColumnWidths_DropsBudgetBelowThreshold(t *testing.T) {
-	if _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget - 1); wBudget != 0 {
+	if _, _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget - 1); wBudget != 0 {
 		t.Errorf("at width %d, wBudget = %d, want 0 (BUDGET column dropped)", minWidthForBudget-1, wBudget)
 	}
-	if _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget); wBudget == 0 {
+	if _, _, _, _, wBudget, _, _ := columnWidths(minWidthForBudget); wBudget == 0 {
 		t.Errorf("at width %d, wBudget = 0, want > 0 (BUDGET column kept)", minWidthForBudget)
 	}
 }
 
 func TestColumnWidths_DropsCycleBelowThreshold(t *testing.T) {
-	if _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle - 1); wCycle != 0 {
+	if _, _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle - 1); wCycle != 0 {
 		t.Errorf("at width %d, wCycle = %d, want 0 (CYCLE column dropped)", minWidthForCycle-1, wCycle)
 	}
-	if _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle); wCycle == 0 {
+	if _, _, wCycle, _, _, _, _ := columnWidths(minWidthForCycle); wCycle == 0 {
 		t.Errorf("at width %d, wCycle = 0, want > 0 (CYCLE column kept)", minWidthForCycle)
 	}
 }
 
 func TestColumnWidths_DegradationOrder(t *testing.T) {
-	// NOTE must drop before N/I, before ORACLE, before BUDGET, before CYCLE,
-	// as width shrinks — never any other order.
+	// NOTE must drop before N/I, before ORACLE, before BUDGET, before DOING,
+	// before CYCLE, as width shrinks — never any other order. DOING sits above
+	// the numeric health columns (dropped after them) but below CYCLE.
 	if minWidthForNote <= minWidthForNI {
 		t.Errorf("minWidthForNote (%d) must be > minWidthForNI (%d)", minWidthForNote, minWidthForNI)
 	}
@@ -194,13 +204,16 @@ func TestColumnWidths_DegradationOrder(t *testing.T) {
 	if minWidthForOracle <= minWidthForBudget {
 		t.Errorf("minWidthForOracle (%d) must be > minWidthForBudget (%d)", minWidthForOracle, minWidthForBudget)
 	}
-	if minWidthForBudget <= minWidthForCycle {
-		t.Errorf("minWidthForBudget (%d) must be > minWidthForCycle (%d)", minWidthForBudget, minWidthForCycle)
+	if minWidthForBudget <= minWidthForDoing {
+		t.Errorf("minWidthForBudget (%d) must be > minWidthForDoing (%d)", minWidthForBudget, minWidthForDoing)
+	}
+	if minWidthForDoing <= minWidthForCycle {
+		t.Errorf("minWidthForDoing (%d) must be > minWidthForCycle (%d)", minWidthForDoing, minWidthForCycle)
 	}
 }
 
 func TestColumnWidths_NameNeverBelowMinimum(t *testing.T) {
-	wName, _, _, _, _, _ := columnWidths(20)
+	wName, _, _, _, _, _, _ := columnWidths(20)
 	if wName < 10 {
 		t.Errorf("wName = %d at a very narrow width, want >= 10 (usable minimum)", wName)
 	}
@@ -1020,6 +1033,46 @@ func TestNoteForRow_NeitherGovernorNorStallNorDrift_Empty(t *testing.T) {
 	note, _ := noteForRow(domain.Loop{State: domain.StateRunning})
 	if note != "" {
 		t.Errorf("note = %q, want empty", note)
+	}
+}
+
+// ── DOING column (doingForRow) ──────────────────────────────────────
+
+func TestDoingForRow_GoalTextPreferredOverLastText(t *testing.T) {
+	// a goal-bound loop: Goal.Text is the ideal "what is this for", and wins
+	// even when LastText is also present.
+	l := domain.Loop{Goal: domain.Goal{Text: "refactor the scanner"}, LastText: "ran go test, 3 failing"}
+	if got := doingForRow(l); got != "refactor the scanner" {
+		t.Errorf("got %q, want the goal text (preferred over LastText)", got)
+	}
+}
+
+func TestDoingForRow_FallsBackToLastText(t *testing.T) {
+	// the majority case: a plain claude session missionctl only observes has no
+	// Goal.Text, so its last assistant tail is what it's "doing".
+	l := domain.Loop{LastText: "running go test ./..."}
+	if got := doingForRow(l); got != "running go test ./..." {
+		t.Errorf("got %q, want the LastText fallback", got)
+	}
+}
+
+func TestDoingForRow_NeitherGoalNorLastText_Empty(t *testing.T) {
+	if got := doingForRow(domain.Loop{}); got != "" {
+		t.Errorf("got %q, want empty (a just-started loop with no goal and no tail yet)", got)
+	}
+}
+
+func TestDoingForRow_TruncatedToColumnWidth(t *testing.T) {
+	// doingForRow returns the raw text; the caller truncates it to the column
+	// width with trunc — verify that path caps a long goal at the column and
+	// marks it with an ellipsis.
+	long := strings.Repeat("x", doingColWidth+20)
+	got := trunc(doingForRow(domain.Loop{Goal: domain.Goal{Text: long}}), doingColWidth-1)
+	if n := len([]rune(got)); n != doingColWidth-1 {
+		t.Errorf("truncated length = %d runes, want %d (column width - 1)", n, doingColWidth-1)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("got %q, want a trailing ellipsis when truncated", got)
 	}
 }
 

@@ -1148,8 +1148,8 @@ func (m Model) View() string {
 	b.WriteString(stFaint.Render("LOOPS"))
 	b.WriteString("\n")
 
-	wName, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
-	b.WriteString(renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote))
+	wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
+	b.WriteString(renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote))
 	b.WriteString("\n")
 	visible := m.visibleLoops()
 	switch {
@@ -1160,7 +1160,7 @@ func (m Model) View() string {
 	}
 	dupLabels := duplicateLabels(visible)
 	for i, l := range visible {
-		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wCycle, wOracle, wBudget, wNI, wNote, width))
+		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, width))
 		b.WriteString("\n")
 	}
 
@@ -1268,31 +1268,49 @@ const (
 	oracleColWidth = 12
 	budgetColWidth = 13
 	niColWidth     = 5
+	// doingColWidth is deliberately wide (second only to NAME): DOING answers
+	// "what is this loop actually working on?", and a one/two-word fragment
+	// defeats that purpose — so it's sized to fit a short phrase, not a word.
+	doingColWidth = 30
 )
 
-// minWidthForNote/NI/Oracle/Budget/Cycle: below these terminal widths the
-// corresponding column is dropped entirely (not just truncated), in this
-// degradation order as width shrinks: NOTE first (least essential — the
-// state label already hints at "why"), then N/I, then ORACLE, then BUDGET,
-// then CYCLE (most essential — kept the longest). Each threshold is
-// strictly less than the last so that order actually holds.
+// minWidthForNote/NI/Oracle/Budget/Doing/Cycle: below these terminal widths
+// the corresponding column is dropped entirely (not just truncated), in this
+// degradation order as width shrinks: NOTE first (least essential — the state
+// label already hints at "why"), then N/I, then ORACLE, then BUDGET, then
+// DOING, then CYCLE (most essential — kept the longest). DOING is ranked
+// ABOVE the numeric health columns (BUDGET/ORACLE/N-I) on purpose: it answers
+// the operator's actual question ("which loop is this, what's it working
+// on?"), which a budget bar can't — when space is tight, knowing what a loop
+// IS beats knowing its budget fraction. It stays below CYCLE (a cheap,
+// always-useful raw counter) and, obviously, NAME (never dropped). Each
+// threshold is strictly less than the last so that order actually holds.
 const (
 	minWidthForNote   = 70
 	minWidthForNI     = 68
 	minWidthForOracle = 64
 	minWidthForBudget = 60
+	minWidthForDoing  = 55
 	minWidthForCycle  = 50
 )
 
-// columnWidths sizes NAME/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
-// width: CYCLE/ORACLE/BUDGET/N-I are fixed-width when shown at all (dropped
-// below their thresholds, see minWidthForNote/NI/Oracle/Budget/Cycle), and
-// NAME soaks up whatever remains, with a usable minimum and a cap so wide
-// terminals don't stretch it into a chasm between columns (mockup keeps the
-// table compact) — spare width beyond the cap goes to NOTE.
-func columnWidths(width int) (wName, wCycle, wOracle, wBudget, wNI, wNote int) {
+// columnWidths sizes NAME/DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE from the
+// terminal width: DOING/CYCLE/ORACLE/BUDGET/N-I are fixed-width when shown at
+// all (dropped below their thresholds, see minWidthForNote/NI/Oracle/Budget/
+// Doing/Cycle), and NAME soaks up whatever remains, with a usable minimum and
+// a cap so wide terminals don't stretch it into a chasm between columns
+// (mockup keeps the table compact) — spare width beyond the cap goes to NOTE.
+// DOING is a wide fixed column (doingColWidth), so the table's comfortable
+// minimum width is correspondingly higher when it's shown; below that the
+// pre-existing narrow-width behaviour applies (NAME floors, the row overflows)
+// until columns start dropping at their thresholds. A control-room fleet view
+// is expected to run wide, where DOING and NAME both get their full width.
+func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) {
 	if width >= minWidthForCycle {
 		wCycle = cycleColWidth
+	}
+	if width >= minWidthForDoing {
+		wDoing = doingColWidth
 	}
 	if width >= minWidthForOracle {
 		wOracle = oracleColWidth
@@ -1309,7 +1327,7 @@ func columnWidths(width int) (wName, wCycle, wOracle, wBudget, wNI, wNote int) {
 
 	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
 	// leading "  " indent plus cell boundaries need a little slack.
-	fixed := wMarker + wState + wLast + wCycle + wOracle + wBudget + wNI + wNote + gaps
+	fixed := wMarker + wState + wLast + wDoing + wCycle + wOracle + wBudget + wNI + wNote + gaps
 	wName = width - fixed
 	if wName < 10 {
 		wName = 10
@@ -1320,15 +1338,18 @@ func columnWidths(width int) (wName, wCycle, wOracle, wBudget, wNI, wNote int) {
 		}
 		wName = 28
 	}
-	return wName, wCycle, wOracle, wBudget, wNI, wNote
+	return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
 }
 
-func renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote int) string {
+func renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) string {
 	cells := []string{
 		stHeader.Width(wMarker).Render(""),
 		stHeader.Width(wName).Render("NAME"),
-		stHeader.Width(wState).Render("STATE"),
 	}
+	if wDoing > 0 {
+		cells = append(cells, stHeader.Width(wDoing).Render("DOING"))
+	}
+	cells = append(cells, stHeader.Width(wState).Render("STATE"))
 	if wCycle > 0 {
 		cells = append(cells, stHeader.Width(wCycle).Render("CYCLE"))
 	}
@@ -1364,7 +1385,7 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 	return dup
 }
 
-func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudget, wNI, wNote, totalWidth int) string {
+func renderRow(l domain.Loop, sel bool, dup bool, wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, totalWidth int) string {
 	marker := " "
 	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
 	if sel {
@@ -1380,8 +1401,13 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudge
 	cells := []string{
 		markerStyle.Width(wMarker).Render(marker),
 		stInk.Width(wName).Render(trunc(label, wName-1)),
-		st.Width(wState).Render(stateLabel(l)),
 	}
+	if wDoing > 0 {
+		// dim (stDim): DOING is background context, kept visually secondary to
+		// NOTE's warning colors (cRed/cAmber).
+		cells = append(cells, stDim.Width(wDoing).Render(trunc(doingForRow(l), wDoing-1)))
+	}
+	cells = append(cells, st.Width(wState).Render(stateLabel(l)))
 	if wCycle > 0 {
 		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
 	}
@@ -1429,6 +1455,24 @@ func noteForRow(l domain.Loop) (string, lipgloss.Style) {
 		return "✗ " + l.Last.Reason, stateStyle(l)
 	}
 	return "", stateStyle(l)
+}
+
+// doingForRow decides the DOING column's text — a background/context column
+// answering "what is this loop actually working on?", distinct from NOTE's
+// alert channel (which stays untouched). A goal-bound loop (spawned via the
+// tui's "n" key) carries the human-written Goal.Text, the ideal answer; loops
+// missionctl merely observes (the majority — plain claude sessions) fall back
+// to LastText, the last assistant message's tail, already single-line and
+// 120-char-capped by internal/claude.summarizeTailText (the same text feeding
+// the detail pane's TAIL row). "" when a loop has neither yet (e.g. a
+// just-started unbound loop with no assistant output). Unlike noteForRow the
+// style is invariant (always dim, applied by the caller), so only the text is
+// returned. The caller truncates it to the column width.
+func doingForRow(l domain.Loop) string {
+	if l.Goal.Text != "" {
+		return l.Goal.Text
+	}
+	return l.LastText
 }
 
 // cycleLabel: plain count ("6"), or "6/12" once a per-loop MaxCycles exists.
