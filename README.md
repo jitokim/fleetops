@@ -88,6 +88,67 @@ the session) against a 2,000,000-token default cap per loop —
 single call, so summing those would wildly overstate spend rather than
 reflect actual work done.
 
+## Automation (opt-in, off by default)
+
+missionctl is pure observation + one-key human actuation everywhere else in
+this document. There is exactly ONE piece of automation it ships today, and
+it is **opt-in and off by default**:
+
+### 429 auto-redrive
+
+Set `MISSIONCTL_AUTO_REDRIVE_429=1` in the environment missionctl runs in to
+enable it. Unset it (or don't set it at all) to disable — there is no
+in-app toggle for this yet, and no per-loop override; it's a single global
+switch.
+
+**What it does:** when a loop's state transition lands it in `✗ 429`
+(rate-limited) — the same scan edge that would otherwise just sit there
+until you notice and press `r` — missionctl schedules ONE automatic
+re-drive 5 minutes later, via the exact same headless
+`claude --resume <id> -p "<prompt>"` path Tier 2 uses for a manual resume.
+Before firing, it re-checks the loop's CURRENT state: if you already
+resumed it yourself, or it recovered on its own, the scheduled auto-redrive
+silently does nothing.
+
+**Ceilings (both per session, not per day):**
+- At most **3 lifetime attempts** — recounted from the append-only event
+  log on every missionctl restart, so restarting doesn't reset the counter.
+- At most one scheduled at a time — a second 429 edge for the same session
+  within 5 minutes of the last schedule doesn't queue another.
+- On the 3rd attempt failing, you get a desktop notification
+  ("🚀 missionctl · auto-redrive exhausted") and nothing further is
+  scheduled for that session.
+
+Every attempt (success or failure) is recorded in the event log
+(`actor: auto`, distinct from every human-triggered actuation event, which
+is always `actor: human`) — visible in `missionctl report` and the DETAIL
+panel's EVENTS block.
+
+**Why this is the only automation, and why it's built this way — the
+design rationale:**
+- **Tier 2 only.** It never types into a terminal. Every OTHER actuation
+  in this codebase (resume/inject/approve/kill) can fall back to typing
+  into a live pane, which carries a "wrong surface" hazard if session
+  identity is ambiguous. An automated, unattended action can't be allowed
+  anywhere near that risk at all — Tier 2's `claude --resume <id>` is
+  keyed by session id, not by a terminal pane, so there is no surface to
+  get wrong.
+- **Idempotent.** Re-sending a resume against a session that already
+  recovered is a harmless no-op turn, not a destructive action — this is
+  why 429 (a transient, well-understood failure mode) was judged safe to
+  automate at all, unlike e.g. an oracle-rejected DRIFT (which needs a
+  human's judgment call, see `r` on a DRIFT loop's guided re-drive) or a
+  StateFailed loop (the governor already decided to stop it — automation
+  overriding that would defeat the governor's whole purpose).
+- **Transient, not a judgment call.** A 429 is "the API said slow down,"
+  not "something is wrong with this loop's approach" — there's no
+  reasoning required to decide whether retrying is appropriate, unlike
+  DRIFT or a repeated no-improve stall.
+- **Honest about what survives a restart.** The 5-minute delay is a
+  `tea.Tick`, not a persisted job — if you quit missionctl before it
+  fires, the pending retry is simply lost. No silent double-fire risk, no
+  stale on-disk schedule to reconcile on the next launch.
+
 ## Platform support
 
 **macOS is the only platform the full backend matrix works on.** This isn't

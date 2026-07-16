@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,21 @@ import (
 	"github.com/jitokim/missionctl/internal/sessions"
 	runewidth "github.com/mattn/go-runewidth"
 )
+
+// TestMain is this package's safety net against the real
+// ~/.missionctl/history: feat/detail-panel-v2's detailPanelLines reads it
+// (via events.Read) on EVERY m.View() call, and this file has many tests
+// that call View() without any reason to care about history data at all.
+// Defaulting historyDirFn to a deliberately-nonexistent path here means
+// every such test is hermetic by default — reads simply find nothing
+// (events.Read tolerates a missing file, same as a missing dir) — while
+// tests that DO need specific history data still override historyDirFn
+// themselves (see withFakeActuationSeams and others), same
+// save-then-restore pattern as always.
+func TestMain(m *testing.M) {
+	historyDirFn = func() string { return filepath.Join(os.TempDir(), "missionctl-tui-tests-unused-history") }
+	os.Exit(m.Run())
+}
 
 // runeKey builds the tea.KeyMsg bubbletea sends for a single printable
 // character keypress (msg.String() == string(r)).
@@ -392,7 +409,124 @@ func TestView_NoLineExceedsTerminalWidth(t *testing.T) {
 	}
 }
 
-// TestView_SelectedRowVisibleInFleetPanel: with more loops than fit in the
+// detailPanelV2RegressionLoop builds a loop whose DETAIL panel actually
+// exercises every feat/detail-panel-v2 block — LAST ERROR (a REAL
+// transcript file with a long verbatim 429 body, including one long
+// UNBROKEN token — no spaces at all — to stress wrapTailText's hard-break
+// path, not just its ordinary word-wrap), VERDICTS (oracle events),
+// EVENTS (actuation + scan events), and the STALLED callout's flap counter
+// (3 stall transitions within the last hour) — none of which
+// viewRegressionLoops exercises (its Path/history are fake/absent, so
+// those blocks render empty in the standing sweep above). Review fix (P2):
+// the width/height regression sweep must ALSO cover these blocks, not just
+// the pre-v2 key-value rows.
+func detailPanelV2RegressionLoop(t *testing.T, historyDir string) domain.Loop {
+	t.Helper()
+	now := time.Now()
+
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	longToken := strings.Repeat("x", 220) // one unbroken 220-char token — no spaces at all
+	errLine := fmt.Sprintf(
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 Too Many Requests — request id %s retry after 30s"}]},"timestamp":%q}`,
+		longToken, now.Format(time.RFC3339))
+	if err := os.WriteFile(transcriptPath, []byte(errLine+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	evs := []events.Event{
+		{TS: now.Add(-50 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "", ToState: "running", Trigger: events.TriggerActuation, Detail: "spawn: fix the flaky auth test", Actor: events.ActorHuman},
+		{TS: now.Add(-40 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "stalled:rate-limit", Trigger: events.TriggerScan, Detail: "rate-limit", Actor: events.ActorSystem},
+		{TS: now.Add(-39 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "stalled:rate-limit", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman},
+		{TS: now.Add(-25 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "stalled:rate-limit", Trigger: events.TriggerScan, Detail: "rate-limit", Actor: events.ActorSystem},
+		{TS: now.Add(-24 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "stalled:rate-limit", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman},
+		{TS: now.Add(-15 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "idle", Trigger: events.TriggerScan, Actor: events.ActorSystem},
+		{TS: now.Add(-14 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "idle", ToState: "idle", Trigger: events.TriggerOracle, Detail: "progress at cycle 3: made partial progress, one test still failing intermittently under load", Actor: events.ActorAuto},
+		{TS: now.Add(-5 * time.Minute).UnixNano(), SessionID: "v2-regress", FromState: "idle", ToState: "running", Trigger: events.TriggerScan, Actor: events.ActorSystem},
+		{TS: now.UnixNano(), SessionID: "v2-regress", FromState: "running", ToState: "stalled:rate-limit", Trigger: events.TriggerScan, Detail: "rate-limit", Actor: events.ActorSystem}, // 3rd stall within the hour — flap counter
+	}
+	for _, ev := range evs {
+		if err := events.Append(historyDir, ev); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	return domain.Loop{
+		Project: "v2-regress", SessionID: "v2-regress", ProjectDir: "-x-v2",
+		Cwd: "/Users/imac/IdeaProjects/v2-regress", Path: transcriptPath, CwdVerified: true,
+		State: domain.StateStalled, Stall: domain.StallRateLimit, Cycle: 3,
+		Goal:         domain.Goal{Text: "fix the flaky auth test", MaxCycles: 12, BudgetTokens: 2_000_000},
+		TokensSpent:  1_200_000,
+		Last:         &domain.Verdict{Outcome: domain.OutcomeProgress, Reason: "made partial progress, one test still failing intermittently under load"},
+		LastActivity: now,
+		LastText:     "still working on stabilizing the flaky test",
+		BoundAt:      now.Add(-50 * time.Minute),
+	}
+}
+
+// TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks is the P2 review
+// fix's regression: the standing width/height sweep above must ALSO
+// exercise LAST ERROR/VERDICTS/EVENTS/the flap counter, not just render
+// them empty — same acceptance bar (every line <= width, total lines <=
+// height), same width/height matrix, but with a fixture whose DETAIL panel
+// actually populates every feat/detail-panel-v2 block.
+func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	l := detailPanelV2RegressionLoop(t, historyDir)
+
+	for _, width := range []int{45, 65, 70, 90, 120, 175} {
+		for _, height := range []int{18, 24, 40, 60} {
+			t.Run(fmt.Sprintf("width=%d/height=%d", width, height), func(t *testing.T) {
+				m := New()
+				m.w, m.h = width, height
+				m.loops = []domain.Loop{l}
+				m.cursor = 0
+
+				out := m.View()
+				lines := strings.Split(out, "\n")
+				for i, line := range lines {
+					if got := lipgloss.Width(line); got > width {
+						t.Errorf("width=%d: line %d is %d cols wide, want <= %d: %q", width, i, got, width, line)
+					}
+				}
+				if got := len(lines); got > height {
+					t.Errorf("height=%d: rendered frame is %d lines, want <= %d", height, got, height)
+				}
+			})
+		}
+	}
+}
+
+// TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered
+// is a sanity check for the test above: at a generous width/height, the
+// v2 blocks (LAST ERROR/VERDICTS/EVENTS/flap counter) must actually
+// APPEAR — otherwise the width/height sweep above would be silently
+// testing nothing new (an empty panel trivially satisfies both
+// invariants).
+func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	l := detailPanelV2RegressionLoop(t, historyDir)
+
+	m := New()
+	m.w, m.h = 120, 45
+	m.loops = []domain.Loop{l}
+	m.cursor = 0
+	out := m.View()
+
+	for _, want := range []string{"LAST ERROR", "VERDICTS", "EVENTS", "stall in"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the rendered frame to contain %q (the block this regression test exists to exercise), got:\n%s", want, out)
+		}
+	}
+}
+
 // FLEET panel's rows, moving the cursor deep into the list must scroll the
 // panel (visibleWindow) so the selected loop's row is still on screen — not
 // require any NEW keybinding, just keep the existing ↑/↓/g/G-driven cursor
@@ -906,6 +1040,180 @@ func TestUpdate_SecondKAfterWindowExpires_RestartsConfirmCycle(t *testing.T) {
 	}
 }
 
+// ── fix/killed-state: "k" on an already-dead loop ────────────────────────
+
+func TestUpdate_KKey_AlreadyKilled_RefusesFastWithoutConfirmCycle(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateKilled
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — an already-killed loop must refuse before any confirm cycle")
+	}
+	if m.pendingKillSession != "" {
+		t.Error("expected no pending-kill cycle to start for an already-killed loop")
+	}
+	if !strings.Contains(m.status, "already killed/gone") {
+		t.Errorf("status = %q, want the already-killed/gone message", m.status)
+	}
+}
+
+func TestUpdate_KKey_StallGone_RefusesFastWithoutConfirmCycle(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+	m.loops[0].Stall = domain.StallGone
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — a gone loop must refuse before any confirm cycle")
+	}
+	if !strings.Contains(m.status, "already killed/gone") {
+		t.Errorf("status = %q, want the already-killed/gone message", m.status)
+	}
+}
+
+func TestKillCmd_AlreadyKilled_ReturnsFriendlyMessage(t *testing.T) {
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateKilled}
+	msg := killCmd(l)()
+	km, ok := msg.(killResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want killResultMsg", msg)
+	}
+	if !km.ok {
+		t.Error("expected ok=true — this is a graceful no-op, not a failure")
+	}
+	if !strings.Contains(km.text, "already killed/gone") {
+		t.Errorf("text = %q, want the already-killed/gone message", km.text)
+	}
+}
+
+func TestKillCmd_SuccessMessage_DoesNotClaimImmediateStateChange(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return &fakeController{name: "tmux"}, control.Target{Backend: "tmux", ID: "%1"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift}
+	msg := killCmd(l)()
+	km, ok := msg.(killResultMsg)
+	if !ok || !km.ok {
+		t.Fatalf("got %+v, want a successful killResultMsg", msg)
+	}
+	if !strings.Contains(km.text, "state updates on next scan") {
+		t.Errorf("text = %q, want it to say the state updates on the next scan (not an optimistic local state change)", km.text)
+	}
+}
+
+func TestKillCmd_Success_RecordsKillActuationEvent(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return &fakeController{name: "tmux"}, control.Target{Backend: "tmux", ID: "%1"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift}
+	killCmd(l)()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	if !strings.HasPrefix(evs[0].Detail, "kill ") {
+		t.Errorf("Detail = %q, want it to start with \"kill \" (mostRecentActuationIsKill's expected format)", evs[0].Detail)
+	}
+}
+
+func TestUpdate_IKey_KilledLoop_RefusesWithoutEnteringInjectMode(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateKilled
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — a killed loop must not enter inject mode")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if !strings.Contains(m.status, "killed") {
+		t.Errorf("status = %q, want it to mention the loop was killed", m.status)
+	}
+}
+
+func TestSendPromptCmd_KilledLoop_RefusesWithoutDispatching(t *testing.T) {
+	// Belt-and-suspenders: sendPromptCmd itself must refuse StateKilled too
+	// — this is the one shared choke point that matters, since Tier 2's
+	// headless redrive is fully capable of reviving a killed session.
+	redriveCalled := false
+	withFakeActuationSeams(t, nil, func(sessionID, prompt string) error {
+		redriveCalled = true
+		return nil
+	})
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateKilled}
+
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	if redriveCalled {
+		t.Error("expected redriveFn NOT to be called for a killed loop — Tier 2 could otherwise revive it")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || rm.ok {
+		t.Fatalf("got %+v, want a refused resumeResultMsg", msg)
+	}
+	if !strings.Contains(rm.text, "killed") {
+		t.Errorf("text = %q, want it to mention the loop was killed", rm.text)
+	}
+}
+
+// ── fix/killed-state: display + badge exclusion ──────────────────────────
+
+func TestStateLabel_Killed(t *testing.T) {
+	if got := stateLabel(domain.Loop{State: domain.StateKilled}); got != "☠ KILLED" {
+		t.Errorf("got %q, want %q", got, "☠ KILLED")
+	}
+}
+
+func TestStateColor_Killed_IsDimNotRed(t *testing.T) {
+	got := stateColor(domain.Loop{State: domain.StateKilled})
+	if got == cRed {
+		t.Error("StateKilled must NOT be red — it's a completed human decision, not an incident")
+	}
+	if got != cDim {
+		t.Errorf("got %v, want cDim", got)
+	}
+}
+
+func TestCounts_KilledLoop_NotCountedAsStalledOrGated(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{SessionID: "s1", State: domain.StateKilled},
+		{SessionID: "s2", State: domain.StateRunning},
+	}
+	total, running, stalled, idle, gated, _, _, _ := m.counts()
+	if total != 2 {
+		t.Errorf("total = %d, want 2 (killed loops still count toward fleet total)", total)
+	}
+	if running != 1 {
+		t.Errorf("running = %d, want 1", running)
+	}
+	if stalled != 0 {
+		t.Errorf("stalled = %d, want 0 (killed must not be counted as stalled)", stalled)
+	}
+	if gated != 0 {
+		t.Errorf("gated = %d, want 0", gated)
+	}
+	if idle != 0 {
+		t.Errorf("idle = %d, want 0", idle)
+	}
+}
+
 func TestUpdate_AnyOtherKey_ClearsPendingKill(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('k'))
@@ -1068,6 +1376,267 @@ func TestUpdate_RKey_StateFailed_BlockedByKeyGuard(t *testing.T) {
 	}
 	if !strings.Contains(m.status, "stalled or drifted") {
 		t.Errorf("status = %q, want the r-key guard's usual message", m.status)
+	}
+}
+
+// ── feat/drift-guided-redrive ─────────────────────────────────────────────
+
+// ── mode transitions ──────────────────────────────────────────────────────
+
+func TestUpdate_RKey_DriftLoop_EntersModeDriftHint(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if m.mode != modeDriftHint {
+		t.Fatalf("mode = %v, want modeDriftHint", m.mode)
+	}
+	if m.driftHintTarget.SessionID != "sess-1" {
+		t.Errorf("driftHintTarget = %+v, want it snapshotted to sess-1", m.driftHintTarget)
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (textinput.Blink)")
+	}
+}
+
+// TestUpdate_RKey_StalledLoop_NonDriftBypass_StillImmediateResume is the
+// task's explicit "non-drift bypass": StateStalled must keep the EXISTING
+// immediate-resume behavior (no input step at all).
+func TestUpdate_RKey_StalledLoop_NonDriftBypass_StillImmediateResume(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if m.mode == modeDriftHint {
+		t.Error("expected StateStalled to bypass the hint-input step entirely")
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (resumeCmd, dispatched immediately)")
+	}
+	if !strings.Contains(m.status, "resuming") {
+		t.Errorf("status = %q, want the immediate-resume status text", m.status)
+	}
+}
+
+func TestUpdate_RKey_DriftLoop_AmbiguousSharedDir_RefusesBeforeEnteringHintMode(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].State = domain.StateDrift
+	m.loops[1].State = domain.StateDrift
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — ambiguous target must refuse before entering hint mode")
+	}
+	if m.mode == modeDriftHint {
+		t.Error("expected the ambiguity guard to prevent entering modeDriftHint at all")
+	}
+	if m.statusKind != statusErr || !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q (kind %v), want an ambiguity refusal", m.status, m.statusKind)
+	}
+}
+
+func TestUpdate_RKey_DriftLoop_AlreadyActuating_Refuses(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m.actuating = map[string]bool{"sess-1": true}
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — already actuating")
+	}
+	if m.mode == modeDriftHint {
+		t.Error("expected the in-flight guard to prevent entering modeDriftHint")
+	}
+}
+
+func TestUpdate_DriftHint_Esc_Cancels(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+	if m.mode != modeDriftHint {
+		t.Fatal("setup: expected modeDriftHint")
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after esc", m.mode)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd on cancel")
+	}
+	if !strings.Contains(m.status, "cancelled") {
+		t.Errorf("status = %q, want a cancellation message", m.status)
+	}
+}
+
+func TestUpdate_DriftHint_EnterWithHint_DispatchesDriftRedrive(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	for _, r := range "check the auth header casing" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after submit", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (driftRedriveCmd)")
+	}
+	if !m.actuating["sess-1"] {
+		t.Error("expected sess-1 to be marked actuating after dispatch")
+	}
+}
+
+// TestUpdate_DriftHint_EnterEmpty_StillDispatches is the task's
+// "enter=none" behavior: unlike modeInjecting's empty-prompt-cancels
+// convention, an EMPTY hint submission on modeDriftHint is a valid choice
+// (re-drive with no hint), not a cancel.
+func TestUpdate_DriftHint_EnterEmpty_StillDispatches(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd even with an empty hint — enter=none still re-drives")
+	}
+}
+
+func TestUpdate_DriftHint_AlreadyActuatingAtSubmitTime_Refuses(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+	m.actuating = map[string]bool{"sess-1": true} // simulate a race: became actuating while typing
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — already actuating by submit time")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want the already-re-driving message", m.status)
+	}
+}
+
+func TestUpdate_ArrowKeysWhileDriftHint_RouteToInputNotCursor(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+	beforeCursor := m.cursor
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	if m.cursor != beforeCursor {
+		t.Errorf("cursor changed from %d to %d — arrow keys must route to the input during modeDriftHint, not move the cursor", beforeCursor, m.cursor)
+	}
+}
+
+// ── prompt composition (pure function) ────────────────────────────────────
+
+func TestComposeDriftPrompt_WithHint_Appends(t *testing.T) {
+	got := composeDriftPrompt("fix the auth test", "check the header casing")
+	want := "fix the auth test\n\n[operator correction] check the header casing"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestComposeDriftPrompt_EmptyHint_ReturnsUnchanged(t *testing.T) {
+	if got := composeDriftPrompt("fix the auth test", ""); got != "fix the auth test" {
+		t.Errorf("got %q, want the prompt unchanged", got)
+	}
+}
+
+func TestComposeDriftPrompt_WhitespaceOnlyHint_TreatedAsEmpty(t *testing.T) {
+	if got := composeDriftPrompt("fix the auth test", "   \t  "); got != "fix the auth test" {
+		t.Errorf("got %q, want the prompt unchanged for a whitespace-only hint", got)
+	}
+}
+
+func TestComposeDriftPrompt_HintIsTrimmed(t *testing.T) {
+	got := composeDriftPrompt("fix it", "  add a retry  ")
+	want := "fix it\n\n[operator correction] add a retry"
+	if got != want {
+		t.Errorf("got %q, want the hint trimmed of surrounding whitespace", got)
+	}
+}
+
+// ── driftRedriveCmd dispatch ───────────────────────────────────────────────
+
+func TestDriftRedriveCmd_ComposesHintIntoSentPrompt(t *testing.T) {
+	var gotPrompt string
+	fakeCtrl := &fakeController{name: "tmux"}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		},
+		nil,
+	)
+	path := writeTranscriptLastUserPrompt(t, "fix the flaky auth test")
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift, Path: path}
+
+	msg := driftRedriveCmd(l, "check the header casing")()
+
+	gotPrompt = fakeCtrl.lastResumePrompt
+	want := "fix the flaky auth test\n\n[operator correction] check the header casing"
+	if gotPrompt != want {
+		t.Errorf("sent prompt = %q, want %q", gotPrompt, want)
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+}
+
+func TestDriftRedriveCmd_EmptyHint_SendsPromptUnchanged(t *testing.T) {
+	fakeCtrl := &fakeController{name: "tmux"}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		},
+		nil,
+	)
+	path := writeTranscriptLastUserPrompt(t, "fix the flaky auth test")
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift, Path: path}
+
+	driftRedriveCmd(l, "")()
+
+	if fakeCtrl.lastResumePrompt != "fix the flaky auth test" {
+		t.Errorf("sent prompt = %q, want the original prompt unchanged (enter=none)", fakeCtrl.lastResumePrompt)
+	}
+}
+
+// writeTranscriptLastUserPrompt writes a minimal transcript JSONL whose
+// last user message is prompt, so claude.LastUserPrompt(path) returns it.
+func writeTranscriptLastUserPrompt(t *testing.T, prompt string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	line := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%q}}`, prompt)
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return path
+}
+
+// ── DRIFT callout text ─────────────────────────────────────────────────────
+
+func TestRenderDriftCallout_MentionsReDriveWithHint(t *testing.T) {
+	l := domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}}
+	got := renderDriftCallout(l, 80)
+	if !strings.Contains(got, "re-drive with hint") {
+		t.Errorf("got %q, want the callout to mention \"re-drive with hint\"", got)
 	}
 }
 
@@ -1645,9 +2214,10 @@ func TestUpdate_RKey_AfterActuatingCleared_CanDispatchAgain(t *testing.T) {
 // fakeController is a minimal control.Controller test double — only Resume
 // is exercised by sendPromptCmd; the rest are unused stubs.
 type fakeController struct {
-	name         string
-	resumeCalled bool
-	resumeErr    error
+	name             string
+	resumeCalled     bool
+	resumeErr        error
+	lastResumePrompt string // feat/drift-guided-redrive: captures what Resume was actually sent, for asserting hint composition
 }
 
 func (f *fakeController) Name() string                               { return f.name }
@@ -1660,6 +2230,7 @@ func (f *fakeController) Interrupt(control.Target) error             { return ni
 func (f *fakeController) Spawn(string, string) error                 { return nil }
 func (f *fakeController) Resume(t control.Target, prompt string) error {
 	f.resumeCalled = true
+	f.lastResumePrompt = prompt
 	return f.resumeErr
 }
 
@@ -1783,7 +2354,7 @@ func TestRenderInjectPrompt_IdleTarget_NoMidTurnWarning(t *testing.T) {
 func TestRenderResumeCallout_StallGone_MentionsTier2Redrive(t *testing.T) {
 	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallGone}
 
-	out := renderResumeCallout(l, 80)
+	out := renderResumeCallout(l, 80, nil, time.Now())
 
 	if !strings.Contains(out, "RESTART") {
 		t.Errorf("callout = %q, want the RESTART label", out)
@@ -1796,7 +2367,7 @@ func TestRenderResumeCallout_StallGone_MentionsTier2Redrive(t *testing.T) {
 func TestRenderResumeCallout_OtherStall_KeepsResumeWording(t *testing.T) {
 	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
 
-	out := renderResumeCallout(l, 80)
+	out := renderResumeCallout(l, 80, nil, time.Now())
 
 	if !strings.Contains(out, "RESUME") {
 		t.Errorf("callout = %q, want the RESUME label for a non-gone stall", out)
@@ -2064,8 +2635,8 @@ func TestNoteForRow_NeitherGovernorNorStallNorDrift_Empty(t *testing.T) {
 // ── detail pane TAIL row (wrapTailText / detailRowMultiline) ────────
 
 func TestWrapTailText_WrapsToExpectedLineCount(t *testing.T) {
-	// three 5-col lines, all under maxTailLines → returned verbatim, no marker.
-	got := wrapTailText("aa bb cc dd ee ff", 5, maxTailLines)
+	// three 5-col lines, all under tailMaxLines → returned verbatim, no marker.
+	got := wrapTailText("aa bb cc dd ee ff", 5, tailMaxLines)
 	want := []string{"aa bb", "cc dd", "ee ff"}
 	if len(got) != len(want) {
 		t.Fatalf("got %d lines %q, want %d %q", len(got), got, len(want), want)
@@ -2108,7 +2679,7 @@ func TestWrapTailText_FullWidthLastLineMarkerStaysWithinWidth(t *testing.T) {
 }
 
 func TestWrapTailText_ShortTextNoMarkerNoBlanks(t *testing.T) {
-	got := wrapTailText("short text", 40, maxTailLines)
+	got := wrapTailText("short text", 40, tailMaxLines)
 	if len(got) != 1 {
 		t.Fatalf("got %d lines %q, want 1", len(got), got)
 	}
@@ -2126,7 +2697,7 @@ func TestWrapTailText_ShortTextNoMarkerNoBlanks(t *testing.T) {
 }
 
 func TestWrapTailText_NonPositiveArgsReturnNil(t *testing.T) {
-	if got := wrapTailText("anything", 0, maxTailLines); got != nil {
+	if got := wrapTailText("anything", 0, tailMaxLines); got != nil {
 		t.Errorf("width 0: got %q, want nil", got)
 	}
 	if got := wrapTailText("anything", 40, 0); got != nil {
@@ -2165,14 +2736,14 @@ func TestDetailRowMultiline_EmptyLinesRendersNothing(t *testing.T) {
 
 func TestRenderDetail_EmptyLastText_NoTailRow(t *testing.T) {
 	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cwd: "/x", Path: "/x/s1.jsonl"}
-	out := renderDetail(l, 80)
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
 	if strings.Contains(out, "TAIL") {
 		t.Errorf("detail pane should have NO TAIL row when LastText is empty:\n%s", out)
 	}
 }
 
 func TestRenderDetail_LongLastText_ShowsWrappedTruncatedTailRow(t *testing.T) {
-	// long enough to overflow maxTailLines at the pane width → wrapped + marked.
+	// long enough to overflow tailMaxLines at the pane width → wrapped + marked.
 	l := domain.Loop{
 		Project:   "aboard",
 		SessionID: "s1",
@@ -2181,12 +2752,488 @@ func TestRenderDetail_LongLastText_ShowsWrappedTruncatedTailRow(t *testing.T) {
 		Path:      "/x/s1.jsonl",
 		LastText:  strings.Repeat("lorem ipsum dolor sit amet ", 60),
 	}
-	out := renderDetail(l, 80)
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
 	if !strings.Contains(out, "TAIL") {
 		t.Errorf("detail pane should show a TAIL row when LastText is present:\n%s", out)
 	}
 	if !strings.Contains(out, "…") {
 		t.Errorf("an overflowing TAIL should carry a truncation marker:\n%s", out)
+	}
+}
+
+// ── feat/detail-panel-v2 ──────────────────────────────────────────────────
+
+// ── burn rate / ETA math ──────────────────────────────────────────────────
+
+func TestBudgetBurnRateSuffix_UnboundLoop_Omitted(t *testing.T) {
+	l := domain.Loop{Cycle: 5, TokensSpent: 100, Goal: domain.Goal{BudgetTokens: 1000}} // no Goal.Text — unbound
+	if got := budgetBurnRateSuffix(l); got != "" {
+		t.Errorf("got %q, want empty (unbound loop)", got)
+	}
+}
+
+func TestBudgetBurnRateSuffix_CycleBelowTwo_Omitted(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 1000}, Cycle: 1, TokensSpent: 100}
+	if got := budgetBurnRateSuffix(l); got != "" {
+		t.Errorf("got %q, want empty (cycle < 2)", got)
+	}
+}
+
+func TestBudgetBurnRateSuffix_AlreadyOverBudget_Omitted(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 1000}, Cycle: 5, TokensSpent: 1500}
+	if got := budgetBurnRateSuffix(l); got != "" {
+		t.Errorf("got %q, want empty (already over budget, no future ETA)", got)
+	}
+}
+
+func TestBudgetBurnRateSuffix_ComputesRateAndETACycle(t *testing.T) {
+	// rate = 1,800,000/6 = 300,000/cyc; remaining = 200,000; cyclesLeft =
+	// round(200,000/300,000) = 1; etaCycle = 6+1 = 7.
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 2_000_000}, Cycle: 6, TokensSpent: 1_800_000}
+	got := budgetBurnRateSuffix(l)
+	if !strings.Contains(got, "300k/cyc") {
+		t.Errorf("got %q, want it to mention the ~300k/cyc rate", got)
+	}
+	if !strings.Contains(got, "cap ~c7") {
+		t.Errorf("got %q, want it to mention the ETA cycle ~c7", got)
+	}
+}
+
+func TestBudgetLine_UnboundLoop_NoSuffixButBaseStillRenders(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{BudgetTokens: 1000}, TokensSpent: 500}
+	got := budgetLine(l)
+	if !strings.Contains(got, "500") {
+		t.Errorf("got %q, want the base spent/cap text present regardless of the suffix", got)
+	}
+	if strings.Contains(got, "/cyc") {
+		t.Errorf("got %q, want no burn-rate suffix for an unbound loop", got)
+	}
+}
+
+// ── STAGE row ──────────────────────────────────────────────────────────────
+
+func TestStageElapsed_PrefersBoundAt(t *testing.T) {
+	now := time.Now()
+	l := domain.Loop{BoundAt: now.Add(-90 * time.Second)}
+	got, ok := stageElapsed(l, detailData{now: now})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != 90*time.Second {
+		t.Errorf("got %v, want 90s", got)
+	}
+}
+
+func TestStageElapsed_FallsBackToFirstEventTS(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-5 * time.Minute).UnixNano(), SessionID: "s1", ToState: "running"},
+		{TS: now.Add(-3 * time.Minute).UnixNano(), SessionID: "s1", ToState: "idle"},
+	}
+	got, ok := stageElapsed(domain.Loop{}, detailData{now: now, events: evs})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != 5*time.Minute {
+		t.Errorf("got %v, want 5m (from the FIRST/oldest event)", got)
+	}
+}
+
+func TestStageElapsed_NeitherSource_Omitted(t *testing.T) {
+	if _, ok := stageElapsed(domain.Loop{}, detailData{now: time.Now()}); ok {
+		t.Error("expected ok=false — no BoundAt and no event history at all")
+	}
+}
+
+func TestRenderStageRow_OmittedWithoutElapsedSource(t *testing.T) {
+	if _, ok := renderStageRow(domain.Loop{Cycle: 3}, detailData{now: time.Now()}); ok {
+		t.Error("expected ok=false — STAGE has nothing to compute elapsed from")
+	}
+}
+
+func TestRenderStageRow_GitSegmentOmittedWhenNotOK(t *testing.T) {
+	l := domain.Loop{Cycle: 3, BoundAt: time.Now().Add(-time.Minute)}
+	got, ok := renderStageRow(l, detailData{now: time.Now(), git: gitStatsResult{ok: false}})
+	if !ok {
+		t.Fatal("expected ok=true (elapsed is computable)")
+	}
+	if strings.Contains(got, "file") {
+		t.Errorf("got %q, want no file/± segment when git stats aren't ok", got)
+	}
+}
+
+func TestRenderStageRow_IncludesGitSegmentWhenOK(t *testing.T) {
+	l := domain.Loop{Cycle: 3, BoundAt: time.Now().Add(-time.Minute)}
+	got, ok := renderStageRow(l, detailData{now: time.Now(), git: gitStatsResult{files: 2, plus: 47, minus: 9, ok: true}})
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(got, "2 files +47 −9") {
+		t.Errorf("got %q, want the git file/± segment", got)
+	}
+}
+
+func TestRenderDetail_StageRowAbsentForUnboundLoop(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, BoundAt: time.Now().Add(-time.Minute)}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "STAGE") {
+		t.Errorf("STAGE must not render for an unbound loop even with a valid BoundAt:\n%s", out)
+	}
+}
+
+func TestRenderDetail_StageRowPresentForBoundLoop(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cycle: 3,
+		Goal: domain.Goal{Text: "fix it", MaxCycles: 12}, BoundAt: time.Now().Add(-4 * time.Minute)}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "STAGE") {
+		t.Errorf("STAGE should render for a bound loop with a valid elapsed source:\n%s", out)
+	}
+}
+
+// ── LAST ERROR extraction + staleness ───────────────────────────────────────
+
+func TestIsErrorStale_ErrorBeforeRecovery_Stale(t *testing.T) {
+	now := time.Now()
+	errTS := now.Add(-10 * time.Minute)
+	evs := []events.Event{
+		{TS: now.Add(-9 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "running"}, // recovered AFTER the error
+	}
+	if !isErrorStale(errTS, evs) {
+		t.Error("expected the error to be stale — the loop recovered after it")
+	}
+}
+
+func TestIsErrorStale_ErrorAfterRecovery_NotStale(t *testing.T) {
+	now := time.Now()
+	errTS := now.Add(-1 * time.Minute)
+	evs := []events.Event{
+		{TS: now.Add(-9 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "running"}, // recovery predates the error
+	}
+	if isErrorStale(errTS, evs) {
+		t.Error("expected the error to be current — it happened AFTER the last recovery")
+	}
+}
+
+func TestIsErrorStale_NoRecoveryEventAtAll_NotStale(t *testing.T) {
+	if isErrorStale(time.Now(), nil) {
+		t.Error("expected not stale — nothing to compare against, so don't suppress")
+	}
+}
+
+// TestIsErrorStale_ZeroTimestamp_FailsOpen is the P2 review fix's
+// regression: an unparseable transcript timestamp (claude.LastError /
+// entryTimestamp return the zero time.Time) must NOT be treated as
+// "infinitely old" — that would silently suppress a possibly-LIVE error
+// any time there's ANY healthy transition on record, with no visible
+// symptom other than "LAST ERROR never shows up". Fail open: show it.
+func TestIsErrorStale_ZeroTimestamp_FailsOpen(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "running"},
+	}
+	if isErrorStale(time.Time{}, evs) {
+		t.Error("expected NOT stale for a zero errorTS, even with a healthy transition on record — must fail open")
+	}
+}
+
+func TestIsErrorStale_IdleAlsoCountsAsHealthy(t *testing.T) {
+	now := time.Now()
+	errTS := now.Add(-10 * time.Minute)
+	evs := []events.Event{
+		{TS: now.Add(-9 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "idle"},
+	}
+	if !isErrorStale(errTS, evs) {
+		t.Error("expected stale — idle counts as a healthy recovery state too")
+	}
+}
+
+func TestRenderDetail_LastErrorBlock_ShownWhenCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateStalled, Stall: domain.StallRateLimit, Path: path}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected a LAST ERROR block:\n%s", out)
+	}
+	if !strings.Contains(out, "API Error: 429 rate limited") {
+		t.Errorf("expected the VERBATIM error text:\n%s", out)
+	}
+}
+
+func TestRenderDetail_LastErrorBlock_SuppressedWhenStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	oldTS := time.Now().Add(-time.Hour)
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + oldTS.Format(time.RFC3339) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: path}
+	evs := []events.Event{
+		{TS: time.Now().Add(-30 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "idle"}, // recovered since the error
+	}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), events: evs})
+	if strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected NO LAST ERROR block — the loop recovered since this error:\n%s", out)
+	}
+}
+
+func TestRenderDetail_NoErrorAtAll_NoBlock(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: "/no/such/file.jsonl"}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected no LAST ERROR block when there's no transcript error:\n%s", out)
+	}
+}
+
+// ── VERDICTS block ───────────────────────────────────────────────────────
+
+func TestRenderVerdictsBlock_NoOracleEvents_Empty(t *testing.T) {
+	if got := renderVerdictsBlock(nil, 80); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestRenderVerdictsBlock_ShowsNewestThreeInDescendingOrder(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-4 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "progress at cycle 1: first"},
+		{TS: now.Add(-3 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "progress at cycle 2: second"},
+		{TS: now.Add(-2 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "rejected at cycle 3: third"},
+		{TS: now.Add(-1 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "done at cycle 4: fourth"},
+	}
+	got := renderVerdictsBlock(evs, 80)
+	if strings.Contains(got, "\"first\"") {
+		t.Errorf("got %q, want only the newest 3 (the oldest, \"first\", must be excluded)", got)
+	}
+	newestIdx := strings.Index(got, "\"fourth\"")
+	middleIdx := strings.Index(got, "\"third\"")
+	oldestIdx := strings.Index(got, "\"second\"")
+	if newestIdx == -1 || middleIdx == -1 || oldestIdx == -1 {
+		t.Fatalf("got %q, want second/third/fourth all present", got)
+	}
+	if !(newestIdx < middleIdx && middleIdx < oldestIdx) {
+		t.Errorf("got %q, want newest-first ordering", got)
+	}
+	if !strings.Contains(got, "VERDICTS (4)") {
+		t.Errorf("got %q, want the VERDICTS(4) header — the TOTAL oracle event count, not just the 3 shown", got)
+	}
+}
+
+func TestRenderVerdictsBlock_DoneShowsCheckmark_RejectedShowsCross(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"},
+		{TS: 2, Trigger: events.TriggerOracle, Detail: "rejected at cycle 2: not ok"},
+	}
+	got := renderVerdictsBlock(evs, 80)
+	if !strings.Contains(got, "✓") {
+		t.Errorf("got %q, want a ✓ for the done verdict", got)
+	}
+	if !strings.Contains(got, "✗") {
+		t.Errorf("got %q, want a ✗ for the rejected verdict", got)
+	}
+}
+
+func TestRenderVerdictsBlock_ReasonRenderedVerbatim(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerOracle, Detail: `done at cycle 1: the exact, unparaphrased reason text`},
+	}
+	got := renderVerdictsBlock(evs, 200)
+	if !strings.Contains(got, `"the exact, unparaphrased reason text"`) {
+		t.Errorf("got %q, want the verbatim reason quoted", got)
+	}
+}
+
+func TestRenderDetail_VerdictsBlockAbsentForUnboundLoop(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
+	evs := []events.Event{{TS: 1, Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"}}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), events: evs})
+	if strings.Contains(out, "VERDICTS") {
+		t.Errorf("VERDICTS must not render for an unbound loop:\n%s", out)
+	}
+}
+
+// ── EVENTS block: height budgeting + actor glyphs ───────────────────────────
+
+func TestEventActorGlyph(t *testing.T) {
+	cases := []struct {
+		actor events.Actor
+		want  string
+	}{
+		{events.ActorHuman, "☺ "},
+		{events.ActorAuto, "⎇ "},
+		{events.ActorSystem, "  "},
+	}
+	for _, c := range cases {
+		if got := eventActorGlyph(c.actor); got != c.want {
+			t.Errorf("eventActorGlyph(%v) = %q, want %q", c.actor, got, c.want)
+		}
+	}
+}
+
+func TestRenderEventsBlock_BelowMinRows_Empty(t *testing.T) {
+	evs := []events.Event{{TS: 1, Trigger: events.TriggerScan, ToState: "running"}}
+	if got := renderEventsBlock(evs, 80, eventsMinRows-1); got != "" {
+		t.Errorf("got %q, want empty below eventsMinRows", got)
+	}
+}
+
+func TestRenderEventsBlock_NoEvents_Empty(t *testing.T) {
+	if got := renderEventsBlock(nil, 80, 10); got != "" {
+		t.Errorf("got %q, want empty with no history at all", got)
+	}
+}
+
+func TestRenderEventsBlock_FillsExactlyMaxRows(t *testing.T) {
+	var evs []events.Event
+	for i := 0; i < 20; i++ {
+		evs = append(evs, events.Event{TS: int64(i), Trigger: events.TriggerScan, FromState: "running", ToState: "idle"})
+	}
+	for _, maxRows := range []int{eventsMinRows, 5, 10} {
+		got := renderEventsBlock(evs, 80, maxRows)
+		lines := strings.Split(got, "\n")
+		if len(lines) != maxRows {
+			t.Errorf("maxRows=%d: got %d lines, want exactly %d", maxRows, len(lines), maxRows)
+		}
+	}
+}
+
+func TestRenderEventsBlock_NewestFirst_NeverCoalesced(t *testing.T) {
+	// Three identical stalled->running->stalled flaps must all render as
+	// separate lines — "flapping IS the signal" (never coalesced) — even
+	// though every transition is the identical running<->stalled pair.
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-3 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "running", ToState: "stalled:no-output", Detail: "first"},
+		{TS: now.Add(-2 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "stalled:no-output", ToState: "running", Detail: "second"},
+		{TS: now.Add(-1 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "running", ToState: "stalled:no-output", Detail: "third"},
+	}
+	got := renderEventsBlock(evs, 80, 10)
+	if strings.Count(got, "→") != 3 {
+		t.Errorf("got %q, want all 3 transitions rendered separately (not coalesced)", got)
+	}
+	firstIdx := strings.Index(got, "first")
+	secondIdx := strings.Index(got, "second")
+	thirdIdx := strings.Index(got, "third")
+	if firstIdx == -1 || secondIdx == -1 || thirdIdx == -1 {
+		t.Fatalf("got %q, want all three distinct events present", got)
+	}
+	if !(thirdIdx < secondIdx && secondIdx < firstIdx) {
+		t.Errorf("got %q, want newest-first ordering (third, then second, then first)", got)
+	}
+}
+
+func TestRenderEventsBlock_ActuationEventShowsDetailVerbatim(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman},
+	}
+	got := renderEventsBlock(evs, 80, 10)
+	if !strings.Contains(got, "☺") {
+		t.Errorf("got %q, want the human actor glyph", got)
+	}
+	if !strings.Contains(got, "kill tier1 ok") {
+		t.Errorf("got %q, want the actuation detail verbatim", got)
+	}
+}
+
+func TestRenderDetail_EventsBlockAbsentWhenTooLittleHeight(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerScan, FromState: "running", ToState: "idle"},
+	}
+	// A very small height budget must simply omit EVENTS, not error/panic.
+	out := renderDetail(l, 80, 6, detailData{now: time.Now(), events: evs})
+	if strings.Contains(out, "EVENTS") {
+		t.Errorf("EVENTS should be omitted at a too-small height budget:\n%s", out)
+	}
+}
+
+func TestRenderDetail_EventsBlockPresentWithEnoughHeight(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
+	var evs []events.Event
+	for i := 0; i < 10; i++ {
+		evs = append(evs, events.Event{TS: int64(i), Trigger: events.TriggerScan, FromState: "running", ToState: "idle"})
+	}
+	out := renderDetail(l, 80, 60, detailData{now: time.Now(), events: evs})
+	if !strings.Contains(out, "EVENTS") {
+		t.Errorf("expected an EVENTS block with a generous height budget:\n%s", out)
+	}
+}
+
+// ── flap counter ─────────────────────────────────────────────────────────
+
+func TestOrdinal(t *testing.T) {
+	cases := map[int]string{1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 11: "11th", 12: "12th", 13: "13th", 21: "21st", 22: "22nd", 23: "23rd", 111: "111th"}
+	for n, want := range cases {
+		if got := ordinal(n); got != want {
+			t.Errorf("ordinal(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestFlapCounter_SingleStall_NotFlagged(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-10 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+	}
+	if _, _, ok := flapCounter(evs, now); ok {
+		t.Error("expected ok=false — a single stall isn't a flap")
+	}
+}
+
+func TestFlapCounter_ThreeStallsWithinHour_Flagged(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-20 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+		{TS: now.Add(-15 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:rate-limit"},
+		{TS: now.Add(-5 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:gone"},
+	}
+	count, span, ok := flapCounter(evs, now)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
+	}
+	if span != 20*time.Minute {
+		t.Errorf("span = %v, want 20m (from the earliest counted stall)", span)
+	}
+}
+
+func TestFlapCounter_StallOutsideWindow_Ignored(t *testing.T) {
+	now := time.Now()
+	evs := []events.Event{
+		{TS: now.Add(-2 * time.Hour).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"}, // outside the 1h window
+		{TS: now.Add(-5 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:gone"},
+	}
+	if _, _, ok := flapCounter(evs, now); ok {
+		t.Error("expected ok=false — only 1 stall within the window")
+	}
+}
+
+func TestRenderResumeCallout_FlapCounterAppendedWhenFlapping(t *testing.T) {
+	now := time.Now()
+	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
+	evs := []events.Event{
+		{TS: now.Add(-20 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+		{TS: now.Add(-15 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:rate-limit"},
+		{TS: now.Add(-5 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "stalled:no-output"},
+	}
+	out := renderResumeCallout(l, 80, evs, now)
+	if !strings.Contains(out, "3rd stall in 20:00") {
+		t.Errorf("got %q, want the flap counter annotation (formatUptime's mm:ss form)", out)
+	}
+}
+
+func TestRenderResumeCallout_NoFlap_NoAnnotation(t *testing.T) {
+	l := domain.Loop{SessionID: "sess-1", Stall: domain.StallNoOutput}
+	out := renderResumeCallout(l, 80, nil, time.Now())
+	if strings.Contains(out, "stall in") {
+		t.Errorf("got %q, want no flap annotation with no flap history", out)
 	}
 }
 
@@ -2705,7 +3752,7 @@ func TestDetectTransitions_FirstAppearance_NoEvent(t *testing.T) {
 	m := New() // m.loops is empty — every session in newLoops is "brand new"
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 0 {
 		t.Fatalf("got %d transitions on first appearance, want 0", len(got))
@@ -2722,7 +3769,7 @@ func TestSeedFirstAppearanceGate_AlreadyGated_SeedsNotifyAndEvent(t *testing.T) 
 	m := New()
 	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions for an already-gated first appearance, want 1 (seeded)", len(got))
@@ -2755,7 +3802,7 @@ func TestSeedFirstAppearanceGate_DedupAppliesOnRestartWithinWindow(t *testing.T)
 	now := time.Now()
 	loops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
 
-	first := m.detectTransitions(loops, now)
+	first, _ := m.detectTransitions(loops, now)
 	if len(first) != 1 || !first[0].notify {
 		t.Fatalf("first seed: got %#v, want one notify-flagged transition", first)
 	}
@@ -2764,7 +3811,7 @@ func TestSeedFirstAppearanceGate_DedupAppliesOnRestartWithinWindow(t *testing.T)
 	// being called again before Update ever assigns m.loops = newLoops (not
 	// how Update actually sequences it, but shouldNotify's ledger is what's
 	// under test here, not the m.loops assignment timing).
-	second := m.detectTransitions(loops, now.Add(time.Second))
+	second, _ := m.detectTransitions(loops, now.Add(time.Second))
 	if len(second) != 1 {
 		t.Fatalf("got %d transitions on the second identical seed, want 1 (still seeded, just not re-notified)", len(second))
 	}
@@ -2777,7 +3824,7 @@ func TestSeedFirstAppearanceGate_NonGateFirstAppearance_NotSeeded(t *testing.T) 
 	m := New()
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 0 {
 		t.Fatalf("got %d transitions for a non-gate first appearance, want 0 (only StateGate is seeded, per the review's explicit scope)", len(got))
@@ -2789,7 +3836,7 @@ func TestDetectTransitions_StateChange_EmitsOneEvent(t *testing.T) {
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateIdle}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions, want 1", len(got))
@@ -2813,11 +3860,11 @@ func TestDetectTransitions_SameStateAcrossTwoScans_OnlyOneEventTotal(t *testing.
 	now := time.Now()
 
 	scan2 := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}}
-	firstTransitions := m.detectTransitions(scan2, now)
+	firstTransitions, _ := m.detectTransitions(scan2, now)
 	m.loops = scan2 // simulate Update overwriting m.loops after this scan
 
 	scan3 := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}} // unchanged
-	secondTransitions := m.detectTransitions(scan3, now.Add(3*time.Second))
+	secondTransitions, _ := m.detectTransitions(scan3, now.Add(3*time.Second))
 
 	if len(firstTransitions) != 1 {
 		t.Fatalf("scan1→scan2: got %d transitions, want 1 (the real running→stalled edge)", len(firstTransitions))
@@ -2834,7 +3881,7 @@ func TestDetectTransitions_StallKindChange_SameLoopState_StillCountsAsATransitio
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions for a stall-kind-only change, want 1", len(got))
@@ -2863,7 +3910,7 @@ func TestDetectTransitions_IntoGate_FlaggedForNotify(t *testing.T) {
 	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
 	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 || !got[0].notify {
 		t.Fatalf("got %#v, want exactly one notify-flagged transition", got)
@@ -2884,7 +3931,7 @@ func TestDetectTransitions_OrdinaryTransition_NotFlaggedForNotify(t *testing.T) 
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateIdle}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions, want 1", len(got))
@@ -2901,7 +3948,7 @@ func TestDetectTransitions_AlreadyGated_NoRepeatNotifyFlagOnUnrelatedChange(t *t
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "old?"}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "old?"}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 0 {
 		t.Fatalf("got %d transitions for an unchanged gate, want 0 (same signature both scans)", len(got))
@@ -2969,16 +4016,16 @@ func TestDetectTransitions_DedupAppliesAcrossScans_SecondGateEntryNotRenotified(
 	now := time.Now()
 
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
-	first := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}, now)
+	first, _ := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}, now)
 	if len(first) != 1 || !first[0].notify {
 		t.Fatalf("first gate entry: got %#v, want one notify-flagged transition", first)
 	}
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}
 
 	// leaves the gate, then re-enters it, both within the dedup window.
-	left := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateRunning}}, now.Add(time.Second))
+	left, _ := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateRunning}}, now.Add(time.Second))
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
-	second := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p2"}}, now.Add(2*time.Second))
+	second, _ := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p2"}}, now.Add(2*time.Second))
 
 	if len(left) != 1 {
 		t.Fatalf("leaving the gate: got %d transitions, want 1 (still a real, history-worthy transition)", len(left))
@@ -3129,5 +4176,477 @@ func TestSendPromptCmd_StateFailedRefusal_NoActuationEventRecorded(t *testing.T)
 	}
 	if len(got) != 0 {
 		t.Fatalf("got %d sessions with events, want 0 (refused before any tier was reached)", len(got))
+	}
+}
+
+// ── feat/auto-redrive-429 ──────────────────────────────────────────────────
+
+// withAutoRedriveEnabled overrides autoRedriveEnabledFn to the given value
+// for the duration of one test, restoring the original on cleanup — the
+// opt-in kill switch's test seam (see autoRedriveEnabledFn's doc).
+func withAutoRedriveEnabled(t *testing.T, enabled bool) {
+	t.Helper()
+	orig := autoRedriveEnabledFn
+	t.Cleanup(func() { autoRedriveEnabledFn = orig })
+	autoRedriveEnabledFn = func() bool { return enabled }
+}
+
+// ── opt-in default / kill switch ─────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_OptOutDefault_NeverSchedules(t *testing.T) {
+	withAutoRedriveEnabled(t, false)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	beforeStatus := m.status
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — auto-redrive is opt-in, off by default")
+	}
+	if m.status != beforeStatus {
+		t.Errorf("status = %q, want unchanged from %q — nothing should have happened", m.status, beforeStatus)
+	}
+}
+
+// ── edge-triggered scheduling ─────────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_EdgeTriggersSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	now := time.Now()
+
+	cmd := m.maybeScheduleAutoRedrive429(l, true, now)
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (the scheduled tea.Tick)")
+	}
+	if !strings.Contains(m.status, "auto: re-driving aboard in 5m (attempt 1/3)") {
+		t.Errorf("status = %q, want the scheduled-status text", m.status)
+	}
+	if got, ok := m.autoRedriveScheduledAt["s1"]; !ok || !got.Equal(now) {
+		t.Errorf("autoRedriveScheduledAt[s1] = %v, ok=%v, want %v", got, ok, now)
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_NotAnEdge_NoSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, false, time.Now()); cmd != nil {
+		t.Error("expected nil — enteredRateLimit=false is not a fresh edge")
+	}
+}
+
+// ── dedup window ──────────────────────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_DedupWindow_SecondCallWithinWindowRefused(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	now := time.Now()
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now); cmd == nil {
+		t.Fatal("first call should schedule")
+	}
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now.Add(time.Minute)); cmd != nil {
+		t.Error("expected nil — within the dedup window of the first schedule")
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_AfterDedupWindowExpires_SchedulesAgain(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	now := time.Now()
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now); cmd == nil {
+		t.Fatal("first call should schedule")
+	}
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now.Add(autoRedriveDelay+time.Second)); cmd == nil {
+		t.Error("expected a non-nil cmd — the dedup window has elapsed")
+	}
+}
+
+// ── attempt ceiling ───────────────────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_AttemptCeiling_NoScheduleAtMax(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	m.autoRedriveAttempts = map[string]int{"s1": autoRedriveMaxAttempts}
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — already at the lifetime attempt ceiling")
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_BelowCeiling_Schedules(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	m.autoRedriveAttempts = map[string]int{"s1": autoRedriveMaxAttempts - 1}
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd == nil {
+		t.Error("expected a non-nil cmd — one attempt below the ceiling")
+	}
+}
+
+// ── gate/failed defense in depth ─────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_StateFailed_NeverSchedules(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateFailed, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — StateFailed must never auto-redrive")
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_StateGate_NeverSchedules(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateGate}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — StateGate must never auto-redrive")
+	}
+}
+
+// ── autoRedriveAttemptCount: lazy recount from the event log ──────────────
+
+func TestAutoRedriveAttemptCount_LazySeedsFromEventLog(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	for i := 1; i <= 2; i++ {
+		if err := events.Append(historyDir, events.Event{
+			TS: int64(i), SessionID: "s1", ToState: "stalled:rate-limit",
+			Trigger: events.TriggerActuation, Actor: events.ActorAuto,
+			Detail: fmt.Sprintf("%s%d/%d", autoRedriveDetailPrefix, i, autoRedriveMaxAttempts),
+		}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	m := New()
+	if got := m.autoRedriveAttemptCount("s1"); got != 2 {
+		t.Errorf("got %d, want 2 (recounted from the event log — restart-safe ceiling)", got)
+	}
+}
+
+func TestAutoRedriveAttemptCount_NoHistory_Zero(t *testing.T) {
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	if got := m.autoRedriveAttemptCount("no-such-session"); got != 0 {
+		t.Errorf("got %d, want 0", got)
+	}
+}
+
+func TestAutoRedriveAttemptCount_IgnoresOtherActuationEvents(t *testing.T) {
+	historyDir := t.TempDir()
+	historyDirFn = func() string { return historyDir }
+	if err := events.Append(historyDir, events.Event{TS: 1, SessionID: "s1", Trigger: events.TriggerActuation, Actor: events.ActorHuman, Detail: "kill tier1 ok"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	m := New()
+	if got := m.autoRedriveAttemptCount("s1"); got != 0 {
+		t.Errorf("got %d, want 0 — a human kill event must not count as an auto-redrive attempt", got)
+	}
+}
+
+// ── detectTransitions integration ────────────────────────────────────────
+
+func TestDetectTransitions_EnteredRateLimit_Enabled_SchedulesAutoRedrive(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	_, cmds := m.detectTransitions(newLoops, time.Now())
+
+	if len(cmds) != 1 {
+		t.Fatalf("got %d auto-redrive cmds, want 1", len(cmds))
+	}
+}
+
+func TestDetectTransitions_EnteredRateLimit_OptedOut_NoSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, false)
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	_, cmds := m.detectTransitions(newLoops, time.Now())
+
+	if len(cmds) != 0 {
+		t.Errorf("got %d auto-redrive cmds, want 0 (opted out)", len(cmds))
+	}
+}
+
+func TestDetectTransitions_AlreadyRateLimited_NotANewEdge_NoSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	_, cmds := m.detectTransitions(newLoops, time.Now())
+
+	if len(cmds) != 0 {
+		t.Errorf("got %d auto-redrive cmds, want 0 — already rate-limited last scan, not a fresh edge", len(cmds))
+	}
+}
+
+// ── autoRedriveScheduledMsg: re-check at fire time ────────────────────────
+
+func TestUpdate_AutoRedriveScheduledMsg_StillRateLimited_FiresRedrive(t *testing.T) {
+	withFakeActuationSeams(t, nil, func(sessionID, prompt string) error { return nil })
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (autoRedrive429Cmd)")
+	}
+	if m.autoRedriveAttempts["s1"] != 1 {
+		t.Errorf("autoRedriveAttempts[s1] = %d, want 1", m.autoRedriveAttempts["s1"])
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_Recovered_SkipsFiring(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}} // recovered — no longer rate-limited
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd != nil {
+		t.Error("expected nil — the loop recovered before the delayed redrive fired")
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_LoopGone_SkipsFiring(t *testing.T) {
+	m := New()
+	m.loops = nil // the session aged out of the fleet entirely
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd != nil {
+		t.Error("expected nil — the session is no longer in the fleet at all")
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_NowGateOrFailed_SkipsFiring(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate}} // hit a gate during the delay
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+	if cmd != nil {
+		t.Error("expected nil — no longer StateStalled/StallRateLimit")
+	}
+}
+
+// ── P1 review fix: auto-redrive joins the m.actuating interlock ─────────
+
+func TestUpdate_AutoRedriveScheduledMsg_ManualRedriveInFlight_Skips(t *testing.T) {
+	// A manual "r"/"i" resume already in flight for this session (e.g. the
+	// human pressed r just before the scheduled tick fired) must make the
+	// auto-redrive skip — not race a second concurrent Tier-2 send.
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+	m.actuating = map[string]bool{"s1": true} // simulates a manual resume already dispatched
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd != nil {
+		t.Error("expected nil — a manual actuation is already in flight for this session")
+	}
+	if m.autoRedriveAttempts["s1"] != 0 {
+		t.Errorf("autoRedriveAttempts[s1] = %d, want 0 — the skipped attempt must not count against the ceiling", m.autoRedriveAttempts["s1"])
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_Fires_SetsActuating(t *testing.T) {
+	withFakeActuationSeams(t, nil, func(sessionID, prompt string) error { return nil })
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd")
+	}
+	if !m.actuating["s1"] {
+		t.Error("expected s1 to be marked actuating once the auto-redrive is dispatched")
+	}
+}
+
+// TestUpdate_RKey_AutoRedriveInFlight_ManualResumeRefuses proves the
+// interlock works in the OTHER direction: once an auto-redrive has set
+// m.actuating, the EXISTING manual "r"-key guard (which already checks
+// m.actuating before dispatching resumeCmd) now sees it and refuses — no
+// change needed to that guard itself, just to what sets the flag.
+func TestUpdate_RKey_AutoRedriveInFlight_ManualResumeRefuses(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+	m.loops[0].Stall = domain.StallRateLimit
+	m.actuating = map[string]bool{"sess-1": true} // simulates an auto-redrive already dispatched
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — an auto-redrive is already in flight for this session")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want the already-re-driving message", m.status)
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_ClearsActuatingInterlock(t *testing.T) {
+	m := New()
+	m.actuating = map[string]bool{"s1": true}
+
+	m, _ = updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: 1, ok: true})
+
+	if m.actuating["s1"] {
+		t.Error("expected s1's actuating flag cleared once the auto-redrive result arrives")
+	}
+}
+
+// ── autoRedrive429Cmd: event emission + exhausted notification ───────────
+
+func TestAutoRedrive429Cmd_RecordsEventWithActorAuto(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+	origRedrive := redriveFn
+	defer func() { redriveFn = origRedrive }()
+	redriveFn = func(sessionID, prompt string) error { return nil }
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	autoRedrive429Cmd(l, 1)()
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["s1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	ev := evs[0]
+	if ev.Trigger != events.TriggerActuation {
+		t.Errorf("Trigger = %v, want TriggerActuation", ev.Trigger)
+	}
+	if ev.Actor != events.ActorAuto {
+		t.Errorf("Actor = %v, want ActorAuto (unattended — distinct from every human actuation)", ev.Actor)
+	}
+	if ev.Detail != "auto-redrive-429 attempt 1/3" {
+		t.Errorf("Detail = %q, want the exact literal format", ev.Detail)
+	}
+}
+
+// TestAutoRedrive429Cmd_NeverSendsNotificationDirectly is the P2 review
+// fix's structural regression: the exhaustion-notification DECISION moved
+// to Update's autoRedriveResultMsg handler (keyed on the ceiling, via the
+// shouldNotify dedup ledger, which only a Model method can mutate) —
+// autoRedrive429Cmd itself must never call notifySendFn, regardless of
+// attempt number or outcome.
+func TestAutoRedrive429Cmd_NeverSendsNotificationDirectly(t *testing.T) {
+	historyDirFn = func() string { return t.TempDir() }
+	origRedrive := redriveFn
+	defer func() { redriveFn = origRedrive }()
+	origNotify := notifySendFn
+	defer func() { notifySendFn = origNotify }()
+	notifyCalled := false
+	notifySendFn = func(title, body string) error { notifyCalled = true; return nil }
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	for _, outcome := range []error{nil, errTestJudgeFailed} {
+		redriveFn = func(sessionID, prompt string) error { return outcome }
+		for attempt := 1; attempt <= autoRedriveMaxAttempts; attempt++ {
+			autoRedrive429Cmd(l, attempt)()
+		}
+	}
+	if notifyCalled {
+		t.Error("autoRedrive429Cmd must never call notifySendFn directly, at any attempt or outcome")
+	}
+}
+
+// ── autoRedriveResultMsg: exhaustion keyed on the ceiling, not err ────────
+
+func TestUpdate_AutoRedriveResultMsg_FinalAttemptSuccess_StillNotifiesExhausted(t *testing.T) {
+	// The P2 review fix's core case: the common exhaustion scenario is the
+	// FINAL attempt sending just fine (ok=true) and the loop simply
+	// staying rate-limited — the old err!=nil-only check left this
+	// completely silent. Deliberately does NOT invoke the returned cmd —
+	// that would call the real notify.Send (osascript) unless overridden;
+	// TestAutoRedriveExhaustedNotifyCmd_SendsCorrectTitleAndBody already
+	// covers the cmd's own behavior with notifySendFn properly stubbed.
+	m := New()
+	_, cmd := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: true})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (autoRedriveExhaustedNotifyCmd) even though the final attempt succeeded")
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_FinalAttemptFailure_NotifiesExhausted(t *testing.T) {
+	m := New()
+	_, cmd := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: false})
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (autoRedriveExhaustedNotifyCmd)")
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_NonFinalAttempt_NoNotification(t *testing.T) {
+	m := New()
+	_, cmd1 := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: 1, ok: false})
+	if cmd1 != nil {
+		t.Error("expected nil — attempt 1 of 3 is not the ceiling, no exhaustion yet")
+	}
+	m2 := New()
+	_, cmd2 := updateModel(t, m2, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: 1, ok: true})
+	if cmd2 != nil {
+		t.Error("expected nil — attempt 1 of 3, even on success, is not the ceiling")
+	}
+}
+
+func TestUpdate_AutoRedriveResultMsg_DedupedNotifyOnlyOnce(t *testing.T) {
+	m := New()
+	m, cmd1 := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: false})
+	if cmd1 == nil {
+		t.Fatal("expected the first exhaustion to notify")
+	}
+	_, cmd2 := updateModel(t, m, autoRedriveResultMsg{sessionID: "s1", project: "aboard", attempt: autoRedriveMaxAttempts, ok: false})
+	if cmd2 != nil {
+		t.Error("expected nil — a second exhaustion report for the SAME session must not re-notify (shouldNotify's dedup ledger)")
+	}
+}
+
+func TestAutoRedriveExhaustedNotifyCmd_SendsCorrectTitleAndBody(t *testing.T) {
+	origNotify := notifySendFn
+	defer func() { notifySendFn = origNotify }()
+	var gotTitle, gotBody string
+	notifySendFn = func(title, body string) error {
+		gotTitle, gotBody = title, body
+		return nil
+	}
+
+	autoRedriveExhaustedNotifyCmd("aboard")()
+
+	if gotTitle != notifyTitlePrefix+"missionctl · auto-redrive exhausted" {
+		t.Errorf("title = %q, want the exhausted title", gotTitle)
+	}
+	if gotBody != "aboard" {
+		t.Errorf("body = %q, want the project label", gotBody)
 	}
 }

@@ -4,10 +4,12 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -153,9 +155,10 @@ const (
 )
 
 // mode distinguishes normal fleet-navigation input from the "n" key's
-// free-text goal prompt, the "/" key's filter query, and the "i" key's
-// arbitrary-prompt injection, so arrow/letter keys route to the text input
-// instead of moving the cursor or triggering actions while typing.
+// free-text goal prompt, the "/" key's filter query, the "i" key's
+// arbitrary-prompt injection, and the "r" key's DRIFT-loop hint prompt
+// (feat/drift-guided-redrive), so arrow/letter keys route to the text
+// input instead of moving the cursor or triggering actions while typing.
 type mode int
 
 const (
@@ -163,6 +166,7 @@ const (
 	modePrompting
 	modeFiltering
 	modeInjecting
+	modeDriftHint
 )
 
 // wizardStep is which question of the "n" key's loop-contract wizard is
@@ -232,6 +236,12 @@ type Model struct {
 	// Stall/State fields sendPromptCmd's guards re-check.
 	injectTarget domain.Loop
 
+	// driftHintTarget is the StateDrift loop a modeDriftHint prompt's
+	// corrective hint will be re-driven against — same snapshot-at-
+	// keypress-time reasoning as injectTarget (the fleet can rescan/reorder
+	// while the human is mid-typing the hint).
+	driftHintTarget domain.Loop
+
 	pendingKillSession string // non-empty while awaiting the confirming second "k"
 	pendingKillAt      time.Time
 
@@ -261,6 +271,29 @@ type Model struct {
 	// notification for a still-open gate is a fine trade against
 	// persisting this ledger to disk for a purely cosmetic dedup window.
 	notifiedAt map[string]time.Time
+
+	// gitStats caches the selected loop's working-tree diff stats (files
+	// changed, +/- lines — feat/detail-panel-v2's STAGE row), keyed by
+	// SessionID. Populated by gitStatsCmd, dispatched once per scan tick
+	// (loopsMsg) for ONLY the currently-selected loop — no other loop's
+	// stats are ever rendered, so computing them for the whole fleet would
+	// be pure waste. A zero-value entry (ok=false) simply means "not
+	// computed yet" or "not a git repo" — STAGE omits the file/± portion
+	// either way (see renderStageRow).
+	gitStats map[string]gitStatsResult
+
+	// autoRedriveAttempts/autoRedriveScheduledAt back feat/auto-redrive-429
+	// — the opt-in 429 auto-redrive policy (see
+	// maybeScheduleAutoRedrive429). autoRedriveAttempts is sessionID ->
+	// LIFETIME attempt count (capped at autoRedriveMaxAttempts), lazily
+	// seeded from the event log on first need per session (see
+	// autoRedriveAttemptCount) so a missionctl restart doesn't reset the
+	// ceiling. autoRedriveScheduledAt is sessionID -> when an auto-redrive
+	// was last SCHEDULED — the dedup window that keeps a second
+	// rate-limit edge for the same session, within autoRedriveDelay of the
+	// last one, from scheduling another.
+	autoRedriveAttempts    map[string]int
+	autoRedriveScheduledAt map[string]time.Time
 }
 
 func New() Model {
@@ -288,13 +321,76 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case loopsMsg:
 		newLoops := []domain.Loop(msg)
 		now := time.Now()
-		transitions := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
+		transitions, autoRedriveCmds := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
 		m.loops = newLoops
 		if m.cursor >= len(m.visibleLoops()) {
 			m.cursor = maxInt(0, len(m.visibleLoops())-1)
 		}
 		m.lastScan = now
-		return m, tea.Batch(m.triggerJudgments(), emitTransitionsCmd(transitions))
+		// feat/detail-panel-v2: refresh the SELECTED loop's git stats once
+		// per scan tick — never the whole fleet's (no other loop's stats
+		// are ever rendered, so that would be pure waste).
+		var gitCmd tea.Cmd
+		if sel, ok := m.selected(); ok {
+			gitCmd = gitStatsCmd(sel)
+		}
+		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd}, autoRedriveCmds...)
+		return m, tea.Batch(cmds...)
+	case gitStatsMsg:
+		if m.gitStats == nil {
+			m.gitStats = make(map[string]gitStatsResult)
+		}
+		m.gitStats[msg.sessionID] = msg.stats
+		return m, nil
+	case autoRedriveScheduledMsg:
+		// Re-check the CURRENT (latest scan) state before firing — a loop
+		// that recovered (or aged out of the fleet) during the 5-minute
+		// delay is silently skipped, per the task ("just don't fire", no
+		// skipped event logged).
+		l, found := m.loopBySessionID(msg.sessionID)
+		if !found || l.State != domain.StateStalled || l.Stall != domain.StallRateLimit {
+			return m, nil
+		}
+		// Review fix (P1): auto-redrive now joins the SAME m.actuating
+		// interlock the manual r/i actuations already use — a manual
+		// resume/inject already in flight for this session must not race
+		// against an auto-redrive firing at the same time (most acutely,
+		// two concurrent Tier-2 `claude --resume` headless turns). If
+		// something is already in flight, skip silently: the next 429
+		// scan edge (if the loop is still rate-limited once the manual
+		// action completes) will reschedule.
+		if m.actuating[l.SessionID] {
+			return m, nil
+		}
+		attempt := m.autoRedriveAttemptCount(l.SessionID) + 1
+		m.autoRedriveAttempts[l.SessionID] = attempt
+		m.setActuating(l.SessionID)
+		return m, autoRedrive429Cmd(l, attempt)
+	case autoRedriveResultMsg:
+		// Review fix (P1): clear the SAME interlock set when
+		// autoRedrive429Cmd was dispatched — mirrors resumeResultMsg's own
+		// clear exactly, so a manual r/i press right after an auto-redrive
+		// completes is never wrongly refused as "already re-driving".
+		if m.actuating != nil {
+			delete(m.actuating, msg.sessionID)
+		}
+		if msg.ok {
+			m.status, m.statusKind = fmt.Sprintf("auto-redrive %s: attempt %d/%d sent", msg.project, msg.attempt, autoRedriveMaxAttempts), statusNeutral
+		} else {
+			m.status, m.statusKind = fmt.Sprintf("auto-redrive %s: attempt %d/%d failed", msg.project, msg.attempt, autoRedriveMaxAttempts), statusErr
+		}
+		// Review fix (P2): the exhaustion notification is keyed on
+		// REACHING THE CEILING, not on the redrive's own transport error —
+		// the common exhaustion case is the 3rd attempt sending just fine
+		// (ok=true) and the loop simply staying rate-limited (the API
+		// itself is still saying no), which the old err!=nil-only check
+		// left completely silent. Deduped via the SAME notify ledger
+		// mechanism as the gate/gone edges (shouldNotify), keyed
+		// "auto-exhausted" so it only ever fires once per session.
+		if msg.attempt >= autoRedriveMaxAttempts && m.shouldNotify(msg.sessionID, "auto-exhausted", time.Now()) {
+			return m, autoRedriveExhaustedNotifyCmd(msg.project)
+		}
+		return m, nil
 	case tickMsg:
 		return m, tea.Batch(scan, tick())
 	case tea.KeyMsg:
@@ -418,6 +514,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.mode == modeDriftHint {
+			switch key {
+			case "esc":
+				m.mode = modeNormal
+				m.input.Blur()
+				m.status, m.statusKind = "cancelled", statusNeutral
+				return m, nil
+			case "enter":
+				// Unlike modeInjecting, an EMPTY submission does NOT
+				// cancel — "hint (enter=none)" means pressing Enter with
+				// nothing typed is a valid choice: re-drive with no
+				// corrective hint at all (composeDriftPrompt returns the
+				// last prompt unchanged). Only Esc cancels.
+				hint := strings.TrimSpace(m.input.Value())
+				m.mode = modeNormal
+				m.input.Blur()
+				if m.actuating[m.driftHintTarget.SessionID] {
+					m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", m.driftHintTarget.Project), statusNeutral
+					return m, nil
+				}
+				m.status, m.statusKind = fmt.Sprintf("re-driving %s...", m.driftHintTarget.Project), statusNeutral
+				m.setActuating(m.driftHintTarget.SessionID)
+				return m, driftRedriveCmd(m.driftHintTarget, hint)
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -467,6 +593,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", sel.Project), statusNeutral
 				return m, nil
 			}
+			// feat/drift-guided-redrive: a DRIFT loop's "r" no longer
+			// blindly resends the exact prompt the oracle just rejected —
+			// that throws away its reason. Instead it opens a one-line
+			// hint input (same shape as the "i" key's inject prompt); the
+			// ambiguity guard still applies at THIS keypress time (fail
+			// fast before the human even starts typing a hint), same as
+			// every other actuation dispatch in this file.
+			if sel.State == domain.StateDrift {
+				if !m.ttyPathPlausible(sel) {
+					if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+						m.status, m.statusKind = msg, statusErr
+						return m, nil
+					}
+				}
+				m.driftHintTarget = sel
+				m.mode = modeDriftHint
+				m.input = textinput.New()
+				m.input.Prompt = ""
+				m.input.Focus()
+				return m, textinput.Blink
+			}
 			if sel.Stall == domain.StallGone {
 				// Goes straight to Tier 2 (headless redrive, see
 				// sendPromptCmd) — there's no terminal surface to resolve
@@ -508,15 +655,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Keypress-time state gate mirroring sendPromptCmd's own guards, so
 			// the human doesn't type a whole prompt only to have it silently
 			// refused after Enter (fail fast, before they invest typing effort).
-			// StateFailed is the SAME condition sendPromptCmd itself re-checks —
-			// surfaced early here (belt-and-suspenders, like the r-key guard).
-			// Unlike "r", injection is deliberately NOT restricted to
-			// stalled/drifted loops: idle/running/gated loops are all valid
-			// targets — flexibility is the point of the feature. StallGone no
-			// longer refuses (see sendPromptCmd's Tier 2 redrive path) — it's
-			// now a perfectly valid inject target, just routed headlessly.
+			// StateFailed/StateKilled are the SAME conditions sendPromptCmd
+			// itself re-checks — surfaced early here (belt-and-suspenders,
+			// like the r-key guard). Unlike "r", injection is deliberately
+			// NOT restricted to stalled/drifted loops: idle/running/gated
+			// loops are all valid targets — flexibility is the point of the
+			// feature. StallGone no longer refuses (see sendPromptCmd's
+			// Tier 2 redrive path) — it's now a perfectly valid inject
+			// target, just routed headlessly.
 			if sel.State == domain.StateFailed {
 				m.status, m.statusKind = "governor stopped this loop — k kill or start a new contract, don't inject", statusErr
+				return m, nil
+			}
+			// fix/killed-state: a human's kill decision must not be
+			// silently overridable via Tier 2's headless redrive
+			// (`claude --resume <id> -p <prompt>` would actually REVIVE a
+			// killed session) — StateKilled is domain.LoopState.Terminal(),
+			// same policy-not-capability reasoning as StateFailed above.
+			if sel.State == domain.StateKilled {
+				m.status, m.statusKind = "this loop was killed — start a new contract, don't inject", statusErr
 				return m, nil
 			}
 			// In-flight guard, same reasoning as the r-key's: fail fast
@@ -595,6 +752,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sel, ok := m.selected()
 			if !ok {
 				m.status, m.statusKind = "select a loop to kill", statusNeutral
+				return m, nil
+			}
+			// fix/killed-state: fail fast for a loop that's already gone —
+			// no point running the two-press confirm dance (or reaching
+			// killCmd's own resolveActuationTargetFn call, which would
+			// otherwise surface a confusing "no unambiguous claude
+			// surface" error for a process that simply isn't there
+			// anymore) just to end up back here with the same message.
+			if sel.State == domain.StateKilled || sel.Stall == domain.StallGone {
+				m.status, m.statusKind = fmt.Sprintf("%s already killed/gone — it will age out of the window", sel.Project), statusNeutral
 				return m, nil
 			}
 			now := time.Now()
@@ -738,6 +905,19 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		if l.State == domain.StateFailed {
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "governor stopped this loop (no improvement) — k kill or start a new contract"}
 		}
+		// fix/killed-state: same policy-not-capability reasoning as
+		// StateFailed above — Tier 2's headless redrive
+		// (`claude --resume <id> -p <prompt>`) is fully capable of
+		// reviving a killed session (it doesn't care whether a human
+		// killed it), so this must be blocked at the policy layer, not
+		// left to accidentally succeed. Belt-and-suspenders: the "i" key's
+		// keypress-time guard (Update) already refuses before this is ever
+		// reached via the TUI, but resumeCmd's own "r" guard only checks
+		// Stalled/Drift (which already excludes Killed) — this is the one
+		// shared choke point both paths funnel through.
+		if l.State == domain.StateKilled {
+			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "this loop was killed — start a new contract, don't resume/inject"}
+		}
 
 		if l.Stall != domain.StallGone {
 			ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
@@ -777,6 +957,39 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 			note = " (no prior prompt found — sent Enter only)"
 		}
 		return sendPromptCmd(l, prompt, "resume", "resumed", note)()
+	}
+}
+
+// composeDriftPrompt appends an operator's corrective hint to lastPrompt —
+// "<lastPrompt>\n\n[operator correction] <hint>" — the feat/drift-guided-
+// redrive fix for "r" on a StateDrift loop blindly resending the exact
+// prompt the oracle just rejected, throwing away its reason. hint=""
+// (enter=none — the RE-DRIVE prompt's own label) returns lastPrompt
+// unchanged. Pure function, directly unit-testable without driving key
+// presses through Update.
+func composeDriftPrompt(lastPrompt, hint string) string {
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		return lastPrompt
+	}
+	return lastPrompt + "\n\n[operator correction] " + hint
+}
+
+// driftRedriveCmd is resumeCmd's DRIFT-specific sibling: same fetch-last-
+// prompt-then-sendPromptCmd shape, with the operator's hint woven in via
+// composeDriftPrompt. Kept as its own function (a little duplication with
+// resumeCmd) rather than threading a hint parameter through resumeCmd
+// itself, since resumeCmd's OTHER caller (StateStalled, via the "r" key)
+// never has a hint to offer at all.
+func driftRedriveCmd(l domain.Loop, hint string) tea.Cmd {
+	return func() tea.Msg {
+		prompt, ok := claude.LastUserPrompt(l.Path)
+		note := ""
+		if !ok {
+			note = " (no prior prompt found — sent Enter only)"
+		}
+		prompt = composeDriftPrompt(prompt, hint)
+		return sendPromptCmd(l, prompt, "resume", "re-drove", note)()
 	}
 }
 
@@ -838,6 +1051,15 @@ func manualAttachHint(cwd string) string {
 // pattern as resumeCmd/attachCmd.
 func approveCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
+		// fix/killed-state: defense in depth — the "a" keypress guard
+		// (Update) already requires StateGate, which a killed loop can
+		// never be, so this is currently unreachable via the TUI; kept
+		// here anyway so a future change to that guard can't accidentally
+		// let a killed loop reach a real actuation attempt without an
+		// explicit, sensible refusal.
+		if l.State == domain.StateKilled {
+			return approveResultMsg{false, "this loop was killed — nothing to approve"}
+		}
 		// Tier 1 only (tty → cwd) — approving a gate has no headless Tier-2
 		// equivalent (there's no "press Enter" over `claude --resume -p`;
 		// that starts a brand new turn, not an in-place keypress).
@@ -1146,8 +1368,12 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// SAFETY: same reasoning as resumeCmd's StallGone guard — if the
 		// process is already gone, there's nothing to send "/exit" into
 		// (and doing so anyway risks typing it into a bare shell instead).
-		if l.Stall == domain.StallGone {
-			return killResultMsg{true, fmt.Sprintf("%s already gone — nothing to kill", l.Project)}
+		// fix/killed-state: belt-and-suspenders mirror of the "k" keypress
+		// guard (Update) — StateKilled reaching here at all would only
+		// happen via a stale dispatch, but the discipline in this file is
+		// every guard gets re-checked at the actual dispatch site too.
+		if l.State == domain.StateKilled || l.Stall == domain.StallGone {
+			return killResultMsg{true, fmt.Sprintf("%s already killed/gone — it will age out of the window", l.Project)}
 		}
 		// Tier 1 only (tty → cwd) — killing has no headless Tier-2
 		// equivalent (there's no live conversation left to type "/exit"
@@ -1163,8 +1389,17 @@ func killCmd(l domain.Loop) tea.Cmd {
 			logActuationEvent(l, "kill", "tier1", false, err.Error())
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
 		}
+		// fix/killed-state: the event is written HERE, immediately once
+		// the "/exit" keystroke is confirmed sent — not once the process
+		// has actually exited (which happens asynchronously, outside this
+		// call's control). That's exactly what lets the NEXT scan's
+		// mostRecentActuationIsKill see a kill on record and derive
+		// StateKilled as soon as the process is confirmed gone — the
+		// status line deliberately does NOT optimistically set local model
+		// state itself (that would be a fake, unverified state the next
+		// scan could immediately contradict).
 		logActuationEvent(l, "kill", "tier1", true, "")
-		return killResultMsg{true, fmt.Sprintf("killed %s", l.Project)}
+		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
 	}
 }
 
@@ -1172,6 +1407,13 @@ func killCmd(l domain.Loop) tea.Cmd {
 // process — the loop stays alive, resumable with r.
 func interruptCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
+		// fix/killed-state: defense in depth — the "p" keypress guard
+		// (Update) already requires Running/Gate, which a killed loop can
+		// never be, so this is currently unreachable via the TUI; kept
+		// here anyway, same reasoning as approveCmd's mirror check.
+		if l.State == domain.StateKilled {
+			return interruptResultMsg{false, "this loop was killed — nothing to stop"}
+		}
 		// Tier 1 only (tty → cwd) — interrupting has no headless Tier-2
 		// equivalent (there's no in-flight turn to interrupt via a fresh
 		// --resume -p call; that would start a brand new turn instead).
@@ -1251,8 +1493,13 @@ func judgeCmd(l domain.Loop) tea.Cmd {
 			FromState: l.StateString(),
 			ToState:   l.StateString(),
 			Trigger:   events.TriggerOracle,
-			Detail:    fmt.Sprintf("%s at cycle %d", verdict.Outcome, l.Cycle),
-			Actor:     events.ActorAuto,
+			// feat/detail-panel-v2: the reason is appended verbatim (council
+			// hard rule: never paraphrased) — see events.ParseOracleDetail,
+			// which the VERDICTS block uses to pull it back out. Backward
+			// compatible with report.go's existing outcome-only parser
+			// (still splits on " at cycle", unaffected by anything after).
+			Detail: fmt.Sprintf("%s at cycle %d: %s", verdict.Outcome, l.Cycle, verdict.Reason),
+			Actor:  events.ActorAuto,
 		})
 		return verdictMsg{sessionID: l.SessionID, verdict: verdict}
 	}
@@ -1323,6 +1570,202 @@ const notifyDedupWindow = 10 * time.Minute
 // Center at a glance, without needing an icon at all.
 const notifyTitlePrefix = "🚀 "
 
+// ── feat/auto-redrive-429: opt-in 429 auto-redrive ───────────────────────
+//
+// The FIRST piece of automation this codebase ships — every condition
+// below is a hard gate, not a preference, per the council's "safety bar is
+// maximal" constraint:
+//   - opt-in only, off by default (autoRedriveEnabledFn — env
+//     MISSIONCTL_AUTO_REDRIVE_429=1; unset it to disable entirely, no
+//     in-app toggle this slice).
+//   - Tier 2 ONLY (redriveFn, the headless `claude --resume -p` path) —
+//     never types into a terminal, sidestepping the wrong-surface hazard
+//     entirely for an automated (unattended) action.
+//   - re-checked at fire time against the CURRENT scan snapshot — a loop
+//     that recovered during the 5-minute delay is silently skipped, not
+//     force-redriven.
+//   - a hard lifetime ceiling (3 attempts) and a per-session dedup window,
+//     both enforced before ever scheduling.
+//   - joins the SAME m.actuating interlock manual r/i actuations use
+//     (review fix, P1): a manual resume/inject already in flight skips the
+//     auto-redrive rather than racing it, and vice versa.
+
+// autoRedriveEnabledFn checks the opt-in env var — a func var (not a bare
+// os.Getenv call) so tests don't need to mutate a real process
+// environment variable.
+var autoRedriveEnabledFn = func() bool {
+	return os.Getenv("MISSIONCTL_AUTO_REDRIVE_429") == "1"
+}
+
+const (
+	// autoRedriveDelay is BOTH the schedule-to-fire delay AND the
+	// per-session dedup window (see maybeScheduleAutoRedrive429) — one
+	// constant, since "no auto-redrive attempted in the last 5 minutes"
+	// and "wait 5 minutes before firing" are the same 5 minutes: you can't
+	// schedule a NEW one while the previous one's delay hasn't elapsed.
+	autoRedriveDelay = 5 * time.Minute
+	// autoRedriveMaxAttempts is the LIFETIME cap on auto-redrive attempts
+	// per session (not per day/window) — recounted from the event log on
+	// restart (autoRedriveAttemptCount), never reset.
+	autoRedriveMaxAttempts = 3
+)
+
+// autoRedriveDetailPrefix is the exact detail-field prefix every
+// auto-redrive attempt event carries ("auto-redrive-429 attempt N/3" — the
+// task's own literal wording) — autoRedriveAttemptCount matches on this
+// prefix to recount attempts from the event log.
+const autoRedriveDetailPrefix = "auto-redrive-429 attempt "
+
+// autoRedriveScheduledMsg fires autoRedriveDelay after
+// maybeScheduleAutoRedrive429 schedules it — see scheduleAutoRedrive429Cmd.
+type autoRedriveScheduledMsg struct {
+	sessionID string
+}
+
+// scheduleAutoRedrive429Cmd is a delayed, one-shot tea.Tick — "must
+// survive nothing" per the task: if the TUI quits before this fires, the
+// pending retry is simply lost. Honest and safe (no on-disk "pending
+// retry" record to leak or double-fire on the next launch).
+func scheduleAutoRedrive429Cmd(sessionID string) tea.Cmd {
+	return tea.Tick(autoRedriveDelay, func(time.Time) tea.Msg {
+		return autoRedriveScheduledMsg{sessionID: sessionID}
+	})
+}
+
+// maybeScheduleAutoRedrive429 is the edge-triggered policy gate — called
+// from detectTransitions for every loop whose scan-detected transition
+// might be "entering StallRateLimit" (enteredRateLimit), the exact same
+// edge notify's gate/gone triggers hook into. Returns nil (schedule
+// nothing) unless EVERY condition holds:
+//  1. enteredRateLimit is true (a real edge THIS scan, not "still
+//     rate-limited from before").
+//  2. autoRedriveEnabledFn() — the opt-in kill switch.
+//  3. l.State is neither StateFailed nor StateGate — structurally
+//     unreachable here (l.State is StateStalled by construction of the
+//     rate-limit edge), but checked explicitly per the task's own wording
+//     (defense in depth, matching this codebase's belt-and-suspenders
+//     style elsewhere).
+//  4. no auto-redrive scheduled for this session within the last
+//     autoRedriveDelay (dedup).
+//  5. fewer than autoRedriveMaxAttempts lifetime attempts so far.
+//
+// On success: records the schedule time (closing the dedup window),
+// updates the status line ("auto: re-driving <label> in 5m (attempt
+// N/3)"), and returns scheduleAutoRedrive429Cmd's tea.Tick.
+func (m *Model) maybeScheduleAutoRedrive429(l domain.Loop, enteredRateLimit bool, now time.Time) tea.Cmd {
+	if !enteredRateLimit || !autoRedriveEnabledFn() {
+		return nil
+	}
+	if l.State == domain.StateFailed || l.State == domain.StateGate {
+		return nil
+	}
+	if last, ok := m.autoRedriveScheduledAt[l.SessionID]; ok && now.Sub(last) < autoRedriveDelay {
+		return nil
+	}
+	attempts := m.autoRedriveAttemptCount(l.SessionID)
+	if attempts >= autoRedriveMaxAttempts {
+		return nil
+	}
+	if m.autoRedriveScheduledAt == nil {
+		m.autoRedriveScheduledAt = make(map[string]time.Time)
+	}
+	m.autoRedriveScheduledAt[l.SessionID] = now
+	m.status, m.statusKind = fmt.Sprintf("auto: re-driving %s in 5m (attempt %d/%d)", l.Project, attempts+1, autoRedriveMaxAttempts), statusNeutral
+	return scheduleAutoRedrive429Cmd(l.SessionID)
+}
+
+// autoRedriveAttemptCount returns sessionID's lifetime auto-redrive
+// attempt count, lazily seeding Model.autoRedriveAttempts from the event
+// log (counting TriggerActuation events whose Detail has
+// autoRedriveDetailPrefix) the FIRST time it's asked about a given
+// session — so a missionctl restart recounts from disk instead of
+// silently resetting the ceiling to 0.
+func (m *Model) autoRedriveAttemptCount(sessionID string) int {
+	if m.autoRedriveAttempts == nil {
+		m.autoRedriveAttempts = make(map[string]int)
+	}
+	if n, ok := m.autoRedriveAttempts[sessionID]; ok {
+		return n
+	}
+	evs, _ := events.Read(historyDirFn(), sessionID)
+	n := 0
+	for _, ev := range evs {
+		if ev.Trigger == events.TriggerActuation && strings.HasPrefix(ev.Detail, autoRedriveDetailPrefix) {
+			n++
+		}
+	}
+	m.autoRedriveAttempts[sessionID] = n
+	return n
+}
+
+// loopBySessionID finds sessionID in m.loops — used by
+// autoRedriveScheduledMsg's handler to re-check the CURRENT (latest scan)
+// state before firing a delayed auto-redrive.
+func (m Model) loopBySessionID(sessionID string) (domain.Loop, bool) {
+	for _, l := range m.loops {
+		if l.SessionID == sessionID {
+			return l, true
+		}
+	}
+	return domain.Loop{}, false
+}
+
+// autoRedriveResultMsg reports one auto-redrive attempt's outcome.
+type autoRedriveResultMsg struct {
+	sessionID string
+	project   string
+	attempt   int
+	ok        bool
+}
+
+// autoRedrive429Cmd fires attempt N's headless Tier-2 redrive (Tier 2
+// ONLY — see this section's doc) and records the attempt as a history
+// event regardless of outcome. actor=auto (per the task's explicit
+// wording) — distinct from every OTHER actuation event in this codebase
+// (always actor=human): this one really is unattended. The FINAL
+// (autoRedriveMaxAttempts-th) attempt always triggers the "exhausted"
+// desktop notification (see autoRedriveResultMsg's handler) regardless of
+// whether THIS attempt's transport call itself errored — there's nothing
+// more to schedule either way (the ceiling in maybeScheduleAutoRedrive429
+// already prevents a 4th attempt), so the human needs to know automated
+// retries are done, whether the last one technically "succeeded" (sent
+// fine, API still says no) or not.
+// Review fix (P2): the exhausted-notification DECISION moved to Update's
+// autoRedriveResultMsg handler (keyed on attempt==ceiling, not on err) —
+// see that handler's doc for why, and autoRedriveExhaustedNotifyCmd for the
+// actual (still async) notify.Send call.
+func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
+	return func() tea.Msg {
+		prompt, _ := claude.LastUserPrompt(l.Path) // an empty/absent prior prompt still redrives — same tolerance as resumeCmd
+		err := redriveFn(l.SessionID, prompt)
+		_ = events.Append(historyDirFn(), events.Event{
+			TS:        time.Now().UnixNano(),
+			SessionID: l.SessionID,
+			FromState: l.StateString(),
+			ToState:   l.StateString(),
+			Trigger:   events.TriggerActuation,
+			Detail:    fmt.Sprintf("%s%d/%d", autoRedriveDetailPrefix, attempt, autoRedriveMaxAttempts),
+			Actor:     events.ActorAuto,
+		})
+		return autoRedriveResultMsg{sessionID: l.SessionID, project: l.Project, attempt: attempt, ok: err == nil}
+	}
+}
+
+// autoRedriveExhaustedNotifyCmd sends the "auto-redrive exhausted" desktop
+// notification off the event loop. Split out from autoRedrive429Cmd
+// (review fix, P2) because the DECISION to notify needs Model.notifiedAt's
+// dedup ledger (shouldNotify), which only a pointer-receiver method on
+// Model can mutate — autoRedrive429Cmd itself has no Model access, matching
+// this codebase's established shape for actuation cmds (they close over a
+// Loop, never a Model). The actual notify.Send call stays async here, same
+// discipline as every other notification in this codebase.
+func autoRedriveExhaustedNotifyCmd(project string) tea.Cmd {
+	return func() tea.Msg {
+		_ = notifySendFn(notifyTitlePrefix+"missionctl · auto-redrive exhausted", project)
+		return nil
+	}
+}
+
 // shouldNotify applies the dedup ledger for sessionID's edge ("gate" or
 // "gone"), recording now as the edge's last-notified time whenever it
 // allows a notification through — pointer receiver so the decision (and the
@@ -1355,13 +1798,14 @@ func (m *Model) shouldNotify(sessionID, edge string, now time.Time) bool {
 // INTO StateGate or INTO StallGone, each independently dedup-gated via
 // shouldNotify. Severity floor: nothing else notifies yet (done/drift/429
 // are explicitly out of scope for this slice).
-func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []transitionEvent {
+func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) ([]transitionEvent, []tea.Cmd) {
 	prev := make(map[string]domain.Loop, len(m.loops))
 	for _, l := range m.loops {
 		prev[l.SessionID] = l
 	}
 
 	var out []transitionEvent
+	var cmds []tea.Cmd
 	for _, l := range newLoops {
 		before, ok := prev[l.SessionID]
 		if !ok {
@@ -1387,6 +1831,11 @@ func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []trans
 		enteredGate := before.State != domain.StateGate && l.State == domain.StateGate
 		enteredGone := l.State == domain.StateStalled && l.Stall == domain.StallGone &&
 			!(before.State == domain.StateStalled && before.Stall == domain.StallGone)
+		// feat/auto-redrive-429: the SAME edge notify's gate/gone triggers
+		// hook into — see maybeScheduleAutoRedrive429's doc for the full
+		// policy gate (opt-in, ceiling, dedup).
+		enteredRateLimit := l.State == domain.StateStalled && l.Stall == domain.StallRateLimit &&
+			!(before.State == domain.StateStalled && before.Stall == domain.StallRateLimit)
 		switch {
 		case enteredGate && m.shouldNotify(l.SessionID, "gate", now):
 			te.notify = true
@@ -1397,9 +1846,12 @@ func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []trans
 			te.title = notifyTitlePrefix + "missionctl · loop gone"
 			te.body = l.Project
 		}
+		if cmd := m.maybeScheduleAutoRedrive429(l, enteredRateLimit, now); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		out = append(out, te)
 	}
-	return out
+	return out, cmds
 }
 
 // seedFirstAppearanceGate is the review fix (P2) for a restart-timing gap:
@@ -1756,6 +2208,8 @@ func (m Model) renderBottomLine() string {
 		return renderFilterPrompt(m.input)
 	case modeInjecting:
 		return renderInjectPrompt(m)
+	case modeDriftHint:
+		return renderDriftHintPrompt(m)
 	default:
 		return renderStatusLine(m.status, m.statusKind)
 	}
@@ -2172,12 +2626,24 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 // would be new behavior the task's "behavior unchanged" doesn't ask for; see
 // the PR description's judgment-call note). A placeholder stands in when
 // nothing is selected.
+//
+// feat/detail-panel-v2: also gathers detailData here — the session's event
+// history (a couple of small local file reads via events.Read, cheap enough
+// to do synchronously in View()) and the cached git stats (gitStatsCmd,
+// computed asynchronously per scan tick — see Model.gitStats' doc) — so
+// renderDetail itself stays a pure function over already-known data.
 func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
 	sel, ok := m.selected()
 	if !ok {
 		return []string{stFaint.Render("select a loop to see its detail.")}
 	}
-	lines := strings.Split(renderDetail(sel, innerWidth), "\n")
+	evs, _ := events.Read(historyDirFn(), sel.SessionID) // best-effort; nil on error is fine (every consumer tolerates an empty slice)
+	data := detailData{
+		now:    time.Now(),
+		events: evs,
+		git:    m.gitStats[sel.SessionID],
+	}
+	lines := strings.Split(renderDetail(sel, innerWidth, innerHeight, data), "\n")
 	if len(lines) > innerHeight {
 		lines = lines[:innerHeight]
 	}
@@ -2272,21 +2738,140 @@ func shortID(id string) string {
 	return id[:4]
 }
 
+// ── git working-tree stats (feat/detail-panel-v2's STAGE row) ───────────
+//
+// Computing `git diff`/`git status` is real exec work (unlike reading the
+// event log, a couple of small local file reads) — doing it synchronously
+// inside View() would risk blocking the whole TUI on a wedged git process.
+// So it follows the SAME tea.Cmd/Msg pattern as judgeCmd/verdictMsg: fired
+// once per scan (loopsMsg), only for the currently-selected loop (the only
+// one ever rendered), result cached in Model.gitStats keyed by SessionID.
+
+// gitStatsResult is one loop's working-tree diff snapshot. ok=false means
+// "not a git repo, CwdVerified is false, or the git commands failed/timed
+// out" — STAGE simply omits the file/± portion in that case, never an
+// error shown to the human (this is a nice-to-have annotation, not fleet
+// state).
+type gitStatsResult struct {
+	files, plus, minus int
+	ok                 bool
+}
+
+// gitStatsMsg reports gitStatsCmd's result for sessionID.
+type gitStatsMsg struct {
+	sessionID string
+	stats     gitStatsResult
+}
+
+// gitStatsTimeout bounds each of the two git subprocess calls — a wedged
+// git (e.g. an NFS-mounted repo) must not hang the fleet loop.
+const gitStatsTimeout = 2 * time.Second
+
+// gitStatsCmd computes l's working-tree diff stats off the event loop.
+// CwdVerified is required (same "don't trust a lossy decoded path" guard
+// used elsewhere — see domain.Loop.CwdVerified's doc) — an unverified Cwd
+// isn't safe to run git commands against at all.
+func gitStatsCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		if !l.CwdVerified {
+			return gitStatsMsg{l.SessionID, gitStatsResult{}}
+		}
+		files, plus, minus, ok := computeGitStats(l.Cwd)
+		return gitStatsMsg{l.SessionID, gitStatsResult{files: files, plus: plus, minus: minus, ok: ok}}
+	}
+}
+
+// computeGitStats runs `git diff --shortstat` (tracked-file changes: file
+// count + insertions/deletions) and `git status --porcelain` (adds
+// untracked files to the file count — diff alone can't see them) in cwd.
+// ok=false if the FIRST command fails (not a git repo, or git itself
+// missing) — the second command's failure is tolerated (still returns the
+// diff-only numbers) since a status failure doesn't invalidate the diff.
+func computeGitStats(cwd string) (files, plus, minus int, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitStatsTimeout)
+	defer cancel()
+	diffOut, err := exec.CommandContext(ctx, "git", "-C", cwd, "diff", "--shortstat").Output()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	files, plus, minus = parseShortstat(string(diffOut))
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), gitStatsTimeout)
+	defer cancel2()
+	statusOut, err := exec.CommandContext(ctx2, "git", "-C", cwd, "status", "--porcelain").Output()
+	if err == nil {
+		files += countUntrackedFiles(string(statusOut))
+	}
+	return files, plus, minus, true
+}
+
+// shortstatRe parses `git diff --shortstat`'s summary line, e.g.
+// " 2 files changed, 47 insertions(+), 9 deletions(-)" — any of the three
+// clauses may be absent (e.g. a diff with only deletions omits
+// "insertions").
+var shortstatRe = regexp.MustCompile(`(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?`)
+
+func parseShortstat(s string) (files, plus, minus int) {
+	m := shortstatRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, 0, 0
+	}
+	files, _ = strconv.Atoi(m[1])
+	if m[2] != "" {
+		plus, _ = strconv.Atoi(m[2])
+	}
+	if m[3] != "" {
+		minus, _ = strconv.Atoi(m[3])
+	}
+	return files, plus, minus
+}
+
+// countUntrackedFiles counts `git status --porcelain` lines for an
+// untracked file ("??" prefix) — these never show up in `git diff`, which
+// only ever compares tracked content.
+func countUntrackedFiles(porcelain string) int {
+	n := 0
+	for _, line := range strings.Split(porcelain, "\n") {
+		if strings.HasPrefix(line, "??") {
+			n++
+		}
+	}
+	return n
+}
+
 // ── detail pane ──────────────────────────────────────────────
 
-// maxTailLines caps how many wrapped lines the detail pane's TAIL row shows —
-// a readability ceiling on the last assistant message (the captain floated
-// 5–10; 6 is the middle). Content beyond it is truncated with an ellipsis
-// marker; the full report lives in the pager / oracle, not here. It's a single
-// named constant so widening/narrowing the TAIL row is a one-line change.
-const maxTailLines = 6
+// tailMaxLines caps how many wrapped lines the detail pane's TAIL row shows.
+// feat/detail-panel-v2 (council: TAIL must not grow into a transcript
+// viewer — that's what ↵ attach is for) shrank this from 6 to 4 to make
+// room for the new LAST ERROR/VERDICTS/EVENTS blocks; the full report lives
+// in the pager / oracle / EVENTS block, not here.
+const tailMaxLines = 4
 
 // detailKeyWidth is the fixed column width of a detail row's KEY (see
 // detailRow). TAIL's wrapped continuation lines indent by exactly this much so
 // their text aligns under the value column instead of the label.
 const detailKeyWidth = 8
 
-func renderDetail(l domain.Loop, width int) string {
+// detailData bundles everything renderDetail needs beyond the Loop itself —
+// data that's either expensive (git stats) or requires "now"/the event log
+// for time-relative computations (STAGE elapsed, burn-rate ETA, LAST ERROR
+// staleness, VERDICTS, EVENTS, the STALLED callout's flap counter).
+// Gathered once by the caller (detailPanelLines) so renderDetail itself
+// stays a pure rendering function over already-known data — directly
+// testable without a real event-log dir or git repo.
+type detailData struct {
+	now    time.Time
+	events []events.Event // this session's history, oldest-first (events.Read's contract)
+	git    gitStatsResult
+}
+
+// eventsMinRows is the EVENTS block's floor: below this many rows available
+// (title line + at least 2 data rows), the whole block is omitted rather
+// than rendering a cramped, barely-useful sliver.
+const eventsMinRows = 3
+
+func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	// leave room for the ~8-col key + its gap before truncating long values
 	// (paths) so nothing overflows the terminal width.
 	valueWidth := width - 10
@@ -2321,36 +2906,379 @@ func renderDetail(l domain.Loop, width int) string {
 		if l.Goal.Oracle != "" {
 			d.WriteString(detailRow("RUBRIC", stDim.Render(trunc(l.Goal.Oracle, valueWidth))))
 		}
+		if stage, ok := renderStageRow(l, data); ok {
+			d.WriteString(detailRow("STAGE", stInk.Render(trunc(stage, valueWidth))))
+		}
 	}
-	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(fmt.Sprintf("%s / %s (%d%%)",
-		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100))))))
+	d.WriteString(detailRow("BUDGET", budgetStyle(l).Render(trunc(budgetLine(l), valueWidth))))
 	if l.Goal.Text != "" {
 		d.WriteString(detailRow("N/I", noImproveStyle(l).Render(noImproveLabel(l))))
 	}
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
-	if l.LastText != "" {
-		wrapped := wrapTailText(l.LastText, valueWidth, maxTailLines)
-		for i := range wrapped {
-			wrapped[i] = stDim.Render(wrapped[i])
-		}
-		d.WriteString(detailRowMultiline("TAIL", wrapped))
-	}
 
 	switch l.State {
 	case domain.StateStalled:
-		d.WriteString(renderResumeCallout(l, width))
+		d.WriteString(renderResumeCallout(l, width, data.events, data.now))
 	case domain.StateGate:
 		d.WriteString(renderGateCallout(l, width))
 	case domain.StateDrift:
 		d.WriteString(renderDriftCallout(l, width))
 	}
+
+	if errText, errTS, ok := lastErrorForDetail(l, data); ok {
+		d.WriteString(renderLastErrorBlock(errText, errTS, valueWidth))
+	}
+
+	if l.Goal.Text != "" {
+		if lines := renderVerdictsBlock(data.events, valueWidth); lines != "" {
+			d.WriteString(lines)
+		}
+	}
+
+	top := strings.TrimRight(d.String(), "\n")
+
+	var tail string
+	if l.LastText != "" {
+		wrapped := wrapTailText(l.LastText, valueWidth, tailMaxLines)
+		for i := range wrapped {
+			wrapped[i] = stDim.Render(wrapped[i])
+		}
+		tail = strings.TrimRight(detailRowMultiline("TAIL", wrapped), "\n")
+	}
+
+	// EVENTS absorbs whatever height is left after everything else
+	// (including TAIL, capped at tailMaxLines, and the top block above) —
+	// see eventsMinRows' doc for the floor below which it's omitted
+	// entirely rather than rendered cramped.
+	used := strings.Count(top, "\n") + 1
+	if tail != "" {
+		used += strings.Count(tail, "\n") + 1
+	}
+	remaining := height - used
+	eventsBlock := ""
+	if remaining >= eventsMinRows {
+		eventsBlock = renderEventsBlock(data.events, valueWidth, remaining)
+	}
+
+	var out strings.Builder
+	out.WriteString(top)
+	if eventsBlock != "" {
+		out.WriteString("\n")
+		out.WriteString(eventsBlock)
+	}
+	if tail != "" {
+		out.WriteString("\n")
+		out.WriteString(tail)
+	}
 	// No border/padding here (unlike the pre-two-pane stDetail wrap this
 	// used to return): renderDetail's output now lives INSIDE the DETAIL
 	// panel's own bordered box (see renderPanel), which already supplies
 	// the border — wrapping it again here would nest two borders.
-	return strings.TrimRight(d.String(), "\n")
+	return out.String()
+}
+
+// budgetLine is the BUDGET row's value: the existing "<spent> / <cap>
+// (P%)" plus, when computable, an inline burn rate + ETA cycle —
+// "3.9M / 2.0M · ~4.1k/cyc · cap ~c483" (rate = TokensSpent/Cycle; ETA
+// cycle = the cycle number at which the budget is projected to run out,
+// current cycle + remaining budget / rate). Omitted for an unbound loop,
+// before cycle 2 (not enough data for a meaningful rate), or once already
+// over budget (no future ETA to report — judgment call, see PR body).
+func budgetLine(l domain.Loop) string {
+	base := fmt.Sprintf("%s / %s (%d%%)",
+		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100)))
+	suffix := budgetBurnRateSuffix(l)
+	return base + suffix
+}
+
+func budgetBurnRateSuffix(l domain.Loop) string {
+	if l.Goal.Text == "" || l.Goal.BudgetTokens <= 0 || l.Cycle < 2 {
+		return ""
+	}
+	rate := float64(l.TokensSpent) / float64(l.Cycle)
+	if rate <= 0 {
+		return ""
+	}
+	remaining := float64(l.Goal.BudgetTokens - l.TokensSpent)
+	if remaining <= 0 {
+		return ""
+	}
+	etaCycle := l.Cycle + int(math.Round(remaining/rate))
+	return fmt.Sprintf(" · ~%s/cyc · cap ~c%d", prettyTokens(int(math.Round(rate))), etaCycle)
+}
+
+// plural: "" for n==1, "s" otherwise — the STAGE row's "N file(s)" wording.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// renderStageRow builds the STAGE row's value — "6/12 · elapsed 04:12 ·
+// 2 files +47 −9" — omitting the elapsed segment's SOURCE data entirely
+// (ok=false, the whole row is skipped by the caller) when neither BoundAt
+// nor the event log's first entry is available. The git file/± segment is
+// independently optional (silently omitted when not a git repo /
+// CwdVerified false — see gitStatsResult).
+func renderStageRow(l domain.Loop, data detailData) (string, bool) {
+	elapsed, ok := stageElapsed(l, data)
+	if !ok {
+		return "", false
+	}
+	line := fmt.Sprintf("%s · elapsed %s", cycleLabel(l), formatUptime(elapsed))
+	if g := data.git; g.ok && (g.files > 0 || g.plus > 0 || g.minus > 0) {
+		line += fmt.Sprintf(" · %d file%s +%d −%d", g.files, plural(g.files), g.plus, g.minus)
+	}
+	return line, true
+}
+
+// stageElapsed prefers BoundAt (when the loop is bound and its registry
+// record actually carries one); falling back to the event log's earliest
+// entry for this session (oldest-first, per events.Read's contract) —
+// "elapsed since we first knew about this loop" either way. ok=false when
+// NEITHER source is available.
+func stageElapsed(l domain.Loop, data detailData) (time.Duration, bool) {
+	if !l.BoundAt.IsZero() {
+		return data.now.Sub(l.BoundAt), true
+	}
+	if len(data.events) == 0 {
+		return 0, false
+	}
+	return data.now.Sub(time.Unix(0, data.events[0].TS)), true
+}
+
+// lastErrorForDetail extracts the loop's most recent transcript error
+// (internal/claude.LastError) and applies the staleness suppression rule:
+// don't show a stale error on a loop that has since recovered — compare
+// against the event log's last transition INTO a healthy state (running or
+// idle). ok=false when there's no error, or it's older than that recovery.
+func lastErrorForDetail(l domain.Loop, data detailData) (string, time.Time, bool) {
+	text, ts, ok := claude.LastError(l.Path)
+	if !ok {
+		return "", time.Time{}, false
+	}
+	if isErrorStale(ts, data.events) {
+		return "", time.Time{}, false
+	}
+	return text, ts, true
+}
+
+// isErrorStale reports whether errorTS predates the event log's most
+// recent scan-triggered transition into StateRunning or StateIdle — i.e.
+// the loop recovered AFTER this error was recorded, so it's stale news, not
+// a live incident.
+// Review fix (P2): a zero errorTS (claude.LastError couldn't parse the
+// transcript entry's timestamp — see entryTimestamp's doc) must FAIL OPEN
+// (treated as NOT stale, i.e. shown) rather than silently suppressing a
+// possibly-live error. The old code compared errorTS.UnixNano() directly —
+// the zero time.Time's UnixNano() is a huge NEGATIVE number, which is
+// "less than" any real lastHealthy timestamp, so an unparseable timestamp
+// was ALWAYS judged older than the last recovery and the block simply
+// never showed, with no visible symptom other than "LAST ERROR never
+// appears" — exactly the failure mode a "fail open" default exists to
+// avoid: if the transcript's timestamp format ever drifts from what
+// entryTimestamp expects, this must not become a silent, permanent blind
+// spot.
+func isErrorStale(errorTS time.Time, evs []events.Event) bool {
+	if errorTS.IsZero() {
+		return false
+	}
+	var lastHealthy int64
+	for _, ev := range evs {
+		if ev.Trigger != events.TriggerScan {
+			continue
+		}
+		if ev.ToState != string(domain.StateRunning) && ev.ToState != string(domain.StateIdle) {
+			continue
+		}
+		if ev.TS > lastHealthy {
+			lastHealthy = ev.TS
+		}
+	}
+	return lastHealthy > 0 && errorTS.UnixNano() < lastHealthy
+}
+
+// lastErrorMaxLines caps the LAST ERROR block's wrapped, head-truncated
+// display — "max ~5 lines" per the task; content beyond it is marked with
+// an ellipsis (via wrapTailText, the same word-wrap+cap machinery TAIL
+// uses) rather than shown unbounded (a single giant stack trace must not
+// swallow the whole panel).
+const lastErrorMaxLines = 5
+
+// renderLastErrorBlock renders the "LAST ERROR (hh:mm:ss · verbatim)"
+// section: a bold red label carrying the entry's own timestamp, then the
+// RAW error text (council hard rule: never paraphrased), word-wrapped and
+// capped.
+func renderLastErrorBlock(text string, ts time.Time, width int) string {
+	var b strings.Builder
+	b.WriteString("\n")
+	label := fmt.Sprintf("LAST ERROR (%s · verbatim)", ts.Format("15:04:05"))
+	b.WriteString(lipgloss.NewStyle().Foreground(cRed).Bold(true).Render(label))
+	b.WriteString("\n")
+	for _, line := range wrapTailText(text, width, lastErrorMaxLines) {
+		b.WriteString(stInk.Render(line))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderVerdictsBlock renders "VERDICTS (N/I n)" — the newest 3 oracle
+// verdicts from the event log, each "hh:mm ✓/✗ \"<reason verbatim>\"".
+// Falls back to the loop's current registry verdict (l.Last) alone when
+// the event log has none yet (e.g. history predates this feature, or was
+// pruned) — but that fallback needs the Loop itself, which this function
+// doesn't receive; see its caller in renderDetail, which only calls this
+// when data.events actually has oracle entries, and separately renders
+// l.Last via the existing ORACLE row when it doesn't. Returns "" (render
+// nothing) when there are no verdicts at all.
+func renderVerdictsBlock(evs []events.Event, width int) string {
+	var oracleEvs []events.Event
+	for _, ev := range evs {
+		if ev.Trigger == events.TriggerOracle {
+			oracleEvs = append(oracleEvs, ev)
+		}
+	}
+	if len(oracleEvs) == 0 {
+		return ""
+	}
+	// newest first, top 3 — oracleEvs is a sub-slice of evs, which
+	// events.Read guarantees oldest-first.
+	start := len(oracleEvs) - 3
+	if start < 0 {
+		start = 0
+	}
+	newest := oracleEvs[start:]
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(stFaint.Render(fmt.Sprintf("VERDICTS (%d)", len(oracleEvs))))
+	for i := len(newest) - 1; i >= 0; i-- {
+		ev := newest[i]
+		outcome, reason := events.ParseOracleDetail(ev.Detail)
+		icon, style := "✓", lipgloss.NewStyle().Foreground(cGreen)
+		if outcome == string(domain.OutcomeRejected) {
+			icon, style = "✗", lipgloss.NewStyle().Foreground(cRed)
+		}
+		t := time.Unix(0, ev.TS).Format("15:04")
+		line := fmt.Sprintf("%s %s %q", t, icon, reason)
+		b.WriteString("\n")
+		b.WriteString(style.Render(trunc(line, width)))
+	}
+	return b.String()
+}
+
+// eventActorGlyph: ☺ human, ⎇ auto, blank (2 spaces, for column alignment)
+// for system/scan-triggered events — the task's own glyph legend.
+func eventActorGlyph(a events.Actor) string {
+	switch a {
+	case events.ActorHuman:
+		return "☺ "
+	case events.ActorAuto:
+		return "⎇ "
+	default:
+		return "  "
+	}
+}
+
+// eventBody renders one event's from→to/action/verdict payload — the part
+// after the timestamp+glyph — varying by Trigger:
+//   - scan/governor: "<from>→<to>", plus Detail if any (e.g. a stall kind).
+//   - actuation: Detail verbatim (already a compact "<action> <tier>
+//     ok|failed: ..." string — see logActuationEvent).
+//   - oracle: "<outcome> \"<reason>\"" (verbatim reason, council hard rule).
+func eventBody(ev events.Event) string {
+	switch ev.Trigger {
+	case events.TriggerActuation:
+		return ev.Detail
+	case events.TriggerOracle:
+		outcome, reason := events.ParseOracleDetail(ev.Detail)
+		if reason != "" {
+			return fmt.Sprintf("%s %q", outcome, reason)
+		}
+		return outcome
+	default: // scan, governor
+		from := ev.FromState
+		if from == "" {
+			from = "—"
+		}
+		body := from + "→" + ev.ToState
+		if ev.Detail != "" {
+			body += " " + ev.Detail
+		}
+		return body
+	}
+}
+
+// renderEventsBlock renders the EVENTS section: the loop's history
+// newest-first, filling maxRows total lines (including its own "EVENTS"
+// title line — so maxRows-1 actual event lines). Never coalesces repeated
+// transitions (flapping IS the signal, per the task) — a session that
+// bounced stalled→running→stalled 5 times shows all 5 lines.
+func renderEventsBlock(evs []events.Event, width, maxRows int) string {
+	if len(evs) == 0 || maxRows < eventsMinRows {
+		return ""
+	}
+	dataRows := maxRows - 1 // one row spent on the title
+	var b strings.Builder
+	b.WriteString(stFaint.Render("EVENTS"))
+	shown := 0
+	for i := len(evs) - 1; i >= 0 && shown < dataRows; i-- {
+		ev := evs[i]
+		t := time.Unix(0, ev.TS).Format("15:04")
+		line := fmt.Sprintf("%s %s%s", t, eventActorGlyph(ev.Actor), eventBody(ev))
+		b.WriteString("\n")
+		b.WriteString(stDim.Render(trunc(line, width)))
+		shown++
+	}
+	return b.String()
+}
+
+// ordinal renders 1→"1st", 2→"2nd", 3→"3rd", 4→"4th", ... (English
+// ordinal suffix rules — the flap counter's "3rd stall in 20m" wording).
+func ordinal(n int) string {
+	if n%100 >= 11 && n%100 <= 13 {
+		return fmt.Sprintf("%dth", n)
+	}
+	switch n % 10 {
+	case 1:
+		return fmt.Sprintf("%dst", n)
+	case 2:
+		return fmt.Sprintf("%dnd", n)
+	case 3:
+		return fmt.Sprintf("%drd", n)
+	default:
+		return fmt.Sprintf("%dth", n)
+	}
+}
+
+// flapCounter counts scan-triggered transitions INTO any stalled state
+// within the last hour of now — the STALLED/429 callout's "(3rd stall in
+// 20m)" annotation. ok=false when count<=1 (nothing to call out — nobody
+// cares that a loop stalled exactly once). span is the time from the
+// EARLIEST counted stall to now, matching "Nth stall in <span>" — how long
+// this flapping pattern has been going on.
+func flapCounter(evs []events.Event, now time.Time) (count int, span time.Duration, ok bool) {
+	cutoff := now.Add(-time.Hour).UnixNano()
+	var first int64
+	for _, ev := range evs {
+		if ev.Trigger != events.TriggerScan || ev.TS < cutoff {
+			continue
+		}
+		if !strings.HasPrefix(ev.ToState, string(domain.StateStalled)) {
+			continue
+		}
+		count++
+		if first == 0 || ev.TS < first {
+			first = ev.TS
+		}
+	}
+	if count <= 1 {
+		return count, 0, false
+	}
+	return count, now.Sub(time.Unix(0, first)), true
 }
 
 // renderOracleDetail is the ORACLE row's value: icon + the verdict's actual
@@ -2440,7 +3368,12 @@ func wrapTailText(s string, width, maxLines int) []string {
 // session headlessly via `claude --resume <id> -p <prompt>`, which is
 // exactly the restart the manual hint spells out, just without the
 // copy-paste.
-func renderResumeCallout(l domain.Loop, width int) string {
+// renderResumeCallout's evs/now (feat/detail-panel-v2) drive the flap
+// counter — "(3rd stall in 20m)" appended to the stall-kind text when this
+// loop has stalled more than once in the last hour (flapCounter). Every
+// existing caller in this codebase now must pass the session's event
+// history; renderDetail is the only one, via data.events/data.now.
+func renderResumeCallout(l domain.Loop, width int, evs []events.Event, now time.Time) string {
 	gone := l.Stall == domain.StallGone
 	box, accent, chip := stCalloutAmber, cAmber, stKeyChipAmber
 	if l.Stall == domain.StallRateLimit || gone {
@@ -2461,8 +3394,13 @@ func renderResumeCallout(l domain.Loop, width int) string {
 			"   " + stDim.Render("manual: "+manualResumeHint(l.SessionID))
 	}
 
+	stallText := string(l.Stall)
+	if count, span, ok := flapCounter(evs, now); ok {
+		stallText += fmt.Sprintf("  (%s stall in %s)", ordinal(count), formatUptime(span))
+	}
+
 	line := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(label) +
-		" " + stInk.Render(string(l.Stall)) +
+		" " + stInk.Render(stallText) +
 		"   " + action
 	return "\n" + box.Width(contentWidth).Render(line)
 }
@@ -2487,9 +3425,11 @@ func renderGateCallout(l domain.Loop, width int) string {
 }
 
 // renderDriftCallout is the mockup's red gate-line for a loop the oracle
-// rejected: "DRIFT ▸ <reason>   r re-drive   k kill". "r" re-drives the
-// loop by re-sending its LAST USER PROMPT (resumeCmd already allows
-// StateDrift, same send path as a stalled loop's resume).
+// rejected: "DRIFT ▸ <reason>   r re-drive with hint   k kill". "r" opens
+// the one-line hint-input step (feat/drift-guided-redrive) before
+// re-driving the loop with its LAST USER PROMPT plus the operator's
+// optional corrective hint appended (see composeDriftPrompt) — no longer a
+// blind resend of the exact prompt the oracle just rejected.
 func renderDriftCallout(l domain.Loop, width int) string {
 	contentWidth := width - 4
 	if contentWidth < 20 {
@@ -2501,7 +3441,7 @@ func renderDriftCallout(l domain.Loop, width int) string {
 	}
 	line := lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("DRIFT ▸") +
 		" " + stInk.Render(reason) +
-		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive") +
+		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive with hint") +
 		"   " + stKeyChipRed.Render("k") + stDim.Render(" kill")
 	return "\n" + stCalloutRed.Width(contentWidth).Render(line)
 }
@@ -2605,6 +3545,16 @@ func renderInjectPrompt(m Model) string {
 		line += "  " + lipgloss.NewStyle().Foreground(cAmber).Render("(running — lands mid-turn)")
 	}
 	return line
+}
+
+// renderDriftHintPrompt replaces the status line while the "r" key's
+// DRIFT-loop hint input is active: "RE-DRIVE ▸ <project> ◂ hint
+// (enter=none): <input>" — same "always show which loop this targets"
+// discipline as renderInjectPrompt.
+func renderDriftHintPrompt(m Model) string {
+	head := lipgloss.NewStyle().Foreground(cAccent).Bold(true).
+		Render("RE-DRIVE ▸ " + m.driftHintTarget.Project + " ◂ hint (enter=none): ")
+	return head + m.input.View()
 }
 
 // renderKeybar: only keys that actually do something today.
