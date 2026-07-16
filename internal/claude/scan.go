@@ -672,10 +672,18 @@ func assistantMessageText(entry map[string]any) (string, bool) {
 // it across up to maxTailLines lines at the pane's width; the DOING column
 // hard-truncates it to its own narrow column. Keeping LastText itself
 // single-line lets both callers wrap/truncate as they see fit.
+//
+// max is a RUNE count, not a byte count — cut by rune (not internal/tui's
+// trunc, to avoid a tui->claude dependency; same "byte-index slice can land
+// mid-character" hazard trunc's own doc comment warns about). Session
+// transcripts routinely contain multi-byte text (e.g. Korean, 3 bytes/rune in
+// UTF-8); a byte-index cut at the max boundary can slice a rune in half,
+// rendering as a stray "�" right before the "…" marker.
 func summarizeTailText(s string, max int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	return string(r[:max]) + "…"
 }

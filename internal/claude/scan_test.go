@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/gate"
@@ -438,6 +439,34 @@ func TestLastAssistantText_CollapsesNewlinesAndCapsAtTailTextCap(t *testing.T) {
 		t.Errorf("got %q, want truncated with an ellipsis", got)
 	}
 	// tailTextCap runes of content + the 1-rune ellipsis marker.
+	if n := len([]rune(got)); n != tailTextCap+1 {
+		t.Errorf("capped length = %d runes, want %d (tailTextCap + ellipsis)", n, tailTextCap+1)
+	}
+}
+
+func TestLastAssistantText_CapIsRuneSafeForMultibyteText(t *testing.T) {
+	// Korean is 3 bytes/rune in UTF-8, so a byte-index cut at tailTextCap
+	// would land mid-rune for content like this (tailTextCap is not a
+	// multiple of 3) — the exact hazard trunc's own doc comment warns about
+	// ("byte-index slice can land mid-character... stray '�' glyphs"). This
+	// content is real-world plausible: this codebase's own commit history and
+	// UI copy are bilingual Korean/English.
+	long := strings.Repeat("가", tailTextCap+100) // exceed the cap so truncation runs
+	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, long))
+
+	got, ok := LastAssistantText(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("got invalid UTF-8 (mid-rune cut): %q", got)
+	}
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Errorf("got a replacement char (byte-boundary cut a multi-byte rune): %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("got %q, want truncated with an ellipsis", got)
+	}
 	if n := len([]rune(got)); n != tailTextCap+1 {
 		t.Errorf("capped length = %d runes, want %d (tailTextCap + ellipsis)", n, tailTextCap+1)
 	}
