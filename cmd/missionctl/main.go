@@ -1,9 +1,9 @@
 // missionctl — fleet cockpit for Claude Code loops.
 //
 // No args: launch the Bubble Tea TUI (the fleet cockpit).
-// Subcommands: `hook notify` (Claude Code Notification hook entry point,
-// see hook.go) and `hooks install|uninstall` (register/remove that hook in
-// ~/.claude/settings.json, see hooks.go).
+// Subcommands: `hook notify|session-start|session-end` (Claude Code hook
+// entry points, see hook.go) and `hooks install|uninstall` (register/remove
+// those hooks in ~/.claude/settings.json, see hooks.go).
 package main
 
 import (
