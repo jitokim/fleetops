@@ -19,7 +19,9 @@ import (
 	"github.com/jitokim/missionctl/internal/claude"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/events"
 	"github.com/jitokim/missionctl/internal/gate"
+	"github.com/jitokim/missionctl/internal/notify"
 	"github.com/jitokim/missionctl/internal/oracle"
 	"github.com/jitokim/missionctl/internal/registry"
 	"github.com/jitokim/missionctl/internal/sessions"
@@ -37,12 +39,22 @@ import (
 // overridable so sendPromptCmd/approveCmd/interruptCmd/killCmd's tier state
 // machine (and ttyPathPlausible's keypress-time check) can be verified
 // without exec or touching the real ~/.missionctl/sessions.
+//
+// historyDirFn/notifySendFn are events.HistoryDir/notify.Send by default —
+// event-log-and-notify's own seams, same reasoning: overridable so the
+// scan-transition detector, judgeCmd's verdict event, and each actuation
+// cmd's event can be verified without touching the real
+// ~/.missionctl/history, and so tests never actually invoke osascript (which
+// would pop a real, visible desktop notification and doesn't exist outside
+// macOS).
 var (
 	judgeFn                  = oracle.Judge
 	registryDirFn            = registry.LoopsDir
 	resolveActuationTargetFn = control.ResolveActuationTarget
 	redriveFn                = control.Redrive
 	sessionsDirFn            = sessions.SessionsDir
+	historyDirFn             = events.HistoryDir
+	notifySendFn             = notify.Send
 )
 
 type loopsMsg []domain.Loop
@@ -234,6 +246,16 @@ type Model struct {
 	// window, is unverified same-session-concurrency territory per the ADR
 	// — same in-flight-guard shape as m.judging.
 	actuating map[string]bool
+
+	// notifiedAt is the desktop-notification dedup ledger: key is
+	// sessionID+":"+edge (edge is "gate" or "gone" — see shouldNotify),
+	// value is when that edge last fired a notify.Send. In-memory only —
+	// not persisted, so a missionctl restart resets it and can re-notify an
+	// still-open gate once right after restart. Accepted by the council's
+	// design: a restart is rare enough that one extra notification for a
+	// STILL-open gate is a fine trade against persisting this ledger to
+	// disk for a purely cosmetic dedup window.
+	notifiedAt map[string]time.Time
 }
 
 func New() Model {
@@ -259,12 +281,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case loopsMsg:
-		m.loops = []domain.Loop(msg)
+		newLoops := []domain.Loop(msg)
+		now := time.Now()
+		transitions := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
+		m.loops = newLoops
 		if m.cursor >= len(m.visibleLoops()) {
 			m.cursor = maxInt(0, len(m.visibleLoops())-1)
 		}
-		m.lastScan = time.Now()
-		return m, m.triggerJudgments()
+		m.lastScan = now
+		return m, tea.Batch(m.triggerJudgments(), emitTransitionsCmd(transitions))
 	case tickMsg:
 		return m, tea.Batch(scan, tick())
 	case tea.KeyMsg:
@@ -689,7 +714,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 //     StallGone specifically because a stale/recycled tty could otherwise
 //     coincidentally match a DIFFERENT, unrelated live pane (ttys are
 //     OS-recycled — see ResolveActuationTarget's doc).
-func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
+//
+// action is the actuation-event label ("resume"/"inject" — see
+// logActuationEvent), distinct from successVerb (display text: "resumed" vs
+// "injected into") purely because the two callers' display verbs don't
+// share a mechanical stem worth deriving one from the other.
+func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.Cmd {
 	return func() tea.Msg {
 		// SAFETY: the governor stopped this loop (internal/engine.Check via
 		// applyGovernor, no-improve limit reached) — StateFailed is
@@ -699,6 +729,7 @@ func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
 		// fresh contract), not have "r"/"i" quietly override the governor.
 		// This is policy, not capability — unlike StallGone, it applies
 		// regardless of which tier could technically reach the session.
+		// No actuation event here — nothing was dispatched to any tier.
 		if l.State == domain.StateFailed {
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "governor stopped this loop (no improvement) — k kill or start a new contract"}
 		}
@@ -707,8 +738,10 @@ func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
 			ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 			if backendAvailable && found {
 				if err := ctrl.Resume(target, prompt); err != nil {
+					logActuationEvent(l, action, "tier1", false, err.Error())
 					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
 				}
+				logActuationEvent(l, action, "tier1", true, "")
 				return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, ctrl.Name(), note)}
 			}
 		}
@@ -717,8 +750,10 @@ func sendPromptCmd(l domain.Loop, prompt, successVerb, note string) tea.Cmd {
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
 		if err := redriveFn(l.SessionID, prompt); err != nil {
+			logActuationEvent(l, action, "tier2", false, err.Error())
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
+		logActuationEvent(l, action, "tier2", true, "")
 		return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)}
 	}
 }
@@ -736,7 +771,7 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 		if !ok {
 			note = " (no prior prompt found — sent Enter only)"
 		}
-		return sendPromptCmd(l, prompt, "resumed", note)()
+		return sendPromptCmd(l, prompt, "resume", "resumed", note)()
 	}
 }
 
@@ -753,7 +788,7 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 // would be pure duplication for zero behavioral gain, not a copy-paste
 // oversight.
 func injectCmd(l domain.Loop, prompt string) tea.Cmd {
-	return sendPromptCmd(l, prompt, "injected into", "")
+	return sendPromptCmd(l, prompt, "inject", "injected into", "")
 }
 
 // manualResumeHint is the copy-pasteable fallback for bare terminals (no
@@ -809,6 +844,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
 		}
 		if err := ctrl.Approve(target); err != nil {
+			logActuationEvent(l, "approve", "tier1", false, err.Error())
 			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
 		}
 		// Compare-and-swap delete: only remove the marker THIS decision was
@@ -816,6 +852,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// NEW marker that landed between this loop's scan snapshot and this
 		// approve call (see gate.DeleteMarkerIfTS).
 		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
+		logActuationEvent(l, "approve", "tier1", true, "")
 		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, ctrl.Name())}
 	}
 }
@@ -1118,8 +1155,10 @@ func killCmd(l domain.Loop) tea.Cmd {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
 		}
 		if err := ctrl.Resume(target, "/exit"); err != nil {
+			logActuationEvent(l, "kill", "tier1", false, err.Error())
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
 		}
+		logActuationEvent(l, "kill", "tier1", true, "")
 		return killResultMsg{true, fmt.Sprintf("killed %s", l.Project)}
 	}
 }
@@ -1139,8 +1178,10 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
 		}
 		if err := ctrl.Interrupt(target); err != nil {
+			logActuationEvent(l, "interrupt", "tier1", false, err.Error())
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
 		}
+		logActuationEvent(l, "interrupt", "tier1", true, "")
 		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
 	}
 }
@@ -1181,6 +1222,14 @@ func (m *Model) triggerJudgments() tea.Cmd {
 // goal, using its full (uncapped) last report, then saves the verdict to
 // the registry at the loop's current cycle. Runs off the event loop, same
 // non-blocking pattern as the other *Cmd funcs.
+//
+// event-log-and-notify: a successful verdict also records a
+// events.TriggerOracle history event (detail=outcome+atCycle, per the
+// slice's spec) — best-effort, swallowed error (see internal/events
+// package doc). from_state/to_state are both l.State: a verdict is a
+// JUDGMENT about the loop, not itself a state transition (enrichFromRegistry
+// may promote State from it on the NEXT scan, which gets its own
+// scan-triggered event if it happens — see Model.detectTransitions).
 func judgeCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		lastText, _ := claude.LastAssistantTextFull(l.Path) // ok=false just means an empty report is judged as-is
@@ -1191,8 +1240,195 @@ func judgeCmd(l domain.Loop) tea.Cmd {
 		if err := registry.SaveVerdict(registryDirFn(), l.SessionID, verdict, l.Cycle); err != nil {
 			return verdictMsg{sessionID: l.SessionID, err: err}
 		}
+		_ = events.Append(historyDirFn(), events.Event{
+			TS:        time.Now().UnixNano(),
+			SessionID: l.SessionID,
+			FromState: string(l.State),
+			ToState:   string(l.State),
+			Trigger:   events.TriggerOracle,
+			Detail:    fmt.Sprintf("%s at cycle %d", verdict.Outcome, l.Cycle),
+			Actor:     events.ActorAuto,
+		})
 		return verdictMsg{sessionID: l.SessionID, verdict: verdict}
 	}
+}
+
+// ── scan-triggered history events + desktop notifications ───────────────
+//
+// event-log-and-notify's scanner emitter: every loopsMsg, compare each
+// session's state THIS scan against its state in the PREVIOUS scan (m.loops,
+// still holding the prior snapshot at the point Update calls this) and
+// record one history event per session whose signature actually changed —
+// edge-triggered, never re-emitted just because a session is still sitting
+// in the same state on the next 3s poll. The prev-state map is simply
+// m.loops itself (keyed by session id) — no separate package-level map is
+// needed, since Update always has last scan's Model available before
+// overwriting it with the new one.
+
+// transitionEvent pairs a computed events.Event with whether it should also
+// fire a desktop notification — decided synchronously in detectTransitions
+// (pure logic + the notifiedAt dedup ledger), then actually dispatched by
+// emitTransitionsCmd's tea.Cmd so neither the file write nor the osascript
+// exec ever blocks Update.
+type transitionEvent struct {
+	ev     events.Event
+	notify bool
+	title  string
+	body   string
+}
+
+// stateSignature is the granularity detectTransitions compares scan to
+// scan: plain State, except StateStalled also carries its Stall kind — this
+// is what lets a StallNoOutput→StallGone edge (both StateStalled) register
+// as a real, notify-worthy change instead of looking like "no change" to a
+// State-only comparison. The notify trigger policy explicitly needs exactly
+// this resolution (see its "INTO StallGone" requirement).
+func stateSignature(l domain.Loop) string {
+	if l.State == domain.StateStalled {
+		return string(l.State) + ":" + string(l.Stall)
+	}
+	return string(l.State)
+}
+
+// scanTransitionDetail is the scan-triggered event's detail field: the
+// stall kind when the loop landed in StateStalled (the one case the task's
+// spec calls out by example), empty otherwise — GatePrompt/verdict reason
+// are already carried by their own dedicated callouts/events (renderGate/
+// DriftCallout, the oracle event above), so repeating them here would just
+// be noise.
+func scanTransitionDetail(l domain.Loop) string {
+	if l.State == domain.StateStalled {
+		return string(l.Stall)
+	}
+	return ""
+}
+
+// notifyDedupWindow: at most one desktop notification per (session, edge)
+// within this long — see Model.notifiedAt's doc for the restart caveat.
+const notifyDedupWindow = 10 * time.Minute
+
+// shouldNotify applies the dedup ledger for sessionID's edge ("gate" or
+// "gone"), recording now as the edge's last-notified time whenever it
+// allows a notification through — pointer receiver so the decision (and the
+// ledger write) actually persists onto the Model Update returns, same
+// idiom as triggerJudgments/setActuating.
+func (m *Model) shouldNotify(sessionID, edge string, now time.Time) bool {
+	key := sessionID + ":" + edge
+	if last, ok := m.notifiedAt[key]; ok && now.Sub(last) < notifyDedupWindow {
+		return false
+	}
+	if m.notifiedAt == nil {
+		m.notifiedAt = make(map[string]time.Time)
+	}
+	m.notifiedAt[key] = now
+	return true
+}
+
+// detectTransitions compares m.loops (the PREVIOUS scan, still held at the
+// point Update calls this — see loopsMsg's handler) against newLoops (the
+// scan that just arrived) and returns one transitionEvent per session whose
+// stateSignature changed. A session's FIRST appearance (no entry in the
+// previous scan) is deliberately NOT a transition — there's no from_state
+// to compare against, and treating every loop present at missionctl startup
+// as a "transition" would spam the history log with meaningless
+// "unknown→X" noise on every restart.
+//
+// Notify trigger policy (the task's exact spec): fire ONLY on transitions
+// INTO StateGate or INTO StallGone, each independently dedup-gated via
+// shouldNotify. Severity floor: nothing else notifies yet (done/drift/429
+// are explicitly out of scope for this slice).
+func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []transitionEvent {
+	prev := make(map[string]domain.Loop, len(m.loops))
+	for _, l := range m.loops {
+		prev[l.SessionID] = l
+	}
+
+	var out []transitionEvent
+	for _, l := range newLoops {
+		before, ok := prev[l.SessionID]
+		if !ok || stateSignature(before) == stateSignature(l) {
+			continue
+		}
+
+		te := transitionEvent{ev: events.Event{
+			TS:        now.UnixNano(),
+			SessionID: l.SessionID,
+			FromState: string(before.State),
+			ToState:   string(l.State),
+			Trigger:   events.TriggerScan,
+			Detail:    scanTransitionDetail(l),
+			Actor:     events.ActorSystem,
+		}}
+
+		enteredGate := before.State != domain.StateGate && l.State == domain.StateGate
+		enteredGone := l.State == domain.StateStalled && l.Stall == domain.StallGone &&
+			!(before.State == domain.StateStalled && before.Stall == domain.StallGone)
+		switch {
+		case enteredGate && m.shouldNotify(l.SessionID, "gate", now):
+			te.notify = true
+			te.title = "missionctl · GATE"
+			te.body = fmt.Sprintf("%s: %s", l.Project, l.GatePrompt)
+		case enteredGone && m.shouldNotify(l.SessionID, "gone", now):
+			te.notify = true
+			te.title = "missionctl · loop gone"
+			te.body = l.Project
+		}
+		out = append(out, te)
+	}
+	return out
+}
+
+// emitTransitionsCmd returns a tea.Cmd that performs the actual history-log
+// writes and desktop-notification sends for transitions — off the event
+// loop, so neither ever blocks Update. Best-effort throughout: every
+// events.Append/notifySendFn error is swallowed (see internal/events and
+// internal/notify package docs) — a history-log or notification failure
+// must never surface in the TUI or otherwise interrupt the fleet loop. nil
+// (a documented valid tea.Cmd) when there's nothing to do, so callers can
+// tea.Batch it unconditionally.
+func emitTransitionsCmd(transitions []transitionEvent) tea.Cmd {
+	if len(transitions) == 0 {
+		return nil
+	}
+	return func() tea.Msg {
+		dir := historyDirFn()
+		for _, te := range transitions {
+			_ = events.Append(dir, te.ev)
+			if te.notify {
+				_ = notifySendFn(te.title, te.body)
+			}
+		}
+		return nil
+	}
+}
+
+// logActuationEvent best-effort records an actor=human actuation event —
+// action is what the human triggered ("resume"/"inject"/"approve"/
+// "interrupt"/"kill" — "spawn" is logged separately, see
+// registry.BindPending's doc, since no session_id exists yet at spawn
+// time), tier is which actuation path was actually used ("tier1"/"tier2").
+// from_state/to_state are both l.State: an actuation attempt is a record of
+// WHAT A HUMAN DID, not itself a state transition (the next scan is what
+// would reclassify the loop, and that gets its own scan-triggered event if
+// it happens). Only called at a point where a tier was actually dispatched
+// — the early "no backend"/"ambiguous" refusal branches never reach a tier,
+// so callers simply don't call this for those (nothing was "taken" to log).
+func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText string) {
+	detail := action + " " + tier
+	if ok {
+		detail += " ok"
+	} else {
+		detail += " failed: " + errText
+	}
+	_ = events.Append(historyDirFn(), events.Event{
+		TS:        time.Now().UnixNano(),
+		SessionID: l.SessionID,
+		FromState: string(l.State),
+		ToState:   string(l.State),
+		Trigger:   events.TriggerActuation,
+		Detail:    detail,
+		Actor:     events.ActorHuman,
+	})
 }
 
 // pagerCmd builds the argv for the "o" key's log pager: -R renders color
