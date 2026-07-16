@@ -681,6 +681,96 @@ func TestLastAssistantText_MissingFile(t *testing.T) {
 	}
 }
 
+// ── F2: DOING/TAIL must not go empty for the busiest loops ───────────
+
+func TestLastAssistantText_LastMessageToolOnly_FallsBackToEarlierText(t *testing.T) {
+	// the literal F2 scenario: the LAST assistant message is a separate,
+	// later entry with no text block at all — must fall back to the most
+	// recent assistant text found anywhere in the tail, not just the very
+	// last assistant entry.
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"did the work, tests pass"}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+	)
+
+	got, ok := LastAssistantText(path)
+	if !ok || got != "did the work, tests pass" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "did the work, tests pass")
+	}
+}
+
+// bigToolResultFiller is comfortably bigger than tailBytes (24KB) but well
+// under lastTextTailBytes (256KB) — big enough that a real assistant text
+// entry preceding it falls OUTSIDE the standard tail window, small enough
+// that the widened window still reaches it.
+func bigToolResultFiller() string {
+	return strings.Repeat("x", 40*1024)
+}
+
+func TestLastAssistantText_EarlierTextOutsideSmallTail_WidenedSearchFindsIt(t *testing.T) {
+	// F2's actual root cause for "the busiest loops": a large tool_use/
+	// tool_result payload can push the real report outside the cheap
+	// 24KB tail entirely, not just past the very last message.
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"did the real work, evidence attached"}}`,
+		fmt.Sprintf(`{"type":"user","message":{"content":[{"type":"tool_result","content":"%s"}]}}`, bigToolResultFiller()),
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+	)
+
+	got, ok := LastAssistantText(path)
+	if !ok || got != "did the real work, evidence attached" {
+		t.Errorf("got (%q, %v), want (%q, true) — the widened search must find text outside the small tail", got, ok, "did the real work, evidence attached")
+	}
+}
+
+func TestLastAssistantTextFull_EarlierTextOutsideSmallTail_WidenedSearchFindsIt(t *testing.T) {
+	// the oracle's judged report (internal/oracle.Judge, via
+	// LastAssistantTextFull) shares the exact same root cause and fix.
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"did the real work, evidence attached"}}`,
+		fmt.Sprintf(`{"type":"user","message":{"content":[{"type":"tool_result","content":"%s"}]}}`, bigToolResultFiller()),
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+	)
+
+	got, ok := LastAssistantTextFull(path)
+	if !ok || got != "did the real work, evidence attached" {
+		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "did the real work, evidence attached")
+	}
+}
+
+func TestLastAssistantText_NoTextEvenInWidenedWindow_ReturnsFalse(t *testing.T) {
+	path := writeJSONL(t,
+		fmt.Sprintf(`{"type":"user","message":{"content":[{"type":"tool_result","content":"%s"}]}}`, bigToolResultFiller()),
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+	)
+
+	if _, ok := LastAssistantText(path); ok {
+		t.Error("expected ok=false — no assistant text anywhere, even in the widened window")
+	}
+}
+
+func TestLoopFromLog_LastTextOutsideSmallTail_WidenedSearchFillsDoingAndTail(t *testing.T) {
+	// end-to-end: the domain.Loop.LastText field (which feeds both the
+	// detail pane's TAIL row and the fleet table's DOING column) must not
+	// go empty for a busy loop whose last few messages are tool-only.
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"content":"did the real work, evidence attached"}}`,
+		fmt.Sprintf(`{"type":"user","message":{"content":[{"type":"tool_result","content":"%s"}]}}`, bigToolResultFiller()),
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+
+	l := loopFromLog(path, fi, time.Now(), t.TempDir(), nil)
+
+	if l.LastText != "did the real work, evidence attached" {
+		t.Errorf("LastText = %q, want %q (DOING/TAIL must not go empty for a busy loop)", l.LastText, "did the real work, evidence attached")
+	}
+}
+
 func TestApplyLiveness_OneLiveProcess_NewestKeepsOlderDemoted(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{

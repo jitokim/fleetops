@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/jitokim/missionctl/internal/claude"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
@@ -1246,19 +1247,33 @@ func (m Model) sameProjectDirCount(projectDir string) int {
 }
 
 // ttyPathPlausible reports whether sel has a session registry entry with a
-// non-empty tty — if so, actuation will try the session-unique tty-dispatch
-// path FIRST (control.ResolveActuationTarget's Tier 1a), which needs no
-// ambiguity guard at all (a tty maps to at most one live pane — ADR §2.2/§3
-// step 2). refuseIfAmbiguous only protects the cwd-based fallback (Tier 1b),
-// so it's skipped at keypress time whenever the tty path looks viable —
-// otherwise a loop that tty-dispatch would resolve perfectly safely could be
-// refused for an ambiguity that doesn't even apply to the path it will
-// actually take.
+// non-empty tty — if so, actuation will TRY the session-unique tty-dispatch
+// path FIRST (control.ResolveActuationTarget's Tier 1a), so the keypress-time
+// refuseIfAmbiguous check (which only protects the cwd-based Tier 1b) is
+// skipped here as an optimistic UX shortcut: no sense showing a "N loops
+// share this directory" refusal for a session that's about to be dispatched
+// by tty, not cwd.
 //
-// This is a plain local file read (internal/sessions.ReadSession), not an
-// exec call, so it's safe to run synchronously in Update — unlike the
-// pid-liveness re-check, which only happens later, off the event loop,
-// inside the tea.Cmd (see control.ResolveActuationTarget).
+// IMPORTANT — this is NOT the safety boundary. ttyPathPlausible only checks
+// that a registry entry EXISTS with a tty; it does not (and, being a
+// synchronous read in Update, cannot) validate that the tty↔pid BINDING
+// still holds (see F4 hardening review, and P1-1's pidTTYFn fix). The real
+// guarantee lives downstream, off the event loop, inside
+// control.ResolveActuationTarget: it re-validates the binding right before
+// committing to Tier 1a, and falls through to the cwd chain (Tier 1b —
+// Resolve()+LocateClaude) whenever that check fails. LocateClaude carries
+// its OWN internal ">1 match" ambiguity refusal, so a genuinely ambiguous
+// loop whose tty turned out to be stale/recycled still gets refused —
+// skipping the guard here can only cost a less-specific error message
+// ("no unambiguous claude surface" instead of "N loops share..."), never a
+// wrong-terminal misroute. See internal/control/actuation_test.go and this
+// package's TestSendPromptCmd_TTYPlausibleButBindingFails_* /
+// TestApproveCmd_TierOneFailsAmbiguously_* for the end-to-end proof.
+//
+// This function itself is a plain local file read (internal/sessions.ReadSession),
+// not an exec call, so it's safe to run synchronously in Update — unlike the
+// tty-binding re-check, which only happens later, off the event loop, inside
+// the tea.Cmd (see control.ResolveActuationTarget).
 func (m Model) ttyPathPlausible(sel domain.Loop) bool {
 	entry, err := sessions.ReadSession(sessionsDirFn(), sel.SessionID)
 	return err == nil && entry.TTY != ""
@@ -1538,21 +1553,42 @@ const (
 	minWidthForCycle  = 50
 )
 
+// rowIndent is the ONLY actual inter-cell gap in a rendered row/header: the
+// literal "  " prefixed before lipgloss.JoinHorizontal in both
+// renderTableHeader and renderRow. JoinHorizontal itself adds no spacing of
+// its own — each cell is already padded to its own .Width(), so cells sit
+// directly adjacent. (F1: the old "gaps := 4" fudge factor wasn't the actual
+// bug — see columnWidths' cascade below for what was.)
+const rowIndent = 2
+
 // columnWidths sizes NAME/DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
-// width. CYCLE/ORACLE/BUDGET/N-I/NOTE are fixed-width, dropped below their
-// thresholds (see minWidthForNote/NI/Oracle/Budget/Cycle). NAME and DOING are
-// the two flexible text columns: they SHARE whatever width is left after the
-// fixed columns (see flexNameDoing), each bounded by a floor and a cap, with
-// any width beyond both caps handed to NOTE (as it was before DOING existed).
+// width. CYCLE/ORACLE/BUDGET/N-I/NOTE start from the minWidthForNote/NI/
+// Oracle/Budget/Cycle thresholds (a cheap first guess, correct in the
+// mainstream case), but F1 found those thresholds don't actually guarantee
+// enough room is left over: at w=90, ALL five pass their threshold, yet
+// marker+name-floor+state+those five+last+indent sums to more than 90 —
+// columnWidths' OWN "remaining" math correctly detected that and forced
+// wDoing to 0, but it still unconditionally handed NAME its floor width
+// regardless of whether the FIXED columns alone already exceeded the
+// terminal — an unconditional floor is not a guarantee. Fixed here by
+// cascading: after the threshold guess, actually PROVE
+// alwaysFixed+wCycle+wOracle+wBudget+wNI+wNote+nameFloorWidth fits width,
+// dropping columns one at a time (NOTE first/least essential ... CYCLE
+// last/most essential — the same priority order the thresholds already
+// encoded) until it does. This makes "sum ≤ width" a real, checked
+// invariant instead of resting on the threshold constants being perfectly
+// hand-tuned against the full render-layer cost — exactly the kind of
+// drift that let this bug in when DOING was added.
 //
-// Because NAME+DOING are always kept within that leftover budget, the row's
-// total width never exceeds the terminal width whenever DOING is shown — so it
-// can't soft-wrap onto a second line (there is no viewport/clip in this TUI;
-// padToWidth only pads, never truncates the whole row). When the leftover
-// can't seat both floors, DOING is hidden (wDoing == 0) and NAME flexes alone,
-// exactly the pre-DOING behaviour; only then, at genuinely narrow widths, can
-// the fixed columns alone still overflow — the rough edge the table always had
-// below ~100 cols, which DOING neither introduces nor worsens.
+// NAME and DOING are the two flexible text columns: they SHARE whatever
+// width is left after the (now width-verified) fixed columns (see
+// flexNameDoing), each bounded by a floor and a cap, with any width beyond
+// both caps handed to NOTE (as it was before DOING existed). Because
+// NAME+DOING are always sized from a `remaining` that's guaranteed
+// non-negative post-cascade, the row's total width never exceeds the
+// terminal width — it can't soft-wrap onto a second line (there is no
+// viewport/clip in this TUI; padToWidth only pads, never truncates the
+// whole row).
 func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) {
 	if width >= minWidthForCycle {
 		wCycle = cycleColWidth
@@ -1570,8 +1606,31 @@ func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNot
 		wNote = 24
 	}
 
-	const gaps = 4 // the leading "  " indent plus cell boundaries need slack.
-	fixed := wMarker + wState + wLast + wCycle + wOracle + wBudget + wNI + wNote + gaps
+	alwaysFixed := wMarker + wState + wLast + rowIndent
+	fits := func() bool {
+		return alwaysFixed+wCycle+wOracle+wBudget+wNI+wNote+nameFloorWidth <= width
+	}
+	// Drop order matches the documented degradation priority: NOTE first
+	// (least essential — the state label already hints at "why"), then
+	// N/I, ORACLE, BUDGET, CYCLE last (most essential). Each step is a
+	// no-op if that column was never shown in the first place.
+	if !fits() {
+		wNote = 0
+	}
+	if !fits() {
+		wNI = 0
+	}
+	if !fits() {
+		wOracle = 0
+	}
+	if !fits() {
+		wBudget = 0
+	}
+	if !fits() {
+		wCycle = 0
+	}
+
+	fixed := alwaysFixed + wCycle + wOracle + wBudget + wNI + wNote
 	remaining := width - fixed // the width budget NAME and DOING share
 
 	if remaining >= nameFloorWidth+doingFloorWidth {
@@ -1584,8 +1643,12 @@ func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNot
 	}
 
 	// Not enough room for both floors: DOING steps aside (wDoing stays 0) and
-	// NAME flexes alone. remaining < nameFloorWidth+doingFloorWidth < nameCap
-	// here, so NAME only ever hits its floor in this branch, never its cap.
+	// NAME flexes alone. Thanks to the cascade above, remaining is guaranteed
+	// >= nameFloorWidth here (fits() required exactly that), so this clamp is
+	// defense-in-depth, not the load-bearing guarantee it used to be — it
+	// only still matters at the ABSOLUTE floor (width so small that even
+	// alwaysFixed+nameFloorWidth alone exceeds it, i.e. width < ~40), which
+	// remains the one pre-existing edge this fix doesn't claim to cover.
 	wName = remaining
 	if wName < nameFloorWidth {
 		wName = nameFloorWidth
@@ -2149,16 +2212,36 @@ func renderKeybar(loopCount int, width int) string {
 // ── layout helpers ────────────────────────────────────────────
 
 // padBetween left-aligns left and right-aligns right within width, joined by
-// spaces. If right is empty, left is returned as-is (no trailing padding).
+// spaces, and — F1 — actually GUARANTEES the result fits within width: it
+// used to just floor the gap at 1 and concatenate regardless, so a narrow
+// terminal (e.g. a live-measured w=45 rendering 65 cols) never degraded at
+// all. Degrades in two steps, matching the header/summary band's own
+// priority (left is the identity/label, right is supplementary status):
+//  1. once left+right no longer both fit, drop right entirely;
+//  2. if even left alone still overflows, ANSI-aware truncate it
+//     (ansi.TruncateWc) — left/right here are already lipgloss-styled, so a
+//     plain rune/byte truncate would risk cutting mid-escape-sequence and
+//     corrupting the terminal (unlike trunc(), which this codebase only
+//     ever applies to PLAIN text, styling it afterward).
 func padBetween(left, right string, width int) string {
 	if right == "" {
-		return left
+		return fitWithin(left, width)
 	}
 	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
+	if gap >= 1 {
+		return left + strings.Repeat(" ", gap) + right
 	}
-	return left + strings.Repeat(" ", gap) + right
+	return fitWithin(left, width)
+}
+
+// fitWithin returns s unchanged if it already fits width, else ANSI-aware
+// truncates it — see padBetween's doc for why plain trunc() isn't safe for
+// already-styled input.
+func fitWithin(s string, width int) string {
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	return ansi.TruncateWc(s, width, "…")
 }
 
 // padToWidth right-pads s with spaces until it reaches width (visible
