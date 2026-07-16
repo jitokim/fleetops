@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,7 +84,7 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	loops = enrichFromRegistry(loops, loopsDir, historyDir)
 
 	live, liveOK := LiveClaudeCwds()
-	loops = applyLiveness(loops, live, liveOK)
+	loops = applyLiveness(loops, live, liveOK, historyDir, now, within)
 
 	// Keep metricsCache bounded to sessions actually present in this scan —
 	// otherwise it grows forever as old sessions age out of the window or
@@ -230,7 +231,14 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 //
 // Per ProjectDir, the live count of most-recently-active loops are left
 // untouched (there's a real process behind them). The rest are presumed
-// dead:
+// dead, and — fix/killed-state — FIRST checked for a human kill decision
+// (mostRecentActuationIsKill) before any of the rules below apply: a
+// killed loop becomes StateKilled regardless of what it would otherwise
+// have been, since a human's kill is definitive and must win over even the
+// settled-verdict exemption (case in point — the bug this fixes: killing a
+// StateDrift loop left it showing ✗ DRIFT forever, because the exemption
+// below meant nothing ever re-examined it once "settled"). Absent a kill,
+// the pre-existing rules apply:
 //   - StateIdle (finished its turn, then the process went away) → dropped
 //     entirely: the loop ended cleanly, it's not part of the fleet anymore.
 //   - StateDone / StateDrift (the oracle already rendered a verdict this
@@ -253,7 +261,13 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 // which real path is "the" real one is genuinely ambiguous, so healing is
 // skipped entirely for it: Cwd stays the lossy decode and CwdVerified stays
 // false, rather than risk silently healing to the WRONG one of the two.
-func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.Loop {
+//
+// historyDir/now/within are threaded through purely for
+// mostRecentActuationIsKill — only consulted for loops that reach this
+// function's "presumed dead" branch (idxs[k:] below), never for the whole
+// fleet every scan (the review's efficiency ask): a loop with a live
+// process backing it never needs its history checked at all.
+func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir string, now time.Time, within time.Duration) []domain.Loop {
 	if !ok {
 		return loops // probe failed — do not reclassify the fleet on no data (P1-2)
 	}
@@ -289,6 +303,11 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.L
 			continue // enough live processes for every loop sharing this dir
 		}
 		for _, i := range idxs[k:] {
+			if mostRecentActuationIsKill(historyDir, loops[i].SessionID, now, within) {
+				loops[i].State = domain.StateKilled
+				loops[i].Stall = domain.StallNone
+				continue // wins over every rule below — see doc
+			}
 			switch loops[i].State {
 			case domain.StateIdle:
 				drop[i] = true
@@ -311,6 +330,41 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool) []domain.L
 		}
 	}
 	return out
+}
+
+// mostRecentActuationIsKill reports whether sessionID's most recent
+// actor=human actuation event within `within` of now was a kill attempt
+// (logActuationEvent's "kill <tier> ok|failed: ..." detail format — see
+// internal/tui). Deliberately the MOST RECENT one, not "was there ever a
+// kill": if a kill was followed by a later successful resume/inject
+// actuation (reviving the session before this fix landed, or via a race),
+// that later actuation — not the stale kill — is what should win. events.Read
+// is scoped to just this one session (not internal/events.ReadAll's
+// whole-directory scan), so this stays cheap even called once per
+// process-gone candidate loop per scan.
+func mostRecentActuationIsKill(historyDir, sessionID string, now time.Time, within time.Duration) bool {
+	evs, err := events.Read(historyDir, sessionID)
+	if err != nil {
+		return false
+	}
+	// within<=0 means "no window" (DiscoverLoops' own "0 = keep all"
+	// convention) — MinInt64 so every event passes rather than every event
+	// being (wrongly) treated as expired.
+	cutoff := int64(math.MinInt64)
+	if within > 0 {
+		cutoff = now.Add(-within).UnixNano()
+	}
+	var lastActuation *events.Event
+	for i := range evs {
+		ev := &evs[i]
+		if ev.Trigger != events.TriggerActuation || ev.Actor != events.ActorHuman || ev.TS < cutoff {
+			continue
+		}
+		if lastActuation == nil || ev.TS > lastActuation.TS {
+			lastActuation = ev
+		}
+	}
+	return lastActuation != nil && strings.HasPrefix(lastActuation.Detail, "kill ")
 }
 
 // isHiddenProjectDir reports whether an encoded project dir contains a

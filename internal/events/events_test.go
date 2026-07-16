@@ -272,3 +272,56 @@ func TestAppend_ConcurrentWriters_ForcedRotations_NoDataLoss(t *testing.T) {
 		seen[ev.TS] = true
 	}
 }
+
+// ── Read (single-session, scoped) ────────────────────────────────────────
+
+func TestRead_ReturnsOnlyTheRequestedSession(t *testing.T) {
+	dir := t.TempDir()
+	if err := Append(dir, Event{TS: 1, SessionID: "s1", ToState: "running", Trigger: TriggerScan, Actor: ActorSystem}); err != nil {
+		t.Fatalf("Append s1: %v", err)
+	}
+	if err := Append(dir, Event{TS: 1, SessionID: "s2", ToState: "idle", Trigger: TriggerScan, Actor: ActorSystem}); err != nil {
+		t.Fatalf("Append s2: %v", err)
+	}
+	got, err := Read(dir, "s1")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "s1" {
+		t.Errorf("got %#v, want exactly one s1 event", got)
+	}
+}
+
+func TestRead_MergesRotatedBackupWithLiveFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "s1.jsonl.1"), []byte(`{"ts":1,"session_id":"s1","to_state":"running","trigger":"scan","actor":"system"}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile backup: %v", err)
+	}
+	if err := Append(dir, Event{TS: 2, SessionID: "s1", ToState: "idle", Trigger: TriggerScan, Actor: ActorSystem}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	got, err := Read(dir, "s1")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 2 || got[0].TS != 1 || got[1].TS != 2 {
+		t.Errorf("got %#v, want [ts=1, ts=2] merged oldest-first", got)
+	}
+}
+
+func TestRead_MissingSession_ReturnsEmptyNotError(t *testing.T) {
+	got, err := Read(t.TempDir(), "no-such-session")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d events, want 0", len(got))
+	}
+}
+
+func TestRead_InvalidSessionID_Refused(t *testing.T) {
+	if _, err := Read(t.TempDir(), "../escape"); err == nil {
+		t.Fatal("want an error for a session id containing a path separator")
+	}
+}

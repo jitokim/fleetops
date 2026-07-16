@@ -206,6 +206,31 @@ func ReadAll(dir string) (map[string][]Event, error) {
 	return out, nil
 }
 
+// Read returns sessionID's own history from dir — its live ".jsonl" file
+// merged with a rotated ".1" backup, if any — oldest first. Unlike
+// ReadAll, this reads ONLY the two files that could possibly belong to
+// sessionID, not every file in dir — the efficient path for a caller (e.g.
+// internal/claude's killed-loop derivation) that only needs one specific
+// session's history out of a fleet-wide scan, not a report over all of
+// them. Same tolerance as ReadAll: a missing file is a no-op (not an
+// error), and a malformed line is skipped rather than failing the whole
+// read.
+func Read(dir, sessionID string) ([]Event, error) {
+	if !validSessionID(sessionID) {
+		return nil, &invalidSessionIDError{sessionID}
+	}
+	var out []Event
+	for _, suffix := range [...]string{".jsonl.1", ".jsonl"} {
+		evs, err := readEventFile(filepath.Join(dir, sessionID+suffix))
+		if err != nil {
+			continue // missing or unreadable — best-effort, see doc
+		}
+		out = append(out, evs...)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TS < out[j].TS })
+	return out, nil
+}
+
 // sessionIDFromFilename strips the ".jsonl" or ".jsonl.1" suffix, reporting
 // ok=false for anything else in the directory (defensive — the dir is
 // expected to hold only history files, but a stray unrelated file should be

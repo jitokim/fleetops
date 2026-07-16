@@ -508,15 +508,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Keypress-time state gate mirroring sendPromptCmd's own guards, so
 			// the human doesn't type a whole prompt only to have it silently
 			// refused after Enter (fail fast, before they invest typing effort).
-			// StateFailed is the SAME condition sendPromptCmd itself re-checks —
-			// surfaced early here (belt-and-suspenders, like the r-key guard).
-			// Unlike "r", injection is deliberately NOT restricted to
-			// stalled/drifted loops: idle/running/gated loops are all valid
-			// targets — flexibility is the point of the feature. StallGone no
-			// longer refuses (see sendPromptCmd's Tier 2 redrive path) — it's
-			// now a perfectly valid inject target, just routed headlessly.
+			// StateFailed/StateKilled are the SAME conditions sendPromptCmd
+			// itself re-checks — surfaced early here (belt-and-suspenders,
+			// like the r-key guard). Unlike "r", injection is deliberately
+			// NOT restricted to stalled/drifted loops: idle/running/gated
+			// loops are all valid targets — flexibility is the point of the
+			// feature. StallGone no longer refuses (see sendPromptCmd's
+			// Tier 2 redrive path) — it's now a perfectly valid inject
+			// target, just routed headlessly.
 			if sel.State == domain.StateFailed {
 				m.status, m.statusKind = "governor stopped this loop — k kill or start a new contract, don't inject", statusErr
+				return m, nil
+			}
+			// fix/killed-state: a human's kill decision must not be
+			// silently overridable via Tier 2's headless redrive
+			// (`claude --resume <id> -p <prompt>` would actually REVIVE a
+			// killed session) — StateKilled is domain.LoopState.Terminal(),
+			// same policy-not-capability reasoning as StateFailed above.
+			if sel.State == domain.StateKilled {
+				m.status, m.statusKind = "this loop was killed — start a new contract, don't inject", statusErr
 				return m, nil
 			}
 			// In-flight guard, same reasoning as the r-key's: fail fast
@@ -595,6 +605,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sel, ok := m.selected()
 			if !ok {
 				m.status, m.statusKind = "select a loop to kill", statusNeutral
+				return m, nil
+			}
+			// fix/killed-state: fail fast for a loop that's already gone —
+			// no point running the two-press confirm dance (or reaching
+			// killCmd's own resolveActuationTargetFn call, which would
+			// otherwise surface a confusing "no unambiguous claude
+			// surface" error for a process that simply isn't there
+			// anymore) just to end up back here with the same message.
+			if sel.State == domain.StateKilled || sel.Stall == domain.StallGone {
+				m.status, m.statusKind = fmt.Sprintf("%s already killed/gone — it will age out of the window", sel.Project), statusNeutral
 				return m, nil
 			}
 			now := time.Now()
@@ -738,6 +758,19 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		if l.State == domain.StateFailed {
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "governor stopped this loop (no improvement) — k kill or start a new contract"}
 		}
+		// fix/killed-state: same policy-not-capability reasoning as
+		// StateFailed above — Tier 2's headless redrive
+		// (`claude --resume <id> -p <prompt>`) is fully capable of
+		// reviving a killed session (it doesn't care whether a human
+		// killed it), so this must be blocked at the policy layer, not
+		// left to accidentally succeed. Belt-and-suspenders: the "i" key's
+		// keypress-time guard (Update) already refuses before this is ever
+		// reached via the TUI, but resumeCmd's own "r" guard only checks
+		// Stalled/Drift (which already excludes Killed) — this is the one
+		// shared choke point both paths funnel through.
+		if l.State == domain.StateKilled {
+			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "this loop was killed — start a new contract, don't resume/inject"}
+		}
 
 		if l.Stall != domain.StallGone {
 			ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
@@ -838,6 +871,15 @@ func manualAttachHint(cwd string) string {
 // pattern as resumeCmd/attachCmd.
 func approveCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
+		// fix/killed-state: defense in depth — the "a" keypress guard
+		// (Update) already requires StateGate, which a killed loop can
+		// never be, so this is currently unreachable via the TUI; kept
+		// here anyway so a future change to that guard can't accidentally
+		// let a killed loop reach a real actuation attempt without an
+		// explicit, sensible refusal.
+		if l.State == domain.StateKilled {
+			return approveResultMsg{false, "this loop was killed — nothing to approve"}
+		}
 		// Tier 1 only (tty → cwd) — approving a gate has no headless Tier-2
 		// equivalent (there's no "press Enter" over `claude --resume -p`;
 		// that starts a brand new turn, not an in-place keypress).
@@ -1146,8 +1188,12 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// SAFETY: same reasoning as resumeCmd's StallGone guard — if the
 		// process is already gone, there's nothing to send "/exit" into
 		// (and doing so anyway risks typing it into a bare shell instead).
-		if l.Stall == domain.StallGone {
-			return killResultMsg{true, fmt.Sprintf("%s already gone — nothing to kill", l.Project)}
+		// fix/killed-state: belt-and-suspenders mirror of the "k" keypress
+		// guard (Update) — StateKilled reaching here at all would only
+		// happen via a stale dispatch, but the discipline in this file is
+		// every guard gets re-checked at the actual dispatch site too.
+		if l.State == domain.StateKilled || l.Stall == domain.StallGone {
+			return killResultMsg{true, fmt.Sprintf("%s already killed/gone — it will age out of the window", l.Project)}
 		}
 		// Tier 1 only (tty → cwd) — killing has no headless Tier-2
 		// equivalent (there's no live conversation left to type "/exit"
@@ -1163,8 +1209,17 @@ func killCmd(l domain.Loop) tea.Cmd {
 			logActuationEvent(l, "kill", "tier1", false, err.Error())
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
 		}
+		// fix/killed-state: the event is written HERE, immediately once
+		// the "/exit" keystroke is confirmed sent — not once the process
+		// has actually exited (which happens asynchronously, outside this
+		// call's control). That's exactly what lets the NEXT scan's
+		// mostRecentActuationIsKill see a kill on record and derive
+		// StateKilled as soon as the process is confirmed gone — the
+		// status line deliberately does NOT optimistically set local model
+		// state itself (that would be a fake, unverified state the next
+		// scan could immediately contradict).
 		logActuationEvent(l, "kill", "tier1", true, "")
-		return killResultMsg{true, fmt.Sprintf("killed %s", l.Project)}
+		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
 	}
 }
 
@@ -1172,6 +1227,13 @@ func killCmd(l domain.Loop) tea.Cmd {
 // process — the loop stays alive, resumable with r.
 func interruptCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
+		// fix/killed-state: defense in depth — the "p" keypress guard
+		// (Update) already requires Running/Gate, which a killed loop can
+		// never be, so this is currently unreachable via the TUI; kept
+		// here anyway, same reasoning as approveCmd's mirror check.
+		if l.State == domain.StateKilled {
+			return interruptResultMsg{false, "this loop was killed — nothing to stop"}
+		}
 		// Tier 1 only (tty → cwd) — interrupting has no headless Tier-2
 		// equivalent (there's no in-flight turn to interrupt via a fresh
 		// --resume -p call; that would start a brand new turn instead).

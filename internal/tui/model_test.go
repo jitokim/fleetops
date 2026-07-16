@@ -906,6 +906,180 @@ func TestUpdate_SecondKAfterWindowExpires_RestartsConfirmCycle(t *testing.T) {
 	}
 }
 
+// ── fix/killed-state: "k" on an already-dead loop ────────────────────────
+
+func TestUpdate_KKey_AlreadyKilled_RefusesFastWithoutConfirmCycle(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateKilled
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — an already-killed loop must refuse before any confirm cycle")
+	}
+	if m.pendingKillSession != "" {
+		t.Error("expected no pending-kill cycle to start for an already-killed loop")
+	}
+	if !strings.Contains(m.status, "already killed/gone") {
+		t.Errorf("status = %q, want the already-killed/gone message", m.status)
+	}
+}
+
+func TestUpdate_KKey_StallGone_RefusesFastWithoutConfirmCycle(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+	m.loops[0].Stall = domain.StallGone
+
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — a gone loop must refuse before any confirm cycle")
+	}
+	if !strings.Contains(m.status, "already killed/gone") {
+		t.Errorf("status = %q, want the already-killed/gone message", m.status)
+	}
+}
+
+func TestKillCmd_AlreadyKilled_ReturnsFriendlyMessage(t *testing.T) {
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateKilled}
+	msg := killCmd(l)()
+	km, ok := msg.(killResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want killResultMsg", msg)
+	}
+	if !km.ok {
+		t.Error("expected ok=true — this is a graceful no-op, not a failure")
+	}
+	if !strings.Contains(km.text, "already killed/gone") {
+		t.Errorf("text = %q, want the already-killed/gone message", km.text)
+	}
+}
+
+func TestKillCmd_SuccessMessage_DoesNotClaimImmediateStateChange(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return &fakeController{name: "tmux"}, control.Target{Backend: "tmux", ID: "%1"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift}
+	msg := killCmd(l)()
+	km, ok := msg.(killResultMsg)
+	if !ok || !km.ok {
+		t.Fatalf("got %+v, want a successful killResultMsg", msg)
+	}
+	if !strings.Contains(km.text, "state updates on next scan") {
+		t.Errorf("text = %q, want it to say the state updates on the next scan (not an optimistic local state change)", km.text)
+	}
+}
+
+func TestKillCmd_Success_RecordsKillActuationEvent(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return &fakeController{name: "tmux"}, control.Target{Backend: "tmux", ID: "%1"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift}
+	killCmd(l)()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	if !strings.HasPrefix(evs[0].Detail, "kill ") {
+		t.Errorf("Detail = %q, want it to start with \"kill \" (mostRecentActuationIsKill's expected format)", evs[0].Detail)
+	}
+}
+
+func TestUpdate_IKey_KilledLoop_RefusesWithoutEnteringInjectMode(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateKilled
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — a killed loop must not enter inject mode")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if !strings.Contains(m.status, "killed") {
+		t.Errorf("status = %q, want it to mention the loop was killed", m.status)
+	}
+}
+
+func TestSendPromptCmd_KilledLoop_RefusesWithoutDispatching(t *testing.T) {
+	// Belt-and-suspenders: sendPromptCmd itself must refuse StateKilled too
+	// — this is the one shared choke point that matters, since Tier 2's
+	// headless redrive is fully capable of reviving a killed session.
+	redriveCalled := false
+	withFakeActuationSeams(t, nil, func(sessionID, prompt string) error {
+		redriveCalled = true
+		return nil
+	})
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateKilled}
+
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	if redriveCalled {
+		t.Error("expected redriveFn NOT to be called for a killed loop — Tier 2 could otherwise revive it")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || rm.ok {
+		t.Fatalf("got %+v, want a refused resumeResultMsg", msg)
+	}
+	if !strings.Contains(rm.text, "killed") {
+		t.Errorf("text = %q, want it to mention the loop was killed", rm.text)
+	}
+}
+
+// ── fix/killed-state: display + badge exclusion ──────────────────────────
+
+func TestStateLabel_Killed(t *testing.T) {
+	if got := stateLabel(domain.Loop{State: domain.StateKilled}); got != "☠ KILLED" {
+		t.Errorf("got %q, want %q", got, "☠ KILLED")
+	}
+}
+
+func TestStateColor_Killed_IsDimNotRed(t *testing.T) {
+	got := stateColor(domain.Loop{State: domain.StateKilled})
+	if got == cRed {
+		t.Error("StateKilled must NOT be red — it's a completed human decision, not an incident")
+	}
+	if got != cDim {
+		t.Errorf("got %v, want cDim", got)
+	}
+}
+
+func TestCounts_KilledLoop_NotCountedAsStalledOrGated(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{SessionID: "s1", State: domain.StateKilled},
+		{SessionID: "s2", State: domain.StateRunning},
+	}
+	total, running, stalled, idle, gated, _, _, _ := m.counts()
+	if total != 2 {
+		t.Errorf("total = %d, want 2 (killed loops still count toward fleet total)", total)
+	}
+	if running != 1 {
+		t.Errorf("running = %d, want 1", running)
+	}
+	if stalled != 0 {
+		t.Errorf("stalled = %d, want 0 (killed must not be counted as stalled)", stalled)
+	}
+	if gated != 0 {
+		t.Errorf("gated = %d, want 0", gated)
+	}
+	if idle != 0 {
+		t.Errorf("idle = %d, want 0", idle)
+	}
+}
+
 func TestUpdate_AnyOtherKey_ClearsPendingKill(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('k'))

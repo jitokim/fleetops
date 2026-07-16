@@ -780,7 +780,7 @@ func TestApplyLiveness_OneLiveProcess_NewestKeepsOlderDemoted(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (older idle loop dropped): %+v", len(out), out)
@@ -798,7 +798,7 @@ func TestApplyLiveness_OlderStalled_BecomesGone(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2 (stalled loop kept, reclassified): %+v", len(out), out)
@@ -817,7 +817,7 @@ func TestApplyLiveness_ZeroLiveProcesses_IdleDroppedStalledGone(t *testing.T) {
 	}
 	live := map[string]int{} // no live process at all for this cwd
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (idle dropped, stalled kept): %+v", len(out), out)
@@ -837,7 +837,7 @@ func TestApplyLiveness_RunningPastLiveCount_BecomesGone(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2: %+v", len(out), out)
@@ -855,7 +855,7 @@ func TestApplyLiveness_EnoughLiveProcesses_Untouched(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 2} // one live process per loop
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2 (nothing dropped)", len(out))
@@ -873,7 +873,7 @@ func TestApplyLiveness_DifferentCwdsIndependent(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 1, "/x/other": 0}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 || out[0].SessionID != "a" {
 		t.Errorf("got %+v, want only loop \"a\" (its cwd has a live process; \"b\"'s doesn't)", out)
@@ -887,7 +887,7 @@ func TestApplyLiveness_StateDone_NotDroppedNorDemoted(t *testing.T) {
 	}
 	live := map[string]int{} // zero live processes for this cwd — would normally drop/demote everything
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (StateDone must survive, not be dropped)", len(out))
@@ -904,13 +904,186 @@ func TestApplyLiveness_StateDrift_NotDroppedNorDemoted(t *testing.T) {
 	}
 	live := map[string]int{}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 {
 		t.Fatalf("got %d loops, want 1 (StateDrift must survive)", len(out))
 	}
 	if out[0].State != domain.StateDrift || out[0].Stall != domain.StallNone {
 		t.Errorf("got %+v, want State=StateDrift Stall=StallNone (untouched by liveness)", out[0])
+	}
+}
+
+// ── fix/killed-state: KILLED derivation ──────────────────────────────────
+
+func TestApplyLiveness_DriftLoopKilledAndGone_BecomesKilled(t *testing.T) {
+	// The exact bug this fixes: a human killed a StateDrift loop (k k →
+	// /exit sent, process exits) — without this, the settled-verdict
+	// exemption meant it stayed ✗ DRIFT forever, since nothing ever
+	// re-examined it once "settled".
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
+		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "drift-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
+	}
+	live := map[string]int{} // process confirmed gone
+
+	out := applyLiveness(loops, live, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (killed loops are shown, not dropped)", len(out))
+	}
+	if out[0].State != domain.StateKilled {
+		t.Errorf("State = %v, want StateKilled", out[0].State)
+	}
+	if out[0].Stall != domain.StallNone {
+		t.Errorf("Stall = %v, want StallNone (KILLED is not a stall)", out[0].Stall)
+	}
+}
+
+func TestApplyLiveness_IdleLoopKilledAndGone_BecomesKilled_NotDropped(t *testing.T) {
+	// Without a kill event, a gone StateIdle loop is DROPPED entirely
+	// (existing behavior). With one, it must survive as StateKilled — the
+	// human's kill decision should be visible, not silently vanish.
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "idle-one",
+		FromState: "idle", ToState: "idle", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "idle-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateIdle, LastActivity: now},
+	}
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (killed, not dropped)", len(out))
+	}
+	if out[0].State != domain.StateKilled {
+		t.Errorf("State = %v, want StateKilled", out[0].State)
+	}
+}
+
+func TestApplyLiveness_KillEventButProcessStillAlive_NotKilled(t *testing.T) {
+	// The kill keystroke was sent, but the process hasn't exited yet (or
+	// never will — e.g. it ignored /exit) — as long as a live process still
+	// backs it, liveness must not touch it at all, killed event or not.
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
+		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "drift-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
+	}
+	live := map[string]int{"/x/aboard": 1} // still alive
+
+	out := applyLiveness(loops, live, true, historyDir, now, ActiveWindow)
+
+	if out[0].State != domain.StateDrift {
+		t.Errorf("State = %v, want unchanged StateDrift (process still alive — a pending kill doesn't matter yet)", out[0].State)
+	}
+}
+
+func TestApplyLiveness_NoKillEvent_GoneStalledLoop_UnaffectedByFix(t *testing.T) {
+	// No kill event at all — the pre-existing StallGone demotion for an
+	// ordinary (non-exempt) state must still apply exactly as before.
+	historyDir := t.TempDir()
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "running-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateRunning, LastActivity: now},
+	}
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got %+v, want State=StateStalled Stall=StallGone (existing gone behavior, no kill event on record)", out[0])
+	}
+}
+
+func TestApplyLiveness_KillEventOutsideActiveWindow_Ignored(t *testing.T) {
+	// A kill event older than `within` must not resurrect as a KILLED
+	// derivation — "consider only events within the active window".
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-48 * time.Hour).UnixNano(), SessionID: "drift-one",
+		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "drift-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
+	}
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, 24*time.Hour)
+
+	if out[0].State != domain.StateDrift {
+		t.Errorf("State = %v, want unchanged StateDrift (the kill event is outside the active window)", out[0].State)
+	}
+}
+
+func TestApplyLiveness_LaterResumeAfterKill_NotTreatedAsKilled(t *testing.T) {
+	// A kill followed by a LATER successful actuation (e.g. a race, or a
+	// resume that somehow reached a since-revived session) means the kill
+	// is stale — mostRecentActuationIsKill must look at the MOST RECENT
+	// human actuation, not "was there ever a kill".
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Hour).UnixNano(), SessionID: "drift-one",
+		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append kill: %v", err)
+	}
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
+		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
+		Detail: "resume tier2 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append resume: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "drift-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateDrift, LastActivity: now},
+	}
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if out[0].State != domain.StateDrift {
+		t.Errorf("State = %v, want unchanged StateDrift (most recent actuation was a resume, not a kill)", out[0].State)
+	}
+}
+
+func TestMostRecentActuationIsKill_NoEvents_False(t *testing.T) {
+	if mostRecentActuationIsKill(t.TempDir(), "no-such-session", time.Now(), ActiveWindow) {
+		t.Error("expected false when there's no history at all")
+	}
+}
+
+func TestMostRecentActuationIsKill_IgnoresNonActuationEvents(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", ToState: "idle",
+		Trigger: events.TriggerScan, Actor: events.ActorSystem,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — a scan-trigger event is not a human actuation")
 	}
 }
 
@@ -924,7 +1097,7 @@ func TestApplyLiveness_ProbeFailed_FleetUnchanged(t *testing.T) {
 		{SessionID: "stalled-one", ProjectDir: "-x-aboard", Cwd: "/x/aboard", State: domain.StateStalled, Stall: domain.StallNoOutput, LastActivity: now.Add(-time.Minute)},
 	}
 
-	out := applyLiveness(loops, map[string]int{}, false)
+	out := applyLiveness(loops, map[string]int{}, false, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 2 {
 		t.Fatalf("got %d loops, want 2 (probe failure must leave the fleet untouched): %+v", len(out), out)
@@ -945,7 +1118,7 @@ func TestApplyLiveness_HyphenatedRealDir_MatchesEncodedProjectDir(t *testing.T) 
 	}
 	live := map[string]int{"/Users/x/my-app": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 || out[0].State != domain.StateIdle {
 		t.Errorf("got %+v, want the loop kept and untouched (its real process is live)", out)
@@ -967,7 +1140,7 @@ func TestApplyLiveness_DottedRealDir_MatchesEncodedProjectDir(t *testing.T) {
 	}
 	live := map[string]int{"/Users/imac/.claude-mem/observer-sessions": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 || out[0].State != domain.StateIdle {
 		t.Errorf("got %+v, want the loop kept and untouched (its real process is live)", out)
@@ -981,7 +1154,7 @@ func TestApplyLiveness_HealsCwdAndSetsCwdVerified(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if out[0].Cwd != "/x/aboard" || !out[0].CwdVerified {
 		t.Errorf("got Cwd=%q CwdVerified=%v, want the real lsof path and CwdVerified=true", out[0].Cwd, out[0].CwdVerified)
@@ -999,7 +1172,7 @@ func TestApplyLiveness_HealsCwdEvenWhileDemotedToGone(t *testing.T) {
 	}
 	live := map[string]int{"/x/aboard": 1}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	demoted := out[1]
 	if demoted.State != domain.StateStalled || demoted.Stall != domain.StallGone {
@@ -1025,7 +1198,7 @@ func TestApplyLiveness_EncodeCwdCollision_DoesNotHealCwd(t *testing.T) {
 		"/x/foo.bar": 1,
 	}
 
-	out := applyLiveness(loops, live, true)
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if out[0].CwdVerified {
 		t.Errorf("CwdVerified = true, want false — the ProjectDir is ambiguous between two distinct real paths")
