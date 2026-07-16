@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/gate"
@@ -420,8 +421,8 @@ func TestLastAssistantText_ReturnsLastOfTwo(t *testing.T) {
 	}
 }
 
-func TestLastAssistantText_CollapsesNewlinesAndCaps120(t *testing.T) {
-	long := strings.Repeat("a", 200)
+func TestLastAssistantText_CollapsesNewlinesAndCapsAtTailTextCap(t *testing.T) {
+	long := strings.Repeat("a", tailTextCap+100) // exceed the cap so truncation runs
 	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, "line one\nline two\n"+long))
 
 	got, ok := LastAssistantText(path)
@@ -436,6 +437,56 @@ func TestLastAssistantText_CollapsesNewlinesAndCaps120(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("got %q, want truncated with an ellipsis", got)
+	}
+	// tailTextCap runes of content + the 1-rune ellipsis marker.
+	if n := len([]rune(got)); n != tailTextCap+1 {
+		t.Errorf("capped length = %d runes, want %d (tailTextCap + ellipsis)", n, tailTextCap+1)
+	}
+}
+
+func TestLastAssistantText_CapIsRuneSafeForMultibyteText(t *testing.T) {
+	// Korean is 3 bytes/rune in UTF-8, so a byte-index cut at tailTextCap
+	// would land mid-rune for content like this (tailTextCap is not a
+	// multiple of 3) — the exact hazard trunc's own doc comment warns about
+	// ("byte-index slice can land mid-character... stray '�' glyphs"). This
+	// content is real-world plausible: this codebase's own commit history and
+	// UI copy are bilingual Korean/English.
+	long := strings.Repeat("가", tailTextCap+100) // exceed the cap so truncation runs
+	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, long))
+
+	got, ok := LastAssistantText(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("got invalid UTF-8 (mid-rune cut): %q", got)
+	}
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Errorf("got a replacement char (byte-boundary cut a multi-byte rune): %q", got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("got %q, want truncated with an ellipsis", got)
+	}
+	if n := len([]rune(got)); n != tailTextCap+1 {
+		t.Errorf("capped length = %d runes, want %d (tailTextCap + ellipsis)", n, tailTextCap+1)
+	}
+}
+
+func TestLastAssistantText_UnderCapNotTruncated(t *testing.T) {
+	// A message shorter than the cap is returned whole, with no ellipsis — the
+	// detail pane's TAIL row now shows several lines, so short reports aren't cut.
+	body := strings.Repeat("b", tailTextCap-100)
+	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, body))
+
+	got, ok := LastAssistantText(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != body {
+		t.Errorf("got %d runes, want the message returned verbatim (%d runes, no truncation)", len([]rune(got)), len([]rune(body)))
+	}
+	if strings.HasSuffix(got, "…") {
+		t.Errorf("under-cap message must not be marked truncated: ends with … = %q…", got[:20])
 	}
 }
 
