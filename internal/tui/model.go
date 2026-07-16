@@ -1268,49 +1268,64 @@ const (
 	oracleColWidth = 12
 	budgetColWidth = 13
 	niColWidth     = 5
-	// doingColWidth is deliberately wide (second only to NAME): DOING answers
-	// "what is this loop actually working on?", and a one/two-word fragment
-	// defeats that purpose — so it's sized to fit a short phrase, not a word.
-	doingColWidth = 30
 )
 
-// minWidthForNote/NI/Oracle/Budget/Doing/Cycle: below these terminal widths
-// the corresponding column is dropped entirely (not just truncated), in this
+// NAME and DOING are the two flexible text columns: they SHARE whatever width
+// is left after the fixed columns, each growing from a floor toward a cap.
+//   - floor: below it the text is a noise-y fragment (a 10-char DOING snippet
+//     is closer to noise than signal), so the column is hidden entirely rather
+//     than shown squeezed — the same all-or-nothing a fixed column does at its
+//     threshold, but here the trigger is "the leftover can't seat both floors".
+//   - cap: so neither column runs away on a very wide terminal (the mockup
+//     keeps the table compact); spare beyond both caps goes to NOTE.
+//
+// Keeping NAME+DOING inside the leftover budget is exactly what guarantees the
+// row never exceeds the terminal width — and so never soft-wraps onto a second
+// physical line — whenever DOING is shown. (An earlier fixed-width DOING broke
+// this: a 30-wide column that "survived" down to a 55-col threshold couldn't
+// actually fit until ~130 cols, so mainstream widths like 120 wrapped.)
+const (
+	nameFloorWidth  = 10
+	nameCapWidth    = 28
+	doingFloorWidth = 16
+	doingCapWidth   = 30
+)
+
+// minWidthForNote/NI/Oracle/Budget/Cycle: below these terminal widths the
+// corresponding fixed column is dropped entirely (not just truncated), in this
 // degradation order as width shrinks: NOTE first (least essential — the state
 // label already hints at "why"), then N/I, then ORACLE, then BUDGET, then
-// DOING, then CYCLE (most essential — kept the longest). DOING is ranked
-// ABOVE the numeric health columns (BUDGET/ORACLE/N-I) on purpose: it answers
-// the operator's actual question ("which loop is this, what's it working
-// on?"), which a budget bar can't — when space is tight, knowing what a loop
-// IS beats knowing its budget fraction. It stays below CYCLE (a cheap,
-// always-useful raw counter) and, obviously, NAME (never dropped). Each
-// threshold is strictly less than the last so that order actually holds.
+// CYCLE (most essential — kept the longest). Each threshold is strictly less
+// than the last so that order actually holds. NAME and DOING are NOT in this
+// list: they don't hard-drop at a fixed width, they flex to share the leftover
+// budget (see the nameFloorWidth/doingFloorWidth block and columnWidths), so
+// DOING fades by shrinking-then-hiding rather than snapping off at a threshold.
 const (
 	minWidthForNote   = 70
 	minWidthForNI     = 68
 	minWidthForOracle = 64
 	minWidthForBudget = 60
-	minWidthForDoing  = 55
 	minWidthForCycle  = 50
 )
 
-// columnWidths sizes NAME/DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE from the
-// terminal width: DOING/CYCLE/ORACLE/BUDGET/N-I are fixed-width when shown at
-// all (dropped below their thresholds, see minWidthForNote/NI/Oracle/Budget/
-// Doing/Cycle), and NAME soaks up whatever remains, with a usable minimum and
-// a cap so wide terminals don't stretch it into a chasm between columns
-// (mockup keeps the table compact) — spare width beyond the cap goes to NOTE.
-// DOING is a wide fixed column (doingColWidth), so the table's comfortable
-// minimum width is correspondingly higher when it's shown; below that the
-// pre-existing narrow-width behaviour applies (NAME floors, the row overflows)
-// until columns start dropping at their thresholds. A control-room fleet view
-// is expected to run wide, where DOING and NAME both get their full width.
+// columnWidths sizes NAME/DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
+// width. CYCLE/ORACLE/BUDGET/N-I/NOTE are fixed-width, dropped below their
+// thresholds (see minWidthForNote/NI/Oracle/Budget/Cycle). NAME and DOING are
+// the two flexible text columns: they SHARE whatever width is left after the
+// fixed columns (see flexNameDoing), each bounded by a floor and a cap, with
+// any width beyond both caps handed to NOTE (as it was before DOING existed).
+//
+// Because NAME+DOING are always kept within that leftover budget, the row's
+// total width never exceeds the terminal width whenever DOING is shown — so it
+// can't soft-wrap onto a second line (there is no viewport/clip in this TUI;
+// padToWidth only pads, never truncates the whole row). When the leftover
+// can't seat both floors, DOING is hidden (wDoing == 0) and NAME flexes alone,
+// exactly the pre-DOING behaviour; only then, at genuinely narrow widths, can
+// the fixed columns alone still overflow — the rough edge the table always had
+// below ~100 cols, which DOING neither introduces nor worsens.
 func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) {
 	if width >= minWidthForCycle {
 		wCycle = cycleColWidth
-	}
-	if width >= minWidthForDoing {
-		wDoing = doingColWidth
 	}
 	if width >= minWidthForOracle {
 		wOracle = oracleColWidth
@@ -1325,20 +1340,49 @@ func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNot
 		wNote = 24
 	}
 
-	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
-	// leading "  " indent plus cell boundaries need a little slack.
-	fixed := wMarker + wState + wLast + wDoing + wCycle + wOracle + wBudget + wNI + wNote + gaps
-	wName = width - fixed
-	if wName < 10 {
-		wName = 10
-	}
-	if wName > 28 {
-		if wNote > 0 {
-			wNote += wName - 28
+	const gaps = 4 // the leading "  " indent plus cell boundaries need slack.
+	fixed := wMarker + wState + wLast + wCycle + wOracle + wBudget + wNI + wNote + gaps
+	remaining := width - fixed // the width budget NAME and DOING share
+
+	if remaining >= nameFloorWidth+doingFloorWidth {
+		var spare int
+		wName, wDoing, spare = flexNameDoing(remaining)
+		if spare > 0 && wNote > 0 {
+			wNote += spare
 		}
-		wName = 28
+		return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
+	}
+
+	// Not enough room for both floors: DOING steps aside (wDoing stays 0) and
+	// NAME flexes alone. remaining < nameFloorWidth+doingFloorWidth < nameCap
+	// here, so NAME only ever hits its floor in this branch, never its cap.
+	wName = remaining
+	if wName < nameFloorWidth {
+		wName = nameFloorWidth
 	}
 	return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
+}
+
+// flexNameDoing splits the leftover width budget shared by NAME and DOING,
+// given it's already known both floors fit (remaining >= nameFloorWidth +
+// doingFloorWidth). Each column grows from its floor toward its cap in
+// proportion to its headroom; whatever is left once both are capped is
+// returned as spare for the caller to hand to NOTE. The invariant callers rely
+// on for the no-overflow guarantee: wName + wDoing + spare == remaining, so the
+// two flex columns plus NOTE's bonus never exceed the budget they were given.
+func flexNameDoing(remaining int) (wName, wDoing, spare int) {
+	pool := remaining - nameFloorWidth - doingFloorWidth
+	nameHeadroom := nameCapWidth - nameFloorWidth
+	doingHeadroom := doingCapWidth - doingFloorWidth
+	nameGain := pool * nameHeadroom / (nameHeadroom + doingHeadroom)
+	if nameGain > nameHeadroom {
+		nameGain = nameHeadroom
+	}
+	doingGain := pool - nameGain
+	if doingGain > doingHeadroom {
+		doingGain = doingHeadroom
+	}
+	return nameFloorWidth + nameGain, doingFloorWidth + doingGain, pool - nameGain - doingGain
 }
 
 func renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) string {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/registry"
 )
@@ -146,12 +147,118 @@ func TestColumnWidths_DropsNoteBelowThreshold(t *testing.T) {
 	}
 }
 
-func TestColumnWidths_DropsDoingBelowThreshold(t *testing.T) {
-	if _, wDoing, _, _, _, _, _ := columnWidths(minWidthForDoing - 1); wDoing != 0 {
-		t.Errorf("at width %d, wDoing = %d, want 0 (DOING column dropped)", minWidthForDoing-1, wDoing)
+// sampleLoopForWidth builds a loop whose NAME/DOING/NOTE text all overflow any
+// column, so every rendered cell is padded/truncated to exactly its column
+// width — the worst case for total row width.
+func sampleLoopForWidth() domain.Loop {
+	return domain.Loop{
+		Project: "IdeaProjects-very-long-label", SessionID: "abcd1234",
+		State: domain.StateRunning, Cycle: 6,
+		Goal:         domain.Goal{Text: "add pagination to the search results endpoint and cache it", MaxCycles: 12, BudgetTokens: 200000},
+		TokensSpent:  64000,
+		LastActivity: time.Now().Add(-30 * time.Second),
+		Note:         "⚠ over budget please look",
 	}
-	if _, wDoing, _, _, _, _, _ := columnWidths(minWidthForDoing); wDoing == 0 {
-		t.Errorf("at width %d, wDoing = 0, want > 0 (DOING column kept)", minWidthForDoing)
+}
+
+// renderedRowWidth is the true on-screen width of a row (ANSI-stripped, wide
+// runes counted) — the ground truth for "does the row fit / would it wrap?".
+// sel=false so padToWidth doesn't pad the row out to the terminal width and
+// mask an overflow.
+func renderedRowWidth(l domain.Loop, width int) int {
+	wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
+	row := renderRow(l, false, false, wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, width)
+	return lipgloss.Width(row)
+}
+
+// TestColumnWidths_RowNeverOverflowsWhenDoingShown is the core anti-regression
+// property: whenever DOING is rendered (wDoing > 0), the row must fit within
+// the terminal width — otherwise it soft-wraps onto a second physical line and
+// the selection highlight stops covering it. This is exactly the class of bug
+// the fixed-width DOING introduced at 120 cols; a wide sweep guards it.
+func TestColumnWidths_RowNeverOverflowsWhenDoingShown(t *testing.T) {
+	l := sampleLoopForWidth()
+	for width := 40; width <= 260; width++ {
+		_, wDoing, _, _, _, _, _ := columnWidths(width)
+		if wDoing == 0 {
+			continue // DOING hidden — narrow regime, pre-existing NAME-only behaviour
+		}
+		if got := renderedRowWidth(l, width); got > width {
+			t.Errorf("width=%d: rendered row is %d cols wide (DOING shown, wDoing=%d) — overflows, would wrap", width, got, wDoing)
+		}
+	}
+}
+
+// TestColumnWidths_RowFitsAtCommonWidths pins the mainstream terminal sizes the
+// captain actually uses: the full table (DOING included where it fits) must
+// render within the width, no wrapping. 100 is the lowest width the fixed
+// columns themselves fit in; below it the pre-existing narrow overflow applies
+// (and DOING is hidden, so it isn't DOING's doing) — see the hidden-widths test.
+func TestColumnWidths_RowFitsAtCommonWidths(t *testing.T) {
+	l := sampleLoopForWidth()
+	for _, width := range []int{100, 118, 120, 130, 140, 160, 200} {
+		if got := renderedRowWidth(l, width); got > width {
+			t.Errorf("width=%d: rendered row is %d cols wide, want <= %d", width, got, width)
+		}
+	}
+}
+
+// TestColumnWidths_DoingHiddenWhenNoRoom: below the width that can seat both
+// text columns' floors alongside the fixed columns, DOING is hidden entirely
+// (never a squeezed sub-floor fragment), so it adds nothing to — and can't
+// overflow — the pre-existing narrow layout.
+func TestColumnWidths_DoingHiddenWhenNoRoom(t *testing.T) {
+	for _, width := range []int{40, 60, 80, 100, 110, 115} {
+		if _, wDoing, _, _, _, _, _ := columnWidths(width); wDoing != 0 {
+			t.Errorf("width=%d: wDoing=%d, want 0 (hidden — not enough room for both text columns)", width, wDoing)
+		}
+	}
+}
+
+// TestColumnWidths_DoingShownAndReadableWhenWide: at mainstream+ widths DOING
+// is shown and never below its floor (a readable phrase, not a fragment).
+func TestColumnWidths_DoingShownAndReadableWhenWide(t *testing.T) {
+	for _, width := range []int{120, 130, 140, 160, 200} {
+		_, wDoing, _, _, _, _, _ := columnWidths(width)
+		if wDoing < doingFloorWidth {
+			t.Errorf("width=%d: wDoing=%d, want >= doingFloorWidth (%d) — a shown column must be readable", width, wDoing, doingFloorWidth)
+		}
+	}
+}
+
+// TestColumnWidths_NameAndDoingReachCapsWhenWide: on a very wide terminal both
+// text columns cap out and the leftover flows to NOTE (unchanged behaviour).
+func TestColumnWidths_NameAndDoingReachCapsWhenWide(t *testing.T) {
+	wName, wDoing, _, _, _, _, wNote := columnWidths(240)
+	if wName != nameCapWidth {
+		t.Errorf("wName=%d at width 240, want cap %d", wName, nameCapWidth)
+	}
+	if wDoing != doingCapWidth {
+		t.Errorf("wDoing=%d at width 240, want cap %d", wDoing, doingCapWidth)
+	}
+	if wNote <= 24 {
+		t.Errorf("wNote=%d at width 240, want > 24 (spare beyond both caps flows to NOTE)", wNote)
+	}
+}
+
+// TestFlexNameDoing_InvariantAndBounds: the split must conserve the budget
+// (wName+wDoing+spare == remaining — this is what makes the row fit) and keep
+// each column within [floor, cap], with non-negative spare, at every budget.
+func TestFlexNameDoing_InvariantAndBounds(t *testing.T) {
+	for remaining := nameFloorWidth + doingFloorWidth; remaining <= 320; remaining++ {
+		wName, wDoing, spare := flexNameDoing(remaining)
+		if wName+wDoing+spare != remaining {
+			t.Fatalf("remaining=%d: wName(%d)+wDoing(%d)+spare(%d) != remaining", remaining, wName, wDoing, spare)
+		}
+		if wName < nameFloorWidth || wName > nameCapWidth {
+			t.Errorf("remaining=%d: wName=%d out of [%d,%d]", remaining, wName, nameFloorWidth, nameCapWidth)
+		}
+		if wDoing < doingFloorWidth || wDoing > doingCapWidth {
+			t.Errorf("remaining=%d: wDoing=%d out of [%d,%d]", remaining, wDoing, doingFloorWidth, doingCapWidth)
+		}
+		if spare < 0 {
+			t.Errorf("remaining=%d: spare=%d is negative", remaining, spare)
+		}
 	}
 }
 
@@ -192,9 +299,9 @@ func TestColumnWidths_DropsCycleBelowThreshold(t *testing.T) {
 }
 
 func TestColumnWidths_DegradationOrder(t *testing.T) {
-	// NOTE must drop before N/I, before ORACLE, before BUDGET, before DOING,
-	// before CYCLE, as width shrinks — never any other order. DOING sits above
-	// the numeric health columns (dropped after them) but below CYCLE.
+	// NOTE must drop before N/I, before ORACLE, before BUDGET, before CYCLE, as
+	// width shrinks — never any other order. (NAME and DOING aren't in this
+	// order; they flex to share the leftover — see the row-fit / flex tests.)
 	if minWidthForNote <= minWidthForNI {
 		t.Errorf("minWidthForNote (%d) must be > minWidthForNI (%d)", minWidthForNote, minWidthForNI)
 	}
@@ -204,11 +311,8 @@ func TestColumnWidths_DegradationOrder(t *testing.T) {
 	if minWidthForOracle <= minWidthForBudget {
 		t.Errorf("minWidthForOracle (%d) must be > minWidthForBudget (%d)", minWidthForOracle, minWidthForBudget)
 	}
-	if minWidthForBudget <= minWidthForDoing {
-		t.Errorf("minWidthForBudget (%d) must be > minWidthForDoing (%d)", minWidthForBudget, minWidthForDoing)
-	}
-	if minWidthForDoing <= minWidthForCycle {
-		t.Errorf("minWidthForDoing (%d) must be > minWidthForCycle (%d)", minWidthForDoing, minWidthForCycle)
+	if minWidthForBudget <= minWidthForCycle {
+		t.Errorf("minWidthForBudget (%d) must be > minWidthForCycle (%d)", minWidthForBudget, minWidthForCycle)
 	}
 }
 
@@ -1066,10 +1170,10 @@ func TestDoingForRow_TruncatedToColumnWidth(t *testing.T) {
 	// doingForRow returns the raw text; the caller truncates it to the column
 	// width with trunc — verify that path caps a long goal at the column and
 	// marks it with an ellipsis.
-	long := strings.Repeat("x", doingColWidth+20)
-	got := trunc(doingForRow(domain.Loop{Goal: domain.Goal{Text: long}}), doingColWidth-1)
-	if n := len([]rune(got)); n != doingColWidth-1 {
-		t.Errorf("truncated length = %d runes, want %d (column width - 1)", n, doingColWidth-1)
+	long := strings.Repeat("x", doingCapWidth+20)
+	got := trunc(doingForRow(domain.Loop{Goal: domain.Goal{Text: long}}), doingCapWidth-1)
+	if n := len([]rune(got)); n != doingCapWidth-1 {
+		t.Errorf("truncated length = %d runes, want %d (column width - 1)", n, doingCapWidth-1)
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("got %q, want a trailing ellipsis when truncated", got)
