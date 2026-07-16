@@ -16,6 +16,7 @@ package sessions
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,11 +48,28 @@ type SessionEntry struct {
 	StartedAt      time.Time `json:"started_at"`
 }
 
+// validSessionID rejects anything that isn't a plain, single-component
+// filename — session_id arrives from a Claude Code hook payload (external
+// input; a malformed or crafted payload could in principle reach this via
+// `hook session-start`/`hook session-end`'s stdin) and is joined directly
+// into a filesystem path below. A real session_id is always a UUID, but a
+// value containing a path separator (e.g. "../canary") would let
+// filepath.Join escape SessionsDir entirely — filepath.Base(id) != id
+// catches exactly that (any "/" makes Base return a shorter suffix); a bare
+// "." or ".." both pass through as harmless literal filenames once ".json"
+// is appended ("..json"/"...json"), so no extra special-casing is needed.
+func validSessionID(id string) bool {
+	return id != "" && filepath.Base(id) == id
+}
+
 // WriteSession records sessionID's identity entry. Called from the
 // SessionStart hook — must be fast; its error is only ever used by the hook
 // to decide what to log, and the hook itself always exits 0 regardless (see
 // cmd/missionctl's hook subcommand).
 func WriteSession(dir, sessionID string, entry SessionEntry) error {
+	if !validSessionID(sessionID) {
+		return fmt.Errorf("sessions: invalid session id %q", sessionID)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -66,6 +84,9 @@ func WriteSession(dir, sessionID string, entry SessionEntry) error {
 // error (unlike ListSessions, which skips them) — callers that want
 // best-effort iteration should use ListSessions instead.
 func ReadSession(dir, sessionID string) (SessionEntry, error) {
+	if !validSessionID(sessionID) {
+		return SessionEntry{}, fmt.Errorf("sessions: invalid session id %q", sessionID)
+	}
 	var entry SessionEntry
 	data, err := os.ReadFile(filepath.Join(dir, sessionID+".json"))
 	if err != nil {
@@ -109,7 +130,13 @@ func ListSessions(dir string) map[string]SessionEntry {
 // fire for a session that never got a SessionStart record, or after a stale
 // entry was already pruned (matches gate's CAS-delete tolerance). Any other
 // os.Remove error is returned so the hook can log it (the hook still exits 0).
+// An invalid session id (see validSessionID) is likewise a no-op, not an
+// error — same tolerant posture as a missing file, and it means a crafted
+// session_id can't be used as an arbitrary-file-delete primitive.
 func DeleteSession(dir, sessionID string) error {
+	if !validSessionID(sessionID) {
+		return nil
+	}
 	err := os.Remove(filepath.Join(dir, sessionID+".json"))
 	if os.IsNotExist(err) {
 		return nil

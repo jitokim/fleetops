@@ -142,3 +142,77 @@ func TestSessionsDir_Shape(t *testing.T) {
 		t.Errorf("SessionsDir() = %q, want %q", got, want)
 	}
 }
+
+// TestWriteSession_RejectsPathTraversal is the security property: session_id
+// arrives from a Claude Code hook payload (external input), and a crafted
+// value must not be able to escape SessionsDir via filepath.Join. Proven
+// empirically (not just asserted): a "../canary"-style id must NOT create
+// any file outside dir.
+func TestWriteSession_RejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Dir(dir)
+	canary := filepath.Join(parent, "canary-should-not-exist.json")
+	defer os.Remove(canary) // best-effort cleanup if the guard ever regresses
+
+	if err := WriteSession(dir, "../canary-should-not-exist", sampleEntry()); err == nil {
+		t.Error("WriteSession(\"../canary-should-not-exist\") = nil error, want a rejection")
+	}
+	if _, err := os.Stat(canary); err == nil {
+		t.Fatal("WriteSession escaped dir and wrote outside SessionsDir — path traversal succeeded")
+	}
+}
+
+// TestReadSession_RejectsPathTraversal mirrors the write-side guard.
+func TestReadSession_RejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := ReadSession(dir, "../etc/passwd"); err == nil {
+		t.Error("ReadSession(\"../etc/passwd\") = nil error, want a rejection")
+	}
+}
+
+// TestDeleteSession_RejectsPathTraversal proves DeleteSession can't be used
+// as an arbitrary-file-delete primitive via a crafted session_id — it must
+// be a tolerant no-op (matching DeleteSession's existing "missing entry"
+// tolerance), never attempt the os.Remove at all.
+func TestDeleteSession_RejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Dir(dir)
+	canary := filepath.Join(parent, "canary-must-survive.json")
+	if err := os.WriteFile(canary, []byte("do not delete me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(canary)
+
+	if err := DeleteSession(dir, "../canary-must-survive"); err != nil {
+		t.Errorf("DeleteSession with a traversal id = %v, want nil (tolerant no-op)", err)
+	}
+	if _, err := os.Stat(canary); err != nil {
+		t.Fatal("DeleteSession escaped dir and deleted a file outside SessionsDir")
+	}
+}
+
+func TestValidSessionID(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"7666c9ac-fc6a-4824-8c33-cb2a7d810f99", true}, // real-shaped UUID
+		{"sess-1", true},
+		{"", false},
+		{"..", true},           // harmless once ".json" is appended ("...json")
+		{".", true},            // harmless once ".json" is appended ("..json")
+		{"../canary", false}, // the actual escape vector
+		{"a/b", false},
+		{"a\\b", true}, // NOT a traversal on this tool's target platforms (macOS/Linux):
+		// filepath.Base is OS-separator-aware, and "\" is just a regular
+		// filename character on both, not a path separator — verified
+		// (filepath.Base(`a\b`) == `a\b` here), so this is correctly accepted,
+		// not a gap (this tool doesn't target Windows).
+		{"/etc/passwd", false},
+	}
+	for _, c := range cases {
+		if got := validSessionID(c.id); got != c.want {
+			t.Errorf("validSessionID(%q) = %v, want %v", c.id, got, c.want)
+		}
+	}
+}
