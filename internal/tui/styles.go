@@ -37,9 +37,6 @@ var (
 
 	stKeybar = lipgloss.NewStyle().Foreground(cDim).Background(cChrome).
 			BorderTop(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(cLine)
-	stDetail = lipgloss.NewStyle().Foreground(cInk).
-			BorderTop(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(cLine).
-			PaddingTop(1)
 
 	// the mockup's amber "GATE NEEDS YOU" badge, repurposed honestly for stalls.
 	stBadgeStalled = lipgloss.NewStyle().Foreground(cAmberInk).Background(cAmber).Bold(true).Padding(0, 1)
