@@ -50,6 +50,15 @@ type Target struct {
 	Backend string // "orca" | "cmux" | "tmux"
 	ID      string // orca terminal handle ("term_abc123") / cmux surface ref ("surface:2") / tmux pane id ("%3")
 	Cwd     string
+	// Window is the enclosing cmux window ref ("window:1") that disambiguates a
+	// surface ref across workspaces. Populated ONLY by cmux's Locate/LocateClaude
+	// (captured while walking `cmux tree --json`) and threaded into every cmux
+	// actuation as `--window <ref>`; orca/tmux leave it empty because their
+	// handles/pane-ids are already globally addressable. Without it, cmux scopes
+	// a `--surface`/`--panel` ref to the CALLER's own workspace
+	// ($CMUX_WORKSPACE_ID) and any target in another workspace fails (verified
+	// live on cmux 0.64.15 — see appendCmuxWindow).
+	Window string
 }
 
 // Controller locates and re-drives loops on one multiplexer backend.

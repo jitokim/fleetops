@@ -56,13 +56,33 @@ func (cmuxController) LocateClaude(projectDir string) (Target, bool) {
 }
 
 func (cmuxController) Resume(t Target, prompt string) error {
-	return runWithTimeout(cmuxResumeCmd(t.ID, prompt))
+	return runWithTimeout(cmuxResumeCmd(t.ID, t.Window, prompt))
 }
 
 // cmuxResumeCmd builds the argv that re-sends prompt to a surface and submits
-// it in one call ("\n" sends Enter): cmux send --surface <ref> -- "<prompt>\n".
-func cmuxResumeCmd(surfaceRef, prompt string) []string {
-	return []string{"cmux", "send", "--surface", surfaceRef, "--", prompt + "\n"}
+// it in one call ("\n" sends Enter): cmux send --surface <ref> [--window <ref>]
+// -- "<prompt>\n". The optional --window is what lets a surface outside the
+// caller's own workspace be reached (see appendCmuxWindow).
+func cmuxResumeCmd(surfaceRef, windowRef, prompt string) []string {
+	argv := appendCmuxWindow([]string{"cmux", "send", "--surface", surfaceRef}, windowRef)
+	return append(argv, "--", prompt+"\n")
+}
+
+// appendCmuxWindow appends `--window <ref>` to a cmux actuation argv when
+// windowRef is non-empty, and returns argv unchanged when it is empty. cmux
+// resolves a `--surface`/`--panel` ref within a window context; with --window
+// omitted that context defaults to the CALLER's own workspace
+// ($CMUX_WORKSPACE_ID), so a surface in any OTHER workspace fails — verified
+// live on cmux 0.64.15: cross-workspace `send`/`send-key`/`focus-panel` all
+// fail without it ("Surface not found" / "Surface is not a terminal") and
+// succeed with it, while a same-workspace target accepts --window as a no-op.
+// windowRef is Target.Window: cmux populates it, orca/tmux leave it "" so their
+// argv is never touched.
+func appendCmuxWindow(argv []string, windowRef string) []string {
+	if windowRef == "" {
+		return argv
+	}
+	return append(argv, "--window", windowRef)
 }
 
 // Approve accepts claude's default highlighted option at a gate by sending
@@ -75,22 +95,29 @@ func cmuxResumeCmd(surfaceRef, prompt string) []string {
 // claude-in-cmux gate (none available to drive safely), so the semantic
 // effect — Enter accepts the default — is contract-level, not runtime-tested.
 func (cmuxController) Approve(t Target) error {
-	return runWithTimeout(cmuxApproveCmd(t.ID))
+	return runWithTimeout(cmuxApproveCmd(t.ID, t.Window))
 }
 
-// cmuxApproveCmd builds the argv for a bare Enter keypress into a surface.
-func cmuxApproveCmd(surfaceRef string) []string {
-	return []string{"cmux", "send-key", "--surface", surfaceRef, "enter"}
+// cmuxApproveCmd builds the argv for a bare Enter keypress into a surface:
+// cmux send-key --surface <ref> [--window <ref>] enter (see appendCmuxWindow
+// for why --window is needed to reach a cross-workspace surface).
+func cmuxApproveCmd(surfaceRef, windowRef string) []string {
+	argv := appendCmuxWindow([]string{"cmux", "send-key", "--surface", surfaceRef}, windowRef)
+	return append(argv, "enter")
 }
 
 func (cmuxController) Focus(t Target) error {
-	return runWithTimeout(cmuxFocusCmd(t.ID))
+	return runWithTimeout(cmuxFocusCmd(t.ID, t.Window))
 }
 
 // cmuxFocusCmd builds the argv that brings a cmux surface to the front:
-// focus-panel is the contract's compatibility alias over surface focus.
-func cmuxFocusCmd(surfaceRef string) []string {
-	return []string{"cmux", "focus-panel", "--panel", surfaceRef}
+// focus-panel is the contract's compatibility alias over surface focus. The
+// optional --window reaches a surface outside the caller's own workspace (see
+// appendCmuxWindow) — reproduced live: `focus-panel --panel surface:N` alone
+// fails "not_found: Surface not found" when surface:N is in another workspace,
+// and succeeds once `--window <ref>` is added.
+func cmuxFocusCmd(surfaceRef, windowRef string) []string {
+	return appendCmuxWindow([]string{"cmux", "focus-panel", "--panel", surfaceRef}, windowRef)
 }
 
 // Spawn is not supported on cmux yet — creating a brand new surface running
@@ -109,12 +136,15 @@ func (cmuxController) Spawn(cwd, goal string) error {
 // turn was available to confirm Esc interrupts (rather than kills), so this
 // remains assumed, not runtime-tested.
 func (cmuxController) Interrupt(t Target) error {
-	return runWithTimeout(cmuxInterruptCmd(t.ID))
+	return runWithTimeout(cmuxInterruptCmd(t.ID, t.Window))
 }
 
-// cmuxInterruptCmd builds the argv for an Escape keypress into a surface.
-func cmuxInterruptCmd(surfaceRef string) []string {
-	return []string{"cmux", "send-key", "--surface", surfaceRef, "escape"}
+// cmuxInterruptCmd builds the argv for an Escape keypress into a surface:
+// cmux send-key --surface <ref> [--window <ref>] escape (see appendCmuxWindow
+// for why --window is needed to reach a cross-workspace surface).
+func cmuxInterruptCmd(surfaceRef, windowRef string) []string {
+	argv := appendCmuxWindow([]string{"cmux", "send-key", "--surface", surfaceRef}, windowRef)
+	return append(argv, "escape")
 }
 
 // cmuxTreeJSON runs `cmux tree --json`, bounded by availabilityTimeout so a
@@ -126,13 +156,18 @@ func cmuxTreeJSON() ([]byte, error) {
 }
 
 // cmuxSurface is one terminal-type surface from `cmux tree --json`: its stable
-// ref ("surface:<n>") and the tty it is attached to ("ttys008"). cmux's tree
-// carries NO cwd anywhere (verified against the full 26KB dump on cmux
-// 0.64.15 — zero cwd/path-like keys), so a surface's cwd is resolved
-// out-of-band from the OS by tty (see liveResolveCmuxTTYs), not read here.
+// ref ("surface:<n>"), the tty it is attached to ("ttys008"), and the ref of
+// the window that encloses it ("window:1"). cmux's tree carries NO cwd anywhere
+// (verified against the full 26KB dump on cmux 0.64.15 — zero cwd/path-like
+// keys), so a surface's cwd is resolved out-of-band from the OS by tty (see
+// liveResolveCmuxTTYs), not read here. The window ref IS in the tree (the
+// windows[] array element's "ref"), captured while walking so actuation can
+// pass `--window` and reach surfaces outside the caller's own workspace (see
+// appendCmuxWindow).
 type cmuxSurface struct {
-	ref string
-	tty string
+	ref    string
+	tty    string
+	window string
 }
 
 // ttyResolution is one tty's OS-derived facts: the representative cwd of the
@@ -161,7 +196,7 @@ func locateCmux(jsonBytes []byte, projectDir string, resolve ttyResolver) (Targe
 			continue
 		}
 		if encodeCwd(r.cwd) == projectDir {
-			return Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd}, true
+			return Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd, Window: s.window}, true
 		}
 	}
 	return Target{}, false
@@ -189,7 +224,7 @@ func locateCmuxClaude(jsonBytes []byte, projectDir string, resolve ttyResolver) 
 			continue
 		}
 		if _, seen := firstByTTY[s.tty]; !seen {
-			firstByTTY[s.tty] = Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd}
+			firstByTTY[s.tty] = Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd, Window: s.window}
 		}
 	}
 	if len(firstByTTY) != 1 {
@@ -233,22 +268,31 @@ func parseCmuxTree(jsonBytes []byte) []cmuxSurface {
 		return nil
 	}
 	var surfaces []cmuxSurface
-	walkCmuxNode(root, &surfaces)
+	walkCmuxNode(root, "", &surfaces)
 	return surfaces
 }
 
-func walkCmuxNode(node any, out *[]cmuxSurface) {
+// walkCmuxNode descends the tree carrying the enclosing window ref: whenever a
+// map node is itself a window (its "ref" is "window:<n>", the windows[] array
+// element), that ref becomes the window context for its whole subtree — so each
+// surface is tagged with the window that actually contains it. window is passed
+// by value, so sibling windows never bleed into each other's subtrees.
+func walkCmuxNode(node any, window string, out *[]cmuxSurface) {
 	switch v := node.(type) {
 	case map[string]any:
+		if ref, ok := v["ref"].(string); ok && strings.HasPrefix(ref, "window:") {
+			window = ref
+		}
 		if s, ok := cmuxSurfaceFromNode(v); ok {
+			s.window = window
 			*out = append(*out, s)
 		}
 		for _, child := range v {
-			walkCmuxNode(child, out)
+			walkCmuxNode(child, window, out)
 		}
 	case []any:
 		for _, child := range v {
-			walkCmuxNode(child, out)
+			walkCmuxNode(child, window, out)
 		}
 	}
 }

@@ -88,7 +88,7 @@ reflect actual work done.
 |---|---|---|---|
 | **orca** | ✅ | ✅ | Verified live against the real CLI; preferred when available. |
 | **tmux** | ✅ | ✅ | Verified against tmux's documented command contract. |
-| **cmux** | ✅ (locate/send/focus/approve/interrupt) | ❌ | Verified against real **cmux 0.64.15**: `tree --json` shape, and `send`/`send-key`/`focus-panel` subcommands. Its tree carries no cwd, so surface→dir matching cross-references the OS by tty (`ps`+`lsof`). Spawn is still unsupported (no verified create-surface command). |
+| **cmux** | ✅ (locate/send/focus/approve/interrupt) | ❌ | Verified against real **cmux 0.64.15**: `tree --json` shape, and `send`/`send-key`/`focus-panel` subcommands — including **cross-workspace addressing**: each actuation now passes `--window <ref>` so a surface outside the caller's own workspace is reachable (verified live; without it a cross-workspace target failed). Its tree carries no cwd, so surface→dir matching cross-references the OS by tty (`ps`+`lsof`). Spawn is still unsupported (no verified create-surface command). |
 | **bare terminal** (none of the above) | manual hint only | manual hint only | Observation still works fully; actions print a copy-pasteable command (`claude --resume <id>`, `cd <dir>`, etc.) instead of silently failing. |
 
 `internal/control.Resolve()` picks the first available backend in that order
@@ -110,6 +110,21 @@ reflect actual work done.
   interrupt) key token and the end-to-end effect of Resume/Approve on a live
   claude gate are still assumed (no live claude-in-cmux session was safe to
   drive). Verified on this cmux version only, not all cmux releases.
+- **cmux: cross-workspace addressing (`--window`).** A `--surface`/`--panel`
+  ref is resolved by cmux within a *window* context; with `--window` omitted
+  that context defaults to the caller's own workspace (`$CMUX_WORKSPACE_ID`),
+  so a surface in **any other workspace** silently fails ("Surface not found" /
+  "Surface is not a terminal") — the earlier "verified subcommands" work only
+  covered the flags, not this addressing gap. Locate/LocateClaude now capture
+  each surface's enclosing `window:<n>` ref while walking the tree
+  (`Target.Window`), and every actuation appends `--window <ref>` when it is
+  set. This was reproduced and fixed live on cmux 0.64.15 for all three
+  subcommands (`focus-panel` reproduced directly by the captain; `send` and
+  `send-key` re-verified here by driving a throwaway cross-workspace surface):
+  each failed without `--window` and succeeded with it, correctly targeting the
+  other workspace. A **same-workspace** target accepts `--window` as a verified
+  no-op, so there is no regression. orca/tmux leave `Target.Window` empty (their
+  handles/pane-ids are already globally addressable), so their argv is unchanged.
 - **macOS-first.** Process liveness (`internal/claude`'s liveness pass) shells
   out to `ps axo pid,comm` and `lsof`; it hasn't been adapted for Linux's
   `/proc` or other platforms.
