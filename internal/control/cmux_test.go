@@ -7,44 +7,77 @@ import (
 	"testing"
 )
 
-// --- actuation argv shape (unchanged contracts, verified on cmux 0.64.15) ---
+// --- actuation argv shape (verified on cmux 0.64.15) ---
+//
+// Each builder must append `--window <ref>` when a window ref is supplied
+// (Target.Window, set by cmux's Locate/LocateClaude for a cross-workspace
+// surface) and omit it entirely when empty (same-caller-workspace target, or
+// orca/tmux). The window flag sits among the other flags, before the trailing
+// positional (the "--"/text for send, the key for send-key); focus-panel has
+// no trailing positional.
 
-func TestCmuxResumeCmd(t *testing.T) {
-	got := cmuxResumeCmd("surface:2", "hello world")
+func TestCmuxResumeCmd_NoWindow_OmitsFlag(t *testing.T) {
+	got := cmuxResumeCmd("surface:2", "", "hello world")
 	want := []string{"cmux", "send", "--surface", "surface:2", "--", "hello world\n"}
-
-	if len(got) != len(want) {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
-		}
 	}
 	if got[len(got)-1][len(got[len(got)-1])-1] != '\n' {
 		t.Errorf("last argv element must end in \\n (Enter), got %q", got[len(got)-1])
 	}
 }
 
-func TestCmuxFocusCmd(t *testing.T) {
-	got := cmuxFocusCmd("surface:2")
+func TestCmuxResumeCmd_WithWindow_AppendsFlagBeforeText(t *testing.T) {
+	got := cmuxResumeCmd("surface:2", "window:1", "hello world")
+	want := []string{"cmux", "send", "--surface", "surface:2", "--window", "window:1", "--", "hello world\n"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestCmuxFocusCmd_NoWindow_OmitsFlag(t *testing.T) {
+	got := cmuxFocusCmd("surface:2", "")
 	want := []string{"cmux", "focus-panel", "--panel", "surface:2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
-func TestCmuxApproveCmd(t *testing.T) {
-	got := cmuxApproveCmd("surface:2")
+func TestCmuxFocusCmd_WithWindow_AppendsFlag(t *testing.T) {
+	got := cmuxFocusCmd("surface:2", "window:2")
+	want := []string{"cmux", "focus-panel", "--panel", "surface:2", "--window", "window:2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestCmuxApproveCmd_NoWindow_OmitsFlag(t *testing.T) {
+	got := cmuxApproveCmd("surface:2", "")
 	want := []string{"cmux", "send-key", "--surface", "surface:2", "enter"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
 
-func TestCmuxInterruptCmd(t *testing.T) {
-	got := cmuxInterruptCmd("surface:2")
+func TestCmuxApproveCmd_WithWindow_AppendsFlagBeforeKey(t *testing.T) {
+	got := cmuxApproveCmd("surface:2", "window:1")
+	want := []string{"cmux", "send-key", "--surface", "surface:2", "--window", "window:1", "enter"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestCmuxInterruptCmd_NoWindow_OmitsFlag(t *testing.T) {
+	got := cmuxInterruptCmd("surface:2", "")
 	want := []string{"cmux", "send-key", "--surface", "surface:2", "escape"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestCmuxInterruptCmd_WithWindow_AppendsFlagBeforeKey(t *testing.T) {
+	got := cmuxInterruptCmd("surface:2", "window:2")
+	want := []string{"cmux", "send-key", "--surface", "surface:2", "--window", "window:2", "escape"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -70,20 +103,39 @@ func realCmuxTree(t *testing.T) []byte {
 	return b
 }
 
-func TestParseCmuxTree_RealFixture_CollectsTerminalSurfacesWithTTY(t *testing.T) {
+func TestParseCmuxTree_RealFixture_CollectsTerminalSurfacesWithTTYAndWindow(t *testing.T) {
 	got := parseCmuxTree(realCmuxTree(t))
-	// Only terminal-type surfaces, each with its ref + tty. Browser surfaces
-	// (surface:18/23, tty:null) and the top-level "active" pointer (uses
-	// surface_ref, has no ref/tty of its own) must be excluded. Order is the
-	// array-driven walk order.
+	// Only terminal-type surfaces, each with its ref + tty + enclosing window
+	// ref. Browser surfaces (surface:18/23, tty:null) and the top-level "active"
+	// pointer (uses surface_ref, has no ref/tty of its own) must be excluded.
+	// surface:15/22 live in window:1, surface:50/9 in window:2 — the window ref
+	// is what actuation passes as --window to reach a cross-workspace surface.
+	// Order is the array-driven walk order.
 	want := []cmuxSurface{
-		{ref: "surface:15", tty: "ttys008"},
-		{ref: "surface:22", tty: "ttys009"},
-		{ref: "surface:50", tty: "ttys012"},
-		{ref: "surface:9", tty: "ttys012"},
+		{ref: "surface:15", tty: "ttys008", window: "window:1"},
+		{ref: "surface:22", tty: "ttys009", window: "window:1"},
+		{ref: "surface:50", tty: "ttys012", window: "window:2"},
+		{ref: "surface:9", tty: "ttys012", window: "window:2"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseCmuxTree = %+v, want %+v", got, want)
+	}
+}
+
+func TestParseCmuxTree_WindowRef_MatchesEachSurfacesEnclosingWindow(t *testing.T) {
+	// The crux of the cross-workspace fix: every surface must carry the ref of
+	// the window that actually encloses it in the tree — never a sibling
+	// window's ref bleeding across the windows[] boundary.
+	wantWindow := map[string]string{
+		"surface:15": "window:1", // window:1 / workspace:9
+		"surface:22": "window:1", // window:1 / workspace:9
+		"surface:50": "window:2", // window:2 / workspace:23 — different window
+		"surface:9":  "window:2", // window:2 / workspace:23
+	}
+	for _, s := range parseCmuxTree(realCmuxTree(t)) {
+		if want := wantWindow[s.ref]; s.window != want {
+			t.Errorf("surface %s: window = %q, want %q", s.ref, s.window, want)
+		}
 	}
 }
 
@@ -161,7 +213,7 @@ func TestLocateCmux_TerminalSurfaceMatchingCwd_Found(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	want := Target{Backend: "cmux", ID: "surface:15", Cwd: "/Users/imac/IdeaProjects/aboard"}
+	want := Target{Backend: "cmux", ID: "surface:15", Cwd: "/Users/imac/IdeaProjects/aboard", Window: "window:1"}
 	if got != want {
 		t.Errorf("got %+v, want %+v", got, want)
 	}
@@ -200,7 +252,7 @@ func TestLocateCmuxClaude_SingleClaudeSurface_Found(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok=true — exactly one claude surface matches")
 	}
-	want := Target{Backend: "cmux", ID: "surface:15", Cwd: "/Users/imac/IdeaProjects/aboard"}
+	want := Target{Backend: "cmux", ID: "surface:15", Cwd: "/Users/imac/IdeaProjects/aboard", Window: "window:1"}
 	if got != want {
 		t.Errorf("got %+v, want %+v", got, want)
 	}
@@ -258,6 +310,12 @@ func TestLocateCmuxClaude_SameTTYTwoSurfaces_NotAmbiguous(t *testing.T) {
 	}
 	if got.Cwd != "/Users/imac/IdeaProjects/team" {
 		t.Errorf("got Cwd %q, want /Users/imac/IdeaProjects/team", got.Cwd)
+	}
+	// surface:50 lives in window:2 (a DIFFERENT window than surface:15's
+	// window:1) — the Target must carry that window ref so actuation can pass
+	// --window and reach it even from a caller in another workspace.
+	if got.Window != "window:2" {
+		t.Errorf("got Window %q, want window:2 (surface:50's enclosing window)", got.Window)
 	}
 }
 
