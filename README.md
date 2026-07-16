@@ -2,6 +2,12 @@
 
 A fleet cockpit for Claude Code loops, in your terminal.
 
+> **Status: experimental / 0.1.0-alpha.** This is a young, actively-changing
+> project — expect rough edges, and read the "Known rough edges" and
+> "Limitations" sections below before trusting it with anything you can't
+> afford to have go wrong (it does send real keystrokes and can kill real
+> processes; see "How it works").
+
 You run several `claude` sessions across projects — some grinding on a task, some
 waiting on a permission prompt, some silently dead. missionctl watches
 `~/.claude/projects/`'s own session logs, works out what's *actually* happening
@@ -82,6 +88,26 @@ the session) against a 2,000,000-token default cap per loop —
 single call, so summing those would wildly overstate spend rather than
 reflect actual work done.
 
+## Platform support
+
+**macOS is the only platform the full backend matrix works on.** This isn't
+just the "macOS-first" Limitations bullet below being cautious — it's the
+actual state of each backend:
+
+- **orca** ([stablyai/orca](https://github.com/stablyai/orca)) is macOS-native.
+- **cmux** ([manaflow-ai/cmux](https://github.com/manaflow-ai/cmux)) is
+  macOS-native.
+- **tmux** is the only backend that's cross-platform by itself, but
+  missionctl's own process-liveness check (`internal/claude`'s liveness pass)
+  shells out to `ps axo pid,comm` and `lsof` — a BSD/macOS-flavored check, not
+  Linux's `/proc`. So even the tmux path is unverified and likely degraded on
+  Linux (liveness detection specifically — you may see a session reported as
+  live/idle when its process actually died, or vice versa).
+
+Net effect: a **Windows** user has no working backend at all today — you get
+the bare-terminal manual-hint fallback only. A **Linux** user gets tmux, but
+with unverified liveness detection. Only **macOS** gets the full matrix below.
+
 ## Backend matrix
 
 | Backend | Attach/Resume/Approve/Stop | Spawn | Status |
@@ -90,6 +116,13 @@ reflect actual work done.
 | **tmux** | ✅ | ✅ | Verified against tmux's documented command contract. |
 | **cmux** | ✅ (locate/send/focus/approve/interrupt) | ❌ | Verified against real **cmux 0.64.15**: `tree --json` shape, and `send`/`send-key`/`focus-panel` subcommands — including **cross-workspace addressing**: each actuation now passes `--window <ref>` so a surface outside the caller's own workspace is reachable (verified live; without it a cross-workspace target failed). Its tree carries no cwd, so surface→dir matching cross-references the OS by tty (`ps`+`lsof`). Spawn is still unsupported (no verified create-surface command). |
 | **bare terminal** (none of the above) | manual hint only | manual hint only | Observation still works fully; actions print a copy-pasteable command (`claude --resume <id>`, `cd <dir>`, etc.) instead of silently failing. |
+
+The cmux backend requires a separately-installed CLI
+([manaflow-ai/cmux](https://github.com/manaflow-ai/cmux)) that is
+**independently licensed AGPL-3.0-or-later as of 2026-02-14** — this doesn't
+affect missionctl's own MIT license (the same relationship as any tool that
+shells out to `git`), but know what you're installing before you opt into
+that backend.
 
 `internal/control.Resolve()` picks the first available backend in that order
 (orca → cmux → tmux).
@@ -125,9 +158,33 @@ reflect actual work done.
   other workspace. A **same-workspace** target accepts `--window` as a verified
   no-op, so there is no regression. orca/tmux leave `Target.Window` empty (their
   handles/pane-ids are already globally addressable), so their argv is unchanged.
-- **macOS-first.** Process liveness (`internal/claude`'s liveness pass) shells
-  out to `ps axo pid,comm` and `lsof`; it hasn't been adapted for Linux's
-  `/proc` or other platforms.
+- **macOS-first.** See "Platform support" above — orca and cmux are
+  macOS-native, and even the cross-platform tmux backend's liveness check is
+  unverified on Linux and has no working path on Windows.
 - **No engine yet.** missionctl is pure observation + actuation today — there
-  is no autonomous loop *runner* here (see [`DESIGN.md`](./DESIGN.md) for the
-  longer-term engine/governor design this project is named for).
+  is no autonomous loop *runner* here (see [`VISION.md`](./VISION.md) for the
+  longer-term engine/governor design this project is named for — note that
+  document describes a future architecture, not what's built).
+
+## Known rough edges
+
+Honest framing, not spin: this codebase's real-world actuation testing is
+very fresh and thin, and most of what's caught it so far has been manual
+dogfooding, not test coverage or review.
+
+The clearest example: the cmux backend's `Locate`/`LocateClaude` (surface
+lookup) and its cross-workspace actuation (the `--window` addressing
+described above) were **both completely non-functional against the real cmux
+CLI** — not degraded, not flaky, but dead-on-arrival — until two same-day
+bugfixes landed. Both bugs shipped, then were caught and fixed the same day
+they were dogfooded, not by a test or a review catching them beforehand. If
+you're relying on the cmux backend for anything you care about, be aware that
+"verified against real cmux X.Y.Z" in this README means "worked when someone
+manually drove it that day," not "covered by regression tests" — there isn't
+CI or a test harness that exercises the real CLI yet.
+
+More generally: everything under "Limitations" above that says "verified
+live" or "reproduced and fixed live" was verified by a human manually driving
+the real CLI once, on one version, not by automated tests. Treat those
+claims as "known to have worked at some point," not "guaranteed to keep
+working."

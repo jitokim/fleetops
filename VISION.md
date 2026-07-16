@@ -1,4 +1,12 @@
-# missionctl — design
+# missionctl — vision
+
+> **This describes a future, aspirational architecture — not what's currently
+> implemented.** missionctl today is 100% Go, a pure observer + actuator, with
+> no autonomous loop engine, no daemon, and no persistence store (see the
+> README's "No engine yet" limitation). The Python/Textual/asyncio stack,
+> `LoopEngine`, and `Store` below are a design sketch for where the project
+> could go, not a spec for what exists. For the actual current behavior, see
+> [`README.md`](./README.md).
 
 > **Mission control for a fleet of autonomous agent loops.**
 > You watch the *gates*, not the *work*. Loops run themselves; an independent
