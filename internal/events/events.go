@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // HistoryDir is ~/.missionctl/history (override for tests by passing an
@@ -78,17 +79,38 @@ type Event struct {
 // missionctl run is already far outside normal usage; keeping one backup
 // generation is enough to not silently lose the immediately-prior history
 // without the bookkeeping of a real log-rotation scheme.
-const maxFileSize = 5 * 1024 * 1024
+//
+// A var, not a const, purely so a test can shrink it to force many
+// rotations under concurrent writers (see
+// TestAppend_ConcurrentWriters_ForcedRotations_NoDataLoss) — production
+// code never overrides it.
+var maxFileSize int64 = 5 * 1024 * 1024
 
 // Append records ev to sessionID's history file under dir (HistoryDir(), or
 // a test override). Best-effort by design: every caller in this codebase
 // swallows the returned error (see package doc) — it's returned here purely
 // so a caller COULD choose to log it, not because any caller is expected to
 // treat it as fatal.
+//
+// Review fix (P1): Append is called concurrently from several goroutines
+// within one missionctl process (the scanner's transition detector, every
+// actuation cmd, judgeCmd, applyGovernor, registry.BindPending) — a bare
+// stat-then-rename rotation with no lock could race two concurrent Appends
+// for the SAME session into rotating at once, clobbering the ".1" backup
+// (silent audit-data loss, the exact failure mode a history log must not
+// have). appendMu serializes the whole rotate-then-write span per process.
+// Cross-PROCESS writers (e.g. two missionctl cockpits pointed at the same
+// ~/.missionctl/history) remain unserialized — out of scope for this fix
+// (would need a real file lock, e.g. flock, not just an in-process mutex).
+var appendMu sync.Mutex
+
 func Append(dir string, ev Event) error {
 	if !validSessionID(ev.SessionID) {
 		return &invalidSessionIDError{ev.SessionID}
 	}
+	appendMu.Lock()
+	defer appendMu.Unlock()
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}

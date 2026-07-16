@@ -250,11 +250,16 @@ type Model struct {
 	// notifiedAt is the desktop-notification dedup ledger: key is
 	// sessionID+":"+edge (edge is "gate" or "gone" — see shouldNotify),
 	// value is when that edge last fired a notify.Send. In-memory only —
-	// not persisted, so a missionctl restart resets it and can re-notify an
-	// still-open gate once right after restart. Accepted by the council's
-	// design: a restart is rare enough that one extra notification for a
-	// STILL-open gate is a fine trade against persisting this ledger to
-	// disk for a purely cosmetic dedup window.
+	// not persisted, so a missionctl restart resets it: the first scan
+	// after a restart treats every loop as a "first appearance" (see
+	// detectTransitions), but seedFirstAppearanceGate specifically seeds a
+	// synthetic edge for one already sitting in StateGate, so a restart
+	// DOES still re-notify a still-open gate once (still subject to this
+	// same dedup ledger, so a restart within the SAME 10-minute window as
+	// an already-delivered notification does not double-fire). Accepted by
+	// the council's design: a restart is rare enough that one extra
+	// notification for a still-open gate is a fine trade against
+	// persisting this ledger to disk for a purely cosmetic dedup window.
 	notifiedAt map[string]time.Time
 }
 
@@ -1243,8 +1248,8 @@ func judgeCmd(l domain.Loop) tea.Cmd {
 		_ = events.Append(historyDirFn(), events.Event{
 			TS:        time.Now().UnixNano(),
 			SessionID: l.SessionID,
-			FromState: string(l.State),
-			ToState:   string(l.State),
+			FromState: l.StateString(),
+			ToState:   l.StateString(),
 			Trigger:   events.TriggerOracle,
 			Detail:    fmt.Sprintf("%s at cycle %d", verdict.Outcome, l.Cycle),
 			Actor:     events.ActorAuto,
@@ -1278,16 +1283,18 @@ type transitionEvent struct {
 }
 
 // stateSignature is the granularity detectTransitions compares scan to
-// scan: plain State, except StateStalled also carries its Stall kind — this
-// is what lets a StallNoOutput→StallGone edge (both StateStalled) register
-// as a real, notify-worthy change instead of looking like "no change" to a
-// State-only comparison. The notify trigger policy explicitly needs exactly
-// this resolution (see its "INTO StallGone" requirement).
+// scan — domain.Loop.StateString(), which carries the Stall kind alongside
+// StateStalled (see its doc). This is what lets a StallNoOutput→StallGone
+// edge (both StateStalled) register as a real, notify-worthy change instead
+// of looking like "no change" to a State-only comparison; the notify
+// trigger policy explicitly needs exactly this resolution (its "INTO
+// StallGone" requirement). Review fix (P2): this is also EXACTLY the string
+// recorded as FromState/ToState in the persisted history event — the same
+// signature drives both the in-memory edge-trigger decision and what gets
+// written to disk, so a no-output→gone incident is no longer invisible to
+// `missionctl report`'s FromState!=ToState transition counting.
 func stateSignature(l domain.Loop) string {
-	if l.State == domain.StateStalled {
-		return string(l.State) + ":" + string(l.Stall)
-	}
-	return string(l.State)
+	return l.StateString()
 }
 
 // scanTransitionDetail is the scan-triggered event's detail field: the
@@ -1306,6 +1313,15 @@ func scanTransitionDetail(l domain.Loop) string {
 // notifyDedupWindow: at most one desktop notification per (session, edge)
 // within this long — see Model.notifiedAt's doc for the restart caveat.
 const notifyDedupWindow = 10 * time.Minute
+
+// notifyTitlePrefix: osascript's `display notification` always shows the
+// generic Script Editor icon and can't be pointed at a different one
+// without shipping a real .app bundle (out of scope for a CLI tool) — see
+// internal/notify's package doc for the fuller writeup and future options.
+// A 🚀 prefix on the title is the cheap mitigation the captain asked for:
+// makes a missionctl notification visually identifiable in Notification
+// Center at a glance, without needing an icon at all.
+const notifyTitlePrefix = "🚀 "
 
 // shouldNotify applies the dedup ledger for sessionID's edge ("gate" or
 // "gone"), recording now as the edge's last-notified time whenever it
@@ -1327,11 +1343,13 @@ func (m *Model) shouldNotify(sessionID, edge string, now time.Time) bool {
 // detectTransitions compares m.loops (the PREVIOUS scan, still held at the
 // point Update calls this — see loopsMsg's handler) against newLoops (the
 // scan that just arrived) and returns one transitionEvent per session whose
-// stateSignature changed. A session's FIRST appearance (no entry in the
-// previous scan) is deliberately NOT a transition — there's no from_state
-// to compare against, and treating every loop present at missionctl startup
-// as a "transition" would spam the history log with meaningless
-// "unknown→X" noise on every restart.
+// stateSignature changed, PLUS (review fix, P2) a synthetic edge for a
+// session's FIRST appearance (no entry in the previous scan) when it's
+// ALREADY sitting in StateGate — see seedFirstAppearanceGate's doc for why.
+// Every OTHER first appearance is still deliberately NOT a transition —
+// there's no from_state to compare against, and treating every ordinary
+// loop present at missionctl startup as a "transition" would spam the
+// history log with meaningless "unknown→X" noise on every restart.
 //
 // Notify trigger policy (the task's exact spec): fire ONLY on transitions
 // INTO StateGate or INTO StallGone, each independently dedup-gated via
@@ -1346,15 +1364,21 @@ func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []trans
 	var out []transitionEvent
 	for _, l := range newLoops {
 		before, ok := prev[l.SessionID]
-		if !ok || stateSignature(before) == stateSignature(l) {
+		if !ok {
+			if te, seeded := m.seedFirstAppearanceGate(l, now); seeded {
+				out = append(out, te)
+			}
+			continue
+		}
+		if stateSignature(before) == stateSignature(l) {
 			continue
 		}
 
 		te := transitionEvent{ev: events.Event{
 			TS:        now.UnixNano(),
 			SessionID: l.SessionID,
-			FromState: string(before.State),
-			ToState:   string(l.State),
+			FromState: before.StateString(),
+			ToState:   l.StateString(),
 			Trigger:   events.TriggerScan,
 			Detail:    scanTransitionDetail(l),
 			Actor:     events.ActorSystem,
@@ -1366,16 +1390,54 @@ func (m *Model) detectTransitions(newLoops []domain.Loop, now time.Time) []trans
 		switch {
 		case enteredGate && m.shouldNotify(l.SessionID, "gate", now):
 			te.notify = true
-			te.title = "missionctl · GATE"
+			te.title = notifyTitlePrefix + "missionctl · GATE"
 			te.body = fmt.Sprintf("%s: %s", l.Project, l.GatePrompt)
 		case enteredGone && m.shouldNotify(l.SessionID, "gone", now):
 			te.notify = true
-			te.title = "missionctl · loop gone"
+			te.title = notifyTitlePrefix + "missionctl · loop gone"
 			te.body = l.Project
 		}
 		out = append(out, te)
 	}
 	return out
+}
+
+// seedFirstAppearanceGate is the review fix (P2) for a restart-timing gap:
+// without this, a missionctl restart's first scan sees every loop as a
+// "first appearance" (no previous scan to diff against — see
+// detectTransitions' doc), so an ALREADY-open gate from before the restart
+// would never generate an edge and would silently never notify — directly
+// contradicting Model.notifiedAt's own doc comment, which claimed a restart
+// re-notifies a still-open gate. This seeds exactly that: a synthetic
+// ""→"gate" history event (FromState="" — same "nothing to compare against
+// yet" convention as registry.BindPending's spawn event) for a
+// first-appearance loop that's already gated, still subject to the normal
+// dedup ledger (so a restart within the same 10-minute window as an
+// already-delivered notification does NOT re-notify). Judgment call: the
+// task's review comment scoped this to StateGate specifically; a
+// first-appearance loop already in StallGone is not seeded the same way —
+// flagged for confirmation, not implemented, since restart-time
+// already-gone is a narrower, less clearly human-actionable edge (the
+// human didn't just leave a decision pending, the loop simply died at some
+// unknown point before this cockpit ever started watching it).
+func (m *Model) seedFirstAppearanceGate(l domain.Loop, now time.Time) (transitionEvent, bool) {
+	if l.State != domain.StateGate {
+		return transitionEvent{}, false
+	}
+	te := transitionEvent{ev: events.Event{
+		TS:        now.UnixNano(),
+		SessionID: l.SessionID,
+		FromState: "",
+		ToState:   l.StateString(),
+		Trigger:   events.TriggerScan,
+		Actor:     events.ActorSystem,
+	}}
+	if m.shouldNotify(l.SessionID, "gate", now) {
+		te.notify = true
+		te.title = notifyTitlePrefix + "missionctl · GATE"
+		te.body = fmt.Sprintf("%s: %s", l.Project, l.GatePrompt)
+	}
+	return te, true
 }
 
 // emitTransitionsCmd returns a tea.Cmd that performs the actual history-log
@@ -1423,8 +1485,8 @@ func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText stri
 	_ = events.Append(historyDirFn(), events.Event{
 		TS:        time.Now().UnixNano(),
 		SessionID: l.SessionID,
-		FromState: string(l.State),
-		ToState:   string(l.State),
+		FromState: l.StateString(),
+		ToState:   l.StateString(),
 		Trigger:   events.TriggerActuation,
 		Detail:    detail,
 		Actor:     events.ActorHuman,

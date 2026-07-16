@@ -39,6 +39,46 @@ func TestArgv_EscapesBackslashBeforeQuote(t *testing.T) {
 	}
 }
 
+// TestArgv_EscapesNewlinesInMultilineGatePrompt is the P2 review fix's
+// regression: a multi-line gate prompt (a real possibility — Claude Code's
+// AskUserQuestion/permission prompts can wrap several lines) previously
+// reached osascript with a literal embedded newline, which is not valid
+// inside an AppleScript double-quoted string literal — `display
+// notification` would fail with a syntax error and Send's error is always
+// swallowed by callers, so the notification was silently lost entirely.
+func TestArgv_EscapesNewlinesInMultilineGatePrompt(t *testing.T) {
+	body := "continue with the deploy?\noptions:\n1. yes\n2. no"
+	script := argv("missionctl · GATE", body)[2]
+	if strings.ContainsRune(script, '\n') {
+		t.Errorf("script = %q, must not contain a raw newline byte (invalid inside an AppleScript string literal)", script)
+	}
+	if !strings.Contains(script, `continue with the deploy?\noptions:\n1. yes\n2. no`) {
+		t.Errorf("script = %q, want each newline escaped as the two-character \\n sequence", script)
+	}
+}
+
+func TestArgv_EscapesCarriageReturns(t *testing.T) {
+	script := argv("t", "line1\r\nline2")[2]
+	if strings.ContainsRune(script, '\r') || strings.ContainsRune(script, '\n') {
+		t.Errorf("script = %q, must not contain a raw \\r or \\n byte", script)
+	}
+	if !strings.Contains(script, `line1\r\nline2`) {
+		t.Errorf("script = %q, want \\r and \\n both escaped as two-character sequences", script)
+	}
+}
+
+// TestArgv_NewlineEscapeAppliedAfterBackslashDoubling ensures the escape
+// ORDER documented in appleScriptString actually holds: a raw newline must
+// still escape correctly even when the string also contains a literal
+// backslash (the backslash-doubling pass must not somehow consume or
+// interact with the newline escaping that runs after it).
+func TestArgv_NewlineEscapeAppliedAfterBackslashDoubling(t *testing.T) {
+	script := argv("t", "path\\to\\file\nnext line")[2]
+	if !strings.Contains(script, `path\\to\\file\nnext line`) {
+		t.Errorf("script = %q, want backslashes doubled AND the newline escaped", script)
+	}
+}
+
 func TestArgv_NeverProducesAnUnbalancedQuoteCount(t *testing.T) {
 	cases := []string{
 		``,

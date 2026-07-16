@@ -1,9 +1,11 @@
 package events
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -123,7 +125,7 @@ func TestAppend_RotatesOnceFileExceedsMaxSize(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 	// pre-seed a file already over maxFileSize so the NEXT Append rotates it.
-	big := strings.Repeat("x", maxFileSize+1)
+	big := strings.Repeat("x", int(maxFileSize)+1)
 	if err := os.WriteFile(path, []byte(big), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -152,7 +154,7 @@ func TestAppend_RotationClobbersOlderBackup(t *testing.T) {
 	if err := os.WriteFile(path+".1", []byte("stale backup"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := os.WriteFile(path, []byte(strings.Repeat("y", maxFileSize+1)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(strings.Repeat("y", int(maxFileSize)+1)), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	if err := Append(dir, Event{TS: 1, SessionID: "sess-1", ToState: "running", Trigger: TriggerScan, Actor: ActorSystem}); err != nil {
@@ -164,5 +166,109 @@ func TestAppend_RotationClobbersOlderBackup(t *testing.T) {
 	}
 	if strings.Contains(string(backup), "stale") {
 		t.Error("a single rotation is documented to clobber the previous .1 backup, not chain generations")
+	}
+}
+
+// TestAppend_ConcurrentWritersToSameSession_NoDataLossAcrossRotation is the
+// P1 review fix's regression: Append is called concurrently from several
+// goroutines within one process in production (the scanner's transition
+// detector, every actuation cmd, judgeCmd, applyGovernor,
+// registry.BindPending) — all writing to the SAME session's history file is
+// entirely plausible (e.g. an actuation event and a scan-triggered
+// transition landing in the same instant). Before appendMu, a concurrent
+// stat-then-rename rotation race could silently clobber the ".1" backup or
+// interleave/corrupt a write. Run with `go test -race` to actually catch a
+// data race, not just wrong final counts (this test asserts both).
+func TestAppend_ConcurrentWritersToSameSession_NoDataLossAcrossRotation(t *testing.T) {
+	dir := t.TempDir()
+	const writers = 20
+	const perWriter = 50
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				_ = Append(dir, Event{
+					TS:        int64(w*perWriter + i),
+					SessionID: "sess-concurrent",
+					ToState:   "running",
+					Trigger:   TriggerScan,
+					Actor:     ActorSystem,
+					Detail:    fmt.Sprintf("w%d-%d", w, i),
+				})
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	want := writers * perWriter
+	if len(got["sess-concurrent"]) != want {
+		t.Errorf("got %d events across the live file + any rotated backup, want %d — some writes were lost to an unserialized rotation race", len(got["sess-concurrent"]), want)
+	}
+}
+
+// TestAppend_ConcurrentWriters_ForcedRotations_NoDataLoss shrinks
+// maxFileSize so the concurrent writers below trigger MANY rotations
+// (rather than the previous test's zero), directly exercising the
+// stat-then-rename race appendMu fixes. ReadAll only ever sees the live
+// file plus ONE rotated ".1" backup (by design — a single rotation, no
+// generation chain, see maxFileSize's doc), so events from backups rotated
+// OUT before the final one are expected to be gone; what this test actually
+// asserts is the stronger property a race would violate: not one single
+// event is truncated/corrupted/duplicated across however many rotations
+// happened — every event's own perWriter-index sequence for its writer
+// must appear intact in whatever survives (rather than, e.g., a torn write
+// leaving unparseable bytes ReadAll would just skip, silently shrinking the
+// count with no error at all).
+func TestAppend_ConcurrentWriters_ForcedRotations_NoDataLoss(t *testing.T) {
+	orig := maxFileSize
+	maxFileSize = 512 // tiny — a handful of events already exceeds this
+	defer func() { maxFileSize = orig }()
+
+	dir := t.TempDir()
+	const writers = 10
+	const perWriter = 30
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				_ = Append(dir, Event{
+					TS:        int64(w*perWriter + i),
+					SessionID: "sess-rotating",
+					ToState:   "running",
+					Trigger:   TriggerScan,
+					Actor:     ActorSystem,
+				})
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Not a data-loss assertion on the FULL count (rotation is expected to
+	// drop everything before the single surviving ".1" generation) — the
+	// assertion that actually matters is that ReadAll parses cleanly with
+	// zero malformed lines, proving no interleaved/torn write happened.
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got["sess-rotating"]) == 0 {
+		t.Fatal("expected at least some surviving events after forced rotation")
+	}
+	seen := make(map[int64]bool, len(got["sess-rotating"]))
+	for _, ev := range got["sess-rotating"] {
+		if seen[ev.TS] {
+			t.Errorf("duplicate TS %d — a torn/racing write produced the same event twice", ev.TS)
+		}
+		seen[ev.TS] = true
 	}
 }

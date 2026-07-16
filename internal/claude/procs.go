@@ -58,6 +58,16 @@ func LiveClaudeCwds() (map[string]int, bool) {
 // comm (comm may itself contain further whitespace, e.g. a path with
 // spaces — kept as-is via filepath.Base). The header line ("PID COMM") and
 // any unparseable line are skipped, not treated as errors.
+//
+// A trailing ".exe" is stripped before comparing (matchesClaudeComm) — seen
+// live 2026-07-17: the captain's second session showed up as
+// "/whatever/claude.exe" (lsof-confirmed: `cclaude.exe / fcwd /
+// n~/IdeaProjects/aboard`), origin of the binary name TBD (possibly a
+// native-build install), and the strict "claude" comparison made that
+// process invisible to this scan — wrong live counts, risking a false
+// gone/drop demotion for its sibling loops. Deliberately NOT loosened to a
+// prefix match: "claude-helper" and similar must stay excluded (see
+// TestParsePsClaudePids_ExcludesClaudeHelper).
 func parsePsClaudePids(out string) []int {
 	var pids []int
 	for _, raw := range strings.Split(out, "\n") {
@@ -74,12 +84,21 @@ func parsePsClaudePids(out string) []int {
 			continue // e.g. the "PID COMM" header line
 		}
 		comm := strings.TrimSpace(line[idx:])
-		if filepath.Base(comm) != "claude" {
+		if !matchesClaudeComm(comm) {
 			continue
 		}
 		pids = append(pids, pid)
 	}
 	return pids
+}
+
+// matchesClaudeComm reports whether comm (a ps/tmux "current command" field)
+// names a `claude` process — its base name is exactly "claude", or exactly
+// "claude" once a trailing ".exe" is stripped (see parsePsClaudePids' doc).
+// Never a prefix match: "claude-helper" must stay excluded.
+func matchesClaudeComm(comm string) bool {
+	name := strings.TrimSuffix(filepath.Base(comm), ".exe")
+	return name == "claude"
 }
 
 // parseLsofCwds parses `lsof -a -p <pids> -d cwd -Fn` output: interleaved

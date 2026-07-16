@@ -339,7 +339,7 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 			TS:        now.UnixNano(),
 			SessionID: best.SessionID,
 			FromState: "", // brand new — nothing to transition FROM
-			ToState:   string(best.State),
+			ToState:   best.StateString(),
 			Trigger:   events.TriggerActuation,
 			Detail:    "spawn: " + capDetail(p.Goal),
 			Actor:     events.ActorHuman,

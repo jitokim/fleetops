@@ -253,3 +253,32 @@ func TestVerdictOutcome_UnexpectedFormat_ReturnsWholeString(t *testing.T) {
 		t.Errorf("got %q, want the whole string when there's no \" at cycle\" marker", got)
 	}
 }
+
+// TestWriteReport_StallKindEncodedTransition_CountedAsRealTransition is the
+// P2 review fix's report-level regression: a no-output → gone incident
+// (internal/domain.Loop.StateString's encoding — "stalled:no-output" →
+// "stalled:gone", not the old plain "stalled" → "stalled" that made this
+// invisible) must be counted as a transition, since FromState != ToState
+// once the stall kind is encoded into the persisted state string.
+func TestWriteReport_StallKindEncodedTransition_CountedAsRealTransition(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(dir, events.Event{
+		TS: now.Add(-1 * time.Hour).UnixNano(), SessionID: "s1",
+		FromState: "stalled:no-output", ToState: "stalled:gone",
+		Trigger: events.TriggerScan, Detail: "gone", Actor: events.ActorSystem,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
+		t.Fatalf("writeReport: %v", err)
+	}
+	if !strings.Contains(buf.String(), "transitions:  1\n") {
+		t.Errorf("out = %q, want the no-output→gone incident counted as 1 transition", buf.String())
+	}
+	if !strings.Contains(buf.String(), "last state:   stalled:gone\n") {
+		t.Errorf("out = %q, want last state to show the encoded stall kind", buf.String())
+	}
+}

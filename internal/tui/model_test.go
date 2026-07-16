@@ -2712,6 +2712,78 @@ func TestDetectTransitions_FirstAppearance_NoEvent(t *testing.T) {
 	}
 }
 
+// ── P2 review fix: restart-time re-notify for an already-open gate ───────
+
+func TestSeedFirstAppearanceGate_AlreadyGated_SeedsNotifyAndEvent(t *testing.T) {
+	// Simulates the exact restart gap the review flagged: m.loops is empty
+	// (a fresh Model, as if missionctl just started), and the very FIRST
+	// scan already shows a loop sitting in StateGate — there is no
+	// "previous scan" to diff against, yet this must still notify once.
+	m := New()
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 1 {
+		t.Fatalf("got %d transitions for an already-gated first appearance, want 1 (seeded)", len(got))
+	}
+	te := got[0]
+	if !te.notify {
+		t.Error("expected the seeded edge to be flagged for notify")
+	}
+	if te.title != notifyTitlePrefix+"missionctl · GATE" {
+		t.Errorf("title = %q, want the GATE title", te.title)
+	}
+	if !strings.Contains(te.body, "aboard") || !strings.Contains(te.body, "continue?") {
+		t.Errorf("body = %q, want it to mention the project and gate prompt", te.body)
+	}
+	if te.ev.FromState != "" {
+		t.Errorf("FromState = %q, want empty (nothing to transition from — same convention as a spawn event)", te.ev.FromState)
+	}
+	if te.ev.ToState != string(domain.StateGate) {
+		t.Errorf("ToState = %q, want %q", te.ev.ToState, domain.StateGate)
+	}
+}
+
+func TestSeedFirstAppearanceGate_DedupAppliesOnRestartWithinWindow(t *testing.T) {
+	// If a notification for this exact gate was ALREADY sent (e.g. it was
+	// open before the restart and the ledger... well, the ledger doesn't
+	// survive a restart by construction — but shouldNotify's dedup must
+	// still apply WITHIN one process's lifetime: two back-to-back "restart
+	// scans" for the same still-open gate must only notify once.
+	m := New()
+	now := time.Now()
+	loops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
+
+	first := m.detectTransitions(loops, now)
+	if len(first) != 1 || !first[0].notify {
+		t.Fatalf("first seed: got %#v, want one notify-flagged transition", first)
+	}
+
+	// m.loops is STILL empty here on purpose: this simulates detectTransitions
+	// being called again before Update ever assigns m.loops = newLoops (not
+	// how Update actually sequences it, but shouldNotify's ledger is what's
+	// under test here, not the m.loops assignment timing).
+	second := m.detectTransitions(loops, now.Add(time.Second))
+	if len(second) != 1 {
+		t.Fatalf("got %d transitions on the second identical seed, want 1 (still seeded, just not re-notified)", len(second))
+	}
+	if second[0].notify {
+		t.Error("expected the second seed within the dedup window to NOT re-notify")
+	}
+}
+
+func TestSeedFirstAppearanceGate_NonGateFirstAppearance_NotSeeded(t *testing.T) {
+	m := New()
+	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
+
+	got := m.detectTransitions(newLoops, time.Now())
+
+	if len(got) != 0 {
+		t.Fatalf("got %d transitions for a non-gate first appearance, want 0 (only StateGate is seeded, per the review's explicit scope)", len(got))
+	}
+}
+
 func TestDetectTransitions_StateChange_EmitsOneEvent(t *testing.T) {
 	m := New()
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
@@ -2770,8 +2842,19 @@ func TestDetectTransitions_StallKindChange_SameLoopState_StillCountsAsATransitio
 	if !got[0].notify {
 		t.Error("expected this to be flagged for notify (entering StallGone)")
 	}
-	if got[0].title != "missionctl · loop gone" {
+	if got[0].title != notifyTitlePrefix+"missionctl · loop gone" {
 		t.Errorf("title = %q, want the loop-gone title", got[0].title)
+	}
+	// P2 review fix regression: the PERSISTED FromState/ToState must also
+	// differ, not just the in-memory notify decision — otherwise
+	// `missionctl report`'s FromState!=ToState transition counting (and a
+	// human reading the raw history log) can't see this incident happened
+	// at all, since both sides would read the same plain "stalled".
+	if got[0].ev.FromState == got[0].ev.ToState {
+		t.Errorf("FromState == ToState == %q, want them to differ (stall kind must be encoded into the persisted state)", got[0].ev.FromState)
+	}
+	if got[0].ev.FromState != "stalled:no-output" || got[0].ev.ToState != "stalled:gone" {
+		t.Errorf("FromState/ToState = %q/%q, want stalled:no-output/stalled:gone", got[0].ev.FromState, got[0].ev.ToState)
 	}
 }
 
@@ -2785,7 +2868,7 @@ func TestDetectTransitions_IntoGate_FlaggedForNotify(t *testing.T) {
 	if len(got) != 1 || !got[0].notify {
 		t.Fatalf("got %#v, want exactly one notify-flagged transition", got)
 	}
-	if got[0].title != "missionctl · GATE" {
+	if got[0].title != notifyTitlePrefix+"missionctl · GATE" {
 		t.Errorf("title = %q, want the GATE title", got[0].title)
 	}
 	if !strings.Contains(got[0].body, "aboard") || !strings.Contains(got[0].body, "continue?") {

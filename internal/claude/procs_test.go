@@ -4,23 +4,46 @@ import "testing"
 
 func TestParsePsClaudePids(t *testing.T) {
 	// header line, a plain name, a full-path comm (pgrep -x misses this
-	// one), noise that must NOT match ("node", "claude-helper" — prefix
+	// one), a claude.exe comm (live 2026-07-17: the captain's second
+	// session, origin of the binary name TBD — see matchesClaudeComm's
+	// doc), noise that must NOT match ("node", "claude-helper" — prefix
 	// match on "claude" would wrongly include it).
 	out := "  PID COMM\n" +
 		" 6796 claude\n" +
 		" 9195 /usr/local/bin/claude\n" +
 		"72343 claude\n" +
+		"12345 /whatever/claude.exe\n" +
 		"  111 node\n" +
 		"  222 claude-helper\n"
 
 	pids := parsePsClaudePids(out)
-	want := []int{6796, 9195, 72343}
+	want := []int{6796, 9195, 72343, 12345}
 	if len(pids) != len(want) {
 		t.Fatalf("got %v, want %v", pids, want)
 	}
 	for i, w := range want {
 		if pids[i] != w {
 			t.Errorf("pids[%d] = %d, want %d", i, pids[i], w)
+		}
+	}
+}
+
+func TestMatchesClaudeComm(t *testing.T) {
+	cases := []struct {
+		comm string
+		want bool
+	}{
+		{"claude", true},
+		{"/usr/local/bin/claude", true},
+		{"/whatever/claude.exe", true},
+		{"claude.exe", true},
+		{"claude-helper", false},
+		{"node", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := matchesClaudeComm(c.comm); got != c.want {
+			t.Errorf("matchesClaudeComm(%q) = %v, want %v", c.comm, got, c.want)
 		}
 	}
 }

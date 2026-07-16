@@ -179,14 +179,20 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 	}
 	switch d := engine.Check(*l); d.Action {
 	case engine.Stop:
-		fromState := l.State
+		// fromState is captured via domain.StateString (not the bare
+		// string(l.State) this used before the P2 review fix) since l.Stall
+		// is untouched by this branch — a Stop out of a StateStalled loop
+		// must still record which STALL KIND it was leaving, the same
+		// "encode the kind into the persisted state" fix applied to every
+		// other emitter (see domain.Loop.StateString's doc).
+		fromStateStr := domain.StateString(l.State, l.Stall)
 		l.State = domain.StateFailed
 		l.Note = fmt.Sprintf("stopped: no improvement %d/%d", l.NoImprove, l.Goal.NoImproveLimit)
 		_ = events.Append(historyDir, events.Event{
 			TS:        time.Now().UnixNano(),
 			SessionID: l.SessionID,
-			FromState: string(fromState),
-			ToState:   string(l.State),
+			FromState: fromStateStr,
+			ToState:   l.StateString(),
 			Trigger:   events.TriggerGovernor,
 			Detail:    l.Note,
 			Actor:     events.ActorSystem,

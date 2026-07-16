@@ -75,6 +75,37 @@ func TestParseTmuxClaudePanes_NoClaudePanes(t *testing.T) {
 	}
 }
 
+// TestParseTmuxClaudePanes_ClaudeExeMatches is the review fix's regression:
+// a pane_current_command of "claude.exe" (live 2026-07-17, see
+// isClaudeComm's doc) must still be recognized as a claude pane.
+func TestParseTmuxClaudePanes_ClaudeExeMatches(t *testing.T) {
+	out := "%7\t/Users/imac/IdeaProjects/aboard\tclaude.exe\n"
+	targets := parseTmuxClaudePanes(out)
+	if len(targets) != 1 {
+		t.Fatalf("got %d targets, want 1 (claude.exe must match): %+v", len(targets), targets)
+	}
+}
+
+func TestIsClaudeComm(t *testing.T) {
+	cases := []struct {
+		comm string
+		want bool
+	}{
+		{"claude", true},
+		{"/usr/local/bin/claude", true},
+		{"claude.exe", true},
+		{"/whatever/claude.exe", true},
+		{"claude-helper", false},
+		{"zsh", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isClaudeComm(c.comm); got != c.want {
+			t.Errorf("isClaudeComm(%q) = %v, want %v", c.comm, got, c.want)
+		}
+	}
+}
+
 // TestLocateVsLocateClaude_ShellPaneFirstClaudePaneSecond exercises the
 // exact P0-3 scenario: two panes share a directory, a bare shell pane
 // listed first and a claude pane listed second. Locate (attach, permissive)
@@ -321,6 +352,19 @@ func TestSelectTTYPane_MatchingTTYButNotClaude_NoMatch(t *testing.T) {
 	lines := parseTmuxTTYPaneLines("/dev/ttys012\t%3\tvim\n")
 	if _, ok := selectTTYPane(lines, "ttys012"); ok {
 		t.Error("expected ok=false — the tty matches but the foreground command isn't claude")
+	}
+}
+
+// TestSelectTTYPane_ClaudeExeMatches is the review fix's regression for the
+// tty-dispatch path specifically (see isClaudeComm's doc).
+func TestSelectTTYPane_ClaudeExeMatches(t *testing.T) {
+	lines := parseTmuxTTYPaneLines("/dev/ttys012\t%3\tclaude.exe\n")
+	target, ok := selectTTYPane(lines, "ttys012")
+	if !ok {
+		t.Fatal("expected ok=true — claude.exe must match the same as claude")
+	}
+	if target.ID != "%3" {
+		t.Errorf("got ID %q, want %%3", target.ID)
 	}
 }
 
