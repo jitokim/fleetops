@@ -155,9 +155,10 @@ const (
 )
 
 // mode distinguishes normal fleet-navigation input from the "n" key's
-// free-text goal prompt, the "/" key's filter query, and the "i" key's
-// arbitrary-prompt injection, so arrow/letter keys route to the text input
-// instead of moving the cursor or triggering actions while typing.
+// free-text goal prompt, the "/" key's filter query, the "i" key's
+// arbitrary-prompt injection, and the "r" key's DRIFT-loop hint prompt
+// (feat/drift-guided-redrive), so arrow/letter keys route to the text
+// input instead of moving the cursor or triggering actions while typing.
 type mode int
 
 const (
@@ -165,6 +166,7 @@ const (
 	modePrompting
 	modeFiltering
 	modeInjecting
+	modeDriftHint
 )
 
 // wizardStep is which question of the "n" key's loop-contract wizard is
@@ -233,6 +235,12 @@ type Model struct {
 	// whole Loop is captured so injectCmd has ProjectDir/SessionID plus the
 	// Stall/State fields sendPromptCmd's guards re-check.
 	injectTarget domain.Loop
+
+	// driftHintTarget is the StateDrift loop a modeDriftHint prompt's
+	// corrective hint will be re-driven against — same snapshot-at-
+	// keypress-time reasoning as injectTarget (the fleet can rescan/reorder
+	// while the human is mid-typing the hint).
+	driftHintTarget domain.Loop
 
 	pendingKillSession string // non-empty while awaiting the confirming second "k"
 	pendingKillAt      time.Time
@@ -443,6 +451,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.mode == modeDriftHint {
+			switch key {
+			case "esc":
+				m.mode = modeNormal
+				m.input.Blur()
+				m.status, m.statusKind = "cancelled", statusNeutral
+				return m, nil
+			case "enter":
+				// Unlike modeInjecting, an EMPTY submission does NOT
+				// cancel — "hint (enter=none)" means pressing Enter with
+				// nothing typed is a valid choice: re-drive with no
+				// corrective hint at all (composeDriftPrompt returns the
+				// last prompt unchanged). Only Esc cancels.
+				hint := strings.TrimSpace(m.input.Value())
+				m.mode = modeNormal
+				m.input.Blur()
+				if m.actuating[m.driftHintTarget.SessionID] {
+					m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", m.driftHintTarget.Project), statusNeutral
+					return m, nil
+				}
+				m.status, m.statusKind = fmt.Sprintf("re-driving %s...", m.driftHintTarget.Project), statusNeutral
+				m.setActuating(m.driftHintTarget.SessionID)
+				return m, driftRedriveCmd(m.driftHintTarget, hint)
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -491,6 +529,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.actuating[sel.SessionID] {
 				m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", sel.Project), statusNeutral
 				return m, nil
+			}
+			// feat/drift-guided-redrive: a DRIFT loop's "r" no longer
+			// blindly resends the exact prompt the oracle just rejected —
+			// that throws away its reason. Instead it opens a one-line
+			// hint input (same shape as the "i" key's inject prompt); the
+			// ambiguity guard still applies at THIS keypress time (fail
+			// fast before the human even starts typing a hint), same as
+			// every other actuation dispatch in this file.
+			if sel.State == domain.StateDrift {
+				if !m.ttyPathPlausible(sel) {
+					if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+						m.status, m.statusKind = msg, statusErr
+						return m, nil
+					}
+				}
+				m.driftHintTarget = sel
+				m.mode = modeDriftHint
+				m.input = textinput.New()
+				m.input.Prompt = ""
+				m.input.Focus()
+				return m, textinput.Blink
 			}
 			if sel.Stall == domain.StallGone {
 				// Goes straight to Tier 2 (headless redrive, see
@@ -835,6 +894,39 @@ func resumeCmd(l domain.Loop) tea.Cmd {
 			note = " (no prior prompt found — sent Enter only)"
 		}
 		return sendPromptCmd(l, prompt, "resume", "resumed", note)()
+	}
+}
+
+// composeDriftPrompt appends an operator's corrective hint to lastPrompt —
+// "<lastPrompt>\n\n[operator correction] <hint>" — the feat/drift-guided-
+// redrive fix for "r" on a StateDrift loop blindly resending the exact
+// prompt the oracle just rejected, throwing away its reason. hint=""
+// (enter=none — the RE-DRIVE prompt's own label) returns lastPrompt
+// unchanged. Pure function, directly unit-testable without driving key
+// presses through Update.
+func composeDriftPrompt(lastPrompt, hint string) string {
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		return lastPrompt
+	}
+	return lastPrompt + "\n\n[operator correction] " + hint
+}
+
+// driftRedriveCmd is resumeCmd's DRIFT-specific sibling: same fetch-last-
+// prompt-then-sendPromptCmd shape, with the operator's hint woven in via
+// composeDriftPrompt. Kept as its own function (a little duplication with
+// resumeCmd) rather than threading a hint parameter through resumeCmd
+// itself, since resumeCmd's OTHER caller (StateStalled, via the "r" key)
+// never has a hint to offer at all.
+func driftRedriveCmd(l domain.Loop, hint string) tea.Cmd {
+	return func() tea.Msg {
+		prompt, ok := claude.LastUserPrompt(l.Path)
+		note := ""
+		if !ok {
+			note = " (no prior prompt found — sent Enter only)"
+		}
+		prompt = composeDriftPrompt(prompt, hint)
+		return sendPromptCmd(l, prompt, "resume", "re-drove", note)()
 	}
 }
 
@@ -1848,6 +1940,8 @@ func (m Model) renderBottomLine() string {
 		return renderFilterPrompt(m.input)
 	case modeInjecting:
 		return renderInjectPrompt(m)
+	case modeDriftHint:
+		return renderDriftHintPrompt(m)
 	default:
 		return renderStatusLine(m.status, m.statusKind)
 	}
@@ -3048,9 +3142,11 @@ func renderGateCallout(l domain.Loop, width int) string {
 }
 
 // renderDriftCallout is the mockup's red gate-line for a loop the oracle
-// rejected: "DRIFT ▸ <reason>   r re-drive   k kill". "r" re-drives the
-// loop by re-sending its LAST USER PROMPT (resumeCmd already allows
-// StateDrift, same send path as a stalled loop's resume).
+// rejected: "DRIFT ▸ <reason>   r re-drive with hint   k kill". "r" opens
+// the one-line hint-input step (feat/drift-guided-redrive) before
+// re-driving the loop with its LAST USER PROMPT plus the operator's
+// optional corrective hint appended (see composeDriftPrompt) — no longer a
+// blind resend of the exact prompt the oracle just rejected.
 func renderDriftCallout(l domain.Loop, width int) string {
 	contentWidth := width - 4
 	if contentWidth < 20 {
@@ -3062,7 +3158,7 @@ func renderDriftCallout(l domain.Loop, width int) string {
 	}
 	line := lipgloss.NewStyle().Foreground(cRed).Bold(true).Render("DRIFT ▸") +
 		" " + stInk.Render(reason) +
-		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive") +
+		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive with hint") +
 		"   " + stKeyChipRed.Render("k") + stDim.Render(" kill")
 	return "\n" + stCalloutRed.Width(contentWidth).Render(line)
 }
@@ -3166,6 +3262,16 @@ func renderInjectPrompt(m Model) string {
 		line += "  " + lipgloss.NewStyle().Foreground(cAmber).Render("(running — lands mid-turn)")
 	}
 	return line
+}
+
+// renderDriftHintPrompt replaces the status line while the "r" key's
+// DRIFT-loop hint input is active: "RE-DRIVE ▸ <project> ◂ hint
+// (enter=none): <input>" — same "always show which loop this targets"
+// discipline as renderInjectPrompt.
+func renderDriftHintPrompt(m Model) string {
+	head := lipgloss.NewStyle().Foreground(cAccent).Bold(true).
+		Render("RE-DRIVE ▸ " + m.driftHintTarget.Project + " ◂ hint (enter=none): ")
+	return head + m.input.View()
 }
 
 // renderKeybar: only keys that actually do something today.

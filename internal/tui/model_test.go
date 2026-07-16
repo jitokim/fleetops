@@ -1262,6 +1262,267 @@ func TestUpdate_RKey_StateFailed_BlockedByKeyGuard(t *testing.T) {
 	}
 }
 
+// ── feat/drift-guided-redrive ─────────────────────────────────────────────
+
+// ── mode transitions ──────────────────────────────────────────────────────
+
+func TestUpdate_RKey_DriftLoop_EntersModeDriftHint(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if m.mode != modeDriftHint {
+		t.Fatalf("mode = %v, want modeDriftHint", m.mode)
+	}
+	if m.driftHintTarget.SessionID != "sess-1" {
+		t.Errorf("driftHintTarget = %+v, want it snapshotted to sess-1", m.driftHintTarget)
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (textinput.Blink)")
+	}
+}
+
+// TestUpdate_RKey_StalledLoop_NonDriftBypass_StillImmediateResume is the
+// task's explicit "non-drift bypass": StateStalled must keep the EXISTING
+// immediate-resume behavior (no input step at all).
+func TestUpdate_RKey_StalledLoop_NonDriftBypass_StillImmediateResume(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateStalled
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if m.mode == modeDriftHint {
+		t.Error("expected StateStalled to bypass the hint-input step entirely")
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd (resumeCmd, dispatched immediately)")
+	}
+	if !strings.Contains(m.status, "resuming") {
+		t.Errorf("status = %q, want the immediate-resume status text", m.status)
+	}
+}
+
+func TestUpdate_RKey_DriftLoop_AmbiguousSharedDir_RefusesBeforeEnteringHintMode(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].State = domain.StateDrift
+	m.loops[1].State = domain.StateDrift
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — ambiguous target must refuse before entering hint mode")
+	}
+	if m.mode == modeDriftHint {
+		t.Error("expected the ambiguity guard to prevent entering modeDriftHint at all")
+	}
+	if m.statusKind != statusErr || !strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q (kind %v), want an ambiguity refusal", m.status, m.statusKind)
+	}
+}
+
+func TestUpdate_RKey_DriftLoop_AlreadyActuating_Refuses(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m.actuating = map[string]bool{"sess-1": true}
+
+	m, cmd := updateModel(t, m, runeKey('r'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — already actuating")
+	}
+	if m.mode == modeDriftHint {
+		t.Error("expected the in-flight guard to prevent entering modeDriftHint")
+	}
+}
+
+func TestUpdate_DriftHint_Esc_Cancels(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+	if m.mode != modeDriftHint {
+		t.Fatal("setup: expected modeDriftHint")
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after esc", m.mode)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd on cancel")
+	}
+	if !strings.Contains(m.status, "cancelled") {
+		t.Errorf("status = %q, want a cancellation message", m.status)
+	}
+}
+
+func TestUpdate_DriftHint_EnterWithHint_DispatchesDriftRedrive(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	for _, r := range "check the auth header casing" {
+		m, _ = updateModel(t, m, runeKey(r))
+	}
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after submit", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (driftRedriveCmd)")
+	}
+	if !m.actuating["sess-1"] {
+		t.Error("expected sess-1 to be marked actuating after dispatch")
+	}
+}
+
+// TestUpdate_DriftHint_EnterEmpty_StillDispatches is the task's
+// "enter=none" behavior: unlike modeInjecting's empty-prompt-cancels
+// convention, an EMPTY hint submission on modeDriftHint is a valid choice
+// (re-drive with no hint), not a cancel.
+func TestUpdate_DriftHint_EnterEmpty_StillDispatches(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd == nil {
+		t.Error("expected a non-nil tea.Cmd even with an empty hint — enter=none still re-drives")
+	}
+}
+
+func TestUpdate_DriftHint_AlreadyActuatingAtSubmitTime_Refuses(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+	m.actuating = map[string]bool{"sess-1": true} // simulate a race: became actuating while typing
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — already actuating by submit time")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want the already-re-driving message", m.status)
+	}
+}
+
+func TestUpdate_ArrowKeysWhileDriftHint_RouteToInputNotCursor(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].State = domain.StateDrift
+	m, _ = updateModel(t, m, runeKey('r'))
+	beforeCursor := m.cursor
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	if m.cursor != beforeCursor {
+		t.Errorf("cursor changed from %d to %d — arrow keys must route to the input during modeDriftHint, not move the cursor", beforeCursor, m.cursor)
+	}
+}
+
+// ── prompt composition (pure function) ────────────────────────────────────
+
+func TestComposeDriftPrompt_WithHint_Appends(t *testing.T) {
+	got := composeDriftPrompt("fix the auth test", "check the header casing")
+	want := "fix the auth test\n\n[operator correction] check the header casing"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestComposeDriftPrompt_EmptyHint_ReturnsUnchanged(t *testing.T) {
+	if got := composeDriftPrompt("fix the auth test", ""); got != "fix the auth test" {
+		t.Errorf("got %q, want the prompt unchanged", got)
+	}
+}
+
+func TestComposeDriftPrompt_WhitespaceOnlyHint_TreatedAsEmpty(t *testing.T) {
+	if got := composeDriftPrompt("fix the auth test", "   \t  "); got != "fix the auth test" {
+		t.Errorf("got %q, want the prompt unchanged for a whitespace-only hint", got)
+	}
+}
+
+func TestComposeDriftPrompt_HintIsTrimmed(t *testing.T) {
+	got := composeDriftPrompt("fix it", "  add a retry  ")
+	want := "fix it\n\n[operator correction] add a retry"
+	if got != want {
+		t.Errorf("got %q, want the hint trimmed of surrounding whitespace", got)
+	}
+}
+
+// ── driftRedriveCmd dispatch ───────────────────────────────────────────────
+
+func TestDriftRedriveCmd_ComposesHintIntoSentPrompt(t *testing.T) {
+	var gotPrompt string
+	fakeCtrl := &fakeController{name: "tmux"}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		},
+		nil,
+	)
+	path := writeTranscriptLastUserPrompt(t, "fix the flaky auth test")
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift, Path: path}
+
+	msg := driftRedriveCmd(l, "check the header casing")()
+
+	gotPrompt = fakeCtrl.lastResumePrompt
+	want := "fix the flaky auth test\n\n[operator correction] check the header casing"
+	if gotPrompt != want {
+		t.Errorf("sent prompt = %q, want %q", gotPrompt, want)
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+}
+
+func TestDriftRedriveCmd_EmptyHint_SendsPromptUnchanged(t *testing.T) {
+	fakeCtrl := &fakeController{name: "tmux"}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		},
+		nil,
+	)
+	path := writeTranscriptLastUserPrompt(t, "fix the flaky auth test")
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateDrift, Path: path}
+
+	driftRedriveCmd(l, "")()
+
+	if fakeCtrl.lastResumePrompt != "fix the flaky auth test" {
+		t.Errorf("sent prompt = %q, want the original prompt unchanged (enter=none)", fakeCtrl.lastResumePrompt)
+	}
+}
+
+// writeTranscriptLastUserPrompt writes a minimal transcript JSONL whose
+// last user message is prompt, so claude.LastUserPrompt(path) returns it.
+func writeTranscriptLastUserPrompt(t *testing.T, prompt string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	line := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%q}}`, prompt)
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return path
+}
+
+// ── DRIFT callout text ─────────────────────────────────────────────────────
+
+func TestRenderDriftCallout_MentionsReDriveWithHint(t *testing.T) {
+	l := domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}}
+	got := renderDriftCallout(l, 80)
+	if !strings.Contains(got, "re-drive with hint") {
+		t.Errorf("got %q, want the callout to mention \"re-drive with hint\"", got)
+	}
+}
+
 func TestResumeCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
 	// belt-and-suspenders: resumeCmd itself must refuse on StateFailed too,
 	// independent of the "r" keypress guard (see resumeCmd's SAFETY comment).
@@ -1836,9 +2097,10 @@ func TestUpdate_RKey_AfterActuatingCleared_CanDispatchAgain(t *testing.T) {
 // fakeController is a minimal control.Controller test double — only Resume
 // is exercised by sendPromptCmd; the rest are unused stubs.
 type fakeController struct {
-	name         string
-	resumeCalled bool
-	resumeErr    error
+	name             string
+	resumeCalled     bool
+	resumeErr        error
+	lastResumePrompt string // feat/drift-guided-redrive: captures what Resume was actually sent, for asserting hint composition
 }
 
 func (f *fakeController) Name() string                               { return f.name }
@@ -1851,6 +2113,7 @@ func (f *fakeController) Interrupt(control.Target) error             { return ni
 func (f *fakeController) Spawn(string, string) error                 { return nil }
 func (f *fakeController) Resume(t control.Target, prompt string) error {
 	f.resumeCalled = true
+	f.lastResumePrompt = prompt
 	return f.resumeErr
 }
 
