@@ -382,6 +382,191 @@ func TestLoopFromLog_StaleGate_DeletedAndIgnored(t *testing.T) {
 	}
 }
 
+// askUserQuestionText / askUserQuestionLine mirror the real shape of a pending
+// AskUserQuestion tool_use (verified against a live session log): an assistant
+// entry, stop_reason "tool_use", whose message.content array holds a tool_use
+// block named "AskUserQuestion" with input.questions[0].question.
+const askUserQuestionText = "이번 UPSTAGE_MODEL 변경 커밋에 어떤 JIRA 키를 붙일까요?"
+
+const askUserQuestionLine = `{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"이번 UPSTAGE_MODEL 변경 커밋에 어떤 JIRA 키를 붙일까요?","header":"JIRA 티켓","multiSelect":false,"options":[{"label":"새 JIRA 티켓 발급 (권장)","description":"신규 티켓 생성 후 그 키로 커밋"},{"label":"티켓 없이 진행","description":"컨벤션 예외"}]}]}}]}}`
+
+func TestPendingAskUserQuestion(t *testing.T) {
+	const bashToolUseLine = `{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}]}}`
+	// A user entry answering the question (a tool_result) — once this is the
+	// last user/assistant entry, the question is no longer pending.
+	const answerLine = `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"새 JIRA 티켓 발급 (권장)"}]}}`
+
+	cases := []struct {
+		name         string
+		lines        []string
+		wantOK       bool
+		wantQuestion string
+	}{
+		{
+			name:         "pending AskUserQuestion is the last turn",
+			lines:        []string{`{"type":"user","message":{"content":"어떤 키?"}}`, askUserQuestionLine},
+			wantOK:       true,
+			wantQuestion: askUserQuestionText,
+		},
+		{
+			// The exact real-world case that broke the naive "check the literal
+			// last line" approach: Claude Code appends non-turn system/attachment
+			// entries AFTER a pending question. They must be filtered out.
+			name: "trailing system/attachment noise after pending question",
+			lines: []string{
+				`{"type":"user","message":{"content":"어떤 키?"}}`,
+				askUserQuestionLine,
+				`{"type":"attachment","attachment":{"type":"task_reminder"}}`,
+				`{"type":"attachment","attachment":{"type":"task_reminder"}}`,
+				`{"type":"system","content":"periodic reminder"}`,
+			},
+			wantOK:       true,
+			wantQuestion: askUserQuestionText,
+		},
+		{
+			name:   "answered — a later user tool_result is now the last entry",
+			lines:  []string{`{"type":"user","message":{"content":"어떤 키?"}}`, askUserQuestionLine, answerLine},
+			wantOK: false,
+		},
+		{
+			name:   "completed turn (end_turn) is not a gate",
+			lines:  []string{`{"type":"user","message":{"content":"do it"}}`, `{"type":"assistant","message":{"content":"done","stop_reason":"end_turn"}}`},
+			wantOK: false,
+		},
+		{
+			name:   "a different tool (Bash) is not a gate",
+			lines:  []string{`{"type":"user","message":{"content":"do it"}}`, bashToolUseLine},
+			wantOK: false,
+		},
+		{
+			name:   "content is a plain string, not a block array",
+			lines:  []string{`{"type":"assistant","message":{"content":"AskUserQuestion","stop_reason":"tool_use"}}`},
+			wantOK: false,
+		},
+		{
+			name:   "malformed: input.questions missing",
+			lines:  []string{`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{}}]}}`},
+			wantOK: false,
+		},
+		{
+			name:   "malformed: questions is an empty array",
+			lines:  []string{`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[]}}]}}`},
+			wantOK: false,
+		},
+		{
+			name:   "malformed: question field missing on first question",
+			lines:  []string{`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"header":"JIRA"}]}}]}}`},
+			wantOK: false,
+		},
+		{
+			name:   "empty buffer",
+			lines:  nil,
+			wantOK: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			buf := []byte(strings.Join(c.lines, "\n"))
+			question, ok := pendingAskUserQuestion(buf)
+			if ok != c.wantOK {
+				t.Fatalf("pendingAskUserQuestion ok=%v, want %v (question=%q)", ok, c.wantOK, question)
+			}
+			if ok && question != c.wantQuestion {
+				t.Errorf("question=%q, want %q", question, c.wantQuestion)
+			}
+			if !ok && question != "" {
+				t.Errorf("question=%q, want empty string when ok=false", question)
+			}
+		})
+	}
+}
+
+func TestPendingAskUserQuestion_LongQuestionCollapsedAndCapped(t *testing.T) {
+	// The extracted question feeds a single-line, status-line-style GatePrompt,
+	// so it must be newline-collapsed and length-bounded (via summarizeTailText,
+	// tailTextCap) — a pathological multi-line/very-long question must not blow
+	// up the gate callout.
+	long := "line one\n" + strings.Repeat("가", tailTextCap+50)
+	line := fmt.Sprintf(`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":%q}]}}]}}`, long)
+
+	question, ok := pendingAskUserQuestion([]byte(line))
+	if !ok {
+		t.Fatal("expected ok=true for a valid (if long) question")
+	}
+	if strings.Contains(question, "\n") {
+		t.Error("expected newlines collapsed to spaces in the gate prompt")
+	}
+	if n := utf8.RuneCountInString(question); n > tailTextCap+1 { // +1 for the ellipsis rune
+		t.Errorf("question rune length = %d, want <= %d (bounded by tailTextCap)", n, tailTextCap+1)
+	}
+}
+
+func TestLoopFromLog_PendingAskUserQuestion_ClassifiesAsGate(t *testing.T) {
+	// End-to-end: a loop whose tail is a pending AskUserQuestion (with the
+	// real-world trailing attachment/system noise) classifies as ◆ GATE with a
+	// non-empty GatePrompt and StallNone — REGARDLESS of idleFor, because a
+	// pending human decision is not a recency question. No hook marker exists
+	// for AskUserQuestion (upstream gap), so pending is nil.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"어떤 키?"}}`,
+		askUserQuestionLine,
+		`{"type":"attachment","attachment":{"type":"task_reminder"}}`,
+		`{"type":"system","content":"periodic reminder"}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+
+	// fresh (well within IdleThreshold) AND long-idle (well past it): a pending
+	// AskUserQuestion is a gate in both.
+	for _, now := range []time.Time{fi.ModTime().Add(time.Second), fi.ModTime().Add(time.Hour)} {
+		l := loopFromLog(path, fi, now, t.TempDir(), nil)
+		if l.State != domain.StateGate {
+			t.Errorf("now=%v: got State=%v, want %v", now, l.State, domain.StateGate)
+		}
+		if l.Stall != domain.StallNone {
+			t.Errorf("now=%v: got Stall=%v, want %v (gated, not stalled)", now, l.Stall, domain.StallNone)
+		}
+		if l.GatePrompt != askUserQuestionText {
+			t.Errorf("now=%v: GatePrompt=%q, want %q", now, l.GatePrompt, askUserQuestionText)
+		}
+		if l.GateTS != 0 {
+			t.Errorf("now=%v: GateTS=%d, want 0 (no hook marker backs an AskUserQuestion gate)", now, l.GateTS)
+		}
+	}
+}
+
+func TestLoopFromLog_HookMarkerGate_BeatsAskUserQuestion(t *testing.T) {
+	// If a real Notification-hook gate marker AND a pending AskUserQuestion
+	// coexist (rare — some OTHER gate fired around the same time), the
+	// authoritative hook marker wins: its Message is the GatePrompt and GateTS
+	// is set, not clobbered by the tail-derived AskUserQuestion.
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"어떤 키?"}}`,
+		askUserQuestionLine,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	pending := map[string]gate.Info{
+		session: {Type: "permission_prompt", Message: "Permission required to run: Bash(npm test)", TS: fi.ModTime()},
+	}
+
+	l := loopFromLog(path, fi, fi.ModTime().Add(time.Hour), t.TempDir(), pending)
+	if l.State != domain.StateGate {
+		t.Fatalf("got State=%v, want %v", l.State, domain.StateGate)
+	}
+	if l.GatePrompt != "Permission required to run: Bash(npm test)" {
+		t.Errorf("GatePrompt=%q, want the hook marker's Message (not the AskUserQuestion text)", l.GatePrompt)
+	}
+	if l.GateTS != fi.ModTime().UnixNano() {
+		t.Errorf("GateTS=%d, want %d (the hook marker's TS, preserved)", l.GateTS, fi.ModTime().UnixNano())
+	}
+}
+
 func TestLastAssistantText_StringContent(t *testing.T) {
 	path := writeJSONL(t, `{"type":"assistant","message":{"content":"plain string reply"}}`)
 

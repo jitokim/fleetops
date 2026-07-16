@@ -314,12 +314,14 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 		l.Goal.BudgetTokens = DefaultBudgetTokens // v0 default until per-loop budgets exist
 	}
 
-	// One shared tail read serves both classification and the detail pane's
-	// TAIL row (LastText) — avoid reading the file twice. Classification
-	// always runs (not just once "idle"): "running" means a turn is
-	// genuinely in flight, not merely "wrote recently" (see classifyLoop) —
-	// a loop that finished its turn a second ago is idle, not running.
-	if buf, ok := readTail(path, tailBytes); ok {
+	// One shared tail read serves classification, the detail pane's TAIL row
+	// (LastText), AND the AskUserQuestion gate check further below — avoid
+	// reading the file more than once. Classification always runs (not just
+	// once "idle"): "running" means a turn is genuinely in flight, not merely
+	// "wrote recently" (see classifyLoop) — a loop that finished its turn a
+	// second ago is idle, not running.
+	buf, haveTail := readTail(path, tailBytes)
+	if haveTail {
 		if text, ok := lastAssistantTextFromTail(buf); ok {
 			l.LastText = text
 		}
@@ -352,6 +354,29 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 			// above and this delete (e.g. the human answered, then a fresh
 			// permission prompt fired moments later) — see gate.DeleteMarkerIfTS.
 			gate.DeleteMarkerIfTS(gatesDir, session, info.TS.UnixNano())
+		}
+	}
+
+	// A pending AskUserQuestion is a gate the Notification-hook path above
+	// structurally cannot see: AskUserQuestion never fires a Notification hook
+	// (confirmed upstream gap, anthropics/claude-code#59908), so no marker ever
+	// lands for it, and its tool_use turn otherwise falls through to
+	// StateStalled/no-output — indistinguishable from a genuinely hung session.
+	// Detect it straight from the tail instead. Like a hook gate it's
+	// unambiguously "blocked on a human" the moment it appears, so it applies
+	// IMMEDIATELY — not gated behind the idle stall timeout (same reasoning as
+	// the marker check's IsGateActive: a pending human decision is not a
+	// recency question), which is why this overrides an otherwise-Running tail
+	// too. A real hook-marker gate set just above still wins (don't clobber an
+	// already-set StateGate); a genuinely finished turn (StateIdle) has no
+	// pending question by construction. No GateTS is set — there's no marker
+	// file to compare-and-swap delete, and approveCmd treats GateTS==0 as a
+	// no-op delete (it still sends the approve keystroke to the surface).
+	if haveTail && l.State != domain.StateGate && l.State != domain.StateIdle {
+		if question, ok := pendingAskUserQuestion(buf); ok {
+			l.State = domain.StateGate
+			l.Stall = domain.StallNone
+			l.GatePrompt = question
 		}
 	}
 	return l
@@ -472,6 +497,88 @@ func lastTurnEnded(buf []byte) bool {
 	}
 	stopReason, _ := msg["stop_reason"].(string)
 	return stopReason == "end_turn"
+}
+
+// pendingAskUserQuestion reports whether the tail's last user/assistant entry
+// is an unanswered AskUserQuestion tool_use, and if so the first question's
+// text (already bounded for GatePrompt). AskUserQuestion — Claude Code's
+// interactive numbered-choice prompt for a structured human decision — never
+// fires a Notification hook (confirmed upstream gap, anthropics/claude-code
+// #59908), so the gate.Pending marker path can't catch it; its tool_use turn
+// (stop_reason "tool_use", not "end_turn") otherwise classifies as
+// StateStalled/no-output, indistinguishable from a genuinely hung session.
+//
+// Same tolerant tail scan as lastTurnEnded: a possibly-truncated first line
+// simply fails to parse and is skipped, and only user/assistant entries are
+// kept, so the non-turn system/attachment noise Claude Code appends AFTER a
+// pending question (e.g. periodic task_reminder attachments) is ignored rather
+// than mistaken for the last turn. If this assistant AskUserQuestion is
+// genuinely the last user/assistant entry, no later user tool_result answered
+// it (an answer would BE the last user entry, so last["type"] would be "user"
+// and this returns false). Any missing/malformed shape yields ("", false) —
+// never a panic, matching this file's tolerant-parse discipline.
+func pendingAskUserQuestion(buf []byte) (string, bool) {
+	var last map[string]any
+	for _, line := range strings.Split(string(buf), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if t, _ := entry["type"].(string); t == "user" || t == "assistant" {
+			last = entry
+		}
+	}
+	if last == nil || last["type"] != "assistant" {
+		return "", false
+	}
+	msg, ok := last["message"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	content, ok := msg["content"].([]any)
+	if !ok {
+		return "", false
+	}
+	for _, block := range content {
+		b, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		if b["type"] != "tool_use" || b["name"] != "AskUserQuestion" {
+			continue
+		}
+		if question, ok := firstAskUserQuestionText(b); ok {
+			return summarizeTailText(question, tailTextCap), true
+		}
+	}
+	return "", false
+}
+
+// firstAskUserQuestionText pulls input.questions[0].question out of an
+// AskUserQuestion tool_use block, tolerating any missing/wrong-typed shape (a
+// malformed block is treated as "no pending question", never a panic).
+func firstAskUserQuestionText(block map[string]any) (string, bool) {
+	input, ok := block["input"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	questions, ok := input["questions"].([]any)
+	if !ok || len(questions) == 0 {
+		return "", false
+	}
+	first, ok := questions[0].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	text, ok := first["question"].(string)
+	if !ok || text == "" {
+		return "", false
+	}
+	return text, true
 }
 
 // projectLabel turns "-Users-imac-IdeaProjects-aboard" into "aboard".
