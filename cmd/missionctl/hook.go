@@ -4,17 +4,27 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"time"
 
 	"github.com/jitokim/missionctl/internal/gate"
+	"github.com/jitokim/missionctl/internal/sessions"
 )
 
 // runHookCmd dispatches `missionctl hook <sub>`. Unknown subcommands are
-// silently ignored (exit 0) — see notifyHook for why.
+// silently ignored (exit 0) — see notifyHook for why the whole hook path is
+// non-fatal.
 func runHookCmd(args []string) {
-	if len(args) == 0 || args[0] != "notify" {
+	if len(args) == 0 {
 		return
 	}
-	notifyHook()
+	switch args[0] {
+	case "notify":
+		notifyHook()
+	case "session-start":
+		sessionStartHook()
+	case "session-end":
+		sessionEndHook()
+	}
 }
 
 // hookPayload is the subset of Claude Code's Notification hook JSON we care
@@ -46,4 +56,62 @@ func notifyHook() {
 		return
 	}
 	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, payload.Message, payload.NotificationType)
+}
+
+// sessionHookPayload is the subset of Claude Code's SessionStart / SessionEnd
+// hook JSON we care about; unknown fields are ignored, not an error.
+//
+// SessionStart's shape is confirmed live (two independent research spikes):
+// session_id, cwd, transcript_path, source ("startup"/"resume"/"clear"/
+// "compact"). SessionEnd's shape is NOT confirmed live — treated tolerantly:
+// only session_id (the one field every hook payload carries) is relied on,
+// which is all sessionEndHook needs to find the entry to delete. See
+// docs/adr-vendor-independent-actuation.md §3 step 1.
+type sessionHookPayload struct {
+	SessionID      string `json:"session_id"`
+	Cwd            string `json:"cwd"`
+	TranscriptPath string `json:"transcript_path"`
+	Source         string `json:"source"`
+}
+
+// sessionStartHook reads the SessionStart hook's JSON from stdin, resolves
+// this session's owning `claude` pid+tty by walking up from os.Getppid(), and
+// writes a session-identity entry (internal/sessions.WriteSession). Same
+// non-negotiable contract as notifyHook: swallow every error, always exit 0 —
+// a bug here must never be able to break the user's real claude session.
+func sessionStartHook() {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return
+	}
+	var payload sessionHookPayload
+	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+		return
+	}
+	pid, tty := sessions.ResolveClaudeTTY(os.Getppid())
+	_ = sessions.WriteSession(sessions.SessionsDir(), payload.SessionID, sessions.SessionEntry{
+		PID:            pid,
+		TTY:            tty,
+		Cwd:            payload.Cwd,
+		TranscriptPath: payload.TranscriptPath,
+		Source:         payload.Source,
+		StartedAt:      time.Now(),
+	})
+}
+
+// sessionEndHook reads the SessionEnd hook's JSON from stdin and removes the
+// session's identity entry (internal/sessions.DeleteSession). A SIGKILL'd
+// session skips SessionEnd entirely, so a leaked entry is expected and pruned
+// elsewhere by a liveness check — this is only the clean-shutdown path. Same
+// swallow-every-error, always-exit-0 contract as notifyHook.
+func sessionEndHook() {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return
+	}
+	var payload sessionHookPayload
+	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+		return
+	}
+	_ = sessions.DeleteSession(sessions.SessionsDir(), payload.SessionID)
 }
