@@ -1616,8 +1616,9 @@ func noteForRow(l domain.Loop) (string, lipgloss.Style) {
 // tui's "n" key) carries the human-written Goal.Text, the ideal answer; loops
 // missionctl merely observes (the majority — plain claude sessions) fall back
 // to LastText, the last assistant message's tail, already single-line and
-// 120-char-capped by internal/claude.summarizeTailText (the same text feeding
-// the detail pane's TAIL row). "" when a loop has neither yet (e.g. a
+// length-capped (tailTextCap, 800 chars) by internal/claude.summarizeTailText
+// (the same text feeding the detail pane's TAIL row, which re-wraps it across
+// several lines). "" when a loop has neither yet (e.g. a
 // just-started unbound loop with no assistant output). Unlike noteForRow the
 // style is invariant (always dim, applied by the caller), so only the text is
 // returned. The caller truncates it to the column width.
@@ -1674,6 +1675,18 @@ func shortID(id string) string {
 
 // ── detail pane ──────────────────────────────────────────────
 
+// maxTailLines caps how many wrapped lines the detail pane's TAIL row shows —
+// a readability ceiling on the last assistant message (the captain floated
+// 5–10; 6 is the middle). Content beyond it is truncated with an ellipsis
+// marker; the full report lives in the pager / oracle, not here. It's a single
+// named constant so widening/narrowing the TAIL row is a one-line change.
+const maxTailLines = 6
+
+// detailKeyWidth is the fixed column width of a detail row's KEY (see
+// detailRow). TAIL's wrapped continuation lines indent by exactly this much so
+// their text aligns under the value column instead of the label.
+const detailKeyWidth = 8
+
 func renderDetail(l domain.Loop, width int) string {
 	// leave room for the ~8-col key + its gap before truncating long values
 	// (paths) so nothing overflows the terminal width.
@@ -1711,7 +1724,11 @@ func renderDetail(l domain.Loop, width int) string {
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
 	if l.LastText != "" {
-		d.WriteString(detailRow("TAIL", stDim.Render(trunc(l.LastText, valueWidth))))
+		wrapped := wrapTailText(l.LastText, valueWidth, maxTailLines)
+		for i := range wrapped {
+			wrapped[i] = stDim.Render(wrapped[i])
+		}
+		d.WriteString(detailRowMultiline("TAIL", wrapped))
 	}
 
 	switch l.State {
@@ -1744,9 +1761,62 @@ func renderOracleDetail(l domain.Loop, valueWidth int) string {
 }
 
 // detailRow is one KEY  value line in the mockup's key-value grid (faint
-// uppercase key, ~8 cols wide).
+// uppercase key, detailKeyWidth cols wide). value is assumed single-line and
+// already styled by the caller; use detailRowMultiline for wrapped values.
 func detailRow(key, value string) string {
-	return stFaint.Width(8).Render(key) + value + "\n"
+	return stFaint.Width(detailKeyWidth).Render(key) + value + "\n"
+}
+
+// detailRowMultiline renders a KEY row whose value spans multiple lines: the
+// KEY sits on the first line (same shape as detailRow), and every continuation
+// line is indented by detailKeyWidth so its text aligns under the value column
+// — a clean continuation, not a new row and not the label repeated. Callers
+// style the value lines themselves (as with detailRow). Empty lines → "".
+func detailRowMultiline(key string, lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(stFaint.Width(detailKeyWidth).Render(key))
+	b.WriteString(lines[0])
+	b.WriteString("\n")
+	indent := strings.Repeat(" ", detailKeyWidth)
+	for _, line := range lines[1:] {
+		b.WriteString(indent)
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// wrapTailText word-wraps s to width columns and returns at most maxLines
+// plain (unstyled) lines for the detail pane's TAIL row. s is already
+// single-line (newlines collapsed by internal/claude.summarizeTailText); this
+// splits it across the pane's value column. When the wrapped text has MORE
+// than maxLines lines (content was cut), the last returned line ends with the
+// same "…" marker trunc uses, so it's visually clear there's more — otherwise
+// every wrapped line is returned as-is (no padding, no wasted blank lines).
+func wrapTailText(s string, width, maxLines int) []string {
+	if width <= 0 || maxLines <= 0 {
+		return nil
+	}
+	// lipgloss.Width word-wraps (hard-breaking any single word longer than
+	// width) and left-pads each line to width; strip that padding so the
+	// lines carry only their own text.
+	wrapped := strings.Split(lipgloss.NewStyle().Width(width).Render(s), "\n")
+	for i := range wrapped {
+		wrapped[i] = strings.TrimRight(wrapped[i], " ")
+	}
+	if len(wrapped) <= maxLines {
+		return wrapped
+	}
+	wrapped = wrapped[:maxLines]
+	last := maxLines - 1
+	// Force a truncation marker on the last shown line. trunc keeps it within
+	// width: a full-width line drops its last rune for the "…"; a short line
+	// simply gains the "…".
+	wrapped[last] = trunc(wrapped[last]+"…", width)
+	return wrapped
 }
 
 // renderResumeCallout is the mockup's amber gate-line, repurposed for a

@@ -564,12 +564,12 @@ func userMessageText(entry map[string]any) (string, bool) {
 	return "", false
 }
 
-// LastAssistantText returns the last assistant message's text (first 120
-// chars, newlines collapsed to spaces) from the tail of the session log —
-// "what was it last doing", shown in the detail pane's TAIL row. ok is false
-// if the tail has no assistant text. Thin path-based wrapper around
-// lastAssistantTextFromTail, which loopFromLog calls directly against a tail
-// buffer it already read (see readTail).
+// LastAssistantText returns the last assistant message's text (first
+// tailTextCap chars, newlines collapsed to spaces) from the tail of the
+// session log — "what was it last doing", shown in the detail pane's TAIL
+// row. ok is false if the tail has no assistant text. Thin path-based wrapper
+// around lastAssistantTextFromTail, which loopFromLog calls directly against a
+// tail buffer it already read (see readTail).
 func LastAssistantText(path string) (string, bool) {
 	buf, ok := readTail(path, tailBytes)
 	if !ok {
@@ -578,21 +578,30 @@ func LastAssistantText(path string) (string, bool) {
 	return lastAssistantTextFromTail(buf)
 }
 
+// tailTextCap bounds LastText, the summarized last-assistant message. It's
+// sized to fill several wrapped lines in the detail pane's TAIL row
+// (internal/tui renders up to maxTailLines of it) at typical terminal widths,
+// while staying bounded — it is deliberately NOT the full uncapped report,
+// which LastAssistantTextFull already serves separately for the oracle. Bumped
+// from 120 (a single hard-truncated line) once the TAIL row learned to wrap.
+const tailTextCap = 800
+
 // lastAssistantTextFromTail is LastAssistantText's buffer-only core: finds
-// the raw text, then caps it to 120 chars for the TAIL row.
+// the raw text, then caps it to tailTextCap chars for the TAIL row.
 func lastAssistantTextFromTail(buf []byte) (string, bool) {
 	text, ok := lastAssistantTextRawFromTail(buf)
 	if !ok {
 		return "", false
 	}
-	return summarizeTailText(text, 120), true
+	return summarizeTailText(text, tailTextCap), true
 }
 
 // LastAssistantTextFull returns the last assistant message's RAW text from
 // the tail of the session log — uncapped, unlike LastAssistantText (which
-// caps at 120 chars for the TUI's TAIL row). The oracle (internal/oracle)
-// needs the full report to judge accurately; a 120-char summary would
-// throw away exactly the evidence it's supposed to check.
+// caps at tailTextCap chars for the TUI's TAIL row). The oracle
+// (internal/oracle) needs the full report to judge accurately; an
+// 800-char summary would throw away exactly the evidence it's supposed to
+// check.
 func LastAssistantTextFull(path string) (string, bool) {
 	buf, ok := readTail(path, tailBytes)
 	if !ok {
@@ -658,8 +667,11 @@ func assistantMessageText(entry map[string]any) (string, bool) {
 	return "", false
 }
 
-// summarizeTailText collapses newlines to spaces and caps length for a
-// one-line TAIL row.
+// summarizeTailText collapses newlines to spaces and caps length, yielding a
+// single-line, bounded string (LastText). The detail pane's TAIL row re-wraps
+// it across up to maxTailLines lines at the pane's width; the DOING column
+// hard-truncates it to its own narrow column. Keeping LastText itself
+// single-line lets both callers wrap/truncate as they see fit.
 func summarizeTailText(s string, max int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) <= max {

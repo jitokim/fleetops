@@ -1437,6 +1437,151 @@ func TestDoingForRow_TruncatedToColumnWidth(t *testing.T) {
 	}
 }
 
+func TestDoingForRow_CapBumpDoesNotChangeRenderedOutput(t *testing.T) {
+	// Bumping LastText's cap (120→800 in internal/claude.summarizeTailText) must
+	// be a no-op for DOING: DOING hard-truncates LastText to its own column
+	// (doingCapWidth=30), far below either cap, so only the first ~30 runes ever
+	// reach the screen. Two LastTexts that agree on their first 120 runes but
+	// differ beyond it must render identically in DOING.
+	prefix := strings.Repeat("a", 120)
+	asIfCappedAt120 := prefix
+	asIfCappedAt800 := prefix + strings.Repeat("b", 680)
+	got120 := trunc(doingForRow(domain.Loop{LastText: asIfCappedAt120}), doingCapWidth)
+	got800 := trunc(doingForRow(domain.Loop{LastText: asIfCappedAt800}), doingCapWidth)
+	if got120 != got800 {
+		t.Errorf("DOING render changed after cap bump: 120-cap=%q 800-cap=%q", got120, got800)
+	}
+}
+
+// ── detail pane TAIL row (wrapTailText / detailRowMultiline) ────────
+
+func TestWrapTailText_WrapsToExpectedLineCount(t *testing.T) {
+	// three 5-col lines, all under maxTailLines → returned verbatim, no marker.
+	got := wrapTailText("aa bb cc dd ee ff", 5, maxTailLines)
+	want := []string{"aa bb", "cc dd", "ee ff"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines %q, want %d %q", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestWrapTailText_CapsAtMaxLinesWithMarker(t *testing.T) {
+	// "one two ... ten" @ width 12 wraps to 5 lines; capping at 3 keeps 3 and
+	// marks the last as truncated so it's clear content was dropped.
+	got := wrapTailText("one two three four five six seven eight nine ten", 12, 3)
+	if len(got) != 3 {
+		t.Fatalf("got %d lines %q, want 3 (capped)", len(got), got)
+	}
+	if !strings.HasSuffix(got[2], "…") {
+		t.Errorf("last shown line %q lacks the truncation marker", got[2])
+	}
+	if n := len([]rune(got[2])); n > 12 {
+		t.Errorf("last line = %d runes, want <= width 12", n)
+	}
+}
+
+func TestWrapTailText_FullWidthLastLineMarkerStaysWithinWidth(t *testing.T) {
+	// each word is exactly the width; the marker must displace a rune rather
+	// than overflow the column.
+	got := wrapTailText("aaaaa bbbbb ccccc ddddd", 5, 2)
+	if len(got) != 2 {
+		t.Fatalf("got %d lines %q, want 2", len(got), got)
+	}
+	if got[1] != "bbbb…" {
+		t.Errorf("last line = %q, want %q (last rune dropped for the marker)", got[1], "bbbb…")
+	}
+	if n := len([]rune(got[1])); n != 5 {
+		t.Errorf("last line = %d runes, want exactly width 5 (no overflow)", n)
+	}
+}
+
+func TestWrapTailText_ShortTextNoMarkerNoBlanks(t *testing.T) {
+	got := wrapTailText("short text", 40, maxTailLines)
+	if len(got) != 1 {
+		t.Fatalf("got %d lines %q, want 1", len(got), got)
+	}
+	if got[0] != "short text" {
+		t.Errorf("got %q, want %q", got[0], "short text")
+	}
+	if strings.HasSuffix(got[0], "…") {
+		t.Errorf("short text must not be marked truncated: %q", got[0])
+	}
+	for i, line := range got {
+		if line == "" {
+			t.Errorf("line %d is a wasted blank line", i)
+		}
+	}
+}
+
+func TestWrapTailText_NonPositiveArgsReturnNil(t *testing.T) {
+	if got := wrapTailText("anything", 0, maxTailLines); got != nil {
+		t.Errorf("width 0: got %q, want nil", got)
+	}
+	if got := wrapTailText("anything", 40, 0); got != nil {
+		t.Errorf("maxLines 0: got %q, want nil", got)
+	}
+}
+
+func TestDetailRowMultiline_KeyOnFirstLineContinuationIndented(t *testing.T) {
+	out := detailRowMultiline("TAIL", []string{"alpha", "beta", "gamma"})
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d physical lines %q, want 3", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "TAIL") || !strings.HasSuffix(lines[0], "alpha") {
+		t.Errorf("first line %q should carry the KEY then the first value line", lines[0])
+	}
+	indent := strings.Repeat(" ", detailKeyWidth)
+	for i, line := range lines[1:] {
+		if !strings.HasPrefix(line, indent) {
+			t.Errorf("continuation line %d = %q, want a %d-space indent under the value column", i+1, line, detailKeyWidth)
+		}
+		if strings.Contains(line, "TAIL") {
+			t.Errorf("continuation line %d = %q should not repeat the KEY", i+1, line)
+		}
+		if strings.TrimLeft(line, " ") == "" {
+			t.Errorf("continuation line %d = %q is blank", i+1, line)
+		}
+	}
+}
+
+func TestDetailRowMultiline_EmptyLinesRendersNothing(t *testing.T) {
+	if out := detailRowMultiline("TAIL", nil); out != "" {
+		t.Errorf("got %q, want empty for no value lines", out)
+	}
+}
+
+func TestRenderDetail_EmptyLastText_NoTailRow(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cwd: "/x", Path: "/x/s1.jsonl"}
+	out := renderDetail(l, 80)
+	if strings.Contains(out, "TAIL") {
+		t.Errorf("detail pane should have NO TAIL row when LastText is empty:\n%s", out)
+	}
+}
+
+func TestRenderDetail_LongLastText_ShowsWrappedTruncatedTailRow(t *testing.T) {
+	// long enough to overflow maxTailLines at the pane width → wrapped + marked.
+	l := domain.Loop{
+		Project:   "aboard",
+		SessionID: "s1",
+		State:     domain.StateIdle,
+		Cwd:       "/x",
+		Path:      "/x/s1.jsonl",
+		LastText:  strings.Repeat("lorem ipsum dolor sit amet ", 60),
+	}
+	out := renderDetail(l, 80)
+	if !strings.Contains(out, "TAIL") {
+		t.Errorf("detail pane should show a TAIL row when LastText is present:\n%s", out)
+	}
+	if !strings.Contains(out, "…") {
+		t.Errorf("an overflowing TAIL should carry a truncation marker:\n%s", out)
+	}
+}
+
 // errTestJudgeFailed is a sentinel error for TestJudgeCmd_JudgeErrorReportedWithoutSaving.
 var errTestJudgeFailed = &testJudgeError{}
 

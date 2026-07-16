@@ -420,8 +420,8 @@ func TestLastAssistantText_ReturnsLastOfTwo(t *testing.T) {
 	}
 }
 
-func TestLastAssistantText_CollapsesNewlinesAndCaps120(t *testing.T) {
-	long := strings.Repeat("a", 200)
+func TestLastAssistantText_CollapsesNewlinesAndCapsAtTailTextCap(t *testing.T) {
+	long := strings.Repeat("a", tailTextCap+100) // exceed the cap so truncation runs
 	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, "line one\nline two\n"+long))
 
 	got, ok := LastAssistantText(path)
@@ -436,6 +436,28 @@ func TestLastAssistantText_CollapsesNewlinesAndCaps120(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "…") {
 		t.Errorf("got %q, want truncated with an ellipsis", got)
+	}
+	// tailTextCap runes of content + the 1-rune ellipsis marker.
+	if n := len([]rune(got)); n != tailTextCap+1 {
+		t.Errorf("capped length = %d runes, want %d (tailTextCap + ellipsis)", n, tailTextCap+1)
+	}
+}
+
+func TestLastAssistantText_UnderCapNotTruncated(t *testing.T) {
+	// A message shorter than the cap is returned whole, with no ellipsis — the
+	// detail pane's TAIL row now shows several lines, so short reports aren't cut.
+	body := strings.Repeat("b", tailTextCap-100)
+	path := writeJSONL(t, fmt.Sprintf(`{"type":"assistant","message":{"content":%q}}`, body))
+
+	got, ok := LastAssistantText(path)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != body {
+		t.Errorf("got %d runes, want the message returned verbatim (%d runes, no truncation)", len([]rune(got)), len([]rune(body)))
+	}
+	if strings.HasSuffix(got, "…") {
+		t.Errorf("under-cap message must not be marked truncated: ends with … = %q…", got[:20])
 	}
 }
 
