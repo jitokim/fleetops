@@ -300,6 +300,23 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 		}
 
 		k := liveCountByProjectDir[pd]
+		// fix/exit-gate-ux (architecture judge item D): a collided
+		// ProjectDir's summed live count is unattributable — encodeCwd
+		// collapsed TWO DISTINCT real directories into this one pd, so we
+		// have no way to tell which of the group's loop entries the
+		// counted live processes actually back (same ambiguity the
+		// healing guard above already refuses to resolve — see its doc).
+		// Trusting the raw sum here would let a genuinely-dead loop in
+		// one colliding dir "borrow" aliveness from an UNRELATED live
+		// process in the OTHER colliding dir, escaping StallGone purely
+		// by coincidence of arithmetic. Treat it as zero evidence instead:
+		// every loop sharing this ProjectDir goes through the SAME
+		// "presumed dead" scrutiny below (kill-check, idle-drop,
+		// done/drift exemption, else Gone) that an under-backed group
+		// already gets — never silently exempted.
+		if collidedProjectDir[pd] {
+			k = 0
+		}
 		if k >= len(idxs) {
 			continue // enough live processes for every loop sharing this dir
 		}
@@ -556,12 +573,36 @@ func readTail(path string, n int64) ([]byte, bool) {
 }
 
 // hasRateLimitMarker looks for a recent rate-limit marker in the tail.
+//
+// fix/exit-gate-ux (architecture judge item C): this used to match
+// "rate limit"/"rate-limit"/"429 "/"usage limit" as BARE substrings
+// anywhere in the tail — the SAME false-positive class internal/claude.
+// LastError was fixed for (see apiErrorMarker's doc): ordinary conversation
+// can mention a status code or discuss rate limiting without any actual
+// error occurring at all (this repo's own transcripts are a real example —
+// a status update mentioning the "429 auto-redrive" FEATURE by name). A
+// transcript merely discussing rate limits must not get StallRateLimit.
+//
+// Two independent, tightened signals now gate a match:
+//  1. a genuinely structured API error shape — `"status":429` or
+//     `"type":"rate_limit_error"` (Anthropic's actual error-type slug) —
+//     safe as bare substrings since this exact key:value JSON shape
+//     essentially never occurs in ordinary prose.
+//  2. Claude Code's own synthesized "API Error" marker (apiErrorMarker)
+//     PLUS a rate-limit-specific word in the SAME tail — i.e. a bare
+//     "429"/"rate limit"/"usage limit" mention only counts when there's
+//     also a genuine synthesized error entry present, never on its own.
 func hasRateLimitMarker(buf []byte) bool {
 	s := strings.ToLower(string(buf))
+	if strings.Contains(s, "\"status\":429") || strings.Contains(s, "\"type\":\"rate_limit_error\"") {
+		return true
+	}
+	if !strings.Contains(s, apiErrorMarker) {
+		return false
+	}
 	return strings.Contains(s, "rate limit") ||
 		strings.Contains(s, "rate-limit") ||
-		strings.Contains(s, "\"status\":429") ||
-		strings.Contains(s, "429 ") ||
+		strings.Contains(s, "429") ||
 		strings.Contains(s, "usage limit")
 }
 

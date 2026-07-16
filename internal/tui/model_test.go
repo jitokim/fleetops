@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/jitokim/missionctl/internal/claude"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
 	"github.com/jitokim/missionctl/internal/events"
@@ -459,6 +460,23 @@ func detailPanelV2RegressionLoop(t *testing.T, historyDir string) domain.Loop {
 	}
 }
 
+// primeDetailCache runs the REAL detailCacheCmd synchronously and returns
+// its result as a ready-to-assign m.detailCache map — fix/exit-gate-ux
+// moved the DETAIL panel's event-log read and transcript LAST ERROR parse
+// off View() into an async Model-cache (mirroring gitStatsCmd), so any
+// test that drives m.View() directly (bypassing Update()'s loopsMsg
+// dispatch) must warm the cache itself first, exactly like this helper
+// does — otherwise the DETAIL panel would just see the safe "not computed
+// yet" zero value and silently render nothing new.
+func primeDetailCache(t *testing.T, l domain.Loop) map[string]detailCacheEntry {
+	t.Helper()
+	msg, ok := detailCacheCmd(l)().(detailCacheMsg)
+	if !ok {
+		t.Fatalf("detailCacheCmd(%q) did not return a detailCacheMsg", l.SessionID)
+	}
+	return map[string]detailCacheEntry{msg.sessionID: msg.entry}
+}
+
 // TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks is the P2 review
 // fix's regression: the standing width/height sweep above must ALSO
 // exercise LAST ERROR/VERDICTS/EVENTS/the flap counter, not just render
@@ -480,6 +498,7 @@ func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks(t *testing.T) {
 				m.w, m.h = width, height
 				m.loops = []domain.Loop{l}
 				m.cursor = 0
+				m.detailCache = primeDetailCache(t, l) // fix/exit-gate-ux: events+LAST ERROR are now async-cached, not read synchronously by View()
 
 				out := m.View()
 				lines := strings.Split(out, "\n")
@@ -514,6 +533,7 @@ func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered(t 
 	m.w, m.h = 120, 45
 	m.loops = []domain.Loop{l}
 	m.cursor = 0
+	m.detailCache = primeDetailCache(t, l) // fix/exit-gate-ux: events+LAST ERROR are now async-cached, not read synchronously by View()
 	out := m.View()
 
 	for _, want := range []string{"LAST ERROR", "VERDICTS", "EVENTS", "stall in"} {
@@ -553,37 +573,147 @@ func TestRenderHeaderBlock_ExactlyThreeLines_AtNarrowWidths(t *testing.T) {
 	}
 }
 
-// TestHeaderHintColumnCount_DropsColumnsAsWidthShrinks pins the column
-// count at representative widths — hint columns must drop right-to-left
-// (fewer columns at narrower widths), reaching 0 below headerHintMinWidth.
-func TestHeaderHintColumnCount_DropsColumnsAsWidthShrinks(t *testing.T) {
+// TestHeaderHintColumnCount_DropsColumnsAsAvailShrinks pins the column
+// count at representative (totalWidth, availForHints) pairs — hint columns
+// must drop right-to-left as the space renderHeaderBlock hands them
+// shrinks, reaching 0 either below headerHintMinWidth OR whenever
+// availForHints itself is 0 (fix/exit-gate-ux: availForHints is now
+// computed by renderHeaderBlock AFTER giving LEFT/MIDDLE priority — see
+// its doc — so this function no longer derives it from width itself).
+func TestHeaderHintColumnCount_DropsColumnsAsAvailShrinks(t *testing.T) {
 	cases := []struct {
-		width int
-		want  int
+		totalWidth, avail, want int
 	}{
-		{headerHintMinWidth - 1, 0}, // one below the threshold — whole grid dropped
-		{headerHintMinWidth, 1},
-		{175, 4}, // capped at the number of columns headerHintKeys actually needs
-		{300, 4}, // still capped — extra width doesn't grow a 5th column
+		{headerHintMinWidth - 1, 1000, 0}, // below the total-width floor — whole grid dropped regardless of avail
+		{headerHintMinWidth, 0, 0},        // MIDDLE claimed everything — no room left for hints
+		{headerHintMinWidth, headerHintColWidth, 1},
+		{300, headerHintColWidth * 100, 4}, // capped at the number of columns headerHintKeys actually needs
 	}
 	for _, c := range cases {
-		if got := headerHintColumnCount(c.width); got != c.want {
-			t.Errorf("headerHintColumnCount(%d) = %d, want %d", c.width, got, c.want)
+		if got := headerHintColumnCount(c.totalWidth, c.avail); got != c.want {
+			t.Errorf("headerHintColumnCount(%d, %d) = %d, want %d", c.totalWidth, c.avail, got, c.want)
 		}
 	}
 }
 
-// TestHeaderHintColumnCount_MonotonicallyNonDecreasing: columns must never
-// drop as width GROWS (no oscillation) — the width-degradation direction is
-// exclusively "narrower → fewer or equal columns".
-func TestHeaderHintColumnCount_MonotonicallyNonDecreasing(t *testing.T) {
+// TestHeaderHintColumnCount_MonotonicallyNonDecreasingInAvail: columns must
+// never drop as availForHints GROWS (no oscillation), for a fixed
+// totalWidth above the minimum threshold.
+func TestHeaderHintColumnCount_MonotonicallyNonDecreasingInAvail(t *testing.T) {
 	prev := -1
-	for width := 1; width <= 300; width++ {
-		got := headerHintColumnCount(width)
+	for avail := 0; avail <= 300; avail++ {
+		got := headerHintColumnCount(300, avail)
 		if got < prev {
-			t.Fatalf("width=%d: cols=%d, want >= previous width's %d (must not decrease as width grows)", width, got, prev)
+			t.Fatalf("avail=%d: cols=%d, want >= previous avail's %d (must not decrease as avail grows)", avail, got, prev)
 		}
 		prev = got
+	}
+}
+
+// ── fix/exit-gate-ux: header width-priority order (UX judge items 2+3) ───
+
+// headerHeavyModel builds a Model whose fleet-stats band is long enough to
+// have previously truncated at ~80 cols (the judge's exact repro: "fleet 10
+// · 1 ru…", "budget 7.4M · o…") — 10 loops across every counted state, real
+// token spend, and a judged verdict so both MIDDLE lines are non-trivial,
+// plus gated>0 so the attention badge is also present.
+func headerHeavyModel() Model {
+	m := New()
+	m.hostname = "host"
+	loops := []domain.Loop{
+		{Project: "p1", SessionID: "s1", State: domain.StateRunning, TokensSpent: 1_000_000},
+		{Project: "p2", SessionID: "s2", State: domain.StateGate, TokensSpent: 1_000_000},
+		{Project: "p3", SessionID: "s3", State: domain.StateStalled, TokensSpent: 1_000_000},
+		{Project: "p4", SessionID: "s4", State: domain.StateStalled, TokensSpent: 1_000_000},
+		{Project: "p5", SessionID: "s5", State: domain.StateStalled, TokensSpent: 1_000_000},
+		{Project: "p6", SessionID: "s6", State: domain.StateIdle, TokensSpent: 1_000_000},
+		{Project: "p7", SessionID: "s7", State: domain.StateIdle, TokensSpent: 1_000_000,
+			Last: &domain.Verdict{Outcome: domain.OutcomeDone}},
+		{Project: "p8", SessionID: "s8", State: domain.StateDone, TokensSpent: 400_000},
+		{Project: "p9", SessionID: "s9", State: domain.StateFailed},
+		{Project: "p10", SessionID: "s10", State: domain.StateKilled},
+	}
+	m.loops = loops
+	return m
+}
+
+// TestRenderHeaderBlock_StatsSurviveBeforeHintsAt80Cols is the judge's
+// exact live repro, fixed: at 80 cols, a heavy fleet-stats band must
+// render FULLY (no "…" truncation) — hint columns give up room first.
+func TestRenderHeaderBlock_StatsSurviveBeforeHintsAt80Cols(t *testing.T) {
+	m := headerHeavyModel()
+	out := renderHeaderBlock(m, 80)
+	if strings.Contains(out, "…") {
+		t.Errorf("expected the fleet-stats band to render in full at 80 cols (hints must drop first), got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet 10") || !strings.Contains(out, "budget 7.4M") || !strings.Contains(out, "oracle") {
+		t.Errorf("expected the full fleet-stats content to appear at 80 cols, got:\n%s", out)
+	}
+}
+
+// TestRenderHeaderBlock_HintsDropBeforeStatsTruncate: as width shrinks from
+// a generous value down to 80, the hint grid's column count must shrink
+// (or vanish) BEFORE the fleet-stats band ever loses a character — the
+// exact priority flip the judge asked for.
+func TestRenderHeaderBlock_HintsDropBeforeStatsTruncate(t *testing.T) {
+	m := headerHeavyModel()
+	wideCols := headerHintColumnCountForModel(m, 175)
+	tightCols := headerHintColumnCountForModel(m, 80)
+	if tightCols >= wideCols {
+		t.Errorf("expected fewer hint columns at 80 cols (%d) than at 175 cols (%d) — hints must degrade before stats", tightCols, wideCols)
+	}
+	out := renderHeaderBlock(m, 80)
+	if strings.Contains(out, "…") {
+		t.Errorf("stats truncated at 80 cols before hints were fully dropped:\n%s", out)
+	}
+}
+
+// headerHintColumnCountForModel renders the header and counts how many
+// "<" hint-chip openers appear in the FIRST hint row — a black-box way to
+// read back how many columns actually rendered, without exposing
+// renderHeaderBlock's internal width-allocation math to the test.
+func headerHintColumnCountForModel(m Model, width int) int {
+	out := renderHeaderBlock(m, width)
+	lines := strings.Split(out, "\n")
+	if len(lines) == 0 {
+		return 0
+	}
+	return strings.Count(lines[0], "<")
+}
+
+// TestRenderHeaderBlock_BadgeNeverTruncates is UX judge item 3's direct
+// regression: with a GATE pending, the "▲ N GATE NEEDS YOU" badge (or its
+// abbreviated "▲N GATE" fallback) must NEVER be ansi-truncated with "…" —
+// it's the sole attention cue in narrow/list-only mode — across a sweep
+// down to a realistically narrow width.
+func TestRenderHeaderBlock_BadgeNeverTruncates(t *testing.T) {
+	m := headerHeavyModel() // gated=1
+	for _, width := range []int{45, 50, 60, 70, 80, 90, 120, 175} {
+		out := renderHeaderBlock(m, width)
+		if !strings.Contains(out, "GATE") {
+			t.Errorf("width=%d: expected the GATE badge to appear somewhere in the header:\n%s", width, out)
+			continue
+		}
+		if strings.Contains(out, "GATE…") || strings.Contains(out, "▲…") {
+			t.Errorf("width=%d: badge appears truncated:\n%s", width, out)
+		}
+	}
+}
+
+// TestRenderHeaderBlock_BadgeFallsBackToAbbreviatedForm_WhenTight: at a
+// width too tight for the full "▲ N GATE NEEDS YOU" form but wide enough
+// for the abbreviated "▲N GATE" form, the abbreviated form must render
+// (not the full form clipped, and not nothing).
+func TestRenderHeaderBlock_BadgeFallsBackToAbbreviatedForm_WhenTight(t *testing.T) {
+	m := New()
+	m.hostname = "h"
+	m.loops = []domain.Loop{{Project: "p", SessionID: "s", State: domain.StateGate}}
+	out := renderHeaderBlock(m, headerLeftWidth+9) // room for "▲1 GATE" (~8 cols) but not "▲ 1 GATE NEEDS YOU" (~19 cols)
+	if !strings.Contains(out, "▲1 GATE") {
+		t.Errorf("expected the abbreviated badge form, got:\n%s", out)
+	}
+	if strings.Contains(out, "NEEDS YOU") {
+		t.Errorf("expected the FULL badge form to be replaced, not shown truncated, got:\n%s", out)
 	}
 }
 
@@ -608,6 +738,35 @@ func TestRenderHeaderBlock_HintGridPresentAtThreshold(t *testing.T) {
 	}
 }
 
+// TestHeaderHintKeys_GroupedByFunction pins fix/exit-gate-ux item 7's
+// reordering: column-major fill groups send actions (r/i/a), lifecycle
+// (n/k/p), nav (↵/o//), and quit (q) into adjacent cells — see
+// headerHintKeys' doc for the grouping rationale.
+func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
+	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q"}
+	if len(headerHintKeys) != len(want) {
+		t.Fatalf("got %d keys, want %d", len(headerHintKeys), len(want))
+	}
+	for i, k := range headerHintKeys {
+		if k.key != want[i] {
+			t.Errorf("headerHintKeys[%d] = %q, want %q", i, k.key, want[i])
+		}
+	}
+}
+
+// TestRenderHeaderHintGrid_AllKeysPresent_NothingRegressed verifies every
+// keybinding the old bottom keybar used to show still appears somewhere in
+// the hint grid at a generous width — the item-7 reorder above must not
+// have dropped anything.
+func TestRenderHeaderHintGrid_AllKeysPresent_NothingRegressed(t *testing.T) {
+	out := renderHeaderHintGrid(4, 4*headerHintColWidth)
+	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q"} {
+		if !strings.Contains(out, "<"+k+">") {
+			t.Errorf("expected hint grid to contain key %q, got:\n%s", k, out)
+		}
+	}
+}
+
 // TestRenderHeaderLeft_HostnameNotTruncatedAtTypicalLength verifies
 // headerLeftWidth is generous enough for a realistic hostname (the
 // regression this constant's own doc comment cites) — a real bug caught
@@ -622,6 +781,46 @@ func TestRenderHeaderLeft_HostnameNotTruncatedAtTypicalLength(t *testing.T) {
 	}
 	if !strings.Contains(out, m.hostname) {
 		t.Errorf("expected the full hostname to appear untruncated, got:\n%s", out)
+	}
+}
+
+// ── fix/exit-gate-ux: empty-state onboarding (UX judge item 5) ───────────
+
+// TestFleetPanelLines_EmptyFleet_ShowsOnboardingHint: the empty FLEET
+// panel used to dead-end a new user with just a fact ("no active Claude
+// Code loops in the window.") — it must also point at the two most likely
+// next actions: spawning a loop, and installing the hooks gate detection
+// depends on.
+func TestFleetPanelLines_EmptyFleet_ShowsOnboardingHint(t *testing.T) {
+	m := New()
+	lines := m.fleetPanelLines(80, 10)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "no active Claude Code loops") {
+		t.Errorf("expected the empty-fleet fact to still be present:\n%s", joined)
+	}
+	if !strings.Contains(joined, "press n to spawn a loop") {
+		t.Errorf("expected a hint to spawn a loop with n:\n%s", joined)
+	}
+	if !strings.Contains(joined, "missionctl hooks install") {
+		t.Errorf("expected a hint to install hooks for gate detection:\n%s", joined)
+	}
+}
+
+// TestFleetPanelLines_EmptyFilterResult_NoOnboardingHint: the OTHER empty
+// state — a filter that matches nothing — is a different situation (loops
+// exist, the filter just excludes all of them) and must NOT show the
+// onboarding hint, which would be misleading there.
+func TestFleetPanelLines_EmptyFilterResult_NoOnboardingHint(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "s1", State: domain.StateRunning}}
+	m.filterQuery = "no-such-match-xyz"
+	lines := m.fleetPanelLines(80, 10)
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "press n to spawn") {
+		t.Errorf("did not expect the onboarding hint for a filter-empty result:\n%s", joined)
+	}
+	if !strings.Contains(joined, "no loops match filter") {
+		t.Errorf("expected the filter-empty message:\n%s", joined)
 	}
 }
 
@@ -2708,19 +2907,27 @@ func TestNoteForRow_GovernorNote_FailedStateIsRed(t *testing.T) {
 	}
 }
 
-func TestNoteForRow_NoGovernorNote_FallsBackToStallText(t *testing.T) {
+// TestNoteForRow_NoGovernorNote_StalledStaysEmpty is fix/exit-gate-ux's
+// (UX judge item 4) reversal of the old fallback: StateStalled already has
+// its own callout box (renderResumeCallout) stating the stall reason — the
+// NOTE row must NOT also echo it (that was 1 of the 3 repeats the judge
+// flagged).
+func TestNoteForRow_NoGovernorNote_StalledStaysEmpty(t *testing.T) {
 	l := domain.Loop{State: domain.StateStalled, Stall: domain.StallNoOutput}
 	note, _ := noteForRow(l)
-	if note != "⚠ no output" {
-		t.Errorf("note = %q, want the stall-derived text", note)
+	if note != "" {
+		t.Errorf("note = %q, want empty — the STALLED callout already states this", note)
 	}
 }
 
-func TestNoteForRow_NoGovernorNote_FallsBackToDriftReason(t *testing.T) {
+// TestNoteForRow_NoGovernorNote_DriftStaysEmpty: same reversal for
+// StateDrift — renderDriftCallout already states l.Last.Reason as its own
+// headline.
+func TestNoteForRow_NoGovernorNote_DriftStaysEmpty(t *testing.T) {
 	l := domain.Loop{State: domain.StateDrift, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence shown"}}
 	note, _ := noteForRow(l)
-	if note != "✗ no evidence shown" {
-		t.Errorf("note = %q, want the drift reason", note)
+	if note != "" {
+		t.Errorf("note = %q, want empty — the DRIFT callout already states this", note)
 	}
 }
 
@@ -2898,14 +3105,45 @@ func TestBudgetBurnRateSuffix_ComputesRateAndETACycle(t *testing.T) {
 	}
 }
 
-func TestBudgetLine_UnboundLoop_NoSuffixButBaseStillRenders(t *testing.T) {
+// TestBudgetLine_NoGoalText_NoSuffixButBaseStillRenders: a loop with a cap
+// set but no Goal.Text (budgetBurnRateSuffix's OWN "unbound" check, keyed
+// on Goal.Text — a different condition than budgetLine's own
+// BudgetTokens<=0 check below) still shows the base spent/cap/percent, just
+// without a burn-rate suffix.
+func TestBudgetLine_NoGoalText_NoSuffixButBaseStillRenders(t *testing.T) {
 	l := domain.Loop{Goal: domain.Goal{BudgetTokens: 1000}, TokensSpent: 500}
 	got := budgetLine(l)
 	if !strings.Contains(got, "500") {
 		t.Errorf("got %q, want the base spent/cap text present regardless of the suffix", got)
 	}
 	if strings.Contains(got, "/cyc") {
-		t.Errorf("got %q, want no burn-rate suffix for an unbound loop", got)
+		t.Errorf("got %q, want no burn-rate suffix without Goal.Text", got)
+	}
+}
+
+// TestBudgetLine_UnboundBudget_NoCapNoPercentNoSuffix is fix/exit-gate-ux's
+// P1 regression ("most common view is broken" — most real OBSERVED loops
+// have no wizard-set contract at all, so Goal.BudgetTokens is always 0):
+// budgetLine used to render a fabricated "<spent> / 0 (0%)" — a cap and
+// percentage against a budget that was never set. It must show ONLY the
+// pretty-printed spend, with no "/ 0 (0%)" and no burn-rate suffix (ETA
+// needs a real cap to project against).
+func TestBudgetLine_UnboundBudget_NoCapNoPercentNoSuffix(t *testing.T) {
+	l := domain.Loop{Project: "observed", TokensSpent: 380_000} // BudgetTokens unset — an observed, non-contracted session
+	got := budgetLine(l)
+	if got != "380k" {
+		t.Errorf("got %q, want exactly the pretty-printed spend %q — no cap, no percent, no suffix", got, "380k")
+	}
+}
+
+// TestBudgetLine_BoundLoop_Unchanged pins that a loop WITH a real budget
+// cap keeps showing the full "<spent> / <cap> (P%)" form — the fix above
+// must only change the BudgetTokens<=0 case, not bound loops.
+func TestBudgetLine_BoundLoop_Unchanged(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{Text: "g", BudgetTokens: 1_000_000}, TokensSpent: 500_000}
+	got := budgetLine(l)
+	if !strings.Contains(got, "500k / 1.0M (50%)") {
+		t.Errorf("got %q, want the full spent/cap/percent form for a bound loop", got)
 	}
 }
 
@@ -2989,6 +3227,56 @@ func TestRenderDetail_StageRowPresentForBoundLoop(t *testing.T) {
 	}
 }
 
+// ── fix/exit-gate-ux: DETAIL self-repetition (UX judge item 4) ───────────
+
+// TestRenderDetail_FirstLine_SessionIDOnly_NoProjectEcho: the panel's own
+// title already reads "DETAIL ▸ <project>" (see detailTitle) — the
+// content block's first line must not print the project name a second
+// time, just the session id.
+func TestRenderDetail_FirstLine_SessionIDOnly_NoProjectEcho(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "sess-xyz", State: domain.StateRunning}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	lines := strings.Split(out, "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one line")
+	}
+	if strings.Contains(lines[0], "aboard") {
+		t.Errorf("first line = %q, must not repeat the project name (already in the panel title)", lines[0])
+	}
+	if !strings.Contains(lines[0], "sess-xyz") {
+		t.Errorf("first line = %q, want the session id", lines[0])
+	}
+}
+
+// TestRenderOracleDetail_DriftLoop_ShowsCycleNotReason: on a DRIFT loop,
+// renderDriftCallout already prints l.Last.Reason as its own headline
+// below — ORACLE must show a DIFFERENT fact (the verdict's cycle), not the
+// same reason string a second (well, third — NOTE used to be the second)
+// time.
+func TestRenderOracleDetail_DriftLoop_ShowsCycleNotReason(t *testing.T) {
+	l := domain.Loop{State: domain.StateDrift, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence shown", AtCycle: 4}}
+	got := renderOracleDetail(l, 80)
+	if strings.Contains(got, "no evidence shown") {
+		t.Errorf("got %q, must NOT repeat the reason text the DRIFT callout already shows", got)
+	}
+	if !strings.Contains(got, "4") {
+		t.Errorf("got %q, want it to mention the verdict's cycle (4)", got)
+	}
+}
+
+// TestRenderOracleDetail_NonDriftRejected_StillShowsReason: the
+// cycle-instead-of-reason substitution is SPECIFIC to StateDrift (where a
+// callout duplicates it) — a loop whose State has since moved on from
+// DRIFT (e.g. re-driven back to running) but still carries an old rejected
+// verdict has no callout repeating it, so the full reason must still show.
+func TestRenderOracleDetail_NonDriftRejected_StillShowsReason(t *testing.T) {
+	l := domain.Loop{State: domain.StateRunning, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence shown", AtCycle: 4}}
+	got := renderOracleDetail(l, 80)
+	if !strings.Contains(got, "no evidence shown") {
+		t.Errorf("got %q, want the full reason (no DRIFT callout exists to duplicate it here)", got)
+	}
+}
+
 // ── LAST ERROR extraction + staleness ───────────────────────────────────────
 
 func TestIsErrorStale_ErrorBeforeRecovery_Stale(t *testing.T) {
@@ -3046,15 +3334,28 @@ func TestIsErrorStale_IdleAlsoCountsAsHealthy(t *testing.T) {
 	}
 }
 
-func TestRenderDetail_LastErrorBlock_ShownWhenCurrent(t *testing.T) {
-	dir := t.TempDir()
+// lastErrorFromFile writes content to a transcript file and runs the REAL
+// claude.LastError extraction against it, wrapping the result as
+// detailData's lastError field — fix/exit-gate-ux moved that extraction
+// off renderDetail (see detailCacheCmd), so tests that want to exercise
+// the real parsing pipeline now do so explicitly at this seam, then feed
+// the result into renderDetail exactly as detailPanelLines does.
+func lastErrorFromFile(t *testing.T, dir, content string) lastErrorResult {
+	t.Helper()
 	path := filepath.Join(dir, "s1.jsonl")
-	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateStalled, Stall: domain.StallRateLimit, Path: path}
-	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	text, ts, ok := claude.LastError(path)
+	return lastErrorResult{text: text, ts: ts, ok: ok}
+}
+
+func TestRenderDetail_LastErrorBlock_ShownWhenCurrent(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
+	lastErr := lastErrorFromFile(t, dir, content)
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), lastError: lastErr})
 	if !strings.Contains(out, "LAST ERROR") {
 		t.Errorf("expected a LAST ERROR block:\n%s", out)
 	}
@@ -3065,17 +3366,14 @@ func TestRenderDetail_LastErrorBlock_ShownWhenCurrent(t *testing.T) {
 
 func TestRenderDetail_LastErrorBlock_SuppressedWhenStale(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "s1.jsonl")
 	oldTS := time.Now().Add(-time.Hour)
 	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + oldTS.Format(time.RFC3339) + `"}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: path}
+	lastErr := lastErrorFromFile(t, dir, content)
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
 	evs := []events.Event{
 		{TS: time.Now().Add(-30 * time.Minute).UnixNano(), Trigger: events.TriggerScan, ToState: "idle"}, // recovered since the error
 	}
-	out := renderDetail(l, 80, 40, detailData{now: time.Now(), events: evs})
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), events: evs, lastError: lastErr})
 	if strings.Contains(out, "LAST ERROR") {
 		t.Errorf("expected NO LAST ERROR block — the loop recovered since this error:\n%s", out)
 	}
@@ -3090,23 +3388,117 @@ func TestRenderDetail_LastErrorBlock_SuppressedWhenStale(t *testing.T) {
 // reproduced against this repo's own real transcript before the fix.
 func TestRenderDetail_HealthyConversationMentioningStatusCode_NoBlock(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "s1.jsonl")
 	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"landed #24 (429 auto-redrive) — Tier 2 only, opt-in. main is green."}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning, Path: path}
-	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	lastErr := lastErrorFromFile(t, dir, content)
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now(), lastError: lastErr})
 	if strings.Contains(out, "LAST ERROR") {
 		t.Errorf("expected NO LAST ERROR block — this is ordinary conversation mentioning a status code, not a real error:\n%s", out)
 	}
 }
 
 func TestRenderDetail_NoErrorAtAll_NoBlock(t *testing.T) {
-	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: "/no/such/file.jsonl"}
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle}
 	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
 	if strings.Contains(out, "LAST ERROR") {
 		t.Errorf("expected no LAST ERROR block when there's no transcript error:\n%s", out)
+	}
+}
+
+// ── DETAIL panel async cache (fix/exit-gate-ux, architecture judge P1) ───
+
+// TestDetailCacheCmd_GathersEventsAndLastError is detailCacheCmd's own
+// direct regression: it must gather BOTH the event log (via events.Read)
+// AND the transcript's LAST ERROR (via claude.LastError) off the render
+// path, bundled into one detailCacheMsg keyed by SessionID.
+func TestDetailCacheCmd_GathersEventsAndLastError(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	ev := events.Event{SessionID: "s1", TS: time.Now().UnixNano(), Trigger: events.TriggerScan, ToState: "running"}
+	if err := events.Append(historyDir, ev); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	transcriptPath := filepath.Join(t.TempDir(), "s1.jsonl")
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 rate limited"}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "s1", Path: transcriptPath}
+	msg, ok := detailCacheCmd(l)().(detailCacheMsg)
+	if !ok {
+		t.Fatalf("detailCacheCmd did not return a detailCacheMsg")
+	}
+	if msg.sessionID != "s1" {
+		t.Errorf("sessionID = %q, want %q", msg.sessionID, "s1")
+	}
+	if len(msg.entry.events) != 1 {
+		t.Errorf("got %d events, want 1 (from the real history dir)", len(msg.entry.events))
+	}
+	if !msg.entry.lastError.ok || msg.entry.lastError.text != "API Error: 429 rate limited" {
+		t.Errorf("lastError = %+v, want ok=true text=%q", msg.entry.lastError, "API Error: 429 rate limited")
+	}
+}
+
+// TestUpdate_DetailCacheMsg_PopulatesCache mirrors gitStatsMsg's own
+// Update handling: a detailCacheMsg must land in m.detailCache keyed by
+// SessionID, lazily initializing the map on first use.
+func TestUpdate_DetailCacheMsg_PopulatesCache(t *testing.T) {
+	m := New()
+	entry := detailCacheEntry{
+		events:    []events.Event{{SessionID: "s1", TS: time.Now().UnixNano()}},
+		lastError: lastErrorResult{text: "boom", ok: true},
+	}
+	updated, cmd := m.Update(detailCacheMsg{sessionID: "s1", entry: entry})
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("expected no follow-up cmd from detailCacheMsg, got one")
+	}
+	got, ok := mm.detailCache["s1"]
+	if !ok {
+		t.Fatal("expected detailCache[\"s1\"] to be populated")
+	}
+	if len(got.events) != 1 || !got.lastError.ok || got.lastError.text != "boom" {
+		t.Errorf("detailCache[\"s1\"] = %+v, want the entry passed in the msg", got)
+	}
+}
+
+// TestUpdate_LoopsMsg_DispatchesDetailCacheCmd is the P1 regression itself:
+// a scan tick (loopsMsg) for a fleet with a selected loop must dispatch a
+// detailCacheCmd for it — the SAME cadence gitStatsCmd already gets — so
+// events.Read/claude.LastError run off the Update/View goroutine, not
+// synchronously inside View() on every keystroke/tick.
+func TestUpdate_LoopsMsg_DispatchesDetailCacheCmd(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	m := New()
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning}
+	_, cmd := m.Update(loopsMsg([]domain.Loop{l}))
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched cmd from loopsMsg")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected loopsMsg's cmd to be a tea.Batch, got %T", cmd())
+	}
+	found := false
+	for _, sub := range batch {
+		if sub == nil {
+			continue
+		}
+		if msg, ok := sub().(detailCacheMsg); ok && msg.sessionID == "s1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected loopsMsg's batched cmds to include a detailCacheCmd for the selected loop (s1)")
 	}
 }
 

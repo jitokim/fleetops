@@ -282,6 +282,23 @@ type Model struct {
 	// either way (see renderStageRow).
 	gitStats map[string]gitStatsResult
 
+	// detailCache caches the selected loop's event-log history and
+	// transcript LAST ERROR extraction, keyed by SessionID — the SAME
+	// off-loop tea.Cmd/Model-cache pattern as gitStats (see its doc),
+	// applied to the two remaining pieces of the DETAIL panel that used to
+	// do real disk I/O (events.Read) and transcript parsing (claude.LastError)
+	// synchronously inside View() itself. fix/exit-gate-ux (architecture
+	// judge, P1): that ran on the render path on EVERY keystroke/tick,
+	// contradicting this file's own off-loop discipline. Populated by
+	// detailCacheCmd, dispatched once per scan tick (loopsMsg) for ONLY the
+	// currently-selected loop, same cadence/scope as gitStats. A zero-value
+	// entry (empty events, lastError.ok=false) simply means "not computed
+	// yet" — renderDetail already tolerates both inputs being empty/absent
+	// (VERDICTS/EVENTS/LAST ERROR blocks are all optional and independently
+	// omitted when there's nothing to show), so there is no separate
+	// loading-placeholder state to manage.
+	detailCache map[string]detailCacheEntry
+
 	// autoRedriveAttempts/autoRedriveScheduledAt back feat/auto-redrive-429
 	// — the opt-in 429 auto-redrive policy (see
 	// maybeScheduleAutoRedrive429). autoRedriveAttempts is sessionID ->
@@ -330,17 +347,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// feat/detail-panel-v2: refresh the SELECTED loop's git stats once
 		// per scan tick — never the whole fleet's (no other loop's stats
 		// are ever rendered, so that would be pure waste).
-		var gitCmd tea.Cmd
+		var gitCmd, detailCmd tea.Cmd
 		if sel, ok := m.selected(); ok {
 			gitCmd = gitStatsCmd(sel)
+			// fix/exit-gate-ux (architecture judge, P1): mirrors gitCmd
+			// exactly — see detailCache's doc for why this replaced the old
+			// synchronous events.Read/claude.LastError calls in View().
+			detailCmd = detailCacheCmd(sel)
 		}
-		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd}, autoRedriveCmds...)
+		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd, detailCmd}, autoRedriveCmds...)
 		return m, tea.Batch(cmds...)
 	case gitStatsMsg:
 		if m.gitStats == nil {
 			m.gitStats = make(map[string]gitStatsResult)
 		}
 		m.gitStats[msg.sessionID] = msg.stats
+		return m, nil
+	case detailCacheMsg:
+		if m.detailCache == nil {
+			m.detailCache = make(map[string]detailCacheEntry)
+		}
+		m.detailCache[msg.sessionID] = msg.entry
 		return m, nil
 	case autoRedriveScheduledMsg:
 		// Re-check the CURRENT (latest scan) state before firing — a loop
@@ -2226,25 +2253,50 @@ func renderRule(width int) string {
 	return lipgloss.NewStyle().Foreground(cLine).Render(strings.Repeat("─", width))
 }
 
-// renderHeaderBlock composes the 3-line header: LEFT (fixed width) + MIDDLE
-// (fleet stats, gets whatever's left after LEFT and the hint grid — the
-// task's "stats column truncates before the logo column") + RIGHT (the
-// hint grid, present only when headerHintColumnCount(width) > 0).
+// renderHeaderBlock composes the 3-line header. Width priority order
+// (fix/exit-gate-ux, UX judge items 2+3 — FLIPS the priority feat/top-hint-
+// grid originally shipped, which the judge caught inverted at ~80 cols:
+// hint columns rendered full while the live fleet-stats band truncated to
+// "fleet 10 · 1 ru…"):
+//  1. the GATE/STALLED attention badge — must NEVER be ansi-truncated (the
+//     sole cue in narrow/list-only mode); falls back to an abbreviated
+//     form before it would ever clip (see headerMiddleContent.render).
+//  2. the fleet-stats band (fleet counts + budget/oracle%) — must stay
+//     FULLY legible; this live band is why the window is open at all.
+//  3. hint-grid columns — dropped right-to-left first, since keybindings
+//     are learnable-once (unlike the badge/stats, which are live state).
+//  4. LEFT (logo/uptime) — lowest priority, shrunk last, and only once
+//     MIDDLE's hard floor (stats + the badge's ABBREVIATED form) wouldn't
+//     otherwise fit at all.
 func renderHeaderBlock(m Model, width int) string {
-	cols := headerHintColumnCount(width)
-	hintWidth := cols * headerHintColWidth
+	content := m.headerMiddleContent()
+	middleMin := content.minWidth()
+	middleIdeal := content.idealWidth()
 
 	leftWidth := headerLeftWidth
 	if leftWidth > width {
 		leftWidth = width
 	}
-	middleWidth := width - leftWidth - hintWidth
-	if middleWidth < 0 {
-		middleWidth = 0
+	if width-leftWidth < middleMin {
+		leftWidth = width - middleMin
+		if leftWidth < 0 {
+			leftWidth = 0
+		}
 	}
 
+	avail := width - leftWidth
+	middleWidth := middleIdeal
+	if middleWidth > avail {
+		middleWidth = avail
+	}
+
+	remaining := avail - middleWidth
+	cols := headerHintColumnCount(width, remaining)
+	hintWidth := cols * headerHintColWidth
+	middleWidth = avail - hintWidth // hand any width the hint grid didn't claim back to MIDDLE
+
 	left := renderHeaderLeft(m, leftWidth)
-	middle := renderHeaderMiddle(m, middleWidth)
+	middle := content.render(middleWidth)
 	if cols == 0 {
 		return lipgloss.JoinHorizontal(lipgloss.Top, left, middle)
 	}
@@ -2287,11 +2339,24 @@ func renderHeaderLeft(m Model, width int) string {
 	return headerRegionLines([]string{line1, line2, ""}, width)
 }
 
-// renderHeaderMiddle: fleet counts / budget+oracle / amber gate-or-stalled
-// badge, stacked — the old single-line renderSummaryBand's content, now
-// split across the header block's 3 rows instead of joined with " · " onto
-// one line with a right-aligned badge.
-func renderHeaderMiddle(m Model, width int) string {
+// headerMiddleContent bundles MIDDLE's three lines' content — fleet
+// counts, budget+oracle, and BOTH forms of the gate/stalled badge (full
+// and abbreviated) — computed ONCE per render from Model, so sizing
+// (minWidth/idealWidth, which renderHeaderBlock uses to allocate LEFT vs
+// MIDDLE vs the hint grid) and actual rendering (render) can never
+// disagree about what MIDDLE needs.
+type headerMiddleContent struct {
+	fleet       string
+	stats       string
+	badgeFull   string
+	badgeAbbrev string
+}
+
+// headerMiddleContent gathers renderHeaderMiddle's old per-render inputs —
+// the old single-line renderSummaryBand's content, split across the header
+// block's 3 rows instead of joined with " · " onto one line with a
+// right-aligned badge.
+func (m Model) headerMiddleContent() headerMiddleContent {
 	total, running, stalled, idle, gated, totalTokens, judged, good := m.counts()
 	// Judgment call: the old band's applied-filter indicator ("filter:
 	// %q") has no dedicated line in the task's 3-line MIDDLE spec — folded
@@ -2302,12 +2367,39 @@ func renderHeaderMiddle(m Model, width int) string {
 	if m.mode != modeFiltering {
 		filterQuery = m.filterQuery
 	}
-	lines := []string{
-		headerFleetCountsLine(total, running, stalled, idle, gated),
-		headerBudgetOracleLine(totalTokens, judged, good, filterQuery),
-		headerGateBadgeLine(gated, stalled),
+	return headerMiddleContent{
+		fleet:       headerFleetCountsLine(total, running, stalled, idle, gated),
+		stats:       headerBudgetOracleLine(totalTokens, judged, good, filterQuery),
+		badgeFull:   headerGateBadgeLine(gated, stalled),
+		badgeAbbrev: headerGateBadgeLineAbbrev(gated, stalled),
 	}
-	return headerRegionLines(lines, width)
+}
+
+// minWidth is MIDDLE's hard floor: the fleet-stats lines' own full width
+// (never abbreviated — UX judge item 2) plus the badge's ABBREVIATED form
+// (the narrowest it's ever allowed to render — item 3, "never truncate", so
+// this floor guarantees room for at least that much). renderHeaderBlock
+// shrinks LEFT first whenever even this floor doesn't otherwise fit.
+func (c headerMiddleContent) minWidth() int {
+	return maxInt(maxInt(lipgloss.Width(c.fleet), lipgloss.Width(c.stats)), lipgloss.Width(c.badgeAbbrev))
+}
+
+// idealWidth is what MIDDLE would need to show its FULL (non-abbreviated)
+// badge form — renderHeaderBlock tries to give it this much before handing
+// anything to the hint grid, but never less than minWidth.
+func (c headerMiddleContent) idealWidth() int {
+	return maxInt(maxInt(lipgloss.Width(c.fleet), lipgloss.Width(c.stats)), lipgloss.Width(c.badgeFull))
+}
+
+// render picks the fullest badge form (full, else abbreviated) that fits
+// width — the badge must NEVER be ansi-truncated by headerRegionLines'
+// fitWithin, which would otherwise clip it mid-glyph.
+func (c headerMiddleContent) render(width int) string {
+	badge := c.badgeFull
+	if badge != "" && lipgloss.Width(badge) > width {
+		badge = c.badgeAbbrev
+	}
+	return headerRegionLines([]string{c.fleet, c.stats, badge}, width)
 }
 
 // headerFleetCountsLine: "fleet N · x run · y gate · z stalled · w idle"
@@ -2367,15 +2459,43 @@ func headerGateBadgeLine(gated, stalled int) string {
 	}
 }
 
+// headerGateBadgeLineAbbrev is headerGateBadgeLine's fallback form
+// (fix/exit-gate-ux, UX judge item 3): "▲N GATE"/"▲N STALLED" — used ONLY
+// when the full form doesn't fit width (see headerMiddleContent.render),
+// so the badge — the sole attention cue in narrow/list-only mode — is
+// NEVER ansi-truncated mid-glyph. Same gate-over-stalled priority as the
+// full form.
+func headerGateBadgeLineAbbrev(gated, stalled int) string {
+	switch {
+	case gated > 0:
+		return stBadgeStalled.Render(fmt.Sprintf("▲%d GATE", gated))
+	case stalled > 0:
+		return stBadgeStalled.Render(fmt.Sprintf("▲%d STALLED", stalled))
+	default:
+		return ""
+	}
+}
+
 // headerHintKeys is the RIGHT region's content — every keybinding the old
 // bottom keybar used to list (minus "↑↓ select": the FLEET panel's own ▸
 // cursor marker already makes selection self-evident, so it didn't earn a
-// grid cell) — in the task's exact given order, filled column-major into
-// headerLines (3) rows.
+// grid cell) — filled column-major into headerLines (3) rows, so this
+// list's order IS the grid's visual column grouping (see
+// renderHeaderHintGrid).
+//
+// fix/exit-gate-ux (UX judge item 7): reordered from the original
+// alphabetical-ish column-major fill (which split "r resume"/"i inject" —
+// both "send something into the loop" — into different columns) into
+// FUNCTIONAL groups, so the grid reads by what each key DOES, not by
+// coincidence of position: col0 = send-into-the-loop (r/i/a — resume,
+// inject, approve all push some decision/prompt at the loop), col1 =
+// lifecycle (n/k/p — start, kill, stop), col2 = nav/view (↵/o// — attach,
+// view log, filter), col3 = quit (alone).
 var headerHintKeys = []struct{ key, action string }{
-	{"r", "resume"}, {"a", "approve"}, {"i", "inject"}, {"↵", "attach"},
-	{"p", "stop"}, {"k", "kill"}, {"n", "new"}, {"o", "log"},
-	{"/", "filter"}, {"q", "quit"},
+	{"r", "resume"}, {"i", "inject"}, {"a", "approve"},
+	{"n", "new"}, {"k", "kill"}, {"p", "stop"},
+	{"↵", "attach"}, {"o", "log"}, {"/", "filter"},
+	{"q", "quit"},
 }
 
 // headerHintColWidth is one hint grid column's width (the task's "~14
@@ -2387,21 +2507,22 @@ const (
 	headerHintMinWidth = 70
 )
 
-// headerHintColumnCount decides how many hint-grid columns fit at width:
-// 0 below headerHintMinWidth (drop the whole grid), otherwise as many
-// headerHintColWidth-wide columns as fit in whatever's left after
-// reserving headerLeftWidth and a floor for MIDDLE — capped at the number
-// of columns headerHintKeys actually needs (no empty trailing columns).
-// Columns drop right-to-left as width shrinks: the LAST column (fewest,
-// least-essential-by-list-order keys) is what a shrinking `avail` runs out
-// of room for first.
-func headerHintColumnCount(width int) int {
-	if width < headerHintMinWidth {
+// headerHintColumnCount decides how many hint-grid columns fit: 0 below
+// headerHintMinWidth (drop the whole grid — keybindings are discoverable
+// in the README at that point), otherwise as many headerHintColWidth-wide
+// columns fit in availForHints — the space renderHeaderBlock has ALREADY
+// determined is left over after giving LEFT and MIDDLE (the fleet-stats
+// band + attention badge — UX judge items 2+3, higher width priority than
+// hints) everything they need. Capped at the number of columns
+// headerHintKeys actually needs (no empty trailing columns). Columns drop
+// right-to-left as availForHints shrinks: the LAST column (fewest,
+// least-essential-by-list-order keys) runs out of room first.
+func headerHintColumnCount(totalWidth, availForHints int) int {
+	if totalWidth < headerHintMinWidth {
 		return 0
 	}
 	maxCols := (len(headerHintKeys) + headerLines - 1) / headerLines // ceil
-	avail := width - headerLeftWidth - headerMiddleFloor
-	cols := avail / headerHintColWidth
+	cols := availForHints / headerHintColWidth
 	if cols > maxCols {
 		cols = maxCols
 	}
@@ -2410,12 +2531,6 @@ func headerHintColumnCount(width int) int {
 	}
 	return cols
 }
-
-// headerMiddleFloor is the minimum width headerHintColumnCount reserves
-// for MIDDLE before handing any more room to the hint grid — without this
-// a very wide terminal could in principle let the grid crowd MIDDLE down
-// to nothing.
-const headerMiddleFloor = 16
 
 // renderHeaderHintGrid lays out cols columns × headerLines rows of
 // "<key> action" cells, column-major (column c holds
@@ -2767,7 +2882,15 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 	visible := m.visibleLoops()
 	switch {
 	case len(m.loops) == 0:
-		return []string{stFaint.Render("no active Claude Code loops in the window.")}
+		// fix/exit-gate-ux (UX judge item 5): the empty FLEET panel used to
+		// just state the fact and dead-end a new user there — no indication
+		// of what to do about it. One extra line pointing at the two most
+		// likely next actions (spawn a loop, or install the hooks that make
+		// gate detection work at all) turns a dead end into a next step.
+		return []string{
+			stFaint.Render("no active Claude Code loops in the window."),
+			stFaint.Render("press n to spawn a loop · run 'missionctl hooks install' for gate detection"),
+		}
 	case len(visible) == 0:
 		return []string{stFaint.Render(fmt.Sprintf("no loops match filter %q.", m.filterQuery))}
 	}
@@ -2799,11 +2922,12 @@ func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
 	if !ok {
 		return []string{stFaint.Render("select a loop to see its detail.")}
 	}
-	evs, _ := events.Read(historyDirFn(), sel.SessionID) // best-effort; nil on error is fine (every consumer tolerates an empty slice)
+	cached := m.detailCache[sel.SessionID] // zero value (empty events, lastError.ok=false) when not yet cached — see detailCache's doc
 	data := detailData{
-		now:    time.Now(),
-		events: evs,
-		git:    m.gitStats[sel.SessionID],
+		now:       time.Now(),
+		events:    cached.events,
+		git:       m.gitStats[sel.SessionID],
+		lastError: cached.lastError,
 	}
 	lines := strings.Split(renderDetail(sel, innerWidth, innerHeight, data), "\n")
 	if len(lines) > innerHeight {
@@ -2834,24 +2958,25 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 // wins when set — it's either an "over budget"/"max cycles reached"
 // escalation (amber, State otherwise unchanged) or a "stopped: no
 // improvement" note paired with StateFailed (red, matching FAILED's own
-// state color) — over the older stall/drift-derived text, which falls back
-// to matching the row's overall state color as before. The stall/drift
-// fallback text duplicates what renderResumeCallout/renderDriftCallout
-// already show in their own callout box for those states — intentionally:
-// this row is what keeps a StateFailed loop's governor note (the one case
-// with no callout of its own) visible at all now that it's off the list.
+// state color) — this row is what keeps a StateFailed loop's governor note
+// (the one case with no callout of its own) visible at all now that it's
+// off the list.
+//
+// fix/exit-gate-ux (UX judge item 4): this used to ALSO fall back to a
+// stall/drift-derived text ("⚠ <stall>" / "✗ <reason>") whenever l.Note was
+// empty — but StateStalled/StateDrift both already have their OWN callout
+// box below (renderResumeCallout/renderDriftCallout) stating the exact
+// same thing, so that fallback made the same fact print twice on top of
+// the ORACLE row ALSO repeating it a third time (see renderOracleDetail's
+// own fix). Dropped entirely: StateFailed (via l.Note above) is the only
+// state left with no callout of its own, so it's the only one that still
+// needs this row for anything.
 func noteForRow(l domain.Loop) (string, lipgloss.Style) {
 	if l.Note != "" {
 		if l.State == domain.StateFailed {
 			return l.Note, lipgloss.NewStyle().Foreground(cRed)
 		}
 		return l.Note, lipgloss.NewStyle().Foreground(cAmber)
-	}
-	switch {
-	case l.Stall != domain.StallNone:
-		return "⚠ " + string(l.Stall), stateStyle(l)
-	case l.State == domain.StateDrift && l.Last != nil:
-		return "✗ " + l.Last.Reason, stateStyle(l)
 	}
 	return "", stateStyle(l)
 }
@@ -3001,6 +3126,60 @@ func countUntrackedFiles(porcelain string) int {
 	return n
 }
 
+// ── DETAIL panel's async event-log + LAST ERROR cache ───────────────────
+//
+// fix/exit-gate-ux (architecture judge, P1): reading the event log
+// (events.Read) and parsing the selected loop's transcript for its last
+// error (claude.LastError) both used to run synchronously inside View() —
+// real disk I/O on the Update/View goroutine on EVERY keystroke and EVERY
+// scan tick, contradicting this file's own off-loop discipline (gitStatsCmd
+// exists precisely to avoid exactly this class of bug for the STAGE row's
+// git stats). Follows the SAME tea.Cmd/Msg/Model-cache pattern as
+// gitStatsCmd verbatim — see its doc.
+
+// lastErrorResult is claude.LastError's three return values, bundled so
+// detailCacheEntry can carry it as one field (mirrors gitStatsResult's own
+// shape/reasoning).
+type lastErrorResult struct {
+	text string
+	ts   time.Time
+	ok   bool
+}
+
+// detailCacheEntry is one loop's cached event history + LAST ERROR
+// extraction. The zero value (nil events, lastError.ok=false) means "not
+// computed yet" — renderDetail already tolerates both being empty/absent
+// (see detailData's doc), so there is no separate loading state to thread
+// through.
+type detailCacheEntry struct {
+	events    []events.Event
+	lastError lastErrorResult
+}
+
+// detailCacheMsg reports detailCacheCmd's result for sessionID.
+type detailCacheMsg struct {
+	sessionID string
+	entry     detailCacheEntry
+}
+
+// detailCacheCmd gathers l's event history and transcript LAST ERROR off
+// the event loop. Both are best-effort (events.Read tolerates a
+// missing/empty history; claude.LastError's ok=false just means "no error
+// entry found") — never an error surfaced to the human, same as gitStatsCmd.
+func detailCacheCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		evs, _ := events.Read(historyDirFn(), l.SessionID)
+		text, ts, ok := claude.LastError(l.Path)
+		return detailCacheMsg{
+			sessionID: l.SessionID,
+			entry: detailCacheEntry{
+				events:    evs,
+				lastError: lastErrorResult{text: text, ts: ts, ok: ok},
+			},
+		}
+	}
+}
+
 // ── detail pane ──────────────────────────────────────────────
 
 // tailMaxLines caps how many wrapped lines the detail pane's TAIL row shows.
@@ -3016,16 +3195,19 @@ const tailMaxLines = 4
 const detailKeyWidth = 8
 
 // detailData bundles everything renderDetail needs beyond the Loop itself —
-// data that's either expensive (git stats) or requires "now"/the event log
-// for time-relative computations (STAGE elapsed, burn-rate ETA, LAST ERROR
-// staleness, VERDICTS, EVENTS, the STALLED callout's flap counter).
-// Gathered once by the caller (detailPanelLines) so renderDetail itself
-// stays a pure rendering function over already-known data — directly
-// testable without a real event-log dir or git repo.
+// data that's either expensive (git stats, transcript parsing) or requires
+// "now"/the event log for time-relative computations (STAGE elapsed,
+// burn-rate ETA, LAST ERROR staleness, VERDICTS, EVENTS, the STALLED
+// callout's flap counter). Gathered once by the caller (detailPanelLines,
+// from Model's async caches — see detailCacheCmd/gitStatsCmd) so
+// renderDetail itself stays a pure rendering function over already-known
+// data — directly testable without a real event-log dir, transcript file,
+// or git repo.
 type detailData struct {
-	now    time.Time
-	events []events.Event // this session's history, oldest-first (events.Read's contract)
-	git    gitStatsResult
+	now       time.Time
+	events    []events.Event // this session's history, oldest-first (events.Read's contract)
+	git       gitStatsResult
+	lastError lastErrorResult // the selected loop's transcript LAST ERROR (claude.LastError), cached async — see detailCacheCmd
 }
 
 // eventsMinRows is the EVENTS block's floor: below this many rows available
@@ -3042,8 +3224,13 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	}
 
 	var d strings.Builder
-	d.WriteString(stTitle.Render("▸ " + l.Project))
-	d.WriteString("  " + stFaint.Render(l.SessionID))
+	// fix/exit-gate-ux (UX judge item 4): this used to lead with
+	// "▸ <project>  <sid>" — but the panel's own title (see detailTitle)
+	// already reads "DETAIL ▸ <project>", so the project name printed a
+	// SECOND time as this content block's very first thing a human's eye
+	// hits. Lead with the session id alone — it's the one identifying fact
+	// the panel title doesn't already carry.
+	d.WriteString(stFaint.Render(l.SessionID))
 	d.WriteString("\n")
 	d.WriteString(detailRow("STATE", stateStyle(l).Render(stateLabel(l))))
 	// NOTE: moved here from the old flat table's NOTE column (see
@@ -3089,7 +3276,7 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 		d.WriteString(renderDriftCallout(l, width))
 	}
 
-	if errText, errTS, ok := lastErrorForDetail(l, data); ok {
+	if errText, errTS, ok := lastErrorForDetail(data); ok {
 		d.WriteString(renderLastErrorBlock(errText, errTS, valueWidth))
 	}
 
@@ -3145,10 +3332,22 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 // (P%)" plus, when computable, an inline burn rate + ETA cycle —
 // "3.9M / 2.0M · ~4.1k/cyc · cap ~c483" (rate = TokensSpent/Cycle; ETA
 // cycle = the cycle number at which the budget is projected to run out,
-// current cycle + remaining budget / rate). Omitted for an unbound loop,
-// before cycle 2 (not enough data for a meaningful rate), or once already
-// over budget (no future ETA to report — judgment call, see PR body).
+// current cycle + remaining budget / rate). The burn/ETA suffix is
+// omitted before cycle 2 (not enough data for a meaningful rate), or once
+// already over budget (no future ETA to report — judgment call, see PR
+// body).
+//
+// fix/exit-gate-ux (UX judge, P1 — "most common view is broken"): an
+// UNBOUND loop (Goal.BudgetTokens<=0 — most real observed sessions, which
+// aren't started via the "n" wizard's contract) used to render "<spent> /
+// 0 (0%)" — a fabricated cap and percentage against a budget that was
+// never set. There is no "/ <cap> (P%)" to show without a real cap, and no
+// burn-rate ETA either (it needs one to compute against) — just the raw
+// spend.
 func budgetLine(l domain.Loop) string {
+	if l.Goal.BudgetTokens <= 0 {
+		return prettyTokens(l.TokensSpent)
+	}
 	base := fmt.Sprintf("%s / %s (%d%%)",
 		prettyTokens(l.TokensSpent), prettyTokens(l.Goal.BudgetTokens), int(math.Round(l.BudgetFrac()*100)))
 	suffix := budgetBurnRateSuffix(l)
@@ -3212,20 +3411,21 @@ func stageElapsed(l domain.Loop, data detailData) (time.Duration, bool) {
 	return data.now.Sub(time.Unix(0, data.events[0].TS)), true
 }
 
-// lastErrorForDetail extracts the loop's most recent transcript error
-// (internal/claude.LastError) and applies the staleness suppression rule:
-// don't show a stale error on a loop that has since recovered — compare
-// against the event log's last transition INTO a healthy state (running or
-// idle). ok=false when there's no error, or it's older than that recovery.
-func lastErrorForDetail(l domain.Loop, data detailData) (string, time.Time, bool) {
-	text, ts, ok := claude.LastError(l.Path)
-	if !ok {
+// lastErrorForDetail applies the staleness suppression rule to data's
+// already-cached LAST ERROR extraction (see detailCacheCmd — this no
+// longer calls claude.LastError itself, fix/exit-gate-ux moved that off
+// the render path): don't show a stale error on a loop that has since
+// recovered — compare against the event log's last transition INTO a
+// healthy state (running or idle). ok=false when there's no cached error,
+// or it's older than that recovery.
+func lastErrorForDetail(data detailData) (string, time.Time, bool) {
+	if !data.lastError.ok {
 		return "", time.Time{}, false
 	}
-	if isErrorStale(ts, data.events) {
+	if isErrorStale(data.lastError.ts, data.events) {
 		return "", time.Time{}, false
 	}
-	return text, ts, true
+	return data.lastError.text, data.lastError.ts, true
 }
 
 // isErrorStale reports whether errorTS predates the event log's most
@@ -3446,6 +3646,14 @@ func flapCounter(evs []events.Event, now time.Time) (count int, span time.Durati
 // renderOracleDetail is the ORACLE row's value: icon + the verdict's actual
 // reason (not just the short table-cell label), colored by outcome. "—" if
 // never judged yet.
+//
+// fix/exit-gate-ux (UX judge item 4): on a DRIFT loop specifically, this
+// used to show "✗ <reason>" — the EXACT SAME reason string
+// renderDriftCallout already prints as its own headline below (StateDrift
+// is BY DEFINITION "oracle rejected this loop's done claim", so
+// l.Last.Reason here and there are one and the same fact). Show a
+// DIFFERENT fact instead — the cycle the verdict landed at — rather than
+// let it 3-peat across NOTE/ORACLE/callout.
 func renderOracleDetail(l domain.Loop, valueWidth int) string {
 	if l.Last == nil {
 		return stFaint.Render("—")
@@ -3457,6 +3665,9 @@ func renderOracleDetail(l domain.Loop, valueWidth int) string {
 	case domain.OutcomeRejected:
 		icon = "✗"
 		style = lipgloss.NewStyle().Foreground(cRed)
+	}
+	if l.State == domain.StateDrift {
+		return style.Render(fmt.Sprintf("%s at cycle %d", icon, l.Last.AtCycle))
 	}
 	return style.Render(icon + " " + trunc(l.Last.Reason, valueWidth-2))
 }
