@@ -3255,7 +3255,7 @@ func TestRenderDetail_FirstLine_SessionIDOnly_NoProjectEcho(t *testing.T) {
 // time.
 func TestRenderOracleDetail_DriftLoop_ShowsCycleNotReason(t *testing.T) {
 	l := domain.Loop{State: domain.StateDrift, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence shown", AtCycle: 4}}
-	got := renderOracleDetail(l, 80)
+	got := renderOracleDetail(l)
 	if strings.Contains(got, "no evidence shown") {
 		t.Errorf("got %q, must NOT repeat the reason text the DRIFT callout already shows", got)
 	}
@@ -3264,16 +3264,36 @@ func TestRenderOracleDetail_DriftLoop_ShowsCycleNotReason(t *testing.T) {
 	}
 }
 
-// TestRenderOracleDetail_NonDriftRejected_StillShowsReason: the
-// cycle-instead-of-reason substitution is SPECIFIC to StateDrift (where a
-// callout duplicates it) — a loop whose State has since moved on from
-// DRIFT (e.g. re-driven back to running) but still carries an old rejected
-// verdict has no callout repeating it, so the full reason must still show.
-func TestRenderOracleDetail_NonDriftRejected_StillShowsReason(t *testing.T) {
+// TestRenderOracleDetail_DoneLoop_ShowsCycleNotReason is fix/detail-dedup's
+// re-judge regression: a DONE loop (no callout at all — DONE has none)
+// STILL had the same reason string repeating between ORACLE and VERDICTS.
+// The compact glyph+cycle form is now universal, not StateDrift-specific —
+// VERDICTS (renderVerdictsBlock) is the ONE place the verbatim reason
+// lives, regardless of outcome/state.
+func TestRenderOracleDetail_DoneLoop_ShowsCycleNotReason(t *testing.T) {
+	l := domain.Loop{State: domain.StateDone, Last: &domain.Verdict{Outcome: domain.OutcomeDone, Reason: "all tests pass, feature verified", AtCycle: 6}}
+	got := renderOracleDetail(l)
+	if strings.Contains(got, "all tests pass") {
+		t.Errorf("got %q, must NOT repeat the reason text VERDICTS already shows", got)
+	}
+	if !strings.Contains(got, "✓") || !strings.Contains(got, "6") {
+		t.Errorf("got %q, want a compact ✓ glyph + cycle 6", got)
+	}
+}
+
+// TestRenderOracleDetail_NonDriftRejected_AlsoCompact: fix/detail-dedup
+// dropped the StateDrift-only carve-out entirely — a loop whose State has
+// since moved on from DRIFT (e.g. re-driven back to running) but still
+// carries an old rejected verdict ALSO gets the compact form now, not the
+// full reason (VERDICTS is the one place for that, regardless of State).
+func TestRenderOracleDetail_NonDriftRejected_AlsoCompact(t *testing.T) {
 	l := domain.Loop{State: domain.StateRunning, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence shown", AtCycle: 4}}
-	got := renderOracleDetail(l, 80)
-	if !strings.Contains(got, "no evidence shown") {
-		t.Errorf("got %q, want the full reason (no DRIFT callout exists to duplicate it here)", got)
+	got := renderOracleDetail(l)
+	if strings.Contains(got, "no evidence shown") {
+		t.Errorf("got %q, want the compact form — VERDICTS is the one place for the full reason now", got)
+	}
+	if !strings.Contains(got, "✗") || !strings.Contains(got, "4") {
+		t.Errorf("got %q, want a compact ✗ glyph + cycle 4", got)
 	}
 }
 
@@ -3569,6 +3589,65 @@ func TestRenderDetail_VerdictsBlockAbsentForUnboundLoop(t *testing.T) {
 	}
 }
 
+// ── fix/detail-dedup: end-to-end reason-appears-once (UX judge re-judge) ──
+
+// TestRenderDetail_DoneLoop_ReasonAppearsExactlyOnce is the re-judge's
+// exact repro for a DONE loop: verified live that the SAME verdict reason
+// rendered 3x within one DETAIL viewport. DONE has no action callout at
+// all, so after this fix the reason must appear EXACTLY ONCE in the whole
+// DETAIL output — in VERDICTS, and nowhere else (not ORACLE, not EVENTS).
+func TestRenderDetail_DoneLoop_ReasonAppearsExactlyOnce(t *testing.T) {
+	const reason = "all tests pass, feature verified end to end"
+	now := time.Now()
+	l := domain.Loop{
+		Project: "aboard", SessionID: "s1", State: domain.StateDone, Cycle: 6,
+		Goal: domain.Goal{Text: "ship the feature", MaxCycles: 12},
+		Last: &domain.Verdict{Outcome: domain.OutcomeDone, Reason: reason, AtCycle: 6},
+	}
+	evs := []events.Event{
+		{TS: now.Add(-10 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "running", ToState: "idle"},
+		{TS: now.Add(-1 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "done at cycle 6: " + reason},
+	}
+	out := renderDetail(l, 100, 40, detailData{now: now, events: evs})
+
+	if got := strings.Count(out, reason); got != 1 {
+		t.Errorf("reason %q appears %d times in the DONE loop's DETAIL output, want exactly 1:\n%s", reason, got, out)
+	}
+	if !strings.Contains(out, "VERDICTS") {
+		t.Errorf("expected VERDICTS to be present (it's the one place the reason should live):\n%s", out)
+	}
+}
+
+// TestRenderDetail_DriftLoop_ReasonAppearsOnceInVerdictsPlusOnceInCallout
+// is the re-judge's DRIFT repro: the reason must appear in VERDICTS once
+// AND in the DRIFT callout's headline once (that's "the problem + what to
+// act on now" — a defensible distinct purpose from VERDICTS' judgment
+// history) — exactly 2 total, never a 3rd copy in ORACLE or EVENTS.
+func TestRenderDetail_DriftLoop_ReasonAppearsOnceInVerdictsPlusOnceInCallout(t *testing.T) {
+	const reason = "no evidence the feature was actually tested"
+	now := time.Now()
+	l := domain.Loop{
+		Project: "aboard", SessionID: "s1", State: domain.StateDrift, Cycle: 4,
+		Goal: domain.Goal{Text: "ship the feature", MaxCycles: 12},
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: reason, AtCycle: 4},
+	}
+	evs := []events.Event{
+		{TS: now.Add(-10 * time.Minute).UnixNano(), Trigger: events.TriggerScan, FromState: "running", ToState: "idle"},
+		{TS: now.Add(-1 * time.Minute).UnixNano(), Trigger: events.TriggerOracle, Detail: "rejected at cycle 4: " + reason},
+	}
+	out := renderDetail(l, 100, 40, detailData{now: now, events: evs})
+
+	if got := strings.Count(out, reason); got != 2 {
+		t.Errorf("reason %q appears %d times in the DRIFT loop's DETAIL output, want exactly 2 (VERDICTS + callout):\n%s", reason, got, out)
+	}
+	if !strings.Contains(out, "VERDICTS") {
+		t.Errorf("expected VERDICTS to be present:\n%s", out)
+	}
+	if !strings.Contains(out, "DRIFT ▸") {
+		t.Errorf("expected the DRIFT callout to be present:\n%s", out)
+	}
+}
+
 // ── EVENTS block: height budgeting + actor glyphs ───────────────────────────
 
 func TestEventActorGlyph(t *testing.T) {
@@ -3649,6 +3728,44 @@ func TestRenderEventsBlock_ActuationEventShowsDetailVerbatim(t *testing.T) {
 	}
 	if !strings.Contains(got, "kill tier1 ok") {
 		t.Errorf("got %q, want the actuation detail verbatim", got)
+	}
+}
+
+// TestRenderEventsBlock_OracleEventsExcluded is fix/detail-dedup's core
+// regression: VERDICTS (renderVerdictsBlock) is the dedicated oracle view
+// — a TriggerOracle event showing up here TOO (same ts, same verbatim
+// reason, only the glyph differing) was the exact 3-peat the UX judge's
+// re-judge caught. EVENTS is the actuation/scan/governor timeline only.
+func TestRenderEventsBlock_OracleEventsExcluded(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerScan, FromState: "running", ToState: "idle"},
+		{TS: 2, Trigger: events.TriggerOracle, Detail: `done at cycle 1: "all tests pass, feature verified"`},
+		{TS: 3, Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman},
+	}
+	got := renderEventsBlock(evs, 80, 10)
+	if strings.Contains(got, "all tests pass") {
+		t.Errorf("got %q, want the oracle verdict's reason NOT to appear in EVENTS (VERDICTS owns it)", got)
+	}
+	if !strings.Contains(got, "→") {
+		t.Errorf("got %q, want the scan transition still present", got)
+	}
+	if !strings.Contains(got, "resume tier1 ok") {
+		t.Errorf("got %q, want the actuation event still present", got)
+	}
+}
+
+// TestRenderEventsBlock_OnlyOracleEvents_RendersEmpty: if EVERY event in
+// the history happens to be an oracle verdict (e.g. a brand new goal-bound
+// loop judged once, no other history yet), EVENTS must render nothing at
+// all — an "EVENTS" header with zero data rows under it would be worse
+// than omitting the block, same convention renderVerdictsBlock already
+// follows for "nothing to show".
+func TestRenderEventsBlock_OnlyOracleEvents_RendersEmpty(t *testing.T) {
+	evs := []events.Event{
+		{TS: 1, Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"},
+	}
+	if got := renderEventsBlock(evs, 80, 10); got != "" {
+		t.Errorf("got %q, want empty when every event is an oracle verdict", got)
 	}
 }
 
