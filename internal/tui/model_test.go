@@ -3619,7 +3619,7 @@ func TestDetectTransitions_FirstAppearance_NoEvent(t *testing.T) {
 	m := New() // m.loops is empty — every session in newLoops is "brand new"
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 0 {
 		t.Fatalf("got %d transitions on first appearance, want 0", len(got))
@@ -3636,7 +3636,7 @@ func TestSeedFirstAppearanceGate_AlreadyGated_SeedsNotifyAndEvent(t *testing.T) 
 	m := New()
 	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions for an already-gated first appearance, want 1 (seeded)", len(got))
@@ -3669,7 +3669,7 @@ func TestSeedFirstAppearanceGate_DedupAppliesOnRestartWithinWindow(t *testing.T)
 	now := time.Now()
 	loops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
 
-	first := m.detectTransitions(loops, now)
+	first, _ := m.detectTransitions(loops, now)
 	if len(first) != 1 || !first[0].notify {
 		t.Fatalf("first seed: got %#v, want one notify-flagged transition", first)
 	}
@@ -3678,7 +3678,7 @@ func TestSeedFirstAppearanceGate_DedupAppliesOnRestartWithinWindow(t *testing.T)
 	// being called again before Update ever assigns m.loops = newLoops (not
 	// how Update actually sequences it, but shouldNotify's ledger is what's
 	// under test here, not the m.loops assignment timing).
-	second := m.detectTransitions(loops, now.Add(time.Second))
+	second, _ := m.detectTransitions(loops, now.Add(time.Second))
 	if len(second) != 1 {
 		t.Fatalf("got %d transitions on the second identical seed, want 1 (still seeded, just not re-notified)", len(second))
 	}
@@ -3691,7 +3691,7 @@ func TestSeedFirstAppearanceGate_NonGateFirstAppearance_NotSeeded(t *testing.T) 
 	m := New()
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 0 {
 		t.Fatalf("got %d transitions for a non-gate first appearance, want 0 (only StateGate is seeded, per the review's explicit scope)", len(got))
@@ -3703,7 +3703,7 @@ func TestDetectTransitions_StateChange_EmitsOneEvent(t *testing.T) {
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateIdle}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions, want 1", len(got))
@@ -3727,11 +3727,11 @@ func TestDetectTransitions_SameStateAcrossTwoScans_OnlyOneEventTotal(t *testing.
 	now := time.Now()
 
 	scan2 := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}}
-	firstTransitions := m.detectTransitions(scan2, now)
+	firstTransitions, _ := m.detectTransitions(scan2, now)
 	m.loops = scan2 // simulate Update overwriting m.loops after this scan
 
 	scan3 := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}} // unchanged
-	secondTransitions := m.detectTransitions(scan3, now.Add(3*time.Second))
+	secondTransitions, _ := m.detectTransitions(scan3, now.Add(3*time.Second))
 
 	if len(firstTransitions) != 1 {
 		t.Fatalf("scan1→scan2: got %d transitions, want 1 (the real running→stalled edge)", len(firstTransitions))
@@ -3748,7 +3748,7 @@ func TestDetectTransitions_StallKindChange_SameLoopState_StillCountsAsATransitio
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallNoOutput}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateStalled, Stall: domain.StallGone}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions for a stall-kind-only change, want 1", len(got))
@@ -3777,7 +3777,7 @@ func TestDetectTransitions_IntoGate_FlaggedForNotify(t *testing.T) {
 	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
 	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate, GatePrompt: "continue?"}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 || !got[0].notify {
 		t.Fatalf("got %#v, want exactly one notify-flagged transition", got)
@@ -3798,7 +3798,7 @@ func TestDetectTransitions_OrdinaryTransition_NotFlaggedForNotify(t *testing.T) 
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateIdle}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 1 {
 		t.Fatalf("got %d transitions, want 1", len(got))
@@ -3815,7 +3815,7 @@ func TestDetectTransitions_AlreadyGated_NoRepeatNotifyFlagOnUnrelatedChange(t *t
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "old?"}}
 	newLoops := []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "old?"}}
 
-	got := m.detectTransitions(newLoops, time.Now())
+	got, _ := m.detectTransitions(newLoops, time.Now())
 
 	if len(got) != 0 {
 		t.Fatalf("got %d transitions for an unchanged gate, want 0 (same signature both scans)", len(got))
@@ -3883,16 +3883,16 @@ func TestDetectTransitions_DedupAppliesAcrossScans_SecondGateEntryNotRenotified(
 	now := time.Now()
 
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
-	first := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}, now)
+	first, _ := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}, now)
 	if len(first) != 1 || !first[0].notify {
 		t.Fatalf("first gate entry: got %#v, want one notify-flagged transition", first)
 	}
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p1"}}
 
 	// leaves the gate, then re-enters it, both within the dedup window.
-	left := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateRunning}}, now.Add(time.Second))
+	left, _ := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateRunning}}, now.Add(time.Second))
 	m.loops = []domain.Loop{{SessionID: "s1", State: domain.StateRunning}}
-	second := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p2"}}, now.Add(2*time.Second))
+	second, _ := m.detectTransitions([]domain.Loop{{SessionID: "s1", State: domain.StateGate, GatePrompt: "p2"}}, now.Add(2*time.Second))
 
 	if len(left) != 1 {
 		t.Fatalf("leaving the gate: got %d transitions, want 1 (still a real, history-worthy transition)", len(left))
@@ -4043,5 +4043,377 @@ func TestSendPromptCmd_StateFailedRefusal_NoActuationEventRecorded(t *testing.T)
 	}
 	if len(got) != 0 {
 		t.Fatalf("got %d sessions with events, want 0 (refused before any tier was reached)", len(got))
+	}
+}
+
+// ── feat/auto-redrive-429 ──────────────────────────────────────────────────
+
+// withAutoRedriveEnabled overrides autoRedriveEnabledFn to the given value
+// for the duration of one test, restoring the original on cleanup — the
+// opt-in kill switch's test seam (see autoRedriveEnabledFn's doc).
+func withAutoRedriveEnabled(t *testing.T, enabled bool) {
+	t.Helper()
+	orig := autoRedriveEnabledFn
+	t.Cleanup(func() { autoRedriveEnabledFn = orig })
+	autoRedriveEnabledFn = func() bool { return enabled }
+}
+
+// ── opt-in default / kill switch ─────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_OptOutDefault_NeverSchedules(t *testing.T) {
+	withAutoRedriveEnabled(t, false)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	beforeStatus := m.status
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — auto-redrive is opt-in, off by default")
+	}
+	if m.status != beforeStatus {
+		t.Errorf("status = %q, want unchanged from %q — nothing should have happened", m.status, beforeStatus)
+	}
+}
+
+// ── edge-triggered scheduling ─────────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_EdgeTriggersSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	now := time.Now()
+
+	cmd := m.maybeScheduleAutoRedrive429(l, true, now)
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (the scheduled tea.Tick)")
+	}
+	if !strings.Contains(m.status, "auto: re-driving aboard in 5m (attempt 1/3)") {
+		t.Errorf("status = %q, want the scheduled-status text", m.status)
+	}
+	if got, ok := m.autoRedriveScheduledAt["s1"]; !ok || !got.Equal(now) {
+		t.Errorf("autoRedriveScheduledAt[s1] = %v, ok=%v, want %v", got, ok, now)
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_NotAnEdge_NoSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, false, time.Now()); cmd != nil {
+		t.Error("expected nil — enteredRateLimit=false is not a fresh edge")
+	}
+}
+
+// ── dedup window ──────────────────────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_DedupWindow_SecondCallWithinWindowRefused(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	now := time.Now()
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now); cmd == nil {
+		t.Fatal("first call should schedule")
+	}
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now.Add(time.Minute)); cmd != nil {
+		t.Error("expected nil — within the dedup window of the first schedule")
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_AfterDedupWindowExpires_SchedulesAgain(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	now := time.Now()
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now); cmd == nil {
+		t.Fatal("first call should schedule")
+	}
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, now.Add(autoRedriveDelay+time.Second)); cmd == nil {
+		t.Error("expected a non-nil cmd — the dedup window has elapsed")
+	}
+}
+
+// ── attempt ceiling ───────────────────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_AttemptCeiling_NoScheduleAtMax(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	m.autoRedriveAttempts = map[string]int{"s1": autoRedriveMaxAttempts}
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — already at the lifetime attempt ceiling")
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_BelowCeiling_Schedules(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	m.autoRedriveAttempts = map[string]int{"s1": autoRedriveMaxAttempts - 1}
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd == nil {
+		t.Error("expected a non-nil cmd — one attempt below the ceiling")
+	}
+}
+
+// ── gate/failed defense in depth ─────────────────────────────────────────
+
+func TestMaybeScheduleAutoRedrive429_StateFailed_NeverSchedules(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateFailed, Stall: domain.StallRateLimit}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — StateFailed must never auto-redrive")
+	}
+}
+
+func TestMaybeScheduleAutoRedrive429_StateGate_NeverSchedules(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateGate}
+
+	if cmd := m.maybeScheduleAutoRedrive429(l, true, time.Now()); cmd != nil {
+		t.Error("expected nil — StateGate must never auto-redrive")
+	}
+}
+
+// ── autoRedriveAttemptCount: lazy recount from the event log ──────────────
+
+func TestAutoRedriveAttemptCount_LazySeedsFromEventLog(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+
+	for i := 1; i <= 2; i++ {
+		if err := events.Append(historyDir, events.Event{
+			TS: int64(i), SessionID: "s1", ToState: "stalled:rate-limit",
+			Trigger: events.TriggerActuation, Actor: events.ActorAuto,
+			Detail: fmt.Sprintf("%s%d/%d", autoRedriveDetailPrefix, i, autoRedriveMaxAttempts),
+		}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	m := New()
+	if got := m.autoRedriveAttemptCount("s1"); got != 2 {
+		t.Errorf("got %d, want 2 (recounted from the event log — restart-safe ceiling)", got)
+	}
+}
+
+func TestAutoRedriveAttemptCount_NoHistory_Zero(t *testing.T) {
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	if got := m.autoRedriveAttemptCount("no-such-session"); got != 0 {
+		t.Errorf("got %d, want 0", got)
+	}
+}
+
+func TestAutoRedriveAttemptCount_IgnoresOtherActuationEvents(t *testing.T) {
+	historyDir := t.TempDir()
+	historyDirFn = func() string { return historyDir }
+	if err := events.Append(historyDir, events.Event{TS: 1, SessionID: "s1", Trigger: events.TriggerActuation, Actor: events.ActorHuman, Detail: "kill tier1 ok"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	m := New()
+	if got := m.autoRedriveAttemptCount("s1"); got != 0 {
+		t.Errorf("got %d, want 0 — a human kill event must not count as an auto-redrive attempt", got)
+	}
+}
+
+// ── detectTransitions integration ────────────────────────────────────────
+
+func TestDetectTransitions_EnteredRateLimit_Enabled_SchedulesAutoRedrive(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	historyDirFn = func() string { return t.TempDir() }
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	_, cmds := m.detectTransitions(newLoops, time.Now())
+
+	if len(cmds) != 1 {
+		t.Fatalf("got %d auto-redrive cmds, want 1", len(cmds))
+	}
+}
+
+func TestDetectTransitions_EnteredRateLimit_OptedOut_NoSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, false)
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	_, cmds := m.detectTransitions(newLoops, time.Now())
+
+	if len(cmds) != 0 {
+		t.Errorf("got %d auto-redrive cmds, want 0 (opted out)", len(cmds))
+	}
+}
+
+func TestDetectTransitions_AlreadyRateLimited_NotANewEdge_NoSchedule(t *testing.T) {
+	withAutoRedriveEnabled(t, true)
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+	newLoops := []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	_, cmds := m.detectTransitions(newLoops, time.Now())
+
+	if len(cmds) != 0 {
+		t.Errorf("got %d auto-redrive cmds, want 0 — already rate-limited last scan, not a fresh edge", len(cmds))
+	}
+}
+
+// ── autoRedriveScheduledMsg: re-check at fire time ────────────────────────
+
+func TestUpdate_AutoRedriveScheduledMsg_StillRateLimited_FiresRedrive(t *testing.T) {
+	withFakeActuationSeams(t, nil, func(sessionID, prompt string) error { return nil })
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}}
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (autoRedrive429Cmd)")
+	}
+	if m.autoRedriveAttempts["s1"] != 1 {
+		t.Errorf("autoRedriveAttempts[s1] = %d, want 1", m.autoRedriveAttempts["s1"])
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_Recovered_SkipsFiring(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateRunning}} // recovered — no longer rate-limited
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd != nil {
+		t.Error("expected nil — the loop recovered before the delayed redrive fired")
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_LoopGone_SkipsFiring(t *testing.T) {
+	m := New()
+	m.loops = nil // the session aged out of the fleet entirely
+
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+
+	if cmd != nil {
+		t.Error("expected nil — the session is no longer in the fleet at all")
+	}
+}
+
+func TestUpdate_AutoRedriveScheduledMsg_NowGateOrFailed_SkipsFiring(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{SessionID: "s1", Project: "aboard", State: domain.StateGate}} // hit a gate during the delay
+	m, cmd := updateModel(t, m, autoRedriveScheduledMsg{sessionID: "s1"})
+	if cmd != nil {
+		t.Error("expected nil — no longer StateStalled/StallRateLimit")
+	}
+}
+
+// ── autoRedrive429Cmd: event emission + exhausted notification ───────────
+
+func TestAutoRedrive429Cmd_RecordsEventWithActorAuto(t *testing.T) {
+	historyDir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return historyDir }
+	origRedrive := redriveFn
+	defer func() { redriveFn = origRedrive }()
+	redriveFn = func(sessionID, prompt string) error { return nil }
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	autoRedrive429Cmd(l, 1)()
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["s1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	ev := evs[0]
+	if ev.Trigger != events.TriggerActuation {
+		t.Errorf("Trigger = %v, want TriggerActuation", ev.Trigger)
+	}
+	if ev.Actor != events.ActorAuto {
+		t.Errorf("Actor = %v, want ActorAuto (unattended — distinct from every human actuation)", ev.Actor)
+	}
+	if ev.Detail != "auto-redrive-429 attempt 1/3" {
+		t.Errorf("Detail = %q, want the exact literal format", ev.Detail)
+	}
+}
+
+func TestAutoRedrive429Cmd_ThirdAttemptFailure_SendsExhaustedNotification(t *testing.T) {
+	historyDirFn = func() string { return t.TempDir() }
+	origRedrive := redriveFn
+	defer func() { redriveFn = origRedrive }()
+	redriveFn = func(sessionID, prompt string) error { return errTestJudgeFailed }
+	origNotify := notifySendFn
+	defer func() { notifySendFn = origNotify }()
+	var gotTitle, gotBody string
+	notifySendFn = func(title, body string) error {
+		gotTitle, gotBody = title, body
+		return nil
+	}
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	autoRedrive429Cmd(l, autoRedriveMaxAttempts)()
+
+	if gotTitle != notifyTitlePrefix+"missionctl · auto-redrive exhausted" {
+		t.Errorf("notify title = %q, want the exhausted title", gotTitle)
+	}
+	if gotBody != "aboard" {
+		t.Errorf("notify body = %q, want the project label", gotBody)
+	}
+}
+
+func TestAutoRedrive429Cmd_FirstAttemptFailure_NoNotificationYet(t *testing.T) {
+	historyDirFn = func() string { return t.TempDir() }
+	origRedrive := redriveFn
+	defer func() { redriveFn = origRedrive }()
+	redriveFn = func(sessionID, prompt string) error { return errTestJudgeFailed }
+	origNotify := notifySendFn
+	defer func() { notifySendFn = origNotify }()
+	notifyCalled := false
+	notifySendFn = func(title, body string) error { notifyCalled = true; return nil }
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	autoRedrive429Cmd(l, 1)()
+
+	if notifyCalled {
+		t.Error("expected NO notification — not yet the final attempt")
+	}
+}
+
+func TestAutoRedrive429Cmd_Success_NoNotification(t *testing.T) {
+	historyDirFn = func() string { return t.TempDir() }
+	origRedrive := redriveFn
+	defer func() { redriveFn = origRedrive }()
+	redriveFn = func(sessionID, prompt string) error { return nil }
+	origNotify := notifySendFn
+	defer func() { notifySendFn = origNotify }()
+	notifyCalled := false
+	notifySendFn = func(title, body string) error { notifyCalled = true; return nil }
+
+	l := domain.Loop{SessionID: "s1", Project: "aboard", State: domain.StateStalled, Stall: domain.StallRateLimit}
+	msg := autoRedrive429Cmd(l, autoRedriveMaxAttempts)()
+
+	if notifyCalled {
+		t.Error("expected NO notification — the final attempt SUCCEEDED")
+	}
+	rm, ok := msg.(autoRedriveResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful autoRedriveResultMsg", msg)
 	}
 }
