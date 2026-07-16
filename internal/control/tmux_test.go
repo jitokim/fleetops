@@ -222,3 +222,110 @@ func TestTmuxNewWindowCmd(t *testing.T) {
 		}
 	}
 }
+
+// ── tty-keyed dispatch (ADR Phase 2 §2.2/§3 step 2) ──────────────────
+
+func TestNormalizeTTY_StripsDevPrefix(t *testing.T) {
+	if got := normalizeTTY("/dev/ttys012"); got != "ttys012" {
+		t.Errorf("got %q, want %q", got, "ttys012")
+	}
+}
+
+func TestNormalizeTTY_BareFormAlreadyNormalized(t *testing.T) {
+	if got := normalizeTTY("ttys012"); got != "ttys012" {
+		t.Errorf("got %q, want %q", got, "ttys012")
+	}
+}
+
+func TestNormalizeTTY_BothFormsCompareEqual(t *testing.T) {
+	// the registry stores the bare form ("ttys012", from `ps -o tty=`);
+	// tmux's #{pane_tty} reports the full device path ("/dev/ttys012") —
+	// normalizeTTY must make these compare equal, which is the whole point
+	// of tty-keyed dispatch working at all.
+	if normalizeTTY("ttys012") != normalizeTTY("/dev/ttys012") {
+		t.Errorf("normalizeTTY(%q) != normalizeTTY(%q), want equal", "ttys012", "/dev/ttys012")
+	}
+}
+
+func TestParseTmuxTTYPaneLines(t *testing.T) {
+	out := "/dev/ttys012\t%3\tclaude\n/dev/ttys013\t%7\tzsh\n"
+	lines := parseTmuxTTYPaneLines(out)
+
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2: %+v", len(lines), lines)
+	}
+	if lines[0] != (tmuxTTYPaneLine{TTY: "/dev/ttys012", ID: "%3", Command: "claude"}) {
+		t.Errorf("lines[0] = %+v, want tty=/dev/ttys012 id=%%3 command=claude", lines[0])
+	}
+	if lines[1] != (tmuxTTYPaneLine{TTY: "/dev/ttys013", ID: "%7", Command: "zsh"}) {
+		t.Errorf("lines[1] = %+v, want tty=/dev/ttys013 id=%%7 command=zsh", lines[1])
+	}
+}
+
+func TestParseTmuxTTYPaneLines_Empty(t *testing.T) {
+	if lines := parseTmuxTTYPaneLines(""); len(lines) != 0 {
+		t.Errorf("got %d lines, want 0", len(lines))
+	}
+}
+
+func TestParseTmuxTTYPaneLines_MalformedLineSkipped(t *testing.T) {
+	out := "/dev/ttys012\t%3\tclaude\nnotabline\n/dev/ttys099\t%9\tzsh\n"
+	lines := parseTmuxTTYPaneLines(out)
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2 (malformed line skipped): %+v", len(lines), lines)
+	}
+}
+
+func TestSelectTTYPane_ShellPaneFirstClaudePaneSecond_DifferentTTYs(t *testing.T) {
+	// shell pane and claude pane at DIFFERENT ttys (tty is what
+	// disambiguates here, not directory, unlike the cwd path) —
+	// selectTTYPane must pick the claude pane at the requested tty,
+	// ignoring the shell pane entirely regardless of listing order.
+	lines := parseTmuxTTYPaneLines("/dev/ttys012\t%3\tzsh\n/dev/ttys013\t%7\tclaude\n")
+
+	target, ok := selectTTYPane(lines, "ttys013")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "%7" {
+		t.Errorf("got ID %q, want %%7 (the claude pane at ttys013)", target.ID)
+	}
+	if target.Backend != "tmux" {
+		t.Errorf("Backend = %q, want tmux", target.Backend)
+	}
+}
+
+func TestSelectTTYPane_RegistryFormMatchesDevPrefixedPaneTTY(t *testing.T) {
+	// the registry stores the bare form ("ttys012"); tmux reports
+	// "#{pane_tty}" as the full device path ("/dev/ttys012") — this is the
+	// exact normalization the whole feature depends on.
+	lines := parseTmuxTTYPaneLines("/dev/ttys012\t%3\tclaude\n")
+
+	target, ok := selectTTYPane(lines, "ttys012")
+	if !ok {
+		t.Fatal("expected ok=true — normalizeTTY must make these compare equal")
+	}
+	if target.ID != "%3" {
+		t.Errorf("got ID %q, want %%3", target.ID)
+	}
+}
+
+func TestSelectTTYPane_NoMatchingTTY(t *testing.T) {
+	lines := parseTmuxTTYPaneLines("/dev/ttys012\t%3\tclaude\n")
+	if _, ok := selectTTYPane(lines, "ttys099"); ok {
+		t.Error("expected ok=false for a tty that isn't present in the fixture")
+	}
+}
+
+func TestSelectTTYPane_MatchingTTYButNotClaude_NoMatch(t *testing.T) {
+	lines := parseTmuxTTYPaneLines("/dev/ttys012\t%3\tvim\n")
+	if _, ok := selectTTYPane(lines, "ttys012"); ok {
+		t.Error("expected ok=false — the tty matches but the foreground command isn't claude")
+	}
+}
+
+func TestSelectTTYPane_EmptyLines(t *testing.T) {
+	if _, ok := selectTTYPane(nil, "ttys012"); ok {
+		t.Error("expected ok=false for no panes at all")
+	}
+}
