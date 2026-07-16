@@ -366,13 +366,6 @@ func viewRegressionLoops() []domain.Loop {
 	}
 }
 
-// TestView_NoLineExceedsTerminalWidth is F1's acceptance bar: at each width
-// in {45,65,90,120,175}, every line of the full rendered frame (header,
-// summary band, table, detail pane, prompt/status/keybar) must fit within
-// the terminal width — ANSI-stripped, wide runes (incl. Korean) counted via
-// lipgloss.Width. This is the regression test for the live-measured
-// overflow (w=90 rendering 100 cols, w=45 header rendering 65 cols) and
-// must keep passing through any future layout change.
 // TestView_NoLineExceedsTerminalWidth is F1's original acceptance bar,
 // extended by feat/two-pane-cockpit with a height-budget check: at every
 // (width, height) combination, every line must fit within the width AND the
@@ -384,9 +377,12 @@ func viewRegressionLoops() []domain.Loop {
 // stops needing to override the requested height — below it the floor
 // intentionally wins over the exact budget (same spirit as the pre-existing
 // "not fully guaranteed under ~40 cols" width caveat; see panelHeightFloor/
-// stackedPanelHeightFloor's docs).
+// stackedPanelHeightFloor's docs). feat/top-hint-grid added 70 to the width
+// sweep — the hint-grid's own drop-the-whole-grid threshold — so the
+// standing regression test also covers the header block's own width
+// degradation, not just the panel area's.
 func TestView_NoLineExceedsTerminalWidth(t *testing.T) {
-	for _, width := range []int{45, 65, 90, 120, 175} {
+	for _, width := range []int{45, 65, 70, 90, 120, 175} {
 		for _, height := range []int{18, 24, 40, 60} {
 			t.Run(fmt.Sprintf("width=%d/height=%d", width, height), func(t *testing.T) {
 				m := New()
@@ -527,6 +523,109 @@ func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered(t 
 	}
 }
 
+// ── feat/top-hint-grid: header block ─────────────────────────────────────
+
+// TestRenderHeaderBlock_ExactlyThreeLines_AtWideWidths verifies the header
+// block itself (not just the full View()) is exactly headerLines (3) rows
+// tall, at every width the hint grid renders at (>=headerHintMinWidth).
+func TestRenderHeaderBlock_ExactlyThreeLines_AtWideWidths(t *testing.T) {
+	m := New()
+	for _, width := range []int{headerHintMinWidth, 90, 120, 175, 300} {
+		out := renderHeaderBlock(m, width)
+		got := len(strings.Split(out, "\n"))
+		if got != headerLines {
+			t.Errorf("width=%d: header block is %d lines, want exactly %d", width, got, headerLines)
+		}
+	}
+}
+
+// TestRenderHeaderBlock_ExactlyThreeLines_AtNarrowWidths: the same
+// exactly-3-lines invariant must hold even once the hint grid is dropped
+// entirely (LEFT+MIDDLE only) or squeezed to its narrowest.
+func TestRenderHeaderBlock_ExactlyThreeLines_AtNarrowWidths(t *testing.T) {
+	m := New()
+	for _, width := range []int{1, 20, 45, 65, headerHintMinWidth - 1} {
+		out := renderHeaderBlock(m, width)
+		got := len(strings.Split(out, "\n"))
+		if got != headerLines {
+			t.Errorf("width=%d: header block is %d lines, want exactly %d", width, got, headerLines)
+		}
+	}
+}
+
+// TestHeaderHintColumnCount_DropsColumnsAsWidthShrinks pins the column
+// count at representative widths — hint columns must drop right-to-left
+// (fewer columns at narrower widths), reaching 0 below headerHintMinWidth.
+func TestHeaderHintColumnCount_DropsColumnsAsWidthShrinks(t *testing.T) {
+	cases := []struct {
+		width int
+		want  int
+	}{
+		{headerHintMinWidth - 1, 0}, // one below the threshold — whole grid dropped
+		{headerHintMinWidth, 1},
+		{175, 4}, // capped at the number of columns headerHintKeys actually needs
+		{300, 4}, // still capped — extra width doesn't grow a 5th column
+	}
+	for _, c := range cases {
+		if got := headerHintColumnCount(c.width); got != c.want {
+			t.Errorf("headerHintColumnCount(%d) = %d, want %d", c.width, got, c.want)
+		}
+	}
+}
+
+// TestHeaderHintColumnCount_MonotonicallyNonDecreasing: columns must never
+// drop as width GROWS (no oscillation) — the width-degradation direction is
+// exclusively "narrower → fewer or equal columns".
+func TestHeaderHintColumnCount_MonotonicallyNonDecreasing(t *testing.T) {
+	prev := -1
+	for width := 1; width <= 300; width++ {
+		got := headerHintColumnCount(width)
+		if got < prev {
+			t.Fatalf("width=%d: cols=%d, want >= previous width's %d (must not decrease as width grows)", width, got, prev)
+		}
+		prev = got
+	}
+}
+
+// TestRenderHeaderBlock_HintGridAbsentBelowThreshold: below
+// headerHintMinWidth, no "<key>" chip renders at all — not even a single
+// squeezed column.
+func TestRenderHeaderBlock_HintGridAbsentBelowThreshold(t *testing.T) {
+	m := New()
+	out := renderHeaderBlock(m, headerHintMinWidth-1)
+	if strings.Contains(out, "<r>") || strings.Contains(out, "<q>") {
+		t.Errorf("header block below the threshold must not show any hint chip:\n%s", out)
+	}
+}
+
+// TestRenderHeaderBlock_HintGridPresentAtThreshold: AT headerHintMinWidth,
+// at least the first (most essential) hint column renders.
+func TestRenderHeaderBlock_HintGridPresentAtThreshold(t *testing.T) {
+	m := New()
+	out := renderHeaderBlock(m, headerHintMinWidth)
+	if !strings.Contains(out, "<r>") {
+		t.Errorf("header block at the threshold width must show at least the first hint column:\n%s", out)
+	}
+}
+
+// TestRenderHeaderLeft_HostnameNotTruncatedAtTypicalLength verifies
+// headerLeftWidth is generous enough for a realistic hostname (the
+// regression this constant's own doc comment cites) — a real bug caught
+// empirically while building this feature (an earlier, narrower
+// headerLeftWidth truncated "iMacui-iMac.local").
+func TestRenderHeaderLeft_HostnameNotTruncatedAtTypicalLength(t *testing.T) {
+	m := New()
+	m.hostname = "iMacui-iMac.local"
+	out := renderHeaderLeft(m, headerLeftWidth)
+	if strings.Contains(out, "…") {
+		t.Errorf("hostname line got truncated at headerLeftWidth=%d:\n%s", headerLeftWidth, out)
+	}
+	if !strings.Contains(out, m.hostname) {
+		t.Errorf("expected the full hostname to appear untruncated, got:\n%s", out)
+	}
+}
+
+// TestView_SelectedRowVisibleInFleetPanel: with more loops than fit in the
 // FLEET panel's rows, moving the cursor deep into the list must scroll the
 // panel (visibleWindow) so the selected loop's row is still on screen — not
 // require any NEW keybinding, just keep the existing ↑/↓/g/G-driven cursor

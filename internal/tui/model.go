@@ -2142,33 +2142,23 @@ func (m Model) View() string {
 	height := m.termHeight()
 	var b strings.Builder
 
-	b.WriteString(renderHeaderRow(m, width))
+	b.WriteString(renderHeaderBlock(m, width))
 	b.WriteString("\n")
 	b.WriteString(renderRule(width))
 	b.WriteString("\n")
 
-	total, running, stalled, idle, gated, totalTokens, judged, good := m.counts()
-	// The summary band's counts always describe the whole fleet, not the
-	// filtered view — a filter narrows what you're looking AT, not the
-	// facts. Only show the applied-filter indicator once it's committed
-	// (not while still typing it — the prompt line below already shows the
-	// live query, showing both would be redundant).
-	bandFilter := ""
-	if m.mode != modeFiltering {
-		bandFilter = m.filterQuery
-	}
-	b.WriteString(renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good, bandFilter, width))
-	b.WriteString("\n\n")
-
-	// Chrome accounted for above (header+rule+band+blank = topChromeLines)
-	// and below (blank+bottomLine+keybar = bottomChromeLines) is a FIXED
-	// line count regardless of content — renderBottomLine always returns
-	// exactly one line (even if blank), which is what makes this budget a
-	// real guarantee rather than an estimate. Whatever's left goes to the
-	// panel area, floored so the UI never collapses to nothing at an
+	// Chrome accounted for above (the 3-line header block + rule =
+	// topChromeLines) and below (just the bottom line = bottomChromeLines)
+	// is a FIXED line count regardless of content — renderBottomLine always
+	// returns exactly one line (even if blank), which is what makes this
+	// budget a real guarantee rather than an estimate. Whatever's left goes
+	// to the panel area, floored so the UI never collapses to nothing at an
 	// absurdly short terminal — layoutStacked needs a taller floor than the
 	// other two modes since it renders two bordered panels, not one (see
-	// stackedPanelHeightFloor).
+	// stackedPanelHeightFloor). feat/top-hint-grid removed the bottom
+	// keybar (its keybindings moved into the header block's hint grid) and
+	// the blank lines around both chrome regions, handing every freed line
+	// to the panel area.
 	mode := layoutModeFor(width)
 	floor := panelHeightFloor
 	if mode == layoutStacked {
@@ -2187,18 +2177,17 @@ func (m Model) View() string {
 	default:
 		b.WriteString(m.renderListOnly(width, panelHeight))
 	}
-	b.WriteString("\n\n")
-	b.WriteString(m.renderBottomLine())
 	b.WriteString("\n")
-	b.WriteString(renderKeybar(len(m.loops), width))
+	b.WriteString(m.renderBottomLine())
 	return b.String()
 }
 
-// renderBottomLine is the mode-dependent line just above the keybar: the
-// active wizard/filter/inject prompt, or (in modeNormal) the last action's
-// status. ALWAYS exactly one line, blank when there's nothing to show —
-// unlike the pre-two-pane View, which omitted the line entirely when status
-// was "", this keeps the bottom chrome's line count a fixed constant
+// renderBottomLine is the whole bottom chrome (feat/top-hint-grid removed
+// the keybar entirely — keybindings live in the header block's hint grid
+// now): the active wizard/filter/inject prompt, or (in modeNormal) the last
+// action's status. ALWAYS exactly one line, blank when there's nothing to
+// show — unlike the pre-two-pane View, which omitted the line entirely when
+// status was "", this keeps the bottom chrome's line count a fixed constant
 // (bottomChromeLines) instead of one that depends on frame content.
 func (m Model) renderBottomLine() string {
 	switch m.mode {
@@ -2215,37 +2204,117 @@ func (m Model) renderBottomLine() string {
 	}
 }
 
-// ── header / band / rule ────────────────────────────────────
+// ── header block (feat/top-hint-grid) ────────────────────────
+//
+// The captain's k9s-style insight: keybinding hints belong at the TOP, near
+// where the eyes already live (the FLEET list), not in a bottom keybar that
+// forces constant eye travel and competes with the status/wizard line. The
+// single-line header (logo left, LIVE/uptime right) and the separate
+// summary band are replaced by ONE 3-line block split into three
+// side-by-side regions — LEFT (identity), MIDDLE (fleet stats), RIGHT (a
+// keybinding hint grid) — and the bottom keybar (renderKeybar, since
+// removed) is gone entirely; every keybinding it used to show now lives in
+// the header's hint grid instead.
 
-// renderHeaderRow: left "◎ MISSIONCTL  fleet cockpit", right-aligned
-// "● LIVE · <uptime> up · <hostname>".
-func renderHeaderRow(m Model, width int) string {
-	left := stTitle.Render("◎ MISSIONCTL") + stFaint.Render("  fleet cockpit")
-	right := stLive.Render("●") + stDim.Render(" LIVE · ") +
-		stDim.Bold(true).Render(formatUptime(time.Since(m.start))) +
-		stDim.Render(" up · "+m.hostname)
-	return padBetween(left, right, width)
-}
+// headerLines is the header block's fixed height — every region below is
+// padded/clipped to exactly this many lines (headerRegionLines) so
+// lipgloss.JoinHorizontal always composes a clean 3-row grid regardless of
+// how much each region actually has to say this frame.
+const headerLines = 3
 
 func renderRule(width int) string {
 	return lipgloss.NewStyle().Foreground(cLine).Render(strings.Repeat("─", width))
 }
 
-// renderSummaryBand: "fleet N · x run · y gate · z stalled · w idle ·
-// budget <spent> · oracle P% · filter "q"" (zero-count segments omitted,
-// fleet always shown; budget/oracle/filter omitted when there's no
-// spend/no judged loops/no applied filter) with a right-aligned amber
-// badge: gates take priority ("▲ N GATE NEEDS YOU") since a gate is a human
-// actively being asked something right now; otherwise stalls get the badge
-// ("▲ N STALLED NEED YOU") — the mockup's gate badge, honestly repurposed
-// for stalls when there's no gate. budget is total spend across the fleet,
-// not spent/cap — per-loop caps are all the same v0 default
-// (DefaultBudgetTokens), so a fleet-wide cap would be a meaningless sum.
-// oracle% is the share of judged (bound + verdict-rendered at least once)
-// loops whose latest outcome is done or progress — i.e. "not currently
-// drifting". These counts always describe the WHOLE fleet, not a filtered
-// subset — see View's bandFilter comment.
-func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged, good int, filterQuery string, width int) string {
+// renderHeaderBlock composes the 3-line header: LEFT (fixed width) + MIDDLE
+// (fleet stats, gets whatever's left after LEFT and the hint grid — the
+// task's "stats column truncates before the logo column") + RIGHT (the
+// hint grid, present only when headerHintColumnCount(width) > 0).
+func renderHeaderBlock(m Model, width int) string {
+	cols := headerHintColumnCount(width)
+	hintWidth := cols * headerHintColWidth
+
+	leftWidth := headerLeftWidth
+	if leftWidth > width {
+		leftWidth = width
+	}
+	middleWidth := width - leftWidth - hintWidth
+	if middleWidth < 0 {
+		middleWidth = 0
+	}
+
+	left := renderHeaderLeft(m, leftWidth)
+	middle := renderHeaderMiddle(m, middleWidth)
+	if cols == 0 {
+		return lipgloss.JoinHorizontal(lipgloss.Top, left, middle)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, middle, renderHeaderHintGrid(cols, hintWidth))
+}
+
+// headerRegionLines pads/truncates lines to exactly headerLines entries
+// (padLines — see the two-pane panel machinery) and fits+pads each one to
+// width, so every region composes into a clean grid via JoinHorizontal
+// regardless of its own content length.
+func headerRegionLines(lines []string, width int) string {
+	lines = padLines(lines, headerLines)
+	out := make([]string, headerLines)
+	for i, l := range lines {
+		out[i] = padToWidth(fitWithin(l, width), width)
+	}
+	return strings.Join(out, "\n")
+}
+
+// headerLeftWidth is the LEFT region's width — fixed rather than
+// content-fit, so it does NOT truncate before MIDDLE does (the task's
+// explicit priority: "the stats column truncates before the logo column").
+// 36 comfortably fits "● LIVE 00:00 · <hostname>" for a typical hostname
+// (e.g. "iMacui-iMac.local", 32 cols total) without truncating — a
+// hostname long enough to still overflow this is the one edge this doesn't
+// fully guarantee, same spirit as the two-pane layout's own acknowledged
+// extreme-width edges.
+const headerLeftWidth = 36
+
+// renderHeaderLeft: logo + subtitle, the LIVE/uptime/hostname line, and a
+// free third line. Judgment call: the task's spec offered "line 3 left free
+// or gate badge" as alternatives without picking one — left free, since
+// MIDDLE's own line 3 (renderHeaderMiddle) already carries the gate badge
+// and a second copy here would just be redundant.
+func renderHeaderLeft(m Model, width int) string {
+	line1 := stTitle.Render("◎ MISSIONCTL") + stFaint.Render("  fleet cockpit")
+	line2 := stLive.Render("●") + stDim.Render(" LIVE ") +
+		stDim.Bold(true).Render(formatUptime(time.Since(m.start))) +
+		stDim.Render(" · "+m.hostname)
+	return headerRegionLines([]string{line1, line2, ""}, width)
+}
+
+// renderHeaderMiddle: fleet counts / budget+oracle / amber gate-or-stalled
+// badge, stacked — the old single-line renderSummaryBand's content, now
+// split across the header block's 3 rows instead of joined with " · " onto
+// one line with a right-aligned badge.
+func renderHeaderMiddle(m Model, width int) string {
+	total, running, stalled, idle, gated, totalTokens, judged, good := m.counts()
+	// Judgment call: the old band's applied-filter indicator ("filter:
+	// %q") has no dedicated line in the task's 3-line MIDDLE spec — folded
+	// into line 2 alongside budget/oracle (the same "auxiliary stats"
+	// line), rather than dropped. Same "don't show it while still typing
+	// it" rule as before (the prompt line already shows the live query).
+	filterQuery := ""
+	if m.mode != modeFiltering {
+		filterQuery = m.filterQuery
+	}
+	lines := []string{
+		headerFleetCountsLine(total, running, stalled, idle, gated),
+		headerBudgetOracleLine(totalTokens, judged, good, filterQuery),
+		headerGateBadgeLine(gated, stalled),
+	}
+	return headerRegionLines(lines, width)
+}
+
+// headerFleetCountsLine: "fleet N · x run · y gate · z stalled · w idle"
+// (zero-count segments omitted, fleet always shown) — unchanged from the
+// old renderSummaryBand's left side, minus budget/oracle/filter (now
+// headerBudgetOracleLine's line).
+func headerFleetCountsLine(total, running, stalled, idle, gated int) string {
 	parts := []string{stDim.Render(fmt.Sprintf("fleet %d", total))}
 	if running > 0 {
 		parts = append(parts, lipgloss.NewStyle().Foreground(cBlue).Render(fmt.Sprintf("%d run", running)))
@@ -2259,6 +2328,17 @@ func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged
 	if idle > 0 {
 		parts = append(parts, stDim.Render(fmt.Sprintf("%d idle", idle)))
 	}
+	return strings.Join(parts, stFaint.Render(" · "))
+}
+
+// headerBudgetOracleLine: "budget <spent> · oracle P% · filter \"q\""
+// (each segment omitted when there's nothing to show — no spend, no judged
+// loops, no applied filter). budget is total spend across the fleet, not
+// spent/cap (see the old renderSummaryBand's doc for why a fleet-wide cap
+// would be meaningless); oracle% is the share of judged loops whose latest
+// outcome is done or progress.
+func headerBudgetOracleLine(totalTokens, judged, good int, filterQuery string) string {
+	var parts []string
 	if totalTokens > 0 {
 		parts = append(parts, stDim.Render("budget "+prettyTokens(totalTokens)))
 	}
@@ -2269,16 +2349,99 @@ func renderSummaryBand(total, running, stalled, idle, gated, totalTokens, judged
 	if filterQuery != "" {
 		parts = append(parts, stFaint.Render(fmt.Sprintf("filter: %q", filterQuery)))
 	}
-	left := strings.Join(parts, stFaint.Render(" · "))
+	return strings.Join(parts, stFaint.Render(" · "))
+}
 
-	right := ""
+// headerGateBadgeLine: gates take priority ("▲ N GATE NEEDS YOU") since a
+// gate is a human actively being asked something right now; otherwise
+// stalls get the badge ("▲ N STALLED NEED YOU") — unchanged priority from
+// the old renderSummaryBand's right-aligned badge.
+func headerGateBadgeLine(gated, stalled int) string {
 	switch {
 	case gated > 0:
-		right = stBadgeStalled.Render(fmt.Sprintf("▲ %d GATE NEEDS YOU", gated))
+		return stBadgeStalled.Render(fmt.Sprintf("▲ %d GATE NEEDS YOU", gated))
 	case stalled > 0:
-		right = stBadgeStalled.Render(fmt.Sprintf("▲ %d STALLED NEED YOU", stalled))
+		return stBadgeStalled.Render(fmt.Sprintf("▲ %d STALLED NEED YOU", stalled))
+	default:
+		return ""
 	}
-	return padBetween(left, right, width)
+}
+
+// headerHintKeys is the RIGHT region's content — every keybinding the old
+// bottom keybar used to list (minus "↑↓ select": the FLEET panel's own ▸
+// cursor marker already makes selection self-evident, so it didn't earn a
+// grid cell) — in the task's exact given order, filled column-major into
+// headerLines (3) rows.
+var headerHintKeys = []struct{ key, action string }{
+	{"r", "resume"}, {"a", "approve"}, {"i", "inject"}, {"↵", "attach"},
+	{"p", "stop"}, {"k", "kill"}, {"n", "new"}, {"o", "log"},
+	{"/", "filter"}, {"q", "quit"},
+}
+
+// headerHintColWidth is one hint grid column's width (the task's "~14
+// cols"); headerHintMinWidth is the total terminal width below which the
+// WHOLE grid is dropped rather than showing a single cramped column
+// (keybindings are discoverable in the README at that point, per the task).
+const (
+	headerHintColWidth = 14
+	headerHintMinWidth = 70
+)
+
+// headerHintColumnCount decides how many hint-grid columns fit at width:
+// 0 below headerHintMinWidth (drop the whole grid), otherwise as many
+// headerHintColWidth-wide columns as fit in whatever's left after
+// reserving headerLeftWidth and a floor for MIDDLE — capped at the number
+// of columns headerHintKeys actually needs (no empty trailing columns).
+// Columns drop right-to-left as width shrinks: the LAST column (fewest,
+// least-essential-by-list-order keys) is what a shrinking `avail` runs out
+// of room for first.
+func headerHintColumnCount(width int) int {
+	if width < headerHintMinWidth {
+		return 0
+	}
+	maxCols := (len(headerHintKeys) + headerLines - 1) / headerLines // ceil
+	avail := width - headerLeftWidth - headerMiddleFloor
+	cols := avail / headerHintColWidth
+	if cols > maxCols {
+		cols = maxCols
+	}
+	if cols < 0 {
+		cols = 0
+	}
+	return cols
+}
+
+// headerMiddleFloor is the minimum width headerHintColumnCount reserves
+// for MIDDLE before handing any more room to the hint grid — without this
+// a very wide terminal could in principle let the grid crowd MIDDLE down
+// to nothing.
+const headerMiddleFloor = 16
+
+// renderHeaderHintGrid lays out cols columns × headerLines rows of
+// "<key> action" cells, column-major (column c holds
+// headerHintKeys[c*headerLines : c*headerLines+headerLines]) — matches the
+// task's fill order exactly. A cell past the end of headerHintKeys (the
+// grid's last column is usually only partially full) renders blank.
+func renderHeaderHintGrid(cols, width int) string {
+	colWidth := headerHintColWidth
+	if cols > 0 {
+		colWidth = width / cols
+	}
+	lines := make([]string, headerLines)
+	for row := 0; row < headerLines; row++ {
+		cells := make([]string, cols)
+		for c := 0; c < cols; c++ {
+			idx := c*headerLines + row
+			cell := ""
+			if idx < len(headerHintKeys) {
+				k := headerHintKeys[idx]
+				cell = stKey.Render("<"+k.key+">") + stDim.Render(" "+k.action)
+			}
+			cells[c] = padToWidth(cell, colWidth)
+		}
+		lines[row] = strings.Join(cells, "")
+	}
+	return headerRegionLines(lines, width)
 }
 
 // ── two-pane layout (layout B) ───────────────────────────────
@@ -2328,13 +2491,12 @@ const (
 // provably constant instead of an estimate that content could quietly grow
 // past.
 const (
-	topChromeLines = 4 // header + rule + summary band + blank
-	// bottomChromeLines: blank + bottom line (prompt/status) + keybar.
-	// keybar counts as 2 lines, not 1 — stKeybar (styles.go) sets
-	// BorderTop(true), so renderKeybar's own output is a rule line plus its
-	// content line (confirmed empirically: without this the frame rendered
-	// one line taller than the height budget said it should).
-	bottomChromeLines = 4
+	topChromeLines = headerLines + 1 // the 3-line header block + rule (no blank line — panels gain it, see feat/top-hint-grid)
+	// bottomChromeLines: just the bottom line (prompt/status) — the keybar
+	// (and the blank lines that used to surround both chrome regions) is
+	// gone entirely as of feat/top-hint-grid; every line it used to cost is
+	// handed to the panel area instead.
+	bottomChromeLines = 1
 	panelHeightFloor  = 5 // border(2) + title + rule(2) + >=1 content row
 
 	// stackedPanelHeightFloor is layoutStacked's floor: it renders TWO
@@ -3555,35 +3717,6 @@ func renderDriftHintPrompt(m Model) string {
 	head := lipgloss.NewStyle().Foreground(cAccent).Bold(true).
 		Render("RE-DRIVE ▸ " + m.driftHintTarget.Project + " ◂ hint (enter=none): ")
 	return head + m.input.View()
-}
-
-// renderKeybar: only keys that actually do something today.
-func renderKeybar(loopCount int, width int) string {
-	keys := []string{
-		stKey.Render("↑↓") + stDim.Render(" select"),
-		stKey.Render("/") + stDim.Render(" filter"),
-		stKey.Render("↵") + stDim.Render(" attach"),
-		stKey.Render("a") + stDim.Render(" approve"),
-		stKey.Render("r") + stDim.Render(" resume"),
-		stKey.Render("i") + stDim.Render(" inject"),
-		stKey.Render("p") + stDim.Render(" stop"),
-		stKey.Render("k") + stDim.Render(" kill"),
-		stKey.Render("n") + stDim.Render(" new"),
-		stKey.Render("o") + stDim.Render(" log"),
-		stKey.Render("q") + stDim.Render(" quit"),
-	}
-	sep := stFaint.Render("  ·  ")
-	left := strings.Join(keys, sep)
-	right := stFaint.Render(fmt.Sprintf("missionctl v0.1 · %d loops · ⧗ %s", loopCount, refreshEvery))
-	// Degrade instead of wrapping: drop the right-side info when the bar is
-	// tight, then tighten the key separators — a wrapped keybar reads broken.
-	if lipgloss.Width(left)+lipgloss.Width(right)+1 > width {
-		right = ""
-	}
-	if lipgloss.Width(left) > width {
-		left = strings.Join(keys, stFaint.Render(" · "))
-	}
-	return stKeybar.Width(width).Render(padBetween(left, right, width))
 }
 
 // ── layout helpers ────────────────────────────────────────────
