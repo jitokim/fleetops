@@ -897,13 +897,17 @@ func assistantMessageText(entry map[string]any) (string, bool) {
 }
 
 // LastError scans path's tail (widened if needed — same fallback as
-// LastAssistantText/LastAssistantTextFull) for the most recent ERROR entry:
-// an assistant text block mentioning an API error/429/rate-limit body, or
-// the last tool_result with is_error=true. Returns the RAW error text
-// (council hard rule for feat/detail-panel-v2's LAST ERROR block: rendered
+// LastAssistantText/LastAssistantTextFull) for the most recent GENUINE
+// error entry: an assistant text block carrying Claude Code's own literal
+// "API Error" marker (see apiErrorMarker's doc — never a bare "429"/"rate
+// limit" substring match, which false-positives on ordinary conversation),
+// or a tool_result with is_error=true. Returns the RAW error text (council
+// hard rule for feat/detail-panel-v2's LAST ERROR block: rendered
 // verbatim, never paraphrased) and the entry's own timestamp (parsed from
 // its "timestamp" field, RFC3339 — zero time if missing/unparseable).
-// ok=false when no error entry is found at all (even in the widened tail).
+// ok=false when no error entry is found at all (even in the widened tail)
+// — there is NO fallback to plain assistant text; a healthy loop with no
+// real error must always get ok=false.
 func LastError(path string) (text string, ts time.Time, ok bool) {
 	if buf, readOK := readTail(path, tailBytes); readOK {
 		if e, found := extractLastError(buf); found {
@@ -928,18 +932,33 @@ type errorEntry struct {
 	ts   time.Time
 }
 
-// errorSubstrings are what makes an assistant text block "an error", per
-// the task's own examples — a generic substring match rather than a strict
-// schema, since the exact shape Claude Code uses for a failed API call
-// isn't independently verified in this codebase (documented judgment call,
-// see feat/detail-panel-v2's PR body).
-var errorSubstrings = []string{"api error", "429", "rate limit"}
+// apiErrorMarker is the ONLY signal that makes an assistant text block a
+// genuine error: the literal "API Error" prefix Claude Code itself
+// synthesizes into the transcript when a real API call fails (e.g. "API
+// Error: 429 Too Many Requests — retry after 30s" — the exact shape this
+// package's own fixtures use).
+//
+// fix/last-error-false-positive (P1, live repro): the OLD check matched
+// on ANY of {"api error", "429", "rate limit"} as a bare substring,
+// anywhere in ordinary assistant conversation — not just Claude Code's own
+// synthesized error entries. Caught live against this repo's own real
+// transcript: a healthy loop's normal status-update message, which
+// happened to mention this very codebase's "429 auto-redrive" FEATURE BY
+// NAME, matched the "429" substring and got rendered as a "verbatim
+// error" in the DETAIL panel — on a loop with zero actual API errors. That
+// destroys the block's entire purpose (fire ONLY on real errors) and an
+// operator's trust in it. "429"/"rate limit" alone are commonplace words
+// in any conversation ABOUT rate limits or this feature; only the "API
+// Error" marker is Claude-Code-synthesized and never occurs in organic
+// text. A plain assistant text block without this marker is NEVER an
+// error, full stop — no substring fallback.
+const apiErrorMarker = "api error"
 
 // extractLastError is LastError's buffer-only core: walks every parseable
 // JSONL line (tolerating a truncated first line, same as every other tail
 // scanner in this file) and keeps the LAST matching error entry — either an
-// assistant text block containing one of errorSubstrings, or a user
-// tool_result block with is_error=true.
+// assistant text block carrying apiErrorMarker, or a user tool_result
+// block with is_error=true.
 func extractLastError(buf []byte) (errorEntry, bool) {
 	var last errorEntry
 	found := false
@@ -968,21 +987,19 @@ func extractLastError(buf []byte) (errorEntry, bool) {
 	return last, found
 }
 
-// assistantErrorText reports whether an assistant entry's text content
-// mentions an API error (case-insensitive substring match against
-// errorSubstrings), returning that raw text if so.
+// assistantErrorText reports whether an assistant entry's text content is
+// a genuine Claude-Code-synthesized API error (case-insensitive match
+// against the literal apiErrorMarker — see its doc for why this is the
+// ONLY acceptable signal), returning that raw text if so.
 func assistantErrorText(entry map[string]any) (string, bool) {
 	text, ok := assistantMessageText(entry)
 	if !ok {
 		return "", false
 	}
-	lower := strings.ToLower(text)
-	for _, s := range errorSubstrings {
-		if strings.Contains(lower, s) {
-			return text, true
-		}
+	if !strings.Contains(strings.ToLower(text), apiErrorMarker) {
+		return "", false
 	}
-	return "", false
+	return text, true
 }
 
 // userToolResultError reports whether a user entry's message.content

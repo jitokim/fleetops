@@ -3081,6 +3081,27 @@ func TestRenderDetail_LastErrorBlock_SuppressedWhenStale(t *testing.T) {
 	}
 }
 
+// TestRenderDetail_HealthyConversationMentioningStatusCode_NoBlock is
+// fix/last-error-false-positive's end-to-end regression, at the SAME
+// renderDetail level an operator actually sees: a healthy loop whose
+// transcript's last assistant message is ordinary conversation that
+// happens to mention "429" (e.g. discussing this very repo's own "429
+// auto-redrive" feature by name) must NOT show a LAST ERROR block — live-
+// reproduced against this repo's own real transcript before the fix.
+func TestRenderDetail_HealthyConversationMentioningStatusCode_NoBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	content := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"landed #24 (429 auto-redrive) — Tier 2 only, opt-in. main is green."}]},"timestamp":"` + time.Now().Format(time.RFC3339) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning, Path: path}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected NO LAST ERROR block — this is ordinary conversation mentioning a status code, not a real error:\n%s", out)
+	}
+}
+
 func TestRenderDetail_NoErrorAtAll_NoBlock(t *testing.T) {
 	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Path: "/no/such/file.jsonl"}
 	out := renderDetail(l, 80, 40, detailData{now: time.Now()})

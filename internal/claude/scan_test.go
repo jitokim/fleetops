@@ -1705,6 +1705,37 @@ func TestLastError_NoErrorAtAll_ReturnsFalse(t *testing.T) {
 	}
 }
 
+// TestLastError_BareStatusCodeMention_NotAnError is fix/last-error-false-
+// positive's core regression: live-reproduced against this repo's OWN real
+// transcript (~/.claude/projects/.../aboard/*.jsonl), a healthy loop's
+// ordinary status-report text mentioning THIS CODEBASE's "429 auto-redrive"
+// feature by name got flagged as a "verbatim error" — because the old
+// matcher treated a bare "429" substring anywhere in assistant text as an
+// error signal. Without the literal "API Error" marker, a mention of "429"
+// (a status code number, a feature name, a port, anything) must NEVER
+// qualify.
+func TestLastError_BareStatusCodeMention_NotAnError(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"landed #24 (429 auto-redrive) — Tier 2 only, opt-in"}]}}`,
+	)
+	if _, _, ok := LastError(path); ok {
+		t.Error("expected ok=false — mentioning '429' as a feature name/status code is not a real error, per fix/last-error-false-positive")
+	}
+}
+
+// TestLastError_BareRateLimitMention_NotAnError: same class of false
+// positive, for the "rate limit" phrase — ordinary conversation ABOUT rate
+// limiting (e.g. discussing this feature's design) must not be mistaken
+// for an actual rate-limit error.
+func TestLastError_BareRateLimitMention_NotAnError(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the rate limit auto-redrive only fires on a real 429, per design"}]}}`,
+	)
+	if _, _, ok := LastError(path); ok {
+		t.Error("expected ok=false — discussing rate limiting is not a real error, per fix/last-error-false-positive")
+	}
+}
+
 func TestLastError_ReturnsTheMostRecentOfTwoErrors(t *testing.T) {
 	path := writeJSONL(t,
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 first"}]},"timestamp":"2026-01-01T10:00:00Z"}`,
