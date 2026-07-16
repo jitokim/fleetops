@@ -1253,8 +1253,8 @@ func (m Model) View() string {
 	b.WriteString(stFaint.Render("LOOPS"))
 	b.WriteString("\n")
 
-	wName, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
-	b.WriteString(renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote))
+	wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote := columnWidths(width)
+	b.WriteString(renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote))
 	b.WriteString("\n")
 	visible := m.visibleLoops()
 	switch {
@@ -1265,7 +1265,7 @@ func (m Model) View() string {
 	}
 	dupLabels := duplicateLabels(visible)
 	for i, l := range visible {
-		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wCycle, wOracle, wBudget, wNI, wNote, width))
+		b.WriteString(renderRow(l, i == m.cursor, dupLabels[l.Project], wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, width))
 		b.WriteString("\n")
 	}
 
@@ -1379,12 +1379,36 @@ const (
 	niColWidth     = 5
 )
 
+// NAME and DOING are the two flexible text columns: they SHARE whatever width
+// is left after the fixed columns, each growing from a floor toward a cap.
+//   - floor: below it the text is a noise-y fragment (a 10-char DOING snippet
+//     is closer to noise than signal), so the column is hidden entirely rather
+//     than shown squeezed — the same all-or-nothing a fixed column does at its
+//     threshold, but here the trigger is "the leftover can't seat both floors".
+//   - cap: so neither column runs away on a very wide terminal (the mockup
+//     keeps the table compact); spare beyond both caps goes to NOTE.
+//
+// Keeping NAME+DOING inside the leftover budget is exactly what guarantees the
+// row never exceeds the terminal width — and so never soft-wraps onto a second
+// physical line — whenever DOING is shown. (An earlier fixed-width DOING broke
+// this: a 30-wide column that "survived" down to a 55-col threshold couldn't
+// actually fit until ~130 cols, so mainstream widths like 120 wrapped.)
+const (
+	nameFloorWidth  = 10
+	nameCapWidth    = 28
+	doingFloorWidth = 16
+	doingCapWidth   = 30
+)
+
 // minWidthForNote/NI/Oracle/Budget/Cycle: below these terminal widths the
-// corresponding column is dropped entirely (not just truncated), in this
-// degradation order as width shrinks: NOTE first (least essential — the
-// state label already hints at "why"), then N/I, then ORACLE, then BUDGET,
-// then CYCLE (most essential — kept the longest). Each threshold is
-// strictly less than the last so that order actually holds.
+// corresponding fixed column is dropped entirely (not just truncated), in this
+// degradation order as width shrinks: NOTE first (least essential — the state
+// label already hints at "why"), then N/I, then ORACLE, then BUDGET, then
+// CYCLE (most essential — kept the longest). Each threshold is strictly less
+// than the last so that order actually holds. NAME and DOING are NOT in this
+// list: they don't hard-drop at a fixed width, they flex to share the leftover
+// budget (see the nameFloorWidth/doingFloorWidth block and columnWidths), so
+// DOING fades by shrinking-then-hiding rather than snapping off at a threshold.
 const (
 	minWidthForNote   = 70
 	minWidthForNI     = 68
@@ -1393,13 +1417,22 @@ const (
 	minWidthForCycle  = 50
 )
 
-// columnWidths sizes NAME/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
-// width: CYCLE/ORACLE/BUDGET/N-I are fixed-width when shown at all (dropped
-// below their thresholds, see minWidthForNote/NI/Oracle/Budget/Cycle), and
-// NAME soaks up whatever remains, with a usable minimum and a cap so wide
-// terminals don't stretch it into a chasm between columns (mockup keeps the
-// table compact) — spare width beyond the cap goes to NOTE.
-func columnWidths(width int) (wName, wCycle, wOracle, wBudget, wNI, wNote int) {
+// columnWidths sizes NAME/DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE from the terminal
+// width. CYCLE/ORACLE/BUDGET/N-I/NOTE are fixed-width, dropped below their
+// thresholds (see minWidthForNote/NI/Oracle/Budget/Cycle). NAME and DOING are
+// the two flexible text columns: they SHARE whatever width is left after the
+// fixed columns (see flexNameDoing), each bounded by a floor and a cap, with
+// any width beyond both caps handed to NOTE (as it was before DOING existed).
+//
+// Because NAME+DOING are always kept within that leftover budget, the row's
+// total width never exceeds the terminal width whenever DOING is shown — so it
+// can't soft-wrap onto a second line (there is no viewport/clip in this TUI;
+// padToWidth only pads, never truncates the whole row). When the leftover
+// can't seat both floors, DOING is hidden (wDoing == 0) and NAME flexes alone,
+// exactly the pre-DOING behaviour; only then, at genuinely narrow widths, can
+// the fixed columns alone still overflow — the rough edge the table always had
+// below ~100 cols, which DOING neither introduces nor worsens.
+func columnWidths(width int) (wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) {
 	if width >= minWidthForCycle {
 		wCycle = cycleColWidth
 	}
@@ -1416,28 +1449,60 @@ func columnWidths(width int) (wName, wCycle, wOracle, wBudget, wNI, wNote int) {
 		wNote = 24
 	}
 
-	const gaps = 4 // spacing lipgloss.JoinHorizontal leaves negligible, but the
-	// leading "  " indent plus cell boundaries need a little slack.
+	const gaps = 4 // the leading "  " indent plus cell boundaries need slack.
 	fixed := wMarker + wState + wLast + wCycle + wOracle + wBudget + wNI + wNote + gaps
-	wName = width - fixed
-	if wName < 10 {
-		wName = 10
-	}
-	if wName > 28 {
-		if wNote > 0 {
-			wNote += wName - 28
+	remaining := width - fixed // the width budget NAME and DOING share
+
+	if remaining >= nameFloorWidth+doingFloorWidth {
+		var spare int
+		wName, wDoing, spare = flexNameDoing(remaining)
+		if spare > 0 && wNote > 0 {
+			wNote += spare
 		}
-		wName = 28
+		return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
 	}
-	return wName, wCycle, wOracle, wBudget, wNI, wNote
+
+	// Not enough room for both floors: DOING steps aside (wDoing stays 0) and
+	// NAME flexes alone. remaining < nameFloorWidth+doingFloorWidth < nameCap
+	// here, so NAME only ever hits its floor in this branch, never its cap.
+	wName = remaining
+	if wName < nameFloorWidth {
+		wName = nameFloorWidth
+	}
+	return wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote
 }
 
-func renderTableHeader(wName, wCycle, wOracle, wBudget, wNI, wNote int) string {
+// flexNameDoing splits the leftover width budget shared by NAME and DOING,
+// given it's already known both floors fit (remaining >= nameFloorWidth +
+// doingFloorWidth). Each column grows from its floor toward its cap in
+// proportion to its headroom; whatever is left once both are capped is
+// returned as spare for the caller to hand to NOTE. The invariant callers rely
+// on for the no-overflow guarantee: wName + wDoing + spare == remaining, so the
+// two flex columns plus NOTE's bonus never exceed the budget they were given.
+func flexNameDoing(remaining int) (wName, wDoing, spare int) {
+	pool := remaining - nameFloorWidth - doingFloorWidth
+	nameHeadroom := nameCapWidth - nameFloorWidth
+	doingHeadroom := doingCapWidth - doingFloorWidth
+	nameGain := pool * nameHeadroom / (nameHeadroom + doingHeadroom)
+	if nameGain > nameHeadroom {
+		nameGain = nameHeadroom
+	}
+	doingGain := pool - nameGain
+	if doingGain > doingHeadroom {
+		doingGain = doingHeadroom
+	}
+	return nameFloorWidth + nameGain, doingFloorWidth + doingGain, pool - nameGain - doingGain
+}
+
+func renderTableHeader(wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote int) string {
 	cells := []string{
 		stHeader.Width(wMarker).Render(""),
 		stHeader.Width(wName).Render("NAME"),
-		stHeader.Width(wState).Render("STATE"),
 	}
+	if wDoing > 0 {
+		cells = append(cells, stHeader.Width(wDoing).Render("DOING"))
+	}
+	cells = append(cells, stHeader.Width(wState).Render("STATE"))
 	if wCycle > 0 {
 		cells = append(cells, stHeader.Width(wCycle).Render("CYCLE"))
 	}
@@ -1473,7 +1538,7 @@ func duplicateLabels(loops []domain.Loop) map[string]bool {
 	return dup
 }
 
-func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudget, wNI, wNote, totalWidth int) string {
+func renderRow(l domain.Loop, sel bool, dup bool, wName, wDoing, wCycle, wOracle, wBudget, wNI, wNote, totalWidth int) string {
 	marker := " "
 	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
 	if sel {
@@ -1489,8 +1554,13 @@ func renderRow(l domain.Loop, sel bool, dup bool, wName, wCycle, wOracle, wBudge
 	cells := []string{
 		markerStyle.Width(wMarker).Render(marker),
 		stInk.Width(wName).Render(trunc(label, wName-1)),
-		st.Width(wState).Render(stateLabel(l)),
 	}
+	if wDoing > 0 {
+		// dim (stDim): DOING is background context, kept visually secondary to
+		// NOTE's warning colors (cRed/cAmber).
+		cells = append(cells, stDim.Width(wDoing).Render(trunc(doingForRow(l), wDoing-1)))
+	}
+	cells = append(cells, st.Width(wState).Render(stateLabel(l)))
 	if wCycle > 0 {
 		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
 	}
@@ -1538,6 +1608,24 @@ func noteForRow(l domain.Loop) (string, lipgloss.Style) {
 		return "✗ " + l.Last.Reason, stateStyle(l)
 	}
 	return "", stateStyle(l)
+}
+
+// doingForRow decides the DOING column's text — a background/context column
+// answering "what is this loop actually working on?", distinct from NOTE's
+// alert channel (which stays untouched). A goal-bound loop (spawned via the
+// tui's "n" key) carries the human-written Goal.Text, the ideal answer; loops
+// missionctl merely observes (the majority — plain claude sessions) fall back
+// to LastText, the last assistant message's tail, already single-line and
+// 120-char-capped by internal/claude.summarizeTailText (the same text feeding
+// the detail pane's TAIL row). "" when a loop has neither yet (e.g. a
+// just-started unbound loop with no assistant output). Unlike noteForRow the
+// style is invariant (always dim, applied by the caller), so only the text is
+// returned. The caller truncates it to the column width.
+func doingForRow(l domain.Loop) string {
+	if l.Goal.Text != "" {
+		return l.Goal.Text
+	}
+	return l.LastText
 }
 
 // cycleLabel: plain count ("6"), or "6/12" once a per-loop MaxCycles exists.
