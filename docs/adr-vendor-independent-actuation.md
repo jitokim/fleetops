@@ -201,9 +201,16 @@ capability tier does this session get."
 - cmux's own hook config proves the registry primitive is already
   load-bearing in production, just not for our benefit yet.
 
+**Confirmed live (2026-07-16 follow-up):**
+- `claude --resume &lt;id&gt; -p "&lt;prompt&gt;"` — Tier 2's core mechanism: the
+  resumed turn recalls prior context, returns the SAME session_id (no
+  fork), and appends to the same JSONL transcript the cockpit tails
+  (file observed growing 57.6k→61.9k with the new turn). Remaining
+  nuance, still unverified: concurrency when an interactive TUI holds
+  that session open on-screen at the same moment — the -p turn lands in
+  the transcript, but whether the open TUI re-renders it is unknown.
+
 **Inferred / not live-exercised — verify before building on:**
-- `claude --resume &lt;id&gt; -p "&lt;prompt&gt;"` end-to-end behavior against a
-  session the TUI is actively tailing (Tier 2's core mechanism).
 - Linux `TIOCSTI`/`CONFIG_LEGACY_TIOCSTI` state (no Linux box in either
   spike; from public kernel history).
 - Whether orca's CLI exposes a per-terminal tty directly (would let orca
