@@ -5,6 +5,21 @@
 - context: two independent design reviews (opus + fable), both with live
   verification on the captain's machine — see "Verification" below
 
+**Scope discipline, read this first:** "vendor-independent" in this ADR's
+title refers specifically to *discovery* (§2.1's hook registry — this part
+genuinely works for any terminal, no exceptions, no curated list needed).
+It does **not** mean missionctl aims to actuate into literally any terminal
+that exists. Actuation stays a small, explicit, curated backend list —
+the same shape as how e.g. opencode maintains a fixed supported-model list
+rather than an open-ended "works with any LLM" claim, instead of adding a
+provider on spec. v1's list is orca/cmux/tmux (already built). A backend
+gets added to the list when a real user asks for it, not speculatively —
+see §5's kitty/WezTerm/iTerm2 entry (deferred, not rejected, gated behind
+demand) and §6's finding that the wider ecosystem converges on exactly this
+"pick a short list, full stop" pattern. Everything outside the list is
+Tier 0 (observation + gate detection + manual-hint fallback) **by design**,
+not a gap still to close — see §2.2.
+
 ## 1. Problem
 
 `internal/control`'s three backends (orca, cmux, tmux) each work the same
