@@ -93,7 +93,7 @@ func TestCmuxController_Spawn_ReturnsUnsupportedError(t *testing.T) {
 // --- parseCmuxTree against the REAL cmux 0.64.15 shape ---
 
 // realCmuxTree loads the captured `cmux tree --json` fixture (real shape from
-// cmux 0.64.15 on the captain's machine).
+// cmux 0.64.15 on a real machine).
 func realCmuxTree(t *testing.T) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("testdata", "cmux_tree.json"))

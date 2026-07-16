@@ -190,7 +190,7 @@ func TestColumnWidths_RowNeverOverflowsWhenDoingShown(t *testing.T) {
 }
 
 // TestColumnWidths_RowFitsAtCommonWidths pins the mainstream terminal sizes the
-// captain actually uses: the full table (DOING included where it fits) must
+// human actually uses: the full table (DOING included where it fits) must
 // render within the width, no wrapping. 100 is the lowest width the fixed
 // columns themselves fit in; below it the pre-existing narrow overflow applies
 // (and DOING is hidden, so it isn't DOING's doing) — see the hidden-widths test.

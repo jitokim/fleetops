@@ -118,7 +118,7 @@ func TestOrcaFocusCmd(t *testing.T) {
 }
 
 // realOrcaFixture is the (abridged, faithful) real `orca terminal list
-// --json` output captured from the captain's machine: an RPC envelope with
+// --json` output captured from a real machine: an RPC envelope with
 // four terminals, two of them ("✳ team" and "Terminal 2") sharing the
 // "aboard" worktree.
 const realOrcaFixture = `{
@@ -415,8 +415,8 @@ func TestSelectSpawnedOrcaTerminal_NoMatch(t *testing.T) {
 	}
 }
 
-// realWorktreeCreateFixture is the VERIFIED live response captured from the
-// captain's machine (`orca worktree create --repo "path:/Users/imac/IdeaProjects/aboard"
+// realWorktreeCreateFixture is the VERIFIED live response captured from
+// a real machine (`orca worktree create --repo "path:/Users/imac/IdeaProjects/aboard"
 // --name mctl-wt-probe --agent claude --prompt "..." --json`) — result.worktree.path
 // is the confirmed, primary source extractWorktreePath must use.
 const realWorktreeCreateFixture = `{
