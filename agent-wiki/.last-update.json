@@ -1,0 +1,17 @@
+{
+  "tool": "openwiki-claude-code",
+  "version": "0.0.1",
+  "command": "generate",
+  "gitHead": "fb0a463f2967b3310bb4fed9445933889cb2cdf9",
+  "model": "sonnet",
+  "timestamp": "2026-07-16T09:02:41+00:00",
+  "outputDir": "agent-wiki",
+  "pages": [
+    "actuation.md",
+    "goal-governance.md",
+    "index.md",
+    "observation.md",
+    "quickstart.md",
+    "tui-cli.md"
+  ]
+}
