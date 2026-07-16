@@ -10,8 +10,7 @@ import (
 // replicate the mockup's CSS letter-spacing; bold/caps stand in for that
 // visual weight where it mattered (e.g. the ◎ MISSIONCTL logo).
 var (
-	cChrome = lipgloss.Color("#161d25")
-	cLine   = lipgloss.Color("#20303c")
+	cLine   = lipgloss.Color("#3d5266") // panel borders/hairlines — must stay VISIBLE on any dark terminal bg (was #20303c, which vanished; captain-reported)
 	cInk    = lipgloss.Color("#c9d4de")
 	cDim    = lipgloss.Color("#7a8896")
 	cFaint  = lipgloss.Color("#4f5c69")
@@ -34,9 +33,6 @@ var (
 	stKey    = lipgloss.NewStyle().Foreground(cAccent).Bold(true)
 	stSelRow = lipgloss.NewStyle().Background(cSel)
 	stLive   = lipgloss.NewStyle().Foreground(cGreen)
-
-	stKeybar = lipgloss.NewStyle().Foreground(cDim).Background(cChrome).
-			BorderTop(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(cLine)
 
 	// the mockup's amber "GATE NEEDS YOU" badge, repurposed honestly for stalls.
 	stBadgeStalled = lipgloss.NewStyle().Foreground(cAmberInk).Background(cAmber).Bold(true).Padding(0, 1)
