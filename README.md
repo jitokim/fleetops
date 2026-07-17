@@ -81,7 +81,7 @@ look at the UI, or for screenshotting it without leaking real paths/goals.
 | `r` | resume a stalled/drifted loop (re-sends its last prompt) |
 | `p` | stop the current turn (Esc) without killing the process |
 | `k` | kill — press twice within 3s to confirm (sends `/exit`) |
-| `n` | spawn a new loop: prompts for a goal (plus an optional display name for the FLEET list), starts `claude` in the selected loop's directory (or cwd) |
+| `n` | spawn a new loop: wizard for the goal/contract (plus an optional display name for the FLEET list), then a "where" step that shows the target directory (default: the dir fleetops was launched from) and lets you change it — `[w]` new worktree, `[d]` this dir, `[c]` type a path, `[s]` the selected loop's dir |
 | `o` | open the session log in `less` |
 | `d` | dismiss: hide the selected loop from the list until restart (doesn't touch the session) |
 | `q` | quit |
@@ -271,7 +271,13 @@ through automatically:
    are no longer ambiguous to each other.
 2. **Tier 1b — cwd-based match (orca/cmux/tmux).** The existing
    `Locate`/`LocateClaude` chain, unchanged — still guarded against
-   ambiguity when more than one loop shares a directory.
+   ambiguity when more than one loop shares a directory. For an **idle or
+   stalled** loop that guard is no longer a dead end: `i` (inject) lets you
+   type the prompt anyway and routes it via Tier 2's session-unique headless
+   re-drive (exact session id — it cannot hit a sibling). A **running**
+   (mid-turn) loop still refuses, because a concurrent headless turn against
+   a live interactive session is unverified territory — attach (`↵`) and act
+   there instead.
 3. **Tier 2 — headless re-drive (every backend, every host).**
    `claude --resume <id> -p "<prompt>"` continues the SAME session as a
    fresh background turn, appending to the SAME transcript the cockpit

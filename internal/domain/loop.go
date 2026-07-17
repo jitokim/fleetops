@@ -104,7 +104,7 @@ type Loop struct {
 	Project      string    // decoded project label (e.g. "myproject")
 	ProjectDir   string    // raw encoded project dir name, e.g. "-home-user-myproject"
 	Cwd          string    // best-effort decoded absolute cwd, for display only — see CwdVerified
-	CwdVerified  bool      // true once Cwd was confirmed against a live process's real lsof path (not a lossy decode); gates spawn-into-this-dir (see tui's "n" key)
+	CwdVerified  bool      // true once Cwd was confirmed against a live process's real lsof path (not a lossy decode); gates the spawn wizard's explicit [s] use-this-loop's-dir choice (see tui's wizardWhere)
 	SessionID    string    // Claude Code session id
 	Path         string    // path to the session JSONL
 	LastActivity time.Time // last log write
