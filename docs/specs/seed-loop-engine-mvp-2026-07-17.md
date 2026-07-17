@@ -108,8 +108,13 @@ verifiable per slice):
       by construction (verified structurally in Slice 1 via `ShouldDrive`'s `StateGate`
       clause; verified end-to-end once wired in Slice 3).
 - [ ] **AC-3 (bounded termination).** The `flaky-tests-until-green` demo (design doc
-      §7) terminates in exactly one of DONE / FAILED / GATE(escalation) / GATE(permission)
-      — never runs unbounded. Verified once Slice 3 wires the cycle end-to-end.
+      §7), run autonomously (no human re-drives), terminates in exactly one of DONE /
+      GATE(escalation) / GATE(permission) / DRIFT(halt-for-human) — never runs
+      unbounded. **Autonomous `FAILED` is out of scope for this MVP** (design doc §7/§8):
+      a rejected verdict halts at `DRIFT` for a human, not an auto-redrive; `FAILED` is
+      reachable only semi-assisted, if a human keeps re-driving a drifted loop and the
+      oracle keeps rejecting it (`NoImprove≥limit` → `governor.Stop`). Verified once
+      Slice 3 wires the cycle end-to-end.
 - [ ] **AC-4 (no concurrent turns on one session).** A manual `r`/`i` actuation and an
       engine cycle never produce two concurrent `--resume` turns against the same
       session — both join the existing `m.actuating[sessionID]` interlock (the SAME

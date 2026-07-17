@@ -64,7 +64,8 @@ Redrive returned — reused, see §4). Everything else already happens in the pi
 | Deciding | `verdict==done` | scanner promotes `StateDone` (§3 precedence) | **Done** (terminal) |
 | Deciding | `governor.Check==Stop` (NoImprove≥limit) | scanner promotes `StateFailed` | **Failed** (terminal) |
 | Deciding | `governor.Check==Escalate` (budget/maxCycles) | scanner sets amber `Note` | **Gated** (escalation) |
-| Deciding | `Continue` & verdict∈{progress,rejected} | `triggerDrives`→`driveCmd`→`Redrive` (**new, thin**) | Driving (cycle+1) |
+| Deciding | `Continue` & verdict==progress | `triggerDrives`→`driveCmd`→`Redrive` (**new, thin**) | Driving (cycle+1) |
+| Deciding | verdict==rejected | scanner promotes `StateDrift` (unchanged, `DESIGN.md` §3) | **Drift** (halt — human owns; the engine does not auto-drive a loop the oracle just rejected) |
 | Gated | human `a` (`approveCmd`, unchanged) | — | Observing |
 | Gated(escalation) | human: `k` kill / new contract | — | terminal |
 
@@ -171,10 +172,17 @@ ShouldDrive(l, inFlight) → drive when ALL hold:
 ```
 
 Note the guard `AtCycle == Cycle`: the engine waits for the *current* cycle's oracle
-verdict before driving the next — it never races ahead of the judge. `NextWorkPrompt`
-feeds the last verdict's `Reason` back to the agent ("oracle rejected: <reason> — address
-it and re-verify"), so a rejected/progress cycle drives with corrective signal, mirroring
-the manual `composeDriftPrompt` pattern.
+verdict before driving the next — it never races ahead of the judge. A **rejected**
+verdict never reaches this predicate as `StateIdle` in the first place — the scanner
+promotes it to `StateDrift` first (§2's `Deciding` row), so `l.State == StateIdle`
+alone already excludes it; `l.Last.Outcome != OutcomeDone` is listed for readability
+but is structurally redundant given that wiring (see `engine/driver.go`'s doc for the
+one case — `OutcomeDone` — where this redundancy is load-bearing to spell out).
+`NextWorkPrompt` feeds the last verdict's `Reason` back to the agent ("oracle noted:
+<reason> — address it and continue"), but since only a **progress** verdict ever
+reaches a drive, that feedback is always a progress note, never a rejection
+correction — mirroring the manual `composeDriftPrompt` pattern is deferred to the
+"autonomous drive-through-rejection" follow-up (§8), not part of this MVP.
 
 ## 7. Demo acceptance (#5): flaky-tests-until-green
 
@@ -185,11 +193,25 @@ Contract entered via the `N` wizard:
 - **oracle:** `The agent must RERUN the tests from scratch and show the fresh output; DONE only if that rerun is green. Do not accept a bare "fixed" claim.`
 - **maxCycles:** 8 · NoImproveLimit: 3 (default).
 
-**Termination (all already enforced by governor + oracle + gate):**
+**Termination — the AUTONOMOUS engine (no human re-drives) terminates in exactly one
+of DONE / GATE(escalation) / GATE(permission) / DRIFT(halt-for-human) — never
+autonomous FAILED, and never runs unbounded:**
 - **DONE** — oracle `Outcome==done` (transcript shows a fresh green rerun) → `StateDone`, engine stops. ✅ pass.
-- **FAILED** — `NoImprove≥3` (agent repeatedly claims done, oracle keeps rejecting: the classic flaky/lying signature) → `governor.Stop` → `StateFailed`.
+- **DRIFT (halt for human)** — oracle `Outcome==rejected` (agent claims done without a
+  fresh rerun, or the oracle otherwise pushes back) → `StateDrift` → the engine does
+  NOT auto-drive it (§2's `Deciding` row; §8 non-goal). This is the conservative,
+  fail-closed choice for the MVP: an agent lying about "done" is exactly when a human
+  should own the call, not when the engine should auto-re-drive it up to 3×.
 - **ESCALATE→GATE** — `Cycle≥8` → `governor.Escalate` → amber Note, engine halts for a human.
 - **GATE** — the agent hits a permission prompt (e.g. a command needing approval) → `StateGate` → engine halts; human `a`.
+
+**FAILED is semi-assisted, not autonomous.** `NoImprove≥3` → `governor.Stop` →
+`StateFailed` is still real (unchanged governor logic, DESIGN.md §3) — the classic
+flaky/lying signature — but the engine itself never drives toward it: it only fires
+from `StateIdle`, and a rejected verdict never returns a loop to `StateIdle` without a
+human's `r`/`i` re-drive out of `DRIFT`. So `StateFailed` is only reachable if a human
+keeps manually re-driving a drifted loop and the oracle keeps rejecting it — the
+autonomous demo run by itself cannot land here.
 
 **Honest scope of "independent":** MVP's independence is the **oracle judging the
 transcript evidence of a fresh rerun** — the oracle (haiku) does not itself execute the
@@ -205,6 +227,7 @@ guarantee and is explicitly deferred (§8).
 5. **Stall auto-recovery** — a `Driven` loop that goes `StateStalled` (429 / no-output) surfaces to the human; the engine does not auto-redrive stalls (429 auto-redrive stays the separate opt-in it is).
 6. **Worktree isolation for engine loops** — headless bootstrap spawns in the target cwd; worktree-isolated engine spawn is later.
 7. **Engine self-chaining** — the MVP drives via the 3s scan policy (a few ticks' latency per cycle); a direct drive→judge→drive chain to cut latency is a later optimization.
+8. **Autonomous drive-through-rejection** — the engine re-driving a `DRIFT`/rejected loop with the oracle's corrective feedback, up to `NoImprove`→`FAILED`, is DEFERRED to a follow-up slice with its own dedicated fail-closed review. Auto-driving a loop the oracle just rejected is the "lying agent" runaway path (an agent that repeatedly claims done and gets overruled) and needs its own safety analysis before it's in scope — the MVP's answer for now is: a rejection halts at `DRIFT` for a human to own.
 
 ## 9. Risks & failure modes (#7)
 
@@ -230,7 +253,7 @@ guarantee and is explicitly deferred (§8).
 
 - [ ] `ShouldDrive`/`NextWorkPrompt` unit-tested incl. every fail-closed edge (gate/running/stalled/unjudged/done/budget/no-improve all return `drive=false`).
 - [ ] A gate mid-cycle halts the engine; no drive fires until a human `a`. (never auto-approves.)
-- [ ] `flaky-tests` demo terminates in exactly one of DONE / FAILED / GATE — never runs unbounded.
+- [ ] `flaky-tests` demo terminates in exactly one of DONE / GATE(escalation) / GATE(permission) / DRIFT(halt-for-human) autonomously — never runs unbounded. (`FAILED` is semi-assisted only, see §7 — not reachable by the autonomous demo run by itself.)
 - [ ] A manual `r` and an engine cycle never produce two concurrent `--resume` turns on one session (interlock test).
 - [ ] A driven loop stays visible in the fleet between cycles (dormancy), and a dead one surfaces within `drivenDormantStale`.
 - [ ] Every cycle writes a `TriggerEngine`/`ActorAuto` event; the loop renders with the DRIVEN provenance marker.

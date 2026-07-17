@@ -70,28 +70,44 @@ import (
 //     authorizes the next cycle. Stop (no-improve ceiling hit) obviously
 //     doesn't drive — the scanner will promote StateFailed on the next
 //     scan pass, which the `idle`/`notTerminal` clauses above then cover.
+//   - verdictFresh (l.Last != nil && l.Last.AtCycle == l.Cycle): design
+//     doc §6's exact pseudocode clause, ADDED in feat/engine-cycle (Slice
+//     2 shipped ShouldDrive without it, reasoning it was "structurally
+//     subsumed by idle" — that reasoning covered the OutcomeDone case
+//     correctly, per the note below, but missed a real race: the FIRST
+//     scan tick after a cycle finishes, the loop is StateIdle with an
+//     UNJUDGED or STALE verdict (Last.AtCycle < Cycle) — enrichFromRegistry
+//     has nothing fresh to promote State from yet, so `idle` alone does
+//     NOT exclude this case. Without this clause, triggerDrives could fire
+//     cycle N+1 on the SAME tick triggerJudgments dispatches cycle N's
+//     judgment — racing ahead of the judge, exactly what design §6 says
+//     the engine must never do ("it never races ahead of the judge").
+//     This clause closes that gap: no verdict yet, or a verdict from an
+//     OLDER cycle, both mean wait.
 //
-// Not checked here (deliberately — see the seed spec's open-question note):
-// verdict freshness (Last.AtCycle == Cycle) and Last.Outcome != OutcomeDone,
-// both present in the design doc's §6 pseudocode. They are structurally
-// subsumed by `idle`, GIVEN the wiring the later slices commit to:
-// enrichFromRegistry promotes State to StateDone the SAME scan pass a fresh
-// done-verdict lands (internal/claude/scan.go), strictly BEFORE
-// triggerDrives ever runs (design §5: triggerDrives fires inside
+// Still not checked here (deliberately — see the seed spec's open-question
+// note, now narrowed to this alone): Last.Outcome != OutcomeDone, present
+// in the design doc's §6 pseudocode as a SEPARATE clause. This one IS
+// structurally subsumed by `idle`, given the wiring the later slices
+// commit to: enrichFromRegistry promotes State to StateDone the SAME scan
+// pass a FRESH done-verdict lands (internal/claude/scan.go), strictly
+// BEFORE triggerDrives ever runs (design §5: triggerDrives fires inside
 // Update(loopsMsg), the same handler that already ran that scan's
 // enrichFromRegistry) — so a converged loop is never observed as StateIdle
-// by the time ShouldDrive is called. This depends on triggerDrives being
-// invoked exactly once per scan tick, after enrichFromRegistry, same as
-// triggerJudgments already is. If a later slice's wiring ever violates that
-// ordering, this reasoning — and this function's contract — needs revisiting.
+// by the time ShouldDrive is called; `idle` alone already excludes it.
+// This depends on triggerDrives being invoked exactly once per scan tick,
+// after enrichFromRegistry, same as triggerJudgments already is. If a
+// later slice's wiring ever violates that ordering, this reasoning — and
+// this function's contract — needs revisiting.
 func ShouldDrive(l domain.Loop, driven bool, inFlight bool) bool {
 	inflightOK := !inFlight
 	idle := l.State == domain.StateIdle
 	notTerminal := !l.State.Terminal()
 	notGated := l.State != domain.StateGate
 	governorOK := Check(l).Action == Continue
+	verdictFresh := l.Last != nil && l.Last.AtCycle == l.Cycle
 
-	return driven && inflightOK && idle && notTerminal && notGated && governorOK
+	return driven && inflightOK && idle && notTerminal && notGated && governorOK && verdictFresh
 }
 
 // NextWorkPrompt composes the work prompt for l's NEXT cycle from contract
@@ -99,11 +115,22 @@ func ShouldDrive(l domain.Loop, driven bool, inFlight bool) bool {
 // internal/tui's buildSpawnPrompt already uses to compose cycle 1's prompt,
 // same defaults for an empty doneCondition/rubric) plus l's current cycle
 // number, and — when available — the most recent oracle verdict's reason
-// fed back as corrective signal. This mirrors the manual DRIFT re-drive's
+// fed back as a progress note.
+//
+// feat/engine-cycle correction (was misleading before this comment fix): the
+// reason-feedback line below can ONLY ever carry a *progress* verdict's
+// note, never a rejection correction. ShouldDrive only calls this from
+// l.State == StateIdle, and a REJECTED verdict is promoted to StateDrift by
+// the scanner before the next scan's triggerDrives ever runs (§2's
+// "Deciding" row in the design doc) — so a rejected loop is never StateIdle
+// when NextWorkPrompt is composed for it; it halts at DRIFT for a human
+// instead. The superficial resemblance to the manual DRIFT re-drive's
 // composeDriftPrompt pattern (internal/tui/model.go: "<original> \n\n
-// [operator correction] <hint>"), generalized from "an operator's typed
-// hint" to "the oracle's own verdict reason" — the engine has no operator
-// to ask, so the oracle's own words are the corrective signal instead.
+// [operator correction] <hint>") is that: a resemblance, not the same
+// mechanism — composeDriftPrompt fires on a human's re-drive OUT of DRIFT,
+// which this function is never involved in. Autonomous drive-through-
+// rejection (the engine re-driving a DRIFT loop itself) is explicitly
+// deferred (design doc §8) pending its own fail-closed review.
 //
 // feat/panel-info (precise rename): the contract field and this function's
 // composed prompt line are both "rubric" now, not "oracle" — "oracle"
@@ -132,6 +159,8 @@ func NextWorkPrompt(l domain.Loop, contract registry.Record) string {
 	fmt.Fprintf(&b, "cycle: %d\n", l.Cycle)
 	b.WriteString("\nContinue working toward the goal. Report progress concretely this cycle.\n")
 	if l.Last != nil && l.Last.Reason != "" {
+		// Always a PROGRESS verdict's note here — see the doc comment above:
+		// a rejected verdict never reaches this function from StateIdle.
 		fmt.Fprintf(&b, "\n[oracle, last cycle] %s\n", l.Last.Reason)
 	}
 	b.WriteString("Declare DONE only when the complete condition is met — state the evidence.\n")
