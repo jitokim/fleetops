@@ -54,20 +54,29 @@ var pidTTYFn = func(pid int) string {
 // (resume/approve/interrupt/kill/inject) should land, per the ADR's tier
 // policy:
 //
-//   - Tier 1a — the session registry's tty (internal/sessions, tmux-only
-//     this slice: orca/cmux don't expose a per-terminal tty). Tried only
-//     when the registry has an entry, it carries a tty, AND a live `ps`
-//     confirms the recorded pid CURRENTLY controls that SAME tty right now
-//     (pidTTYFn) — never trust a possibly-stale registry record on its own.
-//     Proving the pid merely exists is NOT enough: ttys are OS-recycled, so
-//     a SIGKILL'd session can leak a registry entry whose tty gets
-//     reassigned to a completely different, unrelated live claude pane,
-//     and/or whose pid gets reused by any other process — pid-existence
-//     alone would pass in both cases and misroute an action onto the wrong
-//     session. Re-validating the BINDING (this exact pid ↔ this exact tty,
-//     right now) is what ADR §3 step 2 means by "re-validate tty↔pid
-//     against live ps at actuation time." Session-unique once the binding
-//     checks out: no ambiguity guard applies on this path.
+//   - Tier 1a — the session registry's tty (internal/sessions), dispatched
+//     to WHICHEVER backend Resolve() picks, if (and only if) that backend
+//     implements TTYLocator (see control.go's doc — verified per-backend,
+//     e.g. cmux's tree carries tty directly; orca's terminal list/show
+//     schema carries none, confirmed live). Tried only when the registry has
+//     an entry, it carries a tty, AND a live `ps` confirms the recorded pid
+//     CURRENTLY controls that SAME tty right now (pidTTYFn) — never trust a
+//     possibly-stale registry record on its own. Proving the pid merely
+//     exists is NOT enough: ttys are OS-recycled, so a SIGKILL'd session can
+//     leak a registry entry whose tty gets reassigned to a completely
+//     different, unrelated live claude pane, and/or whose pid gets reused by
+//     any other process — pid-existence alone would pass in both cases and
+//     misroute an action onto the wrong session. Re-validating the BINDING
+//     (this exact pid ↔ this exact tty, right now) is what ADR §3 step 2
+//     means by "re-validate tty↔pid against live ps at actuation time."
+//     Session-unique once the binding checks out: no ambiguity guard applies
+//     on this path. NOTE: this ties Tier 1a to Resolve()'s single preferred
+//     backend (orca→cmux→tmux) — a session actually hosted in a NON-preferred
+//     backend's surface (e.g. a tmux pane on a machine where orca is also
+//     installed and preferred) won't be found via Tier 1a even if that other
+//     backend implements TTYLocator; it falls to Tier 1b/2 instead. Accepted
+//     trade for a single, predictable "whichever backend is resolved" rule
+//     rather than probing every installed backend on every actuation.
 //   - Tier 1b — the existing cwd-based Resolve()+LocateClaude chain,
 //     unchanged, including its own internal ">1 match" ambiguity refusal.
 //
@@ -77,18 +86,35 @@ var pidTTYFn = func(pid int) string {
 // message: "no unambiguous claude surface"). Callers only use ctrl/target
 // when found=true.
 func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Controller, target Target, backendAvailable, found bool) {
+	resolved, resolvedOK := Resolve()
+
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
-		tmux := tmuxController{}
-		if t, ok := tmux.LocateByTTY(entry.TTY); ok {
-			return tmux, t, true, true
+		if resolvedOK {
+			if t, ok := tierOneA(resolved, entry.TTY); ok {
+				return resolved, t, true, true
+			}
 		}
 	}
-	resolved, resolvedOK := Resolve()
+
 	if !resolvedOK {
 		return nil, Target{}, false, false
 	}
 	t, locateOK := resolved.LocateClaude(projectDir)
 	return resolved, t, true, locateOK
+}
+
+// tierOneA type-asserts resolved as a TTYLocator and, if it implements the
+// interface, tries to locate a surface by tty — pulled out as its own pure
+// function (same reasoning as every other type-assert-then-call seam in this
+// package) so "dispatch Tier 1a to whichever resolved backend implements
+// TTYLocator" is directly unit-testable against a fake Controller, without
+// needing a real orca/cmux/tmux binary on the test machine.
+func tierOneA(resolved Controller, tty string) (Target, bool) {
+	locator, ok := resolved.(TTYLocator)
+	if !ok {
+		return Target{}, false
+	}
+	return locator.LocateByTTY(tty)
 }
 
 // redriveTimeout bounds the Tier-2 headless re-drive call. LONG — a full

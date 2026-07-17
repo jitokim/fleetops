@@ -957,10 +957,10 @@ func TestRenderHeaderBlock_HintGridPresentAtThreshold(t *testing.T) {
 
 // TestHeaderHintKeys_GroupedByFunction pins fix/exit-gate-ux item 7's
 // reordering: column-major fill groups send actions (r/i/a), lifecycle
-// (n/k/p), nav (↵/o//), and quit (q) into adjacent cells — see
-// headerHintKeys' doc for the grouping rationale.
+// (n/k/p), nav (↵/o//), and session housekeeping (q/d) into adjacent
+// cells — see headerHintKeys' doc for the grouping rationale.
 func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
-	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q"}
+	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q", "d"}
 	if len(headerHintKeys) != len(want) {
 		t.Fatalf("got %d keys, want %d", len(headerHintKeys), len(want))
 	}
@@ -977,7 +977,7 @@ func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
 // have dropped anything.
 func TestRenderHeaderHintGrid_AllKeysPresent_NothingRegressed(t *testing.T) {
 	out := renderHeaderHintGrid(4, 4*headerHintColWidth)
-	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q"} {
+	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q", "d"} {
 		if !strings.Contains(out, "<"+k+">") {
 			t.Errorf("expected hint grid to contain key %q, got:\n%s", k, out)
 		}
@@ -7164,10 +7164,81 @@ func TestIsDemoBlockedKey(t *testing.T) {
 			t.Errorf("isDemoBlockedKey(%q) = false, want true", key)
 		}
 	}
-	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c"}
+	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c", "d"}
 	for _, key := range allowed {
 		if isDemoBlockedKey(key) {
 			t.Errorf("isDemoBlockedKey(%q) = true, want false", key)
 		}
+	}
+}
+
+// ── "d" dismiss: hide a loop from the fleet list (view-state only) ───────
+
+func TestUpdate_DKey_DismissesSelectedLoop(t *testing.T) {
+	m := modelWithTwoLoops()
+
+	m, cmd := updateModel(t, m, runeKey('d'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — dismiss is pure view-state")
+	}
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops = %+v, want only sess-2 left", m.loops)
+	}
+	if !m.dismissed["sess-1"] {
+		t.Error("expected sess-1 recorded in the dismissed set")
+	}
+	if !strings.Contains(m.status, "dismissed myproject") {
+		t.Errorf("status = %q, want a dismissed-myproject message", m.status)
+	}
+}
+
+func TestUpdate_DKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
+	m := New()
+
+	m, cmd := updateModel(t, m, runeKey('d'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an empty fleet")
+	}
+	if !strings.Contains(m.status, "select a loop to dismiss") {
+		t.Errorf("status = %q, want the select-a-loop refusal", m.status)
+	}
+}
+
+func TestUpdate_DKey_LastRow_ClampsCursor(t *testing.T) {
+	m := modelWithTwoLoops()
+	m.cursor = 1
+
+	m, _ = updateModel(t, m, runeKey('d'))
+
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-1" {
+		t.Fatalf("loops = %+v, want only sess-1 left", m.loops)
+	}
+	if m.cursor != 0 {
+		t.Errorf("cursor = %d, want 0 (clamped onto the remaining row)", m.cursor)
+	}
+}
+
+func TestUpdate_LoopsMsg_DoesNotResurrectDismissed(t *testing.T) {
+	m := modelWithTwoLoops()
+	m, _ = updateModel(t, m, runeKey('d')) // dismiss sess-1
+
+	rescan := loopsMsg{
+		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	m, _ = updateModel(t, m, rescan)
+
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops after rescan = %+v, want sess-1 still hidden", m.loops)
+	}
+}
+
+func TestWithoutDismissed_EmptySet_ReturnsInputUnchanged(t *testing.T) {
+	m := modelWithTwoLoops()
+	loops := m.withoutDismissed(m.loops)
+	if len(loops) != 2 {
+		t.Fatalf("got %d loops, want 2 — an empty dismissed set must filter nothing", len(loops))
 	}
 }
