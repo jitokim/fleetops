@@ -240,8 +240,18 @@ func (tmuxController) Spawn(cwd, goal string) error {
 // tmuxNewWindowCmd builds the argv that opens a new tmux window running
 // claude in cwd, printing just the new pane's id to stdout (-P -F) so Spawn
 // can target it directly.
+//
+// -d creates the window in the BACKGROUND (detached): tmux new-window without
+// it makes the new window the client's current window, so when the fleetops
+// cockpit is itself running inside that same tmux client, spawning a loop
+// would yank the screen off the cockpit and into the freshly-created claude
+// session — the "creating a loop auto-jumps into attach" hijack. -d keeps the
+// cockpit put; the loop still spawns and its goal is still sent (send-keys
+// below targets the captured pane id, which -P -F still reports for a detached
+// window — focus is irrelevant to it). Take-over (OpenTerminal) deliberately
+// does NOT pass -d: there the human explicitly asked to jump into the session.
 func tmuxNewWindowCmd(cwd string) []string {
-	return []string{"tmux", "new-window", "-c", cwd, "-P", "-F", "#{pane_id}", "claude"}
+	return []string{"tmux", "new-window", "-d", "-c", cwd, "-P", "-F", "#{pane_id}", "claude"}
 }
 
 // OpenTerminal implements control.TerminalOpener: opens a new tmux window in
