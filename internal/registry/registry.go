@@ -59,6 +59,17 @@ type Record struct {
 	NoImproveLimit int
 	Verdict        *domain.Verdict // nil if never judged
 	NoImprove      int
+	// Driven is LoopEngine's durable "this session is engine-owned" flag
+	// (docs/design-loop-engine-mvp.md §1; docs/specs/seed-loop-engine-mvp-
+	// 2026-07-17.md). false for every record created before this field
+	// existed, and false by default even for a freshly-Bound record unless
+	// the caller explicitly opts in (see BindSpec.Driven) — the captain's
+	// opt-in-spike decision: no engine cycle EVER fires unless the loop was
+	// explicitly created engine-driven, off by default. Copied onto
+	// domain.Loop by claude.enrichFromRegistry, mirroring BoundAt's own
+	// copy-in. MarkDriven flips it later (e.g. a take-over clearing it back
+	// to false — a later slice, see the seed spec's attach-preservation AC).
+	Driven bool
 }
 
 // recordFile is Record's on-disk JSON shape.
@@ -72,6 +83,7 @@ type recordFile struct {
 	NoImproveLimit int          `json:"noImproveLimit"`
 	Verdict        *verdictFile `json:"verdict,omitempty"`
 	NoImprove      int          `json:"noImprove"`
+	Driven         bool         `json:"driven,omitempty"`
 }
 
 // BindSpec is a loop's goal-bound contract, as collected by the wizard (the
@@ -85,6 +97,15 @@ type BindSpec struct {
 	Oracle        string
 	Challenger    string
 	MaxCycles     int // 0 = DefaultMaxCycles
+	// Driven opts this loop into LoopEngine at creation time — false (the
+	// zero value) for every EXISTING caller of BindSpec today, since none
+	// of them offer an engine-drive choice yet (that's a later slice's "n"
+	// wizard step). Kept on BindSpec rather than a separate Bind parameter:
+	// one value object for "everything the wizard decided about this
+	// loop's contract," matching this struct's own doc above, and it
+	// threads through WritePending/BindPending's existing plumbing for
+	// free without a second parallel parameter list.
+	Driven bool
 }
 
 type verdictFile struct {
@@ -112,6 +133,7 @@ func Bind(dir, sessionID string, spec BindSpec) error {
 		BoundAt:        time.Now().Unix(),
 		MaxCycles:      maxCycles,
 		NoImproveLimit: DefaultNoImproveLimit,
+		Driven:         spec.Driven,
 	})
 }
 
@@ -139,6 +161,7 @@ func recordFromFile(rf recordFile) Record {
 		MaxCycles:      rf.MaxCycles,
 		NoImproveLimit: rf.NoImproveLimit,
 		NoImprove:      rf.NoImprove,
+		Driven:         rf.Driven,
 	}
 	if rf.Verdict != nil {
 		r.Verdict = &domain.Verdict{
@@ -177,6 +200,7 @@ func SaveVerdict(dir, sessionID string, verdict domain.Verdict, atCycle int) err
 		MaxCycles:      rec.MaxCycles,
 		NoImproveLimit: rec.NoImproveLimit,
 		NoImprove:      rec.NoImprove,
+		Driven:         rec.Driven, // LoopEngine MVP: a verdict save must not silently un-drive a loop
 		Verdict: &verdictFile{
 			Outcome: string(rec.Verdict.Outcome),
 			Reason:  rec.Verdict.Reason,
@@ -184,6 +208,32 @@ func SaveVerdict(dir, sessionID string, verdict domain.Verdict, atCycle int) err
 			TS:      time.Now().Unix(),
 		},
 	})
+}
+
+// MarkDriven flips sessionID's Driven flag — the LoopEngine MVP's
+// engine-ownership toggle (set true at engine-bootstrap; cleared false by
+// a later slice's take-over action, see the seed spec's attach-
+// preservation AC). Operates on the raw on-disk shape directly (read-
+// mutate-write, like SaveVerdict's Load-then-writeRecordFile shape, but at
+// the recordFile level rather than round-tripping through Record) so
+// every OTHER field — notably the verdict's on-disk TS, which
+// Record/recordFromFile doesn't carry into memory at all today (TS is
+// write-only in this format; nothing reads it back) — survives byte-for-
+// byte untouched, not silently reset to "now" as a side effect of a
+// completely unrelated flag flip. Returns an error if sessionID isn't
+// bound yet (MarkDriven never creates a record, same contract as
+// SaveVerdict).
+func MarkDriven(dir, sessionID string, driven bool) error {
+	data, err := os.ReadFile(filepath.Join(dir, sessionID+".json"))
+	if err != nil {
+		return fmt.Errorf("registry: no record for session %s to mark driven", sessionID)
+	}
+	var rf recordFile
+	if err := json.Unmarshal(data, &rf); err != nil {
+		return fmt.Errorf("registry: session %s's record is malformed: %w", sessionID, err)
+	}
+	rf.Driven = driven
+	return writeRecordFile(dir, sessionID, rf)
 }
 
 func writeRecordFile(dir, sessionID string, rf recordFile) error {
@@ -206,6 +256,12 @@ type PendingSpawn struct {
 	Challenger    string
 	MaxCycles     int
 	TS            time.Time
+	// Driven carries BindSpec.Driven through the pending→bound round trip
+	// (WritePending → BindPending → Bind) — without this, a loop spawned
+	// with the engine-drive choice would silently lose it the moment its
+	// session got matched, since BindPending rebuilds a fresh BindSpec from
+	// PendingSpawn's fields, not from the original spec.
+	Driven bool
 }
 
 type pendingFile struct {
@@ -216,6 +272,7 @@ type pendingFile struct {
 	Challenger    string `json:"challenger,omitempty"`
 	MaxCycles     int    `json:"maxCycles,omitempty"`
 	TS            int64  `json:"ts"`
+	Driven        bool   `json:"driven,omitempty"`
 }
 
 // WritePending records a just-spawned loop's full contract (spec) under
@@ -235,6 +292,7 @@ func WritePending(dir, cwd string, spec BindSpec) error {
 		Challenger:    spec.Challenger,
 		MaxCycles:     spec.MaxCycles,
 		TS:            time.Now().Unix(),
+		Driven:        spec.Driven,
 	})
 	if err != nil {
 		return err
@@ -271,6 +329,7 @@ func listPending(dir string) map[string]PendingSpawn {
 			Challenger:    pf.Challenger,
 			MaxCycles:     pf.MaxCycles,
 			TS:            time.Unix(pf.TS, 0),
+			Driven:        pf.Driven,
 		}
 	}
 	return out
@@ -330,6 +389,7 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 			Oracle:        p.Oracle,
 			Challenger:    p.Challenger,
 			MaxCycles:     p.MaxCycles,
+			Driven:        p.Driven,
 		}
 		if err := Bind(loopsDir, best.SessionID, spec); err != nil {
 			continue // best-effort; retry next scan

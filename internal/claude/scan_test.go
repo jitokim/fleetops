@@ -1301,6 +1301,45 @@ func TestEnrichFromRegistry_UnboundLoopUntouched(t *testing.T) {
 	if out[0].State != domain.StateIdle {
 		t.Errorf("State = %v, want unchanged StateIdle", out[0].State)
 	}
+	if out[0].Driven {
+		t.Error("Driven = true, want false — an unbound loop was never handed to the engine")
+	}
+}
+
+// TestEnrichFromRegistry_BoundAndDriven_SurfacesDrivenOnLoop is the
+// captain's exact ask for this slice: a bound+driven registry record must
+// surface as loop.Driven==true — the projection enrichFromRegistry already
+// does for BoundAt, extended to LoopEngine's ownership flag.
+func TestEnrichFromRegistry_BoundAndDriven_SurfacesDrivenOnLoop(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "fix the flaky test", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle}}
+	out := enrichFromRegistry(loops, dir, t.TempDir())
+
+	if !out[0].Driven {
+		t.Error("Driven = false, want true — a driven registry record must surface onto the loop")
+	}
+}
+
+// TestEnrichFromRegistry_BoundNotDriven_LoopStaysNotDriven: the opt-in-
+// spike's off-by-default contract, checked at the enrichment boundary too
+// — a bound-but-not-driven loop (the common case until a later slice's "n"
+// wizard offers the engine-drive choice) must never surface as Driven.
+func TestEnrichFromRegistry_BoundNotDriven_LoopStaysNotDriven(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Goal: "fix the flaky test"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle}}
+	out := enrichFromRegistry(loops, dir, t.TempDir())
+
+	if out[0].Driven {
+		t.Error("Driven = true, want false — a bound-but-not-driven record must not surface as Driven")
+	}
 }
 
 func TestEnrichFromRegistry_BoundLoop_SetsGoalCapsAndNoImprove(t *testing.T) {

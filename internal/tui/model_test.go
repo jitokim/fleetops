@@ -5355,3 +5355,74 @@ func TestAutoRedriveExhaustedNotifyCmd_SendsCorrectTitleAndBody(t *testing.T) {
 		t.Errorf("body = %q, want the project label", gotBody)
 	}
 }
+
+// ── LoopEngine MVP: opt-in kill-switch seam ──────────────────────────────
+//
+// engineEnabledFn is not called from anywhere yet in this slice (a later
+// slice's triggerDrives is the first caller) — these tests pin the seam's
+// contract now so that slice can trust it without re-deriving/re-testing
+// the env-var behavior itself.
+
+func TestEngineEnabledFn_Unset_DefaultsFalse(t *testing.T) {
+	t.Setenv("MISSIONCTL_ENGINE", "") // t.Setenv auto-restores on cleanup; "" mirrors "not set" for this equality check
+	if engineEnabledFn() {
+		t.Error("expected false — the engine is off by default")
+	}
+}
+
+func TestEngineEnabledFn_SetToOne_True(t *testing.T) {
+	t.Setenv("MISSIONCTL_ENGINE", "1")
+	if !engineEnabledFn() {
+		t.Error("expected true with MISSIONCTL_ENGINE=1")
+	}
+}
+
+// TestEngineEnabledFn_AnyOtherValue_False pins the SAME strict-equality
+// contract autoRedriveEnabledFn already has ("==\"1\"", not a truthy
+// parse) — "true"/"yes"/"2" must NOT enable the engine, only the exact
+// string "1". A kill-switch's opt-in side should never have surprising
+// truthy-string ambiguity.
+func TestEngineEnabledFn_AnyOtherValue_False(t *testing.T) {
+	for _, v := range []string{"true", "yes", "0", "2", "TRUE"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("MISSIONCTL_ENGINE", v)
+			if engineEnabledFn() {
+				t.Errorf("MISSIONCTL_ENGINE=%q: expected false — only the exact string \"1\" enables the engine", v)
+			}
+		})
+	}
+}
+
+// withEngineEnabled overrides engineEnabledFn to the given value for the
+// duration of one test, restoring the original on cleanup — mirrors
+// withAutoRedriveEnabled exactly, ready for the later slice that actually
+// calls engineEnabledFn from wiring logic.
+func withEngineEnabled(t *testing.T, enabled bool) {
+	t.Helper()
+	orig := engineEnabledFn
+	t.Cleanup(func() { engineEnabledFn = orig })
+	engineEnabledFn = func() bool { return enabled }
+}
+
+// TestWithEngineEnabled_OverridesAndRestores proves the test seam itself
+// works: a subtest's override takes effect during the subtest, and is
+// restored (subtest t.Cleanup runs at subtest end, before the parent
+// resumes) by the time the parent test observes engineEnabledFn again —
+// cheap insurance so a later slice's tests can trust withEngineEnabled
+// blindly.
+func TestWithEngineEnabled_OverridesAndRestores(t *testing.T) {
+	orig := engineEnabledFn
+	defer func() { engineEnabledFn = orig }()      // belt-and-suspenders: don't leak into other tests even if this one fails oddly
+	engineEnabledFn = func() bool { return false } // known starting value, independent of the real env
+
+	t.Run("override", func(t *testing.T) {
+		withEngineEnabled(t, true)
+		if !engineEnabledFn() {
+			t.Error("expected true while overridden")
+		}
+	})
+
+	if engineEnabledFn() {
+		t.Error("expected false after the subtest ended — withEngineEnabled's cleanup must restore the prior value")
+	}
+}

@@ -1807,6 +1807,31 @@ func autoRedriveExhaustedNotifyCmd(project string) tea.Cmd {
 	}
 }
 
+// ── LoopEngine MVP: opt-in kill-switch seam ──────────────────────────────
+//
+// docs/design-loop-engine-mvp.md; docs/specs/seed-loop-engine-mvp-2026-07-
+// 17.md. Captain decision (opt-in spike, standing discipline for every
+// engine slice): the engine is reachable ONLY behind an explicit opt-in —
+// this env gate AND the "n" wizard's engine-drive choice (a later slice;
+// see registry.BindSpec.Driven). No engine cycle EVER fires unless BOTH
+// are true. Off by default.
+//
+// This slice ships ONLY the env-gate half of the kill-switch (durable-
+// ownership slice — see the file's Driven-related comments elsewhere for
+// the other half). engineEnabledFn is not called from anywhere yet; a
+// later slice's triggerDrives is the first caller. Shipping the seam now
+// means that slice adds a call, not a new env-var contract.
+//
+// Mirrors autoRedriveEnabledFn exactly (a func var, not a bare os.Getenv
+// call, so tests don't need to mutate a real process environment
+// variable) — same "opt-in, off by default, no in-app toggle" shape as
+// the 429 auto-redrive gate above, deliberately: this is the SAME class of
+// decision (an automated action needs an explicit, boring, well-known
+// escape hatch), not a new pattern invented for the engine.
+var engineEnabledFn = func() bool {
+	return os.Getenv("MISSIONCTL_ENGINE") == "1"
+}
+
 // shouldNotify applies the dedup ledger for sessionID's edge ("gate" or
 // "gone"), recording now as the edge's last-notified time whenever it
 // allows a notification through — pointer receiver so the decision (and the

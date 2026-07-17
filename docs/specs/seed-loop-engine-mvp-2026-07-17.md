@@ -15,6 +15,39 @@ source: docs/design-loop-engine-mvp.md (design doc, status: draft for PR-flow im
 > question for reviewers** (see the note at the end) — never silently folded into the
 > design doc's own ACs as if it had always been there.
 
+## Addendum (2026-07-17, post-lock): opt-in spike — standing discipline for every slice
+
+**Captain decision, issued after this spec's initial lock, during the durable-ownership
+slice.** This section is itself locked and is now a review gate for EVERY remaining
+engine slice — reproduce it (or link back here) in each slice's PR body:
+
+1. **The observation cockpit stays first-class.** The engine must never degrade
+   observed-loop behavior — the attach-preservation AC (above) is the concrete instance
+   of this, but the principle is general: nothing about shipping the engine may make
+   the existing cockpit worse, slower, or less trustworthy for a loop the engine
+   doesn't own.
+2. **The engine is reachable ONLY behind an explicit opt-in — BOTH of:**
+   - an env gate, `MISSIONCTL_ENGINE=1` (`engineEnabledFn`, `internal/tui/model.go` —
+     shipped in the durable-ownership slice as a seam, not yet called by anything); AND
+   - the `n` wizard's engine-drive choice, per-loop (`registry.BindSpec.Driven` →
+     `Record.Driven` → `domain.Loop.Driven`, shipped across Slice 0/1).
+
+   **No engine cycle EVER fires unless a loop was explicitly created engine-driven —
+   both gates must be true.** Off by default in every dimension: the env var, the
+   per-loop choice, and (implicitly) every loop that existed before this feature.
+3. **No "better runner" features.** Challenger execution, context compaction, per-loop
+   model/permission config, worktree isolation, fancier prompts — all STAY non-goals
+   (see "Non-goals" below, unchanged by this addendum). **The engine is a governance
+   harness, not an agent runtime.** If a future slice starts adding runner polish on
+   top of the governed-cycle mechanism, that slice's author (or reviewer) must stop and
+   flag it — this is a standing tripwire, not a one-time checklist item.
+4. **Kill-switch.** `MISSIONCTL_ENGINE` unset (or a future global disable) must make
+   EVERY driven loop inert: it keeps rendering and being observed normally (State
+   ownership is untouched either way — see "Where engine state lives" above), but the
+   engine never fires a drive for it. This is the env-gate half of the two-gate opt-in
+   in point 2 — the SAME mechanism, restated here as the specific failure-mode
+   guarantee it must uphold.
+
 ## Goal
 
 missionctl graduates from "observes a fleet and lets a human drive one cycle per
