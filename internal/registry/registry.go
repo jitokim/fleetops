@@ -56,6 +56,7 @@ const (
 // record on someone's disk must keep loading correctly after this rename,
 // not silently lose its rubric (see TestLoad_OracleJSONKeyCompat).
 type Record struct {
+	Name           string // human-given display name for the fleet list; "" = none (TUI falls back to goal/project — see domain.Loop.DisplayLabel)
 	Goal           string
 	DoneCondition  string // completion condition from the wizard's "n" key; "" = oracle judges against Goal alone
 	Rubric         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
@@ -81,6 +82,7 @@ type Record struct {
 // Rubric is INTENTIONALLY unchanged from before the Go field rename (see
 // Record's doc) — this is the on-disk compat seam.
 type recordFile struct {
+	Name           string       `json:"name,omitempty"`
 	Goal           string       `json:"goal"`
 	DoneCondition  string       `json:"doneCondition,omitempty"`
 	Rubric         string       `json:"oracle,omitempty"`
@@ -99,6 +101,7 @@ type recordFile struct {
 // on Bind/WritePending — Goal/DoneCondition/Rubric/Challenger are all plain
 // strings, easy to silently transpose if passed positionally.
 type BindSpec struct {
+	Name          string // optional display name (wizard's "name" step); "" = none
 	Goal          string
 	DoneCondition string
 	Rubric        string
@@ -133,6 +136,7 @@ func Bind(dir, sessionID string, spec BindSpec) error {
 		maxCycles = DefaultMaxCycles
 	}
 	return writeRecordFile(dir, sessionID, recordFile{
+		Name:           spec.Name,
 		Goal:           spec.Goal,
 		DoneCondition:  spec.DoneCondition,
 		Rubric:         spec.Rubric,
@@ -160,6 +164,7 @@ func Load(dir, sessionID string) (Record, bool) {
 
 func recordFromFile(rf recordFile) Record {
 	r := Record{
+		Name:           rf.Name,
 		Goal:           rf.Goal,
 		DoneCondition:  rf.DoneCondition,
 		Rubric:         rf.Rubric,
@@ -257,6 +262,7 @@ func writeRecordFile(dir, sessionID string, rf recordFile) error {
 // PendingSpawn is a not-yet-matched spawn request.
 type PendingSpawn struct {
 	Cwd           string
+	Name          string
 	Goal          string
 	DoneCondition string
 	Rubric        string
@@ -275,6 +281,7 @@ type PendingSpawn struct {
 // tag compat seam as recordFile (see Record's doc).
 type pendingFile struct {
 	Cwd           string `json:"cwd"`
+	Name          string `json:"name,omitempty"`
 	Goal          string `json:"goal"`
 	DoneCondition string `json:"doneCondition,omitempty"`
 	Rubric        string `json:"oracle,omitempty"`
@@ -295,6 +302,7 @@ func WritePending(dir, cwd string, spec BindSpec) error {
 	}
 	data, err := json.Marshal(pendingFile{
 		Cwd:           cwd,
+		Name:          spec.Name,
 		Goal:          spec.Goal,
 		DoneCondition: spec.DoneCondition,
 		Rubric:        spec.Rubric,
@@ -332,6 +340,7 @@ func listPending(dir string) map[string]PendingSpawn {
 		}
 		out[e.Name()] = PendingSpawn{
 			Cwd:           pf.Cwd,
+			Name:          pf.Name,
 			Goal:          pf.Goal,
 			DoneCondition: pf.DoneCondition,
 			Rubric:        pf.Rubric,
@@ -393,6 +402,7 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 			continue // no match yet; retry next scan (until stale)
 		}
 		spec := BindSpec{
+			Name:          p.Name,
 			Goal:          p.Goal,
 			DoneCondition: p.DoneCondition,
 			Rubric:        p.Rubric,

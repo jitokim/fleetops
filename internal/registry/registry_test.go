@@ -648,3 +648,64 @@ func TestCapDetail_MultibyteText_NeverSplitsARune(t *testing.T) {
 		t.Errorf("capDetail produced invalid UTF-8: %q", got)
 	}
 }
+
+func TestBind_NameRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Name: "bugfix loop", Goal: "fix the bug"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	rec, ok := Load(dir, "sess-1")
+	if !ok {
+		t.Fatal("expected a record to load")
+	}
+	if rec.Name != "bugfix loop" {
+		t.Errorf("Name = %q, want %q", rec.Name, "bugfix loop")
+	}
+}
+
+// TestLoad_NameAbsent_DefaultsEmpty: a record persisted before the Name
+// field existed (no "name" key at all) must load with Name == "" — the
+// display-name feature must never corrupt or reject an older record.
+func TestLoad_NameAbsent_DefaultsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{"goal":"fix the bug","boundAt":1700000000,"maxCycles":12,"noImproveLimit":3,"noImprove":0}`
+	if err := os.WriteFile(filepath.Join(dir, "sess-1.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	rec, ok := Load(dir, "sess-1")
+	if !ok {
+		t.Fatal("expected the pre-Name record to load")
+	}
+	if rec.Name != "" {
+		t.Errorf("Name = %q, want empty for a record with no name key", rec.Name)
+	}
+	if rec.Goal != "fix the bug" {
+		t.Errorf("Goal = %q, want the rest of the record intact", rec.Goal)
+	}
+}
+
+// TestBindPending_NameSurvivesRoundTrip: the display name must survive the
+// pending→bound round trip (WritePending → BindPending → Bind) the same way
+// Driven already does — BindPending rebuilds a fresh BindSpec from
+// PendingSpawn's fields, so a field it doesn't copy is silently lost.
+func TestBindPending_NameSurvivesRoundTrip(t *testing.T) {
+	loopsDir, pendingDir := t.TempDir(), t.TempDir()
+	now := time.Now()
+
+	if err := WritePending(pendingDir, "/x/myproject", BindSpec{Name: "bugfix loop", Goal: "fix the bug"}); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "new-sess", Cwd: "/x/myproject", ProjectDir: "-x-myproject", LastActivity: now.Add(time.Second)},
+	}
+
+	BindPending(loopsDir, pendingDir, loops, now, t.TempDir())
+
+	rec, ok := Load(loopsDir, "new-sess")
+	if !ok {
+		t.Fatal("expected \"new-sess\" to be bound")
+	}
+	if rec.Name != "bugfix loop" {
+		t.Errorf("Name = %q, want %q (lost in the pending round trip)", rec.Name, "bugfix loop")
+	}
+}

@@ -98,7 +98,7 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	return loops, nil
 }
 
-// enrichFromRegistry attaches goal-bound metadata (Goal.Text/MaxCycles/
+// enrichFromRegistry attaches goal-bound metadata (Name, Goal.Text/MaxCycles/
 // NoImproveLimit, Last verdict, NoImprove, Driven) from the registry to
 // each loop that has a record — observed (non-spawned) sessions have none
 // and are left untouched (Goal.Text stays "", which the TUI treats as
@@ -120,6 +120,7 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		if !ok {
 			continue
 		}
+		loops[i].Name = rec.Name
 		loops[i].Goal.Text = rec.Goal
 		loops[i].Goal.DoneWhen = rec.DoneCondition
 		loops[i].Goal.Rubric = rec.Rubric
@@ -438,7 +439,6 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 
 	l := domain.Loop{
 		ID:           session,
-		Name:         proj,
 		Project:      proj,
 		ProjectDir:   projectDir,
 		Cwd:          decodeCwd(projectDir),

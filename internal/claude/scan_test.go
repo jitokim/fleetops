@@ -2008,3 +2008,20 @@ func TestLastError_MalformedTimestamp_ZeroTime(t *testing.T) {
 		t.Errorf("ts = %v, want the zero value for an unparseable timestamp", ts)
 	}
 }
+
+// TestEnrichFromRegistry_NameCopiedOntoLoop: the wizard's display name
+// (registry.Record.Name) must surface as Loop.Name — the FLEET list's
+// DisplayLabel reads it from there, same copy-in seam as BoundAt/Driven.
+func TestEnrichFromRegistry_NameCopiedOntoLoop(t *testing.T) {
+	dir := t.TempDir()
+	if err := registry.Bind(dir, "sess-1", registry.BindSpec{Name: "bugfix loop", Goal: "fix the flaky test"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	loops := []domain.Loop{{SessionID: "sess-1", State: domain.StateIdle}}
+	out := enrichFromRegistry(loops, dir, t.TempDir())
+
+	if out[0].Name != "bugfix loop" {
+		t.Errorf("Name = %q, want %q (registry display name must surface onto the loop)", out[0].Name, "bugfix loop")
+	}
+}
