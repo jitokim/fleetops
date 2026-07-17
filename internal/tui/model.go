@@ -234,6 +234,7 @@ type wizardStep int
 
 const (
 	wizardGoal       wizardStep = iota // required; empty cancels
+	wizardName                         // optional; display name for the FLEET list (falls back to goal text — see domain.Loop.DisplayLabel)
 	wizardDoneWhen                     // optional; completion condition
 	wizardRubric                       // optional; verification rubric (was wizardOracle — feat/panel-info's precise rename, see domain.Goal's doc)
 	wizardChallenger                   // optional; adversarial probe description, STORED ONLY
@@ -283,6 +284,7 @@ type Model struct {
 	// see domain.Goal's doc.
 	spawnStep       wizardStep
 	spawnGoal       string
+	spawnName       string
 	spawnDoneWhen   string
 	spawnRubric     string
 	spawnChallenger string
@@ -1107,6 +1109,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spawnNote = spawnNote
 			m.spawnStep = wizardGoal
 			m.spawnGoal = ""
+			m.spawnName = ""
 			m.spawnDoneWhen = ""
 			m.spawnRubric = ""
 			m.spawnChallenger = ""
@@ -1605,6 +1608,12 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.spawnGoal = value
+		m.spawnStep = wizardName
+		m.input = newWizardInput()
+		return m, textinput.Blink
+
+	case wizardName:
+		m.spawnName = value
 		m.spawnStep = wizardDoneWhen
 		m.input = newWizardInput()
 		return m, textinput.Blink
@@ -1685,6 +1694,7 @@ func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 		m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", m.spawnCwd, note), statusNeutral
 	}
 	spec := registry.BindSpec{
+		Name:          m.spawnName,
 		Goal:          m.spawnGoal,
 		DoneCondition: m.spawnDoneWhen,
 		Rubric:        m.spawnRubric,
@@ -1705,6 +1715,7 @@ func (m Model) submitSpawnWizardEngineDrive() (tea.Model, tea.Cmd) {
 	m.input.Blur()
 	m.status, m.statusKind = fmt.Sprintf("engine: bootstrapping %s… (cycle 1)", slugFromGoal(m.spawnGoal, 24)), statusNeutral
 	spec := registry.BindSpec{
+		Name:          m.spawnName,
 		Goal:          m.spawnGoal,
 		DoneCondition: m.spawnDoneWhen,
 		Rubric:        m.spawnRubric,
@@ -3407,10 +3418,20 @@ const (
 // even NAME's ideal floor can't be honored); above the cap NAME stops
 // growing even in a very wide left panel — extra room is just left blank
 // (there's no NOTE-style column left in the list to hand the spare to).
+// The cap was raised from 28 alongside the DisplayLabel change: NAME now
+// usually carries a display name or a goal's first line ("what is this loop
+// doing"), which earns more room than the old project-dir label did.
 const (
 	nameFloorWidth = 10
-	nameCapWidth   = 28
+	nameCapWidth   = 40
 )
+
+// nameGoodWidth is the label width worth protecting: below it a goal-text
+// label degrades into a useless fragment, so listRowWidths sheds the
+// optional ORACLE/CYCLE columns (in their usual drop order) before letting
+// NAME shrink past it. Distinct from listNameFloor (the physical last
+// resort) — this is a READABILITY floor, not a fit floor.
+const nameGoodWidth = 20
 
 // listNameFloor is listRowWidths' absolute last resort — smaller than
 // nameFloorWidth — so the FLEET panel keeps showing SOMETHING for NAME even
@@ -3477,7 +3498,7 @@ func layoutModeFor(width int) layoutMode {
 // is never needed (see renderPanel's doc — a panel shorter than its sibling
 // would otherwise show its bottom border floating above blank filler).
 func (m Model) renderWide(width, panelHeight int) string {
-	leftWidth := width * 2 / 5
+	leftWidth := width / 2
 	if leftWidth < wideLeftFloor {
 		leftWidth = wideLeftFloor
 	}
@@ -3496,9 +3517,15 @@ func (m Model) renderWide(width, panelHeight int) string {
 // renderWide: the floor is enough room for marker+NAME(floor)+STATE+LAST
 // plus the border (2+10+12+14+2=40), the cap keeps the list from wasting a
 // huge share of a very wide terminal that DETAIL would put to better use.
+// The share is an even half (was 2/5) and the cap 72 (was 60) since the
+// DisplayLabel change: the list's NAME column now answers "what is each
+// loop doing" at a glance, which is the panel's whole point — the cap is
+// sized so a full nameCapWidth label plus every optional column fits
+// (2+40+12+7+6+14 + border 2 = 83 is more than DETAIL can spare; 72 keeps
+// ~29 label cols with all columns shown, a workable compromise).
 const (
 	wideLeftFloor = 40
-	wideLeftCap   = 60
+	wideLeftCap   = 72
 )
 
 // renderStacked puts FLEET above DETAIL, both spanning the full width,
@@ -3557,7 +3584,7 @@ func fleetTitle(m Model) string {
 
 func detailTitle(m Model) string {
 	if sel, ok := m.selected(); ok {
-		return "DETAIL ▸ " + sel.Project
+		return "DETAIL ▸ " + sel.DisplayLabel()
 	}
 	return "DETAIL"
 }
@@ -3699,9 +3726,18 @@ func fleetOracleCountsCmd(loops []domain.Loop) tea.Cmd {
 // (dropped first), LAST (last-activity recency) is the most established/
 // essential (dropped last, same priority LAST already had before this
 // change).
+//
+// feat/loop-display-name: ORACLE and CYCLE now drop not just when the row
+// physically can't fit (listNameFloor) but whenever they'd squeeze NAME
+// below nameGoodWidth — the label carries the loop's display name/goal
+// ("what is this loop doing"), the panel's primary answer, which a 7-char
+// fragment can't give. LAST keeps its stricter physical-fit-only rule: at
+// the narrowest panels renderWide ever produces this lands on the same
+// widths as before, so only mid-width panels trade ORACLE/CYCLE for a
+// readable label.
 func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast bool) {
 	showCycle, showOracle, showLast = true, true, true
-	fits := func() bool {
+	name := func() int {
 		fixed := wMarker + wState
 		if showLast {
 			fixed += wLast
@@ -3712,31 +3748,20 @@ func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast b
 		if showOracle {
 			fixed += wOracle
 		}
-		return innerWidth-fixed >= listNameFloor
+		return innerWidth - fixed
 	}
 	// drop right-to-priority: ORACLE first, then CYCLE, then LAST — see
 	// this function's own doc for why this specific order.
-	if !fits() {
+	if name() < nameGoodWidth {
 		showOracle = false
 	}
-	if !fits() {
+	if name() < nameGoodWidth {
 		showCycle = false
 	}
-	if !fits() {
+	if name() < listNameFloor {
 		showLast = false
 	}
-
-	fixed := wMarker + wState
-	if showLast {
-		fixed += wLast
-	}
-	if showCycle {
-		fixed += wCycle
-	}
-	if showOracle {
-		fixed += wOracle
-	}
-	wName = innerWidth - fixed
+	wName = name()
 	if wName < 0 {
 		wName = 0
 	}
@@ -3772,7 +3797,7 @@ func renderListRow(l domain.Loop, sel, dup bool, wName int, showCycle, showOracl
 	}
 	marker := lipgloss.NewStyle().Foreground(cursorColor).Render(cursorGlyph) +
 		lipgloss.NewStyle().Foreground(drivenColor).Render(drivenGlyph)
-	label := l.Project
+	label := l.DisplayLabel()
 	if dup {
 		label += "·" + shortID(l.SessionID)
 	}
@@ -3840,7 +3865,7 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 	rows := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
 		l := visible[i]
-		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.Project], wName, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
+		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.DisplayLabel()], wName, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
 	}
 	return rows
 }
@@ -3876,14 +3901,16 @@ func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
 	return lines
 }
 
-// duplicateLabels reports, for each project label shared by 2+ loops in the
+// duplicateLabels reports, for each display label shared by 2+ loops in the
 // current fleet, whether renderListRow must disambiguate it with a
-// session-id suffix (many loops sharing a common label like "backend" are
-// otherwise indistinguishable in the FLEET panel).
+// session-id suffix — the ONLY place a session-id fragment still reaches
+// the FLEET list (many loops sharing a common label like "backend" are
+// otherwise indistinguishable). Keyed by DisplayLabel, not Project: two
+// loops in the same repo pursuing DIFFERENT goals already read apart.
 func duplicateLabels(loops []domain.Loop) map[string]bool {
 	counts := make(map[string]int, len(loops))
 	for _, l := range loops {
-		counts[l.Project]++
+		counts[l.DisplayLabel()]++
 	}
 	dup := make(map[string]bool, len(counts))
 	for label, n := range counts {
@@ -4859,6 +4886,8 @@ func wizardStepLabel(step wizardStep) string {
 	switch step {
 	case wizardGoal:
 		return "goal:"
+	case wizardName:
+		return "name (fleet list label, optional):"
 	case wizardDoneWhen:
 		return "complete condition:"
 	case wizardRubric:

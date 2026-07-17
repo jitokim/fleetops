@@ -57,3 +57,40 @@ func TestStateString_UnknownStallKind_DoesNotPanic(t *testing.T) {
 		t.Error("expected a non-empty fallback string for an unrecognized StallKind")
 	}
 }
+
+func TestDisplayLabel_ExplicitName_WinsOverGoalAndProject(t *testing.T) {
+	l := Loop{Name: "bugfix loop", Project: "myproject", Goal: Goal{Text: "fix the flaky test"}}
+	if got := l.DisplayLabel(); got != "bugfix loop" {
+		t.Errorf("DisplayLabel() = %q, want the explicit name %q", got, "bugfix loop")
+	}
+}
+
+func TestDisplayLabel_BoundNoName_UsesGoalFirstLine(t *testing.T) {
+	l := Loop{Project: "myproject", Goal: Goal{Text: "fix the flaky test\nand keep coverage"}}
+	if got := l.DisplayLabel(); got != "fix the flaky test" {
+		t.Errorf("DisplayLabel() = %q, want the goal's first line %q", got, "fix the flaky test")
+	}
+}
+
+func TestDisplayLabel_GoalLeadingBlankLines_SkippedToFirstContent(t *testing.T) {
+	l := Loop{Project: "myproject", Goal: Goal{Text: "\n  \n  do the thing  \nrest"}}
+	if got := l.DisplayLabel(); got != "do the thing" {
+		t.Errorf("DisplayLabel() = %q, want %q (first NON-EMPTY line, trimmed)", got, "do the thing")
+	}
+}
+
+func TestDisplayLabel_UnboundLoop_FallsBackToProject(t *testing.T) {
+	l := Loop{Project: "myproject"}
+	if got := l.DisplayLabel(); got != "myproject" {
+		t.Errorf("DisplayLabel() = %q, want the project fallback %q", got, "myproject")
+	}
+}
+
+func TestDisplayLabel_WhitespaceOnlyGoal_FallsBackToProject(t *testing.T) {
+	// a goal that is all whitespace must not produce an empty label — the
+	// project fallback still applies.
+	l := Loop{Project: "myproject", Goal: Goal{Text: "  \n\t\n"}}
+	if got := l.DisplayLabel(); got != "myproject" {
+		t.Errorf("DisplayLabel() = %q, want %q (whitespace-only goal is no label)", got, "myproject")
+	}
+}

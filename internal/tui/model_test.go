@@ -237,8 +237,13 @@ func TestListRowWidths_NeverOverflows(t *testing.T) {
 // exact specified degradation order: as width shrinks, ORACLE
 // drops FIRST, then CYCLE, then LAST — never any other order, never two
 // dropped at once when dropping one alone would fit.
+//
+// feat/loop-display-name moved ORACLE/CYCLE's drop threshold from the
+// physical floor (listNameFloor) to the readability floor (nameGoodWidth)
+// — see listRowWidths' doc — so "full" here means "all three columns AND a
+// readable label"; LAST alone keeps the physical threshold.
 func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
-	full := wMarker + wState + wCycle + wOracle + wLast + listNameFloor
+	full := wMarker + wState + wCycle + wOracle + wLast + nameGoodWidth
 	_, showCycle, showOracle, showLast := listRowWidths(full)
 	if !showCycle || !showOracle || !showLast {
 		t.Fatalf("precondition failed: at full width want all three shown, got cycle=%v oracle=%v last=%v", showCycle, showOracle, showLast)
@@ -254,8 +259,8 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 		t.Errorf("got cycle=%v last=%v, want both still shown once only ORACLE was dropped", showCycle, showLast)
 	}
 
-	// narrow enough that ORACLE+CYCLE together don't fit — CYCLE goes
-	// next, LAST still survives alone.
+	// narrow enough that CYCLE can't keep the label readable either —
+	// CYCLE goes next, LAST still survives alone.
 	tight := wMarker + wState + wLast + listNameFloor
 	_, showCycle, showOracle, showLast = listRowWidths(tight)
 	if showOracle || showCycle {
@@ -269,6 +274,24 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	_, showCycle, showOracle, showLast = listRowWidths(wMarker + wState + listNameFloor - 1)
 	if showCycle || showOracle || showLast {
 		t.Errorf("got cycle=%v oracle=%v last=%v, want all three dropped at this width", showCycle, showOracle, showLast)
+	}
+}
+
+// TestListRowWidths_ReadabilityFloor_ProtectsLabelOverOracleCycle pins the
+// feature's own contract: at a width where everything WOULD physically fit
+// but only with a fragment-sized label, ORACLE/CYCLE yield their room to
+// NAME instead (the 100-col-terminal case: innerWidth 48 used to give
+// NAME 7).
+func TestListRowWidths_ReadabilityFloor_ProtectsLabelOverOracleCycle(t *testing.T) {
+	wName, showCycle, showOracle, showLast := listRowWidths(48)
+	if showOracle || showCycle {
+		t.Errorf("got cycle=%v oracle=%v, want both dropped in favor of a readable label", showCycle, showOracle)
+	}
+	if !showLast {
+		t.Error("showLast = false, want true (LAST keeps its physical-fit-only rule)")
+	}
+	if wName < nameGoodWidth {
+		t.Errorf("wName = %d, want >= nameGoodWidth (%d)", wName, nameGoodWidth)
 	}
 }
 
@@ -1259,10 +1282,11 @@ func TestUpdate_SpawnNote_SurfacesInStatusOnSubmit(t *testing.T) {
 	m, _ = updateModel(t, m, runeKey('n'))
 
 	m, _ = typeAndEnter(t, m, "goal") // step 1: goal
-	m, _ = typeAndEnter(t, m, "")     // step 2: done-when, skipped
-	m, _ = typeAndEnter(t, m, "")     // step 3: oracle, skipped
-	m, _ = typeAndEnter(t, m, "")     // step 4: challenger, skipped
-	m, cmd := typeAndEnter(t, m, "")  // step 5: max_iteration, default
+	m, _ = typeAndEnter(t, m, "")     // step 2: name, skipped
+	m, _ = typeAndEnter(t, m, "")     // step 3: done-when, skipped
+	m, _ = typeAndEnter(t, m, "")     // step 4: oracle, skipped
+	m, _ = typeAndEnter(t, m, "")     // step 5: challenger, skipped
+	m, cmd := typeAndEnter(t, m, "")  // step 6: max_iteration, default
 
 	if cmd == nil {
 		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
@@ -1296,17 +1320,18 @@ func TestUpdate_Esc_CancelsPromptingMode(t *testing.T) {
 }
 
 func TestUpdate_EscAtEachWizardStep_Cancels(t *testing.T) {
-	// esc must cancel the wizard regardless of which of the 5 steps is
+	// esc must cancel the wizard regardless of which of the 6 steps is
 	// currently active.
 	steps := []struct {
 		name    string
 		answers []string // typed+entered before esc
 	}{
 		{"step1_goal", nil},
-		{"step2_doneWhen", []string{"goal"}},
-		{"step3_oracle", []string{"goal", ""}},
-		{"step4_challenger", []string{"goal", "", ""}},
-		{"step5_maxCycles", []string{"goal", "", "", ""}},
+		{"step2_name", []string{"goal"}},
+		{"step3_doneWhen", []string{"goal", ""}},
+		{"step4_oracle", []string{"goal", "", ""}},
+		{"step5_challenger", []string{"goal", "", "", ""}},
+		{"step6_maxCycles", []string{"goal", "", "", "", ""}},
 	}
 	for _, s := range steps {
 		t.Run(s.name, func(t *testing.T) {
@@ -1353,10 +1378,11 @@ func TestWizard_FullFlow_AllStepsFilled(t *testing.T) {
 	m, _ = updateModel(t, m, runeKey('n'))
 
 	m, _ = typeAndEnter(t, m, "fix the bug")                // step 1: goal
-	m, _ = typeAndEnter(t, m, "tests pass")                 // step 2: done when
-	m, _ = typeAndEnter(t, m, "run go test ./...")          // step 3: oracle
-	m, _ = typeAndEnter(t, m, "try to break it with -race") // step 4: challenger
-	m, cmd := typeAndEnter(t, m, "20")                      // step 5: max cycles
+	m, _ = typeAndEnter(t, m, "bugfix loop")                // step 2: name
+	m, _ = typeAndEnter(t, m, "tests pass")                 // step 3: done when
+	m, _ = typeAndEnter(t, m, "run go test ./...")          // step 4: oracle
+	m, _ = typeAndEnter(t, m, "try to break it with -race") // step 5: challenger
+	m, cmd := typeAndEnter(t, m, "20")                      // step 6: max cycles
 
 	if m.mode != modeNormal {
 		t.Errorf("mode = %v, want modeNormal after the full wizard", m.mode)
@@ -1366,6 +1392,9 @@ func TestWizard_FullFlow_AllStepsFilled(t *testing.T) {
 	}
 	if m.spawnGoal != "fix the bug" {
 		t.Errorf("spawnGoal = %q, want %q", m.spawnGoal, "fix the bug")
+	}
+	if m.spawnName != "bugfix loop" {
+		t.Errorf("spawnName = %q, want %q", m.spawnName, "bugfix loop")
 	}
 	if m.spawnDoneWhen != "tests pass" {
 		t.Errorf("spawnDoneWhen = %q, want %q", m.spawnDoneWhen, "tests pass")
@@ -1386,9 +1415,10 @@ func TestWizard_DefaultsAtOptionalSteps(t *testing.T) {
 	m, _ = updateModel(t, m, runeKey('n'))
 
 	m, _ = typeAndEnter(t, m, "fix the bug") // step 1: goal (required)
-	m, _ = typeAndEnter(t, m, "")            // step 2: done when — skipped
-	m, _ = typeAndEnter(t, m, "")            // step 3: rubric — skipped
-	m, _ = typeAndEnter(t, m, "")            // step 4: challenger — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 2: name — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 3: done when — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 4: rubric — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 5: challenger — skipped
 
 	// each of steps 2-4 returns textinput.Blink (a non-nil cmd) to advance
 	// to the next question — only the mode/step, not cmd-nilness, indicates
@@ -1419,6 +1449,7 @@ func TestUpdate_NonNumericMaxCycles_RePromptsSameStep(t *testing.T) {
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
 
 	m, cmd := typeAndEnter(t, m, "not-a-number")
 
@@ -1440,6 +1471,7 @@ func TestUpdate_ZeroMaxCycles_RePromptsSameStep(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
 	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
@@ -1469,13 +1501,14 @@ func TestUpdate_TypeThenEnter_SubmitsSpawn(t *testing.T) {
 	// the returned cmd is textinput.Blink for the next question, not a spawn).
 	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if m.mode != modePrompting {
-		t.Fatalf("mode = %v, want modePrompting (4 more steps to go)", m.mode)
+		t.Fatalf("mode = %v, want modePrompting (5 more steps to go)", m.mode)
 	}
-	if m.spawnStep != wizardDoneWhen {
-		t.Fatalf("spawnStep = %v, want wizardDoneWhen", m.spawnStep)
+	if m.spawnStep != wizardName {
+		t.Fatalf("spawnStep = %v, want wizardName", m.spawnStep)
 	}
 
-	// steps 2-5 all skipped/defaulted — the LAST enter must submit.
+	// steps 2-6 all skipped/defaulted — the LAST enter must submit.
+	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
@@ -4837,6 +4870,7 @@ func TestWizardStepLabel_AllSteps(t *testing.T) {
 		{wizardDoneWhen, "complete condition:"},
 		{wizardRubric, "rubric:"},
 		{wizardChallenger, "challenger:"},
+		{wizardName, "name (fleet list label, optional):"},
 		{wizardMaxCycles, "max_iteration [12]:"},
 	}
 	for _, c := range cases {
@@ -4849,7 +4883,7 @@ func TestWizardStepLabel_AllSteps(t *testing.T) {
 // ── worktree spawn: wizardWhere step ─────────────────────────────────
 
 // reachWizardWhere drives the wizard from a fresh "n" keypress through all
-// 5 free-text steps (goal filled, the rest left empty/default) with
+// 6 free-text steps (goal filled, the rest left empty/default) with
 // worktree eligibility forced true, landing at wizardWhere. Used by every
 // wizardWhere test below so each one only has to exercise the final step.
 func reachWizardWhere(t *testing.T, m Model) Model {
@@ -4857,6 +4891,7 @@ func reachWizardWhere(t *testing.T, m Model) Model {
 	m, _ = updateModel(t, m, runeKey('n'))
 	m.spawnWorktreeEligible = true // simulate checkWorktreeEligibilityCmd's async result having already arrived
 	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
@@ -4874,6 +4909,7 @@ func TestWizard_SkipsWhereStep_WhenNotEligible(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
 	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
@@ -5006,6 +5042,7 @@ func reachWizardEngineDrive(t *testing.T, m Model) Model {
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
 	if m.mode != modePrompting || m.spawnStep != wizardEngineDrive {
 		t.Fatalf("precondition failed: mode=%v step=%v, want modePrompting at wizardEngineDrive", m.mode, m.spawnStep)
 	}
@@ -5033,6 +5070,7 @@ func TestWizard_EngineDisabled_NotEligible_SubmitsDirectly_ManualPathByteForByte
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
 	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
@@ -7489,5 +7527,71 @@ func TestWithoutDismissed_EmptySet_ReturnsInputUnchanged(t *testing.T) {
 	loops := m.withoutDismissed(m.loops)
 	if len(loops) != 2 {
 		t.Fatalf("got %d loops, want 2 — an empty dismissed set must filter nothing", len(loops))
+	}
+}
+
+// ── loop display labels in the FLEET panel (feat/loop-display-name) ──────
+//
+// The panel's whole point is answering "what is each loop doing" WITHOUT
+// opening DETAIL — so a bound loop's row must carry its display name or
+// goal text, not the project-dir label that forced exactly that detour.
+
+func TestFleetPanelLines_BoundLoopNoName_ShowsGoalText(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "myproject", SessionID: "s1", State: domain.StateRunning,
+			Goal: domain.Goal{Text: "fix the flaky auth test", MaxCycles: 12}},
+	}
+	m.cursor = 0
+
+	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
+	if !strings.Contains(joined, "fix the flaky auth") {
+		t.Errorf("expected the goal text as the row label, got:\n%s", joined)
+	}
+}
+
+func TestFleetPanelLines_ExplicitName_ShownInsteadOfGoal(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Name: "auth-bugfix", Project: "myproject", SessionID: "s1", State: domain.StateRunning,
+			Goal: domain.Goal{Text: "fix the flaky auth test", MaxCycles: 12}},
+	}
+	m.cursor = 0
+
+	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
+	if !strings.Contains(joined, "auth-bugfix") {
+		t.Errorf("expected the explicit display name as the row label, got:\n%s", joined)
+	}
+}
+
+// TestDuplicateLabels_SameProjectDifferentGoals_NotDuplicate: two loops in
+// the SAME repo pursuing DIFFERENT goals already read apart by their goal
+// labels — no session-id suffix needed (dup is keyed by DisplayLabel, not
+// Project).
+func TestDuplicateLabels_SameProjectDifferentGoals_NotDuplicate(t *testing.T) {
+	loops := []domain.Loop{
+		{Project: "backend", SessionID: "aaa1", Goal: domain.Goal{Text: "fix the auth bug"}},
+		{Project: "backend", SessionID: "bbb2", Goal: domain.Goal{Text: "add rate limiting"}},
+	}
+	dup := duplicateLabels(loops)
+	if dup["fix the auth bug"] || dup["add rate limiting"] {
+		t.Errorf("dup = %v, want neither goal-labeled loop marked duplicate", dup)
+	}
+}
+
+// TestFleetPanelLines_IdenticalLabels_StillDisambiguatedByShortID: the
+// session-id fragment remains as the LAST-RESORT disambiguator — two loops
+// whose labels truly collide must still be tellable apart.
+func TestFleetPanelLines_IdenticalLabels_StillDisambiguatedByShortID(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "backend", SessionID: "aaa1zzzz", State: domain.StateRunning, Goal: domain.Goal{Text: "fix the bug"}},
+		{Project: "backend", SessionID: "bbb2zzzz", State: domain.StateIdle, Goal: domain.Goal{Text: "fix the bug"}},
+	}
+	m.cursor = 0
+
+	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
+	if !strings.Contains(joined, "·aaa1") || !strings.Contains(joined, "·bbb2") {
+		t.Errorf("expected ·shortID suffixes on colliding labels, got:\n%s", joined)
 	}
 }

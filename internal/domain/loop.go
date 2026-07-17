@@ -2,7 +2,10 @@
 // objects that cross the seams, and the (future) ports. See DESIGN.md.
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // LoopState is where a loop sits in its lifecycle (DESIGN.md §3).
 type LoopState string
@@ -90,7 +93,7 @@ type Verdict struct {
 // LastActivity/Stall come from tailing the log (DESIGN.md, seed spec §Observe).
 type Loop struct {
 	ID           string
-	Name         string
+	Name         string // explicit human-given display name (wizard's "name" step, via registry.Record.Name); "" when none — see DisplayLabel
 	Goal         Goal
 	State        LoopState
 	Cycle        int
@@ -126,6 +129,34 @@ type Loop struct {
 	// driven==false clause already covers that pause with no extra code
 	// (see its doc).
 	Driven bool
+}
+
+// DisplayLabel is the loop's human-facing list label, in falling priority:
+// the explicit display name given at creation (Name), else the goal's first
+// line (a bound loop is best identified by WHAT it's doing), else the
+// project label (all an observed, never-bound session has). Truncation to a
+// column width stays with the renderer — this only picks WHICH text
+// identifies the loop.
+func (l Loop) DisplayLabel() string {
+	if l.Name != "" {
+		return l.Name
+	}
+	if line := firstLine(l.Goal.Text); line != "" {
+		return line
+	}
+	return l.Project
+}
+
+// firstLine is DisplayLabel's goal-text normalizer: the first non-empty
+// line, whitespace-trimmed — a multi-line goal's opening line is its best
+// one-row summary, and embedded newlines would corrupt a single-row layout.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // BudgetFrac is the fraction of the token budget consumed (0..1).
