@@ -57,6 +57,13 @@ var (
 	sessionsDirFn            = sessions.SessionsDir
 	historyDirFn             = events.HistoryDir
 	notifySendFn             = notify.Send
+	// controlResolveFn is control.Resolve by default — attachCmd's own seam
+	// (feat/engine-driver: the captain-mandated attach-preservation AC needs
+	// a regression test pinning that an OBSERVED loop's attach path calls
+	// Locate, never LocateClaude — control.Resolve() do real exec/Available
+	// probes, so attachCmd needed the same overridable-seam treatment every
+	// other actuation path above already has).
+	controlResolveFn = control.Resolve
 )
 
 type loopsMsg []domain.Loop
@@ -1047,9 +1054,16 @@ func manualResumeHint(sessionID string) string {
 // whichever multiplexer backend is available. Works for any loop state (not
 // just stalled) — "jump to it" is useful for a running loop too. Runs off
 // the event loop, same non-blocking pattern as resumeCmd.
+//
+// feat/engine-driver (captain-mandated AC, attach preservation): this is
+// the OBSERVED-loop path and it must NEVER regress across any engine
+// slice — Locate (not LocateClaude) on purpose, unchanged from before the
+// engine existed. An engine-driven loop (no terminal surface at all) is a
+// DIFFERENT path, added in a later slice as a take-over action, not a
+// change to this function. See TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude.
 func attachCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
-		ctrl, ok := control.Resolve()
+		ctrl, ok := controlResolveFn()
 		if !ok {
 			return attachResultMsg{false, "no orca/tmux/cmux — attach manually: " + manualAttachHint(l.Cwd)}
 		}
