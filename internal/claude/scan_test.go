@@ -868,6 +868,124 @@ func TestApplyLiveness_ZeroLiveProcesses_IdleDroppedStalledGone(t *testing.T) {
 	}
 }
 
+// ── LoopEngine MVP (feat/engine-cycle): dormancy exception ────────────────
+
+// TestApplyLiveness_DrivenIdle_RecentActivity_HeldDormant_NotDropped is
+// the dormancy exception's core case: a Driven loop between cycles has NO
+// live process by design (claude -p exits once each cycle finishes) — the
+// usual "no process backing this Idle loop → dropped" rule must not apply
+// to it. Held as Idle, still present in the fleet, not reclassified.
+func TestApplyLiveness_DrivenIdle_RecentActivity_HeldDormant_NotDropped(t *testing.T) {
+	loops := []domain.Loop{
+		{SessionID: "engine-1", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateIdle,
+			LastActivity: time.Now().Add(-2 * time.Minute), Driven: true},
+	}
+	live := map[string]int{} // no live process at all for this cwd
+
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (dormant, not dropped): %+v", len(out), out)
+	}
+	if out[0].State != domain.StateIdle {
+		t.Errorf("State = %v, want StateIdle (dormant, awaiting the engine's next drive)", out[0].State)
+	}
+	if out[0].Stall != domain.StallNone {
+		t.Errorf("Stall = %v, want StallNone", out[0].Stall)
+	}
+}
+
+// TestApplyLiveness_DrivenIdle_StaleActivity_BecomesStalledGone_NotDropped:
+// past drivenDormantStale with still no live process, a Driven loop is
+// presumed genuinely dead — NOT dropped (that would silently disappear a
+// truly stuck engine loop), but reclassified StateStalled/StallGone, the
+// SAME surfacing a non-driven presumed-dead loop already gets.
+func TestApplyLiveness_DrivenIdle_StaleActivity_BecomesStalledGone_NotDropped(t *testing.T) {
+	loops := []domain.Loop{
+		{SessionID: "engine-1", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateIdle,
+			LastActivity: time.Now().Add(-drivenDormantStale - time.Minute), Driven: true},
+	}
+	live := map[string]int{}
+
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1 (surfaced, not dropped): %+v", len(out), out)
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone — stale past drivenDormantStale", out[0].State, out[0].Stall)
+	}
+}
+
+// TestApplyLiveness_DrivenIdle_ExactlyAtStaleThreshold_StillDormant pins
+// the boundary: "<= drivenDormantStale" (not "<") is the held-dormant
+// condition — exactly at the threshold is still dormant, not yet stale.
+func TestApplyLiveness_DrivenIdle_ExactlyAtStaleThreshold_StillDormant(t *testing.T) {
+	// a SINGLE now reference for both the fixture's LastActivity and the
+	// call below — two separate time.Now() calls would let a few
+	// nanoseconds of real test-execution time push now.Sub(LastActivity)
+	// microscopically PAST drivenDormantStale, flaking exactly the
+	// boundary this test exists to pin.
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "engine-1", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateIdle,
+			LastActivity: now.Add(-drivenDormantStale), Driven: true},
+	}
+	live := map[string]int{}
+
+	out := applyLiveness(loops, live, true, t.TempDir(), now, ActiveWindow)
+
+	if len(out) != 1 || out[0].State != domain.StateIdle {
+		t.Errorf("got %+v, want StateIdle (still within the dormancy window)", out)
+	}
+}
+
+// TestApplyLiveness_DrivenLoopKilled_WinsOverDormancy: a human's kill
+// decision must win over the dormancy exception exactly like it already
+// wins over every other rule in this function (fix/killed-state) — a
+// Driven loop is no exception.
+func TestApplyLiveness_DrivenLoopKilled_WinsOverDormancy(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "engine-1",
+		Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "engine-1", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateIdle,
+			LastActivity: now.Add(-time.Minute), Driven: true},
+	}
+	live := map[string]int{}
+
+	out := applyLiveness(loops, live, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 || out[0].State != domain.StateKilled {
+		t.Errorf("got %+v, want StateKilled — a human kill wins over the dormancy exception", out)
+	}
+}
+
+// TestApplyLiveness_NonDrivenIdle_StillDroppedAsUsual is the coordinator's
+// explicit ask: confirm a NON-driven loop's liveness behavior is
+// byte-for-byte unchanged by the dormancy exception — same fixture shape
+// as the dormancy tests above (Idle, no live process), Driven simply
+// false, still dropped exactly like TestApplyLiveness_ZeroLiveProcesses_
+// IdleDroppedStalledGone already established.
+func TestApplyLiveness_NonDrivenIdle_StillDroppedAsUsual(t *testing.T) {
+	loops := []domain.Loop{
+		{SessionID: "observed-1", ProjectDir: "-x-dead", Cwd: "/x/dead", State: domain.StateIdle,
+			LastActivity: time.Now().Add(-2 * time.Minute), Driven: false},
+	}
+	live := map[string]int{}
+
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 0 {
+		t.Errorf("got %d loops, want 0 (dropped — the dormancy exception is Driven-only)", len(out))
+	}
+}
+
 func TestApplyLiveness_RunningPastLiveCount_BecomesGone(t *testing.T) {
 	// a process that just died mid-turn: JSONL still says "running" but
 	// there's no live process backing it once past the live count.

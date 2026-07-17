@@ -221,6 +221,14 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 	}
 }
 
+// drivenDormantStale bounds applyLiveness's LoopEngine dormancy exception
+// (see its doc): a Driven+Idle loop with no live process is held as
+// dormant for up to this long since its last activity — past it, presumed
+// genuinely dead (not merely resting between cycles) and surfaces as
+// StateStalled/StallGone like any other presumed-dead loop, so a truly
+// stuck engine loop is never silently invisible forever.
+const drivenDormantStale = 15 * time.Minute
+
 // applyLiveness cross-checks each loop against live `claude` CLI processes
 // in its cwd — the JSONL alone can't tell "waiting for human" (idle) from
 // "process dead" (terminal closed/crashed): both just stop writing. loops
@@ -252,13 +260,26 @@ func applyGovernor(l *domain.Loop, historyDir string) {
 // the pre-existing rules apply:
 //   - StateIdle (finished its turn, then the process went away) → dropped
 //     entirely: the loop ended cleanly, it's not part of the fleet anymore.
+//     EXCEPTION (LoopEngine MVP, docs/design-loop-engine-mvp.md §3): a
+//     Driven loop's headless bootstrap/cycle has NO live process BETWEEN
+//     turns by design (claude -p exits once each cycle finishes) — this
+//     drop rule would otherwise make an engine loop vanish from the fleet
+//     the instant each cycle's process exits. A Driven+Idle loop is held
+//     as dormant (State stays Idle, NOT dropped) instead, UNLESS it's gone
+//     quiet longer than drivenDormantStale — then it's presumed genuinely
+//     dead, not merely resting between cycles, and falls through to the
+//     SAME StateStalled/StallGone treatment as any other presumed-dead
+//     loop (never dropped either way, once Driven: dropping would let a
+//     truly stuck engine loop silently vanish instead of surfacing it).
 //   - StateDone / StateDrift (the oracle already rendered a verdict this
 //     cycle — see enrichFromRegistry) → left alone, dropped or demoted by
 //     neither rule: that's the terminal record of a judgment, not an
 //     incident, regardless of whether the terminal later closed.
 //   - anything else (StateStalled, or StateRunning past the live count —
 //     e.g. a process that just died mid-turn) → kept, reclassified
-//     StateStalled/StallGone: a mid-work death IS an incident.
+//     StateStalled/StallGone: a mid-work death IS an incident. Applies to
+//     Driven loops exactly the same as observed ones — the dormancy
+//     exception above is StateIdle-specific.
 //
 // Bonus: whenever a ProjectDir has ANY live process backing it (regardless
 // of which specific loop in the group that process belongs to), every loop
@@ -338,6 +359,14 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 			}
 			switch loops[i].State {
 			case domain.StateIdle:
+				if loops[i].Driven {
+					if now.Sub(loops[i].LastActivity) <= drivenDormantStale {
+						continue // dormant — held as Idle, awaiting the engine's next drive
+					}
+					loops[i].State = domain.StateStalled
+					loops[i].Stall = domain.StallGone
+					continue
+				}
 				drop[i] = true
 			case domain.StateDone, domain.StateDrift:
 				// oracle-judged and settled; leave as-is.

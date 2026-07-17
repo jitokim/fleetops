@@ -22,6 +22,7 @@ import (
 	"github.com/jitokim/missionctl/internal/claude"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/engine"
 	"github.com/jitokim/missionctl/internal/events"
 	"github.com/jitokim/missionctl/internal/gate"
 	"github.com/jitokim/missionctl/internal/notify"
@@ -410,7 +411,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// once per scan tick — see fleetOracleCountsCmd's own doc for why
 		// this doesn't reintroduce the per-render event-log read
 		// fix/exit-gate-ux just finished eliminating.
-		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd, detailCmd, fleetOracleCountsCmd(newLoops)}, autoRedriveCmds...)
+		//
+		// feat/engine-cycle: triggerDrives fires AFTER m.loops is already
+		// overwritten (line above) — same ordering triggerJudgments already
+		// relies on, and load-bearing for ShouldDrive's verdictFresh clause
+		// (see its doc): this scan's enrichFromRegistry has already
+		// promoted State/Last for anything that converged, so triggerDrives
+		// only ever sees the POST-scan picture, never a stale pre-scan one.
+		cmds := append([]tea.Cmd{m.triggerJudgments(), m.triggerDrives(), emitTransitionsCmd(transitions), gitCmd, detailCmd, fleetOracleCountsCmd(newLoops)}, autoRedriveCmds...)
 		return m, tea.Batch(cmds...)
 	case gitStatsMsg:
 		if m.gitStats == nil {
@@ -1756,6 +1764,96 @@ func (m *Model) triggerJudgments() tea.Cmd {
 		return nil
 	}
 	return tea.Batch(cmds...)
+}
+
+// ── LoopEngine MVP Slice 3: the cycle ────────────────────────────────────
+//
+// docs/design-loop-engine-mvp.md §5/§6; docs/specs/seed-loop-engine-mvp-
+// 2026-07-17.md. Standing spike discipline (captain decision, unchanged by
+// this slice): the engine is a governance harness, not an agent runtime —
+// this slice adds ONLY the drive-decision + drive-dispatch machinery
+// (mirroring triggerJudgments/judgeCmd's existing shape), no self-chaining
+// (design §8 non-goal — a drive fires at most once per 3s scan tick, the
+// SAME cadence triggerJudgments already has), no provenance badge, no
+// take-over attach (both Slice 4).
+
+// triggerDrives fires one driveCmd per Driven loop that engine.ShouldDrive
+// decides is due for its next cycle — mirrors triggerJudgments' shape
+// exactly: a per-session in-flight guard (here, the SAME m.actuating map
+// manual r/i and 429 auto-redrive already share — not a separate map, see
+// ShouldDrive's own doc for why joining that interlock is load-bearing),
+// batched into one tea.Batch.
+//
+// Gated by engineEnabledFn() FIRST, before touching m.loops at all — the
+// opt-in kill-switch (captain's standing discipline, gate #2 of 2: env
+// MISSIONCTL_ENGINE=1 AND the per-loop Driven flag, both required). Env
+// unset (or anything other than "1") means this returns nil immediately —
+// no drive EVER fires, regardless of how many loops are Driven=true.
+func (m *Model) triggerDrives() tea.Cmd {
+	if !engineEnabledFn() {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for _, l := range m.loops {
+		if !engine.ShouldDrive(l, l.Driven, m.actuating[l.SessionID]) {
+			continue
+		}
+		m.setActuating(l.SessionID)
+		cmds = append(cmds, driveCmd(l))
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// driveCmd fires ONE engine-driven cycle — a thin wrapper around redriveFn
+// (control.Redrive), mirroring autoRedrive429Cmd's shape exactly: load the
+// loop's contract, compose the prompt (engine.NextWorkPrompt, REUSED
+// verbatim from Slice 0/1 — the pure decision core, not reimplemented
+// here), emit the TriggerEngine/ActorAuto history event BEFORE dispatch
+// (so a cycle that never returns — a wedged claude — still leaves a
+// record it was ATTEMPTED), then send.
+//
+// REUSES resumeResultMsg verbatim — NOT a new message type, per the
+// captain's exact instruction. The SAME Update handler that already
+// clears m.actuating for a manual r/i does exactly what an engine cycle's
+// completion needs: clear the interlock (so the NEXT scan tick's
+// triggerDrives — or a human's r/i — can act on this session again),
+// surface the result in the status line. No engine-specific handler.
+//
+// registry.Load happens INSIDE this closure, not synchronously in
+// triggerDrives/Update — same off-the-render-path discipline this file
+// established for gitStatsCmd/detailCacheCmd/fleetOracleCountsCmd (a
+// registry record read is real disk I/O, same class of thing those fixes
+// were about). ok=false (no record found — shouldn't happen for a Driven
+// loop, since Driven implies bound, but defensive) skips the redrive
+// entirely rather than composing a prompt from a zero-value contract.
+func driveCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		contract, ok := registry.Load(registryDirFn(), l.SessionID)
+		if !ok {
+			return resumeResultMsg{sessionID: l.SessionID, ok: false,
+				text: fmt.Sprintf("engine: %s has no registry record — cycle skipped", l.Project)}
+		}
+		prompt := engine.NextWorkPrompt(l, contract)
+		_ = events.Append(historyDirFn(), events.Event{
+			TS:        time.Now().UnixNano(),
+			SessionID: l.SessionID,
+			FromState: l.StateString(),
+			ToState:   l.StateString(),
+			Trigger:   events.TriggerEngine,
+			Detail:    fmt.Sprintf("cycle %d", l.Cycle),
+			Actor:     events.ActorAuto,
+		})
+		err := redriveFn(l.SessionID, prompt)
+		if err != nil {
+			return resumeResultMsg{sessionID: l.SessionID, ok: false,
+				text: fmt.Sprintf("engine: cycle %d failed — %v", l.Cycle, err)}
+		}
+		return resumeResultMsg{sessionID: l.SessionID, ok: true,
+			text: fmt.Sprintf("engine: cycle %d — %s", l.Cycle, slugFromGoal(l.Goal.Text, 24))}
+	}
 }
 
 // judgeCmd asks the oracle to verdict a bound loop's progress against its

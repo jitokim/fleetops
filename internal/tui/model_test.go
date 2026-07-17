@@ -15,6 +15,7 @@ import (
 	"github.com/jitokim/missionctl/internal/claude"
 	"github.com/jitokim/missionctl/internal/control"
 	"github.com/jitokim/missionctl/internal/domain"
+	"github.com/jitokim/missionctl/internal/engine"
 	"github.com/jitokim/missionctl/internal/events"
 	"github.com/jitokim/missionctl/internal/registry"
 	"github.com/jitokim/missionctl/internal/sessions"
@@ -6140,5 +6141,347 @@ func TestBootstrapEngineCmd_ReusesBuildSpawnPromptVerbatim(t *testing.T) {
 	want := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 	if gotPrompt != want {
 		t.Errorf("prompt sent to claude -p was NOT buildSpawnPrompt's output:\ngot:  %q\nwant: %q", gotPrompt, want)
+	}
+}
+
+// ── LoopEngine MVP Slice 3: triggerDrives / driveCmd (the cycle) ─────────
+//
+// docs/design-loop-engine-mvp.md §5/§6. These tests exercise the TWO-GATE
+// opt-in (engineEnabledFn() env kill-switch AND per-loop Driven) and the
+// fail-closed drive predicate at the INTEGRATION level — engine.ShouldDrive
+// itself already has an exhaustive pure truth table in
+// internal/engine/driver_test.go; what's new here is proving triggerDrives
+// actually wires that predicate up correctly (kill-switch short-circuit
+// before ANY loop is even considered, the shared m.actuating interlock,
+// driveCmd's exact event/status/prompt shape).
+
+// engineDriveReadyLoop is a loop that is eligible for a drive under every
+// clause of engine.ShouldDrive: Driven, StateIdle, governor Continue (no
+// ceilings set), and a FRESH verdict (Last.AtCycle == Cycle) — the
+// baseline every fail-closed test below starts from and then breaks
+// exactly one clause of.
+func engineDriveReadyLoop() domain.Loop {
+	return domain.Loop{
+		SessionID: "sess-1",
+		Project:   "aboard",
+		State:     domain.StateIdle,
+		Cycle:     2,
+		Driven:    true,
+		Last:      &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 2},
+		Goal:      domain.Goal{Text: "ship it"},
+	}
+}
+
+func TestTriggerDrives_KillSwitchOff_NoDriveEverFires(t *testing.T) {
+	withEngineEnabled(t, false)
+	m := New()
+	m.loops = []domain.Loop{engineDriveReadyLoop()} // otherwise perfectly eligible
+
+	cmd := m.triggerDrives()
+
+	if cmd != nil {
+		t.Error("expected nil cmd — the env kill-switch must block every drive, even for a fully-eligible Driven loop")
+	}
+	if m.actuating["sess-1"] {
+		t.Error("expected no in-flight guard set — triggerDrives must not touch m.loops at all when the kill-switch is off")
+	}
+}
+
+func TestTriggerDrives_KillSwitchOn_EligibleLoop_DispatchesDriveCmd(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	m.loops = []domain.Loop{engineDriveReadyLoop()}
+
+	cmd := m.triggerDrives()
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil batch cmd for a fully-eligible Driven loop")
+	}
+	if !m.actuating["sess-1"] {
+		t.Error("expected sess-1 marked in-flight (m.actuating) after dispatch")
+	}
+}
+
+func TestTriggerDrives_NotDriven_NoDispatch(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	l := engineDriveReadyLoop()
+	l.Driven = false
+	m.loops = []domain.Loop{l}
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — a non-Driven loop must never be engine-drivable, even with the kill-switch on")
+	}
+	if m.actuating["sess-1"] {
+		t.Error("expected no in-flight guard set for a non-Driven loop")
+	}
+}
+
+// TestTriggerDrives_StateGate_NeverDrives_NoApprovePath is the coordinator's
+// explicit fail-closed review-bar test: a live permission prompt / gate must
+// NEVER be driven past by the engine — it has no approve path, by
+// construction (engine.ShouldDrive's notGated clause). Proven here at the
+// triggerDrives integration level, not just ShouldDrive's own pure table.
+func TestTriggerDrives_StateGate_NeverDrives_NoApprovePath(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	l := engineDriveReadyLoop()
+	l.State = domain.StateGate
+	m.loops = []domain.Loop{l}
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — StateGate must never be driven; the engine has no approve path")
+	}
+	if m.actuating["sess-1"] {
+		t.Error("expected no in-flight guard set for a gated loop")
+	}
+}
+
+func TestTriggerDrives_BudgetExhausted_GovernorStop_NoDispatch(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	l := engineDriveReadyLoop()
+	l.Goal.BudgetTokens = 1000
+	l.TokensSpent = 1000 // exhausted
+	m.loops = []domain.Loop{l}
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — budget exhausted means governor Escalate, no drive")
+	}
+}
+
+func TestTriggerDrives_MaxCyclesReached_GovernorEscalate_NoDispatch(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	l := engineDriveReadyLoop()
+	l.Goal.MaxCycles = 2
+	l.Cycle = 2 // reached
+	l.Last = &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 2}
+	m.loops = []domain.Loop{l}
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — max cycles reached means governor Escalate, no drive (surfaces to human)")
+	}
+}
+
+func TestTriggerDrives_NoImproveAtLimit_GovernorStop_NoDispatch(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	l := engineDriveReadyLoop()
+	l.Goal.NoImproveLimit = 3
+	l.NoImprove = 3 // at limit
+	m.loops = []domain.Loop{l}
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — no-improve ceiling hit means governor Stop, no drive")
+	}
+}
+
+func TestTriggerDrives_StaleVerdict_RacesAheadOfJudge_NoDispatch(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	l := engineDriveReadyLoop()
+	l.Cycle = 3
+	l.Last = &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 2} // stale — cycle 3 not yet judged
+	m.loops = []domain.Loop{l}
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — a stale (unjudged) verdict must never let the engine race ahead of the judge")
+	}
+}
+
+// TestTriggerDrives_ManualActuationInFlight_BlocksEngineDrive is interlock
+// proof, direction 1: a manual r/i already in flight (m.actuating set
+// BEFORE triggerDrives runs, as if a human just pressed r/i on this exact
+// session) must block the engine from also driving it this tick.
+func TestTriggerDrives_ManualActuationInFlight_BlocksEngineDrive(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := New()
+	m.loops = []domain.Loop{engineDriveReadyLoop()}
+	m.actuating = map[string]bool{"sess-1": true} // simulate a manual r/i already in flight
+
+	if cmd := m.triggerDrives(); cmd != nil {
+		t.Error("expected nil cmd — a manual actuation already in flight on this session must block the engine drive")
+	}
+}
+
+// TestTriggerDrives_SetsActuating_BlocksSubsequentManualInject is interlock
+// proof, direction 2: once triggerDrives dispatches a drive (setting
+// m.actuating), a human's SUBSEQUENT "i" keypress on the SAME session must
+// be refused by the EXISTING "already re-driving" guard — proving the
+// engine and manual actuation share the same interlock map bidirectionally,
+// not two independent mechanisms that happen to look similar.
+func TestTriggerDrives_SetsActuating_BlocksSubsequentManualInject(t *testing.T) {
+	withEngineEnabled(t, true)
+	m := modelWithOneLoop()
+	l := engineDriveReadyLoop()
+	l.SessionID = "sess-1" // matches modelWithOneLoop's fixture session, so m.selected() targets the same loop
+	m.loops = []domain.Loop{l}
+
+	cmd := m.triggerDrives()
+	if cmd == nil {
+		t.Fatal("expected a non-nil cmd — precondition: the engine must actually dispatch a drive first")
+	}
+	if !m.actuating["sess-1"] {
+		t.Fatal("expected sess-1 marked in-flight after the engine's drive — precondition for this test")
+	}
+
+	m, cmd = updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected nil cmd — a manual inject must be refused while the engine's drive is in flight")
+	}
+	if !strings.Contains(m.status, "already re-driving") {
+		t.Errorf("status = %q, want the already-re-driving message — the engine and manual actuation must share one interlock", m.status)
+	}
+}
+
+// TestDriveCmd_Success_EmitsEventAndReturnsResumeResultMsg confirms
+// driveCmd's full happy path in one place: the prompt sent to redriveFn is
+// EXACTLY engine.NextWorkPrompt's output (reused verbatim, not
+// reimplemented), a TriggerEngine/ActorAuto history event lands BEFORE
+// dispatch, and the returned resumeResultMsg's status text matches the
+// coordinator's exact spec: "engine: cycle N — <goal-slug>".
+func TestDriveCmd_Success_EmitsEventAndReturnsResumeResultMsg(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir, origRedrive := registryDirFn, historyDirFn, redriveFn
+	defer func() { registryDirFn, historyDirFn, redriveFn = origRegDir, origHistoryDir, origRedrive }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+
+	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", DoneCondition: "tests pass", Rubric: "run the suite", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	var gotSessionID, gotPrompt string
+	redriveFn = func(sessionID, prompt string) error {
+		gotSessionID, gotPrompt = sessionID, prompt
+		return nil
+	}
+
+	l := engineDriveReadyLoop()
+	contract, _ := registry.Load(registryDir, "sess-1")
+	wantPrompt := engine.NextWorkPrompt(l, contract)
+
+	msg := driveCmd(l)()
+
+	if gotSessionID != "sess-1" {
+		t.Errorf("redriveFn sessionID = %q, want sess-1", gotSessionID)
+	}
+	if gotPrompt != wantPrompt {
+		t.Errorf("redriveFn prompt was NOT engine.NextWorkPrompt's output:\ngot:  %q\nwant: %q", gotPrompt, wantPrompt)
+	}
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg (REUSED, not a new message type)", msg)
+	}
+	if !rm.ok {
+		t.Errorf("ok = false, want true: %q", rm.text)
+	}
+	wantText := "engine: cycle 2 — ship-it"
+	if rm.text != wantText {
+		t.Errorf("text = %q, want %q", rm.text, wantText)
+	}
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want exactly 1", len(evs))
+	}
+	if evs[0].Trigger != events.TriggerEngine || evs[0].Actor != events.ActorAuto {
+		t.Errorf("event = %+v, want Trigger=TriggerEngine Actor=ActorAuto", evs[0])
+	}
+	if evs[0].Detail != "cycle 2" {
+		t.Errorf("Detail = %q, want %q", evs[0].Detail, "cycle 2")
+	}
+}
+
+func TestDriveCmd_NoRegistryRecord_GracefulFailure(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir, origRedrive := registryDirFn, historyDirFn, redriveFn
+	defer func() { registryDirFn, historyDirFn, redriveFn = origRegDir, origHistoryDir, origRedrive }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+	redriveCalled := false
+	redriveFn = func(sessionID, prompt string) error { redriveCalled = true; return nil }
+
+	l := engineDriveReadyLoop() // no matching registry.Bind for sess-1
+
+	msg := driveCmd(l)()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("ok = true, want false — no registry record means the cycle must be skipped, not sent with a zero-value contract")
+	}
+	if redriveCalled {
+		t.Error("redriveFn must not be called when there's no registry record")
+	}
+}
+
+func TestDriveCmd_RedriveError_ReturnsFailureResult(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir, origRedrive := registryDirFn, historyDirFn, redriveFn
+	defer func() { registryDirFn, historyDirFn, redriveFn = origRegDir, origHistoryDir, origRedrive }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+
+	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	redriveFn = func(sessionID, prompt string) error { return errTestJudgeFailed }
+
+	msg := driveCmd(engineDriveReadyLoop())()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("ok = true, want false — redriveFn returned an error")
+	}
+	if !strings.Contains(rm.text, "cycle 2 failed") {
+		t.Errorf("text = %q, want it to mention the failed cycle", rm.text)
+	}
+}
+
+// TestDriveCmd_ResumeResultMsg_ClearsActuating confirms the EXISTING
+// resumeResultMsg Update handler (unchanged by this slice, reused verbatim
+// per the captain's exact instruction) correctly clears m.actuating when
+// the message originated from an engine-driven cycle, not just a manual
+// r/i — the whole point of reusing the message type rather than adding a
+// new one.
+func TestDriveCmd_ResumeResultMsg_ClearsActuating(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir, origRedrive := registryDirFn, historyDirFn, redriveFn
+	defer func() { registryDirFn, historyDirFn, redriveFn = origRegDir, origHistoryDir, origRedrive }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	redriveFn = func(sessionID, prompt string) error { return nil }
+
+	m := New()
+	m.actuating = map[string]bool{"sess-1": true}
+
+	msg := driveCmd(engineDriveReadyLoop())()
+	m, _ = updateModel(t, m, msg)
+
+	if m.actuating["sess-1"] {
+		t.Error("expected m.actuating cleared after the driveCmd result lands, via the existing resumeResultMsg handler")
+	}
+	if m.statusKind != statusOK {
+		t.Errorf("statusKind = %v, want statusOK", m.statusKind)
 	}
 }

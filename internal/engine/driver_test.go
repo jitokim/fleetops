@@ -10,6 +10,15 @@ import (
 
 // ── ShouldDrive: the fail-closed truth table ────────────────────────────
 
+// freshVerdict builds a Verdict judged at exactly atCycle — the shape
+// every non-freshness-focused case below needs so it exercises ONLY the
+// clause its name describes, not accidentally passing/failing on the
+// verdictFresh clause (feat/engine-cycle) instead. Dedicated freshness
+// cases (nil Last, stale AtCycle) live in their own test below.
+func freshVerdict(atCycle int) *domain.Verdict {
+	return &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: atCycle}
+}
+
 func TestShouldDrive_TruthTable(t *testing.T) {
 	baseGoal := domain.Goal{BudgetTokens: 1000, MaxCycles: 10, NoImproveLimit: 3}
 
@@ -21,95 +30,137 @@ func TestShouldDrive_TruthTable(t *testing.T) {
 		want     bool
 	}{
 		{
-			name:   "idle + driven + governor continue → drive",
-			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 100, Cycle: 2, NoImprove: 0},
+			name:   "idle + driven + governor continue + fresh verdict → drive",
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 100, Cycle: 2, NoImprove: 0, Last: freshVerdict(2)},
 			driven: true,
 			want:   true,
 		},
 		{
 			name:   "not driven → never drive, even if otherwise eligible",
-			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: false,
 			want:   false,
 		},
 		{
 			name:     "in flight → never drive (interlock)",
-			l:        domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:        domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven:   true,
 			inFlight: true,
 			want:     false,
 		},
 		{
 			name:   "StateGate → never drive (the fail-closed heart: no approve path)",
-			l:      domain.Loop{State: domain.StateGate, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateGate, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "StateRunning → never drive (turn already in flight)",
-			l:      domain.Loop{State: domain.StateRunning, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateRunning, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "StateStalled → never drive (surfaced to human, no auto-recovery here)",
-			l:      domain.Loop{State: domain.StateStalled, Stall: domain.StallNoOutput, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateStalled, Stall: domain.StallNoOutput, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "StateDone (terminal) → never drive",
-			l:      domain.Loop{State: domain.StateDone, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateDone, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "StateFailed (terminal) → never drive",
-			l:      domain.Loop{State: domain.StateFailed, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateFailed, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "StateKilled (terminal) → never drive",
-			l:      domain.Loop{State: domain.StateKilled, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateKilled, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "StateDrift → never drive (idle only; DRIFT needs a human's guided re-drive, not the engine)",
-			l:      domain.Loop{State: domain.StateDrift, Goal: baseGoal, TokensSpent: 100, Cycle: 2},
+			l:      domain.Loop{State: domain.StateDrift, Goal: baseGoal, TokensSpent: 100, Cycle: 2, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 2}},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "governor Stop (no-improve at limit) → never drive",
-			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, NoImprove: 3},
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, Cycle: 2, NoImprove: 3, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "governor Escalate (budget exhausted) → never drive",
-			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, TokensSpent: 1000},
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, Cycle: 2, TokensSpent: 1000, Last: freshVerdict(2)},
 			driven: true,
 			want:   false,
 		},
 		{
 			name:   "governor Escalate (max cycles reached) → never drive",
-			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, Cycle: 10},
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, Cycle: 10, Last: freshVerdict(10)},
 			driven: true,
 			want:   false,
 		},
 		{
-			name:   "zero ceilings (unbound-style Goal) → governor never blocks; idle+driven drives",
-			l:      domain.Loop{State: domain.StateIdle, Goal: domain.Goal{}, TokensSpent: 999999, Cycle: 999999},
+			name:   "zero ceilings (unbound-style Goal) → governor never blocks; idle+driven+fresh drives",
+			l:      domain.Loop{State: domain.StateIdle, Goal: domain.Goal{}, TokensSpent: 999999, Cycle: 999999, Last: freshVerdict(999999)},
 			driven: true,
 			want:   true,
+		},
+		{
+			name:   "no verdict at all (cycle just finished, unjudged) → never drive — must not race ahead of the judge",
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, Cycle: 1, Last: nil},
+			driven: true,
+			want:   false,
+		},
+		{
+			name:   "stale verdict (AtCycle < Cycle) → never drive — the loop has moved on since that judgment",
+			l:      domain.Loop{State: domain.StateIdle, Goal: baseGoal, Cycle: 3, Last: freshVerdict(2)},
+			driven: true,
+			want:   false,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if got := ShouldDrive(c.l, c.driven, c.inFlight); got != c.want {
+				t.Errorf("ShouldDrive(...) = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestShouldDrive_VerdictFreshness isolates the freshness clause
+// (feat/engine-cycle) with a dedicated table, independent of
+// TestShouldDrive_TruthTable's broader sweep — the design doc §6 guard
+// this PR adds: "the engine waits for the CURRENT cycle's oracle verdict
+// before driving the next — it never races ahead of the judge."
+func TestShouldDrive_VerdictFreshness(t *testing.T) {
+	goal := domain.Goal{BudgetTokens: 1000, MaxCycles: 10, NoImproveLimit: 3}
+	base := domain.Loop{State: domain.StateIdle, Goal: goal, Cycle: 5}
+
+	cases := []struct {
+		name string
+		last *domain.Verdict
+		want bool
+	}{
+		{"nil (never judged)", nil, false},
+		{"stale (AtCycle < Cycle)", &domain.Verdict{AtCycle: 4}, false},
+		{"fresh (AtCycle == Cycle)", &domain.Verdict{AtCycle: 5}, true},
+		{"AtCycle > Cycle (shouldn't happen, but defensive — not an exact match)", &domain.Verdict{AtCycle: 6}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := base
+			l.Last = c.last
+			if got := ShouldDrive(l, true, false); got != c.want {
 				t.Errorf("ShouldDrive(...) = %v, want %v", got, c.want)
 			}
 		})
