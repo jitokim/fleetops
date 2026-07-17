@@ -1785,6 +1785,26 @@ func TestUpdate_RKey_AmbiguousSharedDir_Refuses(t *testing.T) {
 	}
 }
 
+// TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable pins Bug 2's Option
+// B honesty fix: the ambiguity refusal is reached specifically because none
+// of the loops sharing this directory has a session-registry tty (see
+// ttyPathPlausible's doc — a registry tty would have routed through the
+// session-unique Tier 1a path instead of ever reaching this cwd-based
+// guard). The message must name the actual fix (`fleetops hooks install`),
+// not just the manual-attach workaround.
+func TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if !strings.Contains(m.status, "session-registry tty") {
+		t.Errorf("status = %q, want it to explain no session has a registry tty", m.status)
+	}
+	if !strings.Contains(m.status, "fleetops hooks install") {
+		t.Errorf("status = %q, want it to point at the actual fix (fleetops hooks install)", m.status)
+	}
+}
+
 func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
 	// the counterpart case: exactly one loop shares this directory, so the
 	// guard must NOT refuse.
@@ -2463,6 +2483,66 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 	rm, ok := msg.(resumeResultMsg)
 	if !ok || !rm.ok {
 		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+}
+
+// TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy pins Bug 2's
+// Option B honesty fix: a non-StallGone loop that downgrades from Tier 1 to
+// Tier 2 (couldn't disambiguate the on-screen session — the common case with
+// N>1 sessions sharing a cwd on a backend with no per-session tty dispatch,
+// e.g. cmux/orca) must say WHY in its success message, not reuse StallGone's
+// plain "output lands in the transcript" text — the human is watching a
+// terminal window that may not visibly update.
+func TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false // backend resolved, but no surface located
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject"} // Stall is zero-value, i.e. NOT StallGone
+
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+	if !strings.Contains(rm.text, "couldn't target the on-screen session unambiguously") {
+		t.Errorf("text = %q, want it to explain the Tier 1→2 downgrade", rm.text)
+	}
+	if !strings.Contains(rm.text, "may not appear in the open window") {
+		t.Errorf("text = %q, want it to warn the open window may not update", rm.text)
+	}
+}
+
+// TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText proves the
+// downgrade explanation above is scoped to the non-StallGone case only — a
+// StallGone loop's Tier 2 re-drive is its NORMAL path (there's no on-screen
+// session to fail to disambiguate: the process is simply gone), so it must
+// keep the original plain message, not the new "couldn't target
+// unambiguously" wording (which would be misleading here).
+func TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			t.Fatal("resolveActuationTargetFn must not be called for a StallGone loop")
+			return nil, control.Target{}, false, false
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", Stall: domain.StallGone}
+
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+	if strings.Contains(rm.text, "couldn't target the on-screen session unambiguously") {
+		t.Errorf("text = %q, StallGone's normal Tier 2 path must not use the downgrade wording", rm.text)
+	}
+	if !strings.Contains(rm.text, "output lands in the transcript") {
+		t.Errorf("text = %q, want the original plain Tier 2 message", rm.text)
 	}
 }
 
