@@ -243,7 +243,11 @@ func TestTmuxInterruptCmd(t *testing.T) {
 
 func TestTmuxNewWindowCmd(t *testing.T) {
 	got := tmuxNewWindowCmd("/home/user/myproject")
-	want := []string{"tmux", "new-window", "-c", "/home/user/myproject", "-P", "-F", "#{pane_id}", "claude"}
+	// -d keeps the new window in the background so spawning a loop never yanks
+	// the cockpit's own tmux client off the cockpit and into the new session
+	// (the "creating a loop auto-jumps into attach" hijack). Unlike
+	// OpenTerminal (take-over), which stays focused on purpose.
+	want := []string{"tmux", "new-window", "-d", "-c", "/home/user/myproject", "-P", "-F", "#{pane_id}", "claude"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -252,6 +256,27 @@ func TestTmuxNewWindowCmd(t *testing.T) {
 			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// TestTmuxNewWindowCmd_IsDetached pins the specific anti-hijack property
+// independently of exact arg order: Spawn's new-window MUST carry -d, and
+// OpenTerminal's must NOT (take-over intentionally focuses the session).
+func TestTmuxNewWindowCmd_IsDetached(t *testing.T) {
+	if !containsArg(tmuxNewWindowCmd("/x"), "-d") {
+		t.Error("Spawn's tmux new-window must be detached (-d) so it doesn't hijack the cockpit into the new session")
+	}
+	if containsArg(tmuxOpenTerminalCmd("/x", "claude --resume s"), "-d") {
+		t.Error("take-over's OpenTerminal must NOT be detached — the human asked to jump into the session")
+	}
+}
+
+func containsArg(argv []string, arg string) bool {
+	for _, a := range argv {
+		if a == arg {
+			return true
+		}
+	}
+	return false
 }
 
 // feat/engine-provenance: OpenTerminal's argv — generalized from

@@ -343,6 +343,102 @@ func TestLocateCmuxClaude_NoCwdMatch_NotFound(t *testing.T) {
 	}
 }
 
+// --- locateCmuxByTTY (Bug 2, Option A: tty-dispatch, control.TTYLocator) ---
+//
+// cmux's tree --json already carries a per-surface tty directly (verified
+// live on cmux 0.64.15 — see cmuxSurfaceTTY), unlike orca (confirmed live:
+// `orca terminal list --json`/`terminal show --json` carry no tty or pid
+// field at all). This is what lets cmuxController implement TTYLocator.
+
+func TestLocateCmuxByTTY_MatchesByTTYRegardlessOfSharedCwd(t *testing.T) {
+	// The Bug 2 fixture: two DISTINCT sessions (ttys008, ttys009) share the
+	// exact same cwd — the many-to-one hazard domain.EncodeCwd's own doc
+	// warns about. LocateByTTY must dispatch by the session-unique tty,
+	// never caring that the cwd collides between them.
+	resolve := stubResolver(map[string]ttyResolution{
+		"ttys008": {cwd: "/home/user/myproject", hasClaude: true},
+		"ttys009": {cwd: "/home/user/myproject", hasClaude: true},
+	})
+	got, ok := locateCmuxByTTY(parseCmuxTree(realCmuxTree(t)), "ttys009", resolve)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	want := Target{Backend: "cmux", ID: "surface:22", Cwd: "/home/user/myproject", Window: "window:1"}
+	if got != want {
+		t.Errorf("got %+v, want %+v (must pick the ttys009 surface, not ttys008's, despite the shared cwd)", got, want)
+	}
+
+	// And the SAME shared-cwd fixture must resolve the OTHER tty to the
+	// OTHER surface — proving this isn't a coincidental single match.
+	got2, ok := locateCmuxByTTY(parseCmuxTree(realCmuxTree(t)), "ttys008", resolve)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got2.ID != "surface:15" {
+		t.Errorf("got ID %q, want surface:15 (ttys008's surface)", got2.ID)
+	}
+}
+
+func TestLocateCmuxByTTY_NoClaudeAttached_NotFound(t *testing.T) {
+	// A bare shell on this tty — must not be handed back as an actuation
+	// target (same reasoning as LocateClaude vs the permissive Locate).
+	resolve := stubResolver(map[string]ttyResolution{
+		"ttys008": {cwd: "/home/user/myproject", hasClaude: false},
+	})
+	if _, ok := locateCmuxByTTY(parseCmuxTree(realCmuxTree(t)), "ttys008", resolve); ok {
+		t.Error("expected ok=false — no claude process attached to this tty")
+	}
+}
+
+func TestLocateCmuxByTTY_NoTTYMatch_NotFound(t *testing.T) {
+	resolve := stubResolver(map[string]ttyResolution{
+		"ttys008": {cwd: "/home/user/myproject", hasClaude: true},
+	})
+	if _, ok := locateCmuxByTTY(parseCmuxTree(realCmuxTree(t)), "ttys999", resolve); ok {
+		t.Error("expected ok=false — no surface has this tty")
+	}
+}
+
+func TestLocateCmuxByTTY_NormalizesDevPrefix(t *testing.T) {
+	// The session registry may store either the bare form or ps's raw
+	// "/dev/ttys008" form (see normalizeTTY) — both sides must normalize
+	// symmetrically, same as tmuxController.LocateByTTY.
+	resolve := stubResolver(map[string]ttyResolution{
+		"ttys008": {cwd: "/home/user/myproject", hasClaude: true},
+	})
+	got, ok := locateCmuxByTTY(parseCmuxTree(realCmuxTree(t)), "/dev/ttys008", resolve)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got.ID != "surface:15" {
+		t.Errorf("got ID %q, want surface:15", got.ID)
+	}
+}
+
+func TestLocateCmuxByTTY_SameTTYTwoSurfaces_ReturnsOne(t *testing.T) {
+	// Mirrors TestLocateCmuxClaude_SameTTYTwoSurfaces_NotAmbiguous: surface:50
+	// and surface:9 both report ttys012 (the same pty listed twice) — any one
+	// is a correct answer, not a refusal.
+	resolve := stubResolver(map[string]ttyResolution{
+		"ttys012": {cwd: "/home/user/team", hasClaude: true},
+	})
+	got, ok := locateCmuxByTTY(parseCmuxTree(realCmuxTree(t)), "ttys012", resolve)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got.ID != "surface:50" {
+		t.Errorf("got ID %q, want surface:50 (first surface on ttys012)", got.ID)
+	}
+}
+
+// TestCmuxController_ImplementsTTYLocator pins that cmuxController satisfies
+// control.TTYLocator (a compile-time-checkable fact, but asserted here too so
+// a future refactor that accidentally breaks the interface fails a test, not
+// just silently loses ResolveActuationTarget's Tier 1a dispatch for cmux).
+func TestCmuxController_ImplementsTTYLocator(t *testing.T) {
+	var _ TTYLocator = cmuxController{}
+}
+
 // --- ps / lsof parsing + tty resolution ---
 
 func TestParseCmuxPsRows_FiltersTTYsAndDetectsClaudeAndForeground(t *testing.T) {

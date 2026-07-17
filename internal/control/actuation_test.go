@@ -143,6 +143,71 @@ func TestResolveActuationTarget_InvalidSessionID_TreatedAsNoEntry(t *testing.T) 
 	}
 }
 
+// --- tierOneA: dispatch to whichever resolved backend implements TTYLocator ---
+//
+// Bug 2 (Option A): ResolveActuationTarget used to hardcode tmuxController{}
+// for Tier 1a regardless of which backend Resolve() actually picked. These
+// tests pin the generalized "type-assert the RESOLVED backend" behavior
+// against fake Controllers, independent of which real multiplexer binaries
+// (if any) happen to be installed on the test machine.
+
+// fakeControllerNoTTY implements control.Controller only — no TTYLocator —
+// the shape orcaController has today (confirmed live: orca's terminal
+// list/show JSON carries no tty/pid field at all).
+type fakeControllerNoTTY struct{}
+
+func (fakeControllerNoTTY) Name() string                       { return "fake-no-tty" }
+func (fakeControllerNoTTY) Available() bool                    { return true }
+func (fakeControllerNoTTY) Locate(string) (Target, bool)       { return Target{}, false }
+func (fakeControllerNoTTY) LocateClaude(string) (Target, bool) { return Target{}, false }
+func (fakeControllerNoTTY) Resume(Target, string) error        { return nil }
+func (fakeControllerNoTTY) Focus(Target) error                 { return nil }
+func (fakeControllerNoTTY) Approve(Target) error               { return nil }
+func (fakeControllerNoTTY) Spawn(string, string) error         { return nil }
+func (fakeControllerNoTTY) Interrupt(Target) error             { return nil }
+
+// fakeControllerWithTTY implements Controller AND TTYLocator — the shape
+// cmuxController has (tty is already exposed directly in `tree --json`).
+type fakeControllerWithTTY struct {
+	fakeControllerNoTTY
+	locateByTTYCalled string // last tty passed in
+	target            Target
+	ok                bool
+}
+
+func (f *fakeControllerWithTTY) Name() string { return "fake-with-tty" }
+func (f *fakeControllerWithTTY) LocateByTTY(tty string) (Target, bool) {
+	f.locateByTTYCalled = tty
+	return f.target, f.ok
+}
+
+func TestTierOneA_ResolvedImplementsTTYLocator_Dispatches(t *testing.T) {
+	want := Target{Backend: "fake-with-tty", ID: "surface:1"}
+	f := &fakeControllerWithTTY{target: want, ok: true}
+
+	got, ok := tierOneA(f, "ttys012")
+
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	if f.locateByTTYCalled != "ttys012" {
+		t.Errorf("LocateByTTY called with %q, want ttys012", f.locateByTTYCalled)
+	}
+}
+
+func TestTierOneA_ResolvedDoesNotImplementTTYLocator_ReturnsNotFound(t *testing.T) {
+	// orca's real shape today: Controller without TTYLocator. Must degrade
+	// gracefully (never panic on the failed type assertion) so
+	// ResolveActuationTarget falls through to Tier 1b.
+	_, ok := tierOneA(fakeControllerNoTTY{}, "ttys012")
+	if ok {
+		t.Error("expected ok=false — resolved backend doesn't implement TTYLocator")
+	}
+}
+
 func TestRedriveArgv(t *testing.T) {
 	got := redriveArgv("sess-abc123", "do the thing")
 	want := []string{"claude", "--resume", "sess-abc123", "-p", "do the thing", "--output-format", "json"}

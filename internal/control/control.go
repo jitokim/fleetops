@@ -148,6 +148,30 @@ type TerminalOpener interface {
 	OpenTerminal(cwd, command string) error
 }
 
+// TTYLocator is another OPTIONAL capability (same shape/reasoning as
+// WorktreeSpawner/TerminalOpener — narrow interface, not a Controller
+// method): locate a live terminal surface by its OS-level controlling tty,
+// the ADR Phase 2 Tier 1a dispatch path (see actuation.go's
+// ResolveActuationTarget). tty is session-unique where cwd is many-to-one
+// (domain.EncodeCwd's own doc) — this is what lets N sessions sharing one
+// worktree/cwd still target the RIGHT one instead of refusing on ambiguity
+// or silently downgrading to Tier 2's headless re-drive.
+//
+// Only a backend whose CLI actually exposes a per-terminal tty (or data
+// resolvable to one, e.g. cmux's tree carries tty directly; see cmux.go's
+// LocateByTTY) can implement this — verified per-backend, never assumed.
+// orca's `terminal list`/`terminal show --json` schema carries NO tty or
+// pid field at all (confirmed live against a running orca instance, see
+// docs/adr-vendor-independent-actuation.md §4's honesty ledger), so
+// orcaController deliberately does NOT implement TTYLocator today. tmux
+// implements it (tmuxController.LocateByTTY, pre-existing). Callers
+// type-assert (same pattern as ctrl.(WorktreeSpawner)/ctrl.(TerminalOpener))
+// and fall back to the cwd-based LocateClaude chain when the resolved
+// backend doesn't support it.
+type TTYLocator interface {
+	LocateByTTY(tty string) (Target, bool)
+}
+
 // Resolve returns the first available controller: orca preferred (the
 // user's own environment), cmux then tmux as fallbacks; ok is false if
 // none of the three backends is available.

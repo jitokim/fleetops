@@ -110,6 +110,14 @@ const (
 // worktreePath + title (spawnTitle, or a Claude-Code-prefixed title if the
 // TUI already relabeled it) via a fresh `terminal list`, rather than
 // trusting the handle create returned.
+//
+// Bug 1 (new-loop auto-jumps into attach) — NO FIX NEEDED here, verified
+// live: `orca terminal create --help` documents "Creates a visible terminal
+// tab without switching focus when possible; falls back to a background
+// handle if the UI cannot adopt it. Pass --focus to switch to it." This call
+// deliberately never passes --focus, so it's already the orca analog of
+// tmux's Spawn `-d` fix (see tmux.go's tmuxNewWindowCmd) — spawning a loop
+// here does not steal the cockpit's focus by orca's own documented default.
 func (orcaController) Spawn(cwd, goal string) error {
 	ctxCreate, cancelCreate := context.WithTimeout(context.Background(), spawnCreateTimeout)
 	defer cancelCreate()
@@ -218,6 +226,11 @@ const spawnWorktreeTimeout = 15 * time.Second
 // tell the human it landed in a SHARED directory, not a fresh isolated one
 // (see the tui's spawnCmd, which compares the returned path against
 // repoCwd to decide the status message).
+//
+// Bug 1 — NO FIX NEEDED here either, same reasoning as Spawn above: `orca
+// worktree create --help` documents "By default this creates the worktree
+// and its first terminal without switching the active Orca view"; --activate
+// is the opt-in flag that WOULD reveal it, and this call never passes it.
 func (orcaController) SpawnWorktree(repoCwd, name, prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), spawnWorktreeTimeout)
 	defer cancel()

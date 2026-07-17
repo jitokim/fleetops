@@ -957,10 +957,10 @@ func TestRenderHeaderBlock_HintGridPresentAtThreshold(t *testing.T) {
 
 // TestHeaderHintKeys_GroupedByFunction pins fix/exit-gate-ux item 7's
 // reordering: column-major fill groups send actions (r/i/a), lifecycle
-// (n/k/p), nav (↵/o//), and quit (q) into adjacent cells — see
-// headerHintKeys' doc for the grouping rationale.
+// (n/k/p), nav (↵/o//), and session housekeeping (q/d) into adjacent
+// cells — see headerHintKeys' doc for the grouping rationale.
 func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
-	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q"}
+	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q", "d"}
 	if len(headerHintKeys) != len(want) {
 		t.Fatalf("got %d keys, want %d", len(headerHintKeys), len(want))
 	}
@@ -977,7 +977,7 @@ func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
 // have dropped anything.
 func TestRenderHeaderHintGrid_AllKeysPresent_NothingRegressed(t *testing.T) {
 	out := renderHeaderHintGrid(4, 4*headerHintColWidth)
-	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q"} {
+	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q", "d"} {
 		if !strings.Contains(out, "<"+k+">") {
 			t.Errorf("expected hint grid to contain key %q, got:\n%s", k, out)
 		}
@@ -1785,6 +1785,26 @@ func TestUpdate_RKey_AmbiguousSharedDir_Refuses(t *testing.T) {
 	}
 }
 
+// TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable pins Bug 2's Option
+// B honesty fix: the ambiguity refusal is reached specifically because none
+// of the loops sharing this directory has a session-registry tty (see
+// ttyPathPlausible's doc — a registry tty would have routed through the
+// session-unique Tier 1a path instead of ever reaching this cwd-based
+// guard). The message must name the actual fix (`fleetops hooks install`),
+// not just the manual-attach workaround.
+func TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if !strings.Contains(m.status, "session-registry tty") {
+		t.Errorf("status = %q, want it to explain no session has a registry tty", m.status)
+	}
+	if !strings.Contains(m.status, "fleetops hooks install") {
+		t.Errorf("status = %q, want it to point at the actual fix (fleetops hooks install)", m.status)
+	}
+}
+
 func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
 	// the counterpart case: exactly one loop shares this directory, so the
 	// guard must NOT refuse.
@@ -2463,6 +2483,66 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 	rm, ok := msg.(resumeResultMsg)
 	if !ok || !rm.ok {
 		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+}
+
+// TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy pins Bug 2's
+// Option B honesty fix: a non-StallGone loop that downgrades from Tier 1 to
+// Tier 2 (couldn't disambiguate the on-screen session — the common case with
+// N>1 sessions sharing a cwd on a backend with no per-session tty dispatch,
+// e.g. cmux/orca) must say WHY in its success message, not reuse StallGone's
+// plain "output lands in the transcript" text — the human is watching a
+// terminal window that may not visibly update.
+func TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false // backend resolved, but no surface located
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject"} // Stall is zero-value, i.e. NOT StallGone
+
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+	if !strings.Contains(rm.text, "couldn't target the on-screen session unambiguously") {
+		t.Errorf("text = %q, want it to explain the Tier 1→2 downgrade", rm.text)
+	}
+	if !strings.Contains(rm.text, "may not appear in the open window") {
+		t.Errorf("text = %q, want it to warn the open window may not update", rm.text)
+	}
+}
+
+// TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText proves the
+// downgrade explanation above is scoped to the non-StallGone case only — a
+// StallGone loop's Tier 2 re-drive is its NORMAL path (there's no on-screen
+// session to fail to disambiguate: the process is simply gone), so it must
+// keep the original plain message, not the new "couldn't target
+// unambiguously" wording (which would be misleading here).
+func TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			t.Fatal("resolveActuationTargetFn must not be called for a StallGone loop")
+			return nil, control.Target{}, false, false
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", Stall: domain.StallGone}
+
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+	if strings.Contains(rm.text, "couldn't target the on-screen session unambiguously") {
+		t.Errorf("text = %q, StallGone's normal Tier 2 path must not use the downgrade wording", rm.text)
+	}
+	if !strings.Contains(rm.text, "output lands in the transcript") {
+		t.Errorf("text = %q, want the original plain Tier 2 message", rm.text)
 	}
 }
 
@@ -7084,10 +7164,81 @@ func TestIsDemoBlockedKey(t *testing.T) {
 			t.Errorf("isDemoBlockedKey(%q) = false, want true", key)
 		}
 	}
-	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c"}
+	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c", "d"}
 	for _, key := range allowed {
 		if isDemoBlockedKey(key) {
 			t.Errorf("isDemoBlockedKey(%q) = true, want false", key)
 		}
+	}
+}
+
+// ── "d" dismiss: hide a loop from the fleet list (view-state only) ───────
+
+func TestUpdate_DKey_DismissesSelectedLoop(t *testing.T) {
+	m := modelWithTwoLoops()
+
+	m, cmd := updateModel(t, m, runeKey('d'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — dismiss is pure view-state")
+	}
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops = %+v, want only sess-2 left", m.loops)
+	}
+	if !m.dismissed["sess-1"] {
+		t.Error("expected sess-1 recorded in the dismissed set")
+	}
+	if !strings.Contains(m.status, "dismissed myproject") {
+		t.Errorf("status = %q, want a dismissed-myproject message", m.status)
+	}
+}
+
+func TestUpdate_DKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
+	m := New()
+
+	m, cmd := updateModel(t, m, runeKey('d'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an empty fleet")
+	}
+	if !strings.Contains(m.status, "select a loop to dismiss") {
+		t.Errorf("status = %q, want the select-a-loop refusal", m.status)
+	}
+}
+
+func TestUpdate_DKey_LastRow_ClampsCursor(t *testing.T) {
+	m := modelWithTwoLoops()
+	m.cursor = 1
+
+	m, _ = updateModel(t, m, runeKey('d'))
+
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-1" {
+		t.Fatalf("loops = %+v, want only sess-1 left", m.loops)
+	}
+	if m.cursor != 0 {
+		t.Errorf("cursor = %d, want 0 (clamped onto the remaining row)", m.cursor)
+	}
+}
+
+func TestUpdate_LoopsMsg_DoesNotResurrectDismissed(t *testing.T) {
+	m := modelWithTwoLoops()
+	m, _ = updateModel(t, m, runeKey('d')) // dismiss sess-1
+
+	rescan := loopsMsg{
+		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	m, _ = updateModel(t, m, rescan)
+
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops after rescan = %+v, want sess-1 still hidden", m.loops)
+	}
+}
+
+func TestWithoutDismissed_EmptySet_ReturnsInputUnchanged(t *testing.T) {
+	m := modelWithTwoLoops()
+	loops := m.withoutDismissed(m.loops)
+	if len(loops) != 2 {
+		t.Fatalf("got %d loops, want 2 — an empty dismissed set must filter nothing", len(loops))
 	}
 }

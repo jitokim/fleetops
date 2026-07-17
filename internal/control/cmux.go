@@ -123,6 +123,17 @@ func cmuxFocusCmd(surfaceRef, windowRef string) []string {
 // claude hasn't been verified against the real cmux CLI (unlike the other
 // actions here, which at least have a plausible/partially-verified
 // contract). Fail explicitly rather than guess at a create-surface command.
+//
+// Bug 1 note for whoever implements this: cmux's own CLI source (inspected
+// directly — no `cmux` binary was installed on the machine this was
+// investigated on, so this is NOT live-verified the way the rest of this
+// file's "verified live" comments are) shows `new-workspace`/`new-surface`/
+// `new-pane` all carrying a `--focus <true|false>` flag, defaulting
+// (per the same source) to NOT switching focus — i.e. the cmux analog of
+// tmux's `-d` fix (tmux.go's tmuxNewWindowCmd) may already be a non-issue by
+// default here too, same shape as orca's Spawn (see orca.go). Re-verify
+// against a real cmux instance before relying on this when Spawn gets
+// implemented.
 func (cmuxController) Spawn(cwd, goal string) error {
 	return fmt.Errorf("spawn not supported on cmux yet")
 }
@@ -231,6 +242,47 @@ func locateCmuxClaude(jsonBytes []byte, projectDir string, resolve ttyResolver) 
 	}
 	for _, t := range firstByTTY {
 		return t, true
+	}
+	return Target{}, false
+}
+
+// LocateByTTY finds the cmux surface whose controlling tty matches tty (as
+// recorded by the session registry, e.g. "ttys012") AND has a live claude
+// process attached — the ADR Phase 2 tty-dispatch path (see
+// ResolveActuationTarget and control.TTYLocator). cmux's `tree --json`
+// already carries a per-surface tty directly (verified live on cmux
+// 0.64.15 — see cmuxSurfaceTTY/parseCmuxTree's doc), so this reuses the
+// SAME liveResolveCmuxTTYs cross-reference locateCmuxClaude already uses to
+// confirm a live claude process is attached — a bare tty match alone isn't
+// enough (the tty could be hosting a plain shell, same reasoning as
+// LocateClaude vs Locate). tty is session-unique (unlike cwd), so — same as
+// tmuxController.LocateByTTY — this does NOT apply the cwd-path's ambiguity
+// refusal: at most one live surface can have a given controlling tty at any
+// moment.
+func (cmuxController) LocateByTTY(tty string) (Target, bool) {
+	out, err := cmuxTreeJSON()
+	if err != nil {
+		return Target{}, false
+	}
+	return locateCmuxByTTY(parseCmuxTree(out), tty, liveResolveCmuxTTYs)
+}
+
+// locateCmuxByTTY is LocateByTTY's pure selection core, pulled out so the
+// tty-matching logic is directly unit-testable against a fixture without a
+// real cmux binary (same pattern as locateCmux/locateCmuxClaude). Multiple
+// surfaces can share one tty (the SAME pty listed as more than one surface
+// ref, verified live — see locateCmuxClaude's doc); any one of them is a
+// correct answer, so the first tty+claude match wins.
+func locateCmuxByTTY(surfaces []cmuxSurface, tty string, resolve ttyResolver) (Target, bool) {
+	want := normalizeTTY(tty)
+	res := resolve(ttysOfSurfaces(surfaces))
+	for _, s := range surfaces {
+		if normalizeTTY(s.tty) != want {
+			continue
+		}
+		if r, ok := res[s.tty]; ok && r.hasClaude {
+			return Target{Backend: "cmux", ID: s.ref, Cwd: r.cwd, Window: s.window}, true
+		}
 	}
 	return Target{}, false
 }

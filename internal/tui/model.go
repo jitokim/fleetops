@@ -304,6 +304,14 @@ type Model struct {
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
+	// dismissed is the "d" key's hide-set: sessionID -> hidden from the
+	// fleet list. In-memory only (same lifetime trade as notifiedAt) — a
+	// fleetops restart brings every dismissed loop back. The loopsMsg
+	// handler filters each scan's result through this set BEFORE
+	// detectTransitions, so a dismissed loop neither reappears on rescan
+	// nor keeps firing gate/gone notifications from off-screen.
+	dismissed map[string]bool
+
 	// injectTarget is the loop a modeInjecting prompt will be sent to,
 	// snapshotted at "i" keypress time — NOT re-resolved from m.selected() at
 	// submit time, because the fleet list can rescan (and reorder) while the
@@ -593,7 +601,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case loopsMsg:
-		newLoops := []domain.Loop(msg)
+		newLoops := m.withoutDismissed([]domain.Loop(msg))
 		now := time.Now()
 		transitions, autoRedriveCmds := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
 		m.loops = newLoops
@@ -1155,6 +1163,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.status, m.statusKind = fmt.Sprintf("stopping %s...", sel.Project), statusNeutral
 			return m, interruptCmd(sel)
+		case "d":
+			// Dismiss: hide the selected loop from the fleet list. Pure
+			// view-state — never touches the session, its process, or disk
+			// (which is also why it isn't demo-blocked), unlike its k/p
+			// neighbors. See Model.dismissed for the rescan/notification
+			// semantics.
+			sel, ok := m.selected()
+			if !ok {
+				m.status, m.statusKind = "select a loop to dismiss", statusNeutral
+				return m, nil
+			}
+			if m.dismissed == nil {
+				m.dismissed = make(map[string]bool)
+			}
+			m.dismissed[sel.SessionID] = true
+			m.loops = m.withoutDismissed(m.loops)
+			if m.cursor >= len(m.visibleLoops()) {
+				m.cursor = maxInt(0, len(m.visibleLoops())-1)
+			}
+			m.status, m.statusKind = fmt.Sprintf("dismissed %s — hidden until restart", sel.Project), statusNeutral
 		}
 	case resumeResultMsg:
 		if m.actuating != nil {
@@ -1308,6 +1336,20 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
 		logActuationEvent(l, action, "tier2", true, "")
+		if l.Stall != domain.StallGone {
+			// Bug 2 (Option B, honesty fix): this branch is a DOWNGRADE, not
+			// StallGone's normal Tier-2 path — Tier 1 either found no
+			// backend or (most commonly, with N>1 sessions sharing a cwd on
+			// a backend with no per-session tty dispatch, e.g. cmux/orca —
+			// see docs/adr-vendor-independent-actuation.md §4 and
+			// ResolveActuationTarget's doc) couldn't disambiguate which
+			// on-screen session was meant, so it fell through to the
+			// headless re-drive instead of silently claiming success in the
+			// open window. Say so, rather than reusing StallGone's plain
+			// "output lands in the transcript" message — the human is
+			// watching a terminal that may not visibly update.
+			return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — couldn't target the on-screen session unambiguously; output lands in the transcript but may not appear in the open window", l.Project)}
+		}
 		return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)}
 	}
 }
@@ -2694,7 +2736,14 @@ func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 	if n <= 1 {
 		return "", false
 	}
-	return fmt.Sprintf("ambiguous: %d loops share %s's directory — attach (↵) and act manually", n, l.Project), true
+	// Bug 2 (Option B, honesty fix): this refusal is reached specifically
+	// because l had no usable session-registry tty (ttyPathPlausible was
+	// false — see its own doc) AND the cwd-based Tier 1b fallback can't
+	// disambiguate N sessions sharing one directory. Tell the human the
+	// actual fix (install the hooks so this session gets a tty entry, which
+	// makes Tier 1a session-unique — see docs/adr-vendor-independent-actuation.md
+	// §2.1), not just the manual-attach workaround.
+	return fmt.Sprintf("ambiguous: %d loops share %s's directory, none has a session-registry tty — attach (↵) or run `fleetops hooks install` so injects can target by session", n, l.Project), true
 }
 
 // sameProjectDirCount counts how many loops in the current fleet (not just
@@ -2752,6 +2801,23 @@ func (m *Model) setActuating(sessionID string) {
 		m.actuating = make(map[string]bool)
 	}
 	m.actuating[sessionID] = true
+}
+
+// withoutDismissed drops every loop the "d" key has hidden this session —
+// applied both at dismiss-keypress time (prune m.loops in place) and to each
+// scan's fresh result in the loopsMsg handler (so a rescan can't resurrect
+// a dismissed loop). See Model.dismissed.
+func (m Model) withoutDismissed(loops []domain.Loop) []domain.Loop {
+	if len(m.dismissed) == 0 {
+		return loops
+	}
+	out := make([]domain.Loop, 0, len(loops))
+	for _, l := range loops {
+		if !m.dismissed[l.SessionID] {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // visibleLoops is what the table/cursor/actions operate on: all loops, or
@@ -3178,12 +3244,13 @@ func headerGateBadgeLineAbbrev(gated, stalled int) string {
 // coincidence of position: col0 = send-into-the-loop (r/i/a — resume,
 // inject, approve all push some decision/prompt at the loop), col1 =
 // lifecycle (n/k/p — start, kill, stop), col2 = nav/view (↵/o// — attach,
-// view log, filter), col3 = quit (alone).
+// view log, filter), col3 = session housekeeping (q quit, d dismiss —
+// appended after the pinned groups so none of them reshuffle).
 var headerHintKeys = []struct{ key, action string }{
 	{"r", "resume"}, {"i", "inject"}, {"a", "approve"},
 	{"n", "new"}, {"k", "kill"}, {"p", "stop"},
 	{"↵", "attach"}, {"o", "log"}, {"/", "filter"},
-	{"q", "quit"},
+	{"q", "quit"}, {"d", "dismiss"},
 }
 
 // headerHintColWidth is one hint grid column's width (the task's "~14
