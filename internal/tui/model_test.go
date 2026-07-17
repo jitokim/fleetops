@@ -2291,22 +2291,261 @@ func TestUpdate_IKey_NoSelection_ShowsStatus(t *testing.T) {
 	}
 }
 
-func TestUpdate_IKey_AmbiguousSharedDir_Refuses(t *testing.T) {
+// TestUpdate_IKey_AmbiguousSharedDir_StalledLoop_EntersInjectingModeForHeadlessFallback
+// pins feat/inject-headless-exact-fallback: a STALLED loop is on
+// injectHeadlessFallbackEligible's allowlist, so an ambiguous cwd (no
+// session-registry tty — e.g. orca, which has no CLI tty/tab-by-session
+// mapping at all) no longer dead-ends here. The human can still type a
+// prompt; sendPromptCmd's existing Tier1→Tier2 fallthrough (unchanged)
+// routes it to the exact session_id via headless redrive — see
+// TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy for the
+// resulting status message. This test supersedes the old
+// TestUpdate_IKey_AmbiguousSharedDir_Refuses (same fixture is StateStalled
+// by default) — see TestUpdate_IKey_AmbiguousSharedDir_RunningLoop_StillRefuses
+// immediately below for the negative case that's still refused.
+func TestUpdate_IKey_AmbiguousSharedDir_StalledLoop_EntersInjectingModeForHeadlessFallback(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir() // both loops StateStalled by default
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (textinput.Blink) — a stalled loop is eligible for the headless fallback, must not refuse")
+	}
+	if m.mode != modeInjecting {
+		t.Errorf("mode = %v, want modeInjecting", m.mode)
+	}
+	if m.statusKind == statusErr {
+		t.Errorf("statusKind = %v, want not statusErr (must not be refused)", m.statusKind)
+	}
+}
+
+// TestUpdate_IKey_AmbiguousSharedDir_RunningLoop_StillRefuses pins the
+// NEGATIVE case of the same feature: a RUNNING loop is NOT on
+// injectHeadlessFallbackEligible's allowlist (a live mid-turn `claude
+// --resume` risks conflicting with/forking the transcript — see its doc),
+// so an ambiguous cwd still dead-ends exactly as before this feature.
+func TestUpdate_IKey_AmbiguousSharedDir_RunningLoop_StillRefuses(t *testing.T) {
 	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].State = domain.StateRunning
+	m.loops[1].State = domain.StateRunning
+	// Defense in depth: redriveFn must never even be REACHABLE for this
+	// case — cmd==nil already proves nothing was dispatched, but fail loudly
+	// if some future change accidentally wires a path to it anyway.
+	origRedrive := redriveFn
+	t.Cleanup(func() { redriveFn = origRedrive })
+	redriveFn = func(sessionID, prompt string) error {
+		t.Fatal("redriveFn must not be called — a running loop must never get the headless fallback")
+		return nil
+	}
 
 	m, cmd := updateModel(t, m, runeKey('i'))
 
 	if cmd != nil {
-		t.Error("expected no tea.Cmd — ambiguous target must refuse before entering inject mode")
+		t.Error("expected no tea.Cmd — a running loop must never get the headless fallback")
 	}
 	if m.mode != modeNormal {
-		t.Errorf("mode = %v, want modeNormal (ambiguous target must not enter inject mode)", m.mode)
+		t.Errorf("mode = %v, want modeNormal (ambiguous running loop must not enter inject mode)", m.mode)
 	}
 	if m.statusKind != statusErr {
 		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
 	}
 	if !strings.Contains(m.status, "ambiguous") {
 		t.Errorf("status = %q, want it to mention the ambiguity", m.status)
+	}
+}
+
+// TestUpdate_IKey_StalledAmbiguous_FullRoundTrip_RoutesToExactSessionIDHeadlessly
+// is feat/inject-headless-exact-fallback's end-to-end proof: press i on an
+// ambiguous STALLED loop (no session-registry tty — the orca case), type a
+// prompt, submit, and verify the dispatched injectCmd actually re-drives the
+// SELECTED loop's EXACT session_id (never its sibling's) via control.Redrive,
+// and the resulting status names that exact session as a background turn.
+func TestUpdate_IKey_StalledAmbiguous_FullRoundTrip_RoutesToExactSessionIDHeadlessly(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir() // both StateStalled, share ProjectDir, no tty entries — cursor 0 = sess-1
+	var tier1Called bool
+	var redriveSessionID, redrivePrompt string
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			tier1Called = true
+			return nil, control.Target{}, true, false // backend resolves but can't disambiguate — the orca/cwd-chain outcome
+		},
+		func(sessionID, prompt string) error {
+			redriveSessionID, redrivePrompt = sessionID, prompt
+			return nil
+		},
+	)
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting", m.mode)
+	}
+
+	m, cmd = typeAndEnter(t, m, "run the tests again")
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (injectCmd)")
+	}
+
+	msg := cmd()
+	m, _ = updateModel(t, m, msg)
+
+	if !tier1Called {
+		t.Error("expected Tier 1 to have been attempted (and to have failed to disambiguate) before falling to Tier 2")
+	}
+	if redriveSessionID != "sess-1" {
+		t.Errorf("redriveFn called with sessionID %q, want %q (the SELECTED loop's exact session_id, not a guess)", redriveSessionID, "sess-1")
+	}
+	if redrivePrompt != "run the tests again" {
+		t.Errorf("redriveFn called with prompt %q, want the typed prompt", redrivePrompt)
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful resumeResultMsg", msg)
+	}
+	if rm.sessionID != "sess-1" {
+		t.Errorf("resumeResultMsg.sessionID = %q, want %q", rm.sessionID, "sess-1")
+	}
+	if !strings.Contains(m.status, "background turn") {
+		t.Errorf("status = %q, want the background-turn notice", m.status)
+	}
+	if !strings.Contains(m.status, shortID("sess-1")) {
+		t.Errorf("status = %q, want it to name the exact session %s", m.status, shortID("sess-1"))
+	}
+}
+
+// TestUpdate_IKey_ResolvableInPlace_FullRoundTrip_UsesTierOneNotHeadless is
+// the unchanged-behavior pin: when Tier 1 CAN resolve a target (an
+// unambiguous single loop, or the tty path), inject still goes in-place —
+// the headless fallback is reached ONLY when Tier 1 genuinely can't
+// disambiguate, never as a shortcut around a resolvable target.
+func TestUpdate_IKey_ResolvableInPlace_FullRoundTrip_UsesTierOneNotHeadless(t *testing.T) {
+	m := modelWithOneLoop() // single loop — not ambiguous, so the eligibility gate is never even consulted
+	ctrl := &fakeController{name: "orca"}
+	var redriveCalled bool
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return ctrl, control.Target{Backend: "orca", ID: "term_1"}, true, true
+		},
+		func(sessionID, prompt string) error { redriveCalled = true; return nil },
+	)
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting", m.mode)
+	}
+
+	m, cmd = typeAndEnter(t, m, "keep going")
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (injectCmd)")
+	}
+	msg := cmd()
+	m, _ = updateModel(t, m, msg)
+
+	if !ctrl.resumeCalled {
+		t.Error("expected Tier 1's ctrl.Resume to have been called — a resolvable target must go in-place")
+	}
+	if redriveCalled {
+		t.Error("expected redriveFn NOT to be called — Tier 1 resolved, headless fallback must not fire")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || !rm.ok {
+		t.Fatalf("got %+v, want a successful in-place resumeResultMsg", msg)
+	}
+	if !strings.Contains(rm.text, "via orca") {
+		t.Errorf("text = %q, want the in-place success message naming the backend", rm.text)
+	}
+	if !strings.Contains(m.status, "injected into") || !strings.Contains(m.status, "via orca") {
+		t.Errorf("status = %q, want the in-place success status text (not the headless-fallback wording)", m.status)
+	}
+}
+
+// modelWithThreeOrcaLoopsSharingWorktree models the real motivating case for
+// this feature: orca has no CLI tty/tab-by-session mapping at all
+// (confirmed live — see docs/adr-vendor-independent-actuation.md §4 and
+// orcaController's deliberate lack of a TTYLocator implementation), so three
+// sessions sharing one worktree can never be disambiguated via a
+// session-registry tty — only via this feature's exact-session_id headless
+// fallback (for the eligible ones) or a dead-end refusal (for the rest).
+func modelWithThreeOrcaLoopsSharingWorktree() Model {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "orca-repo", SessionID: "orca-sess-1", ProjectDir: "-x-orca-repo", Cwd: "/x/orca-repo", CwdVerified: true, State: domain.StateIdle},
+		{Project: "orca-repo", SessionID: "orca-sess-2", ProjectDir: "-x-orca-repo", Cwd: "/x/orca-repo", CwdVerified: true, State: domain.StateStalled},
+		{Project: "orca-repo", SessionID: "orca-sess-3", ProjectDir: "-x-orca-repo", Cwd: "/x/orca-repo", CwdVerified: true, State: domain.StateRunning},
+	}
+	m.cursor = 0
+	return m
+}
+
+// TestUpdate_IKey_OrcaThreeSessionsOneWorktree_IdleSelected_RoutesHeadlessly
+// exercises the orca-flavored fixture's ELIGIBLE case (idle) end-to-end.
+func TestUpdate_IKey_OrcaThreeSessionsOneWorktree_IdleSelected_RoutesHeadlessly(t *testing.T) {
+	m := modelWithThreeOrcaLoopsSharingWorktree() // cursor 0 = orca-sess-1, StateIdle
+	var redriveSessionID string
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false // orca resolves as a backend, but the 3-way cwd match can't disambiguate (LocateClaude's own >1 refusal)
+		},
+		func(sessionID, prompt string) error { redriveSessionID = sessionID; return nil },
+	)
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting (idle is eligible for the fallback)", m.mode)
+	}
+
+	_, cmd = typeAndEnter(t, m, "keep going")
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (injectCmd)")
+	}
+	cmd()
+
+	if redriveSessionID != "orca-sess-1" {
+		t.Errorf("redriveFn called with sessionID %q, want the SELECTED loop's exact id %q (not orca-sess-2 or orca-sess-3)", redriveSessionID, "orca-sess-1")
+	}
+}
+
+// TestUpdate_IKey_OrcaThreeSessionsOneWorktree_RunningSelected_StillRefuses
+// exercises the orca-flavored fixture's INELIGIBLE case (running) — same
+// three-session worktree, but the running one still dead-ends.
+func TestUpdate_IKey_OrcaThreeSessionsOneWorktree_RunningSelected_StillRefuses(t *testing.T) {
+	m := modelWithThreeOrcaLoopsSharingWorktree()
+	m.cursor = 2 // orca-sess-3, StateRunning
+
+	m, cmd := updateModel(t, m, runeKey('i'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — running is never eligible for the fallback, even on orca")
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+}
+
+// TestInjectHeadlessFallbackEligible_ExplicitAllowlist exhaustively pins the
+// fail-closed allowlist: only StateIdle/StateStalled are eligible, every
+// other domain.LoopState value (including hypothetical future ones — this
+// is why it's an allowlist, not "everything except StateRunning") stays
+// ineligible by default.
+func TestInjectHeadlessFallbackEligible_ExplicitAllowlist(t *testing.T) {
+	cases := []struct {
+		state domain.LoopState
+		want  bool
+	}{
+		{domain.StateIdle, true},
+		{domain.StateStalled, true},
+		{domain.StateRunning, false},
+		{domain.StateGate, false},
+		{domain.StateDrift, false},
+		{domain.StateDone, false},
+		{domain.StateFailed, false},
+		{domain.StatePaused, false},
+		{domain.StateKilled, false},
+		{domain.LoopState("some-future-state"), false},
+	}
+	for _, c := range cases {
+		if got := injectHeadlessFallbackEligible(c.state); got != c.want {
+			t.Errorf("injectHeadlessFallbackEligible(%q) = %v, want %v", c.state, got, c.want)
+		}
 	}
 }
 
@@ -2511,8 +2750,18 @@ func TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy(t *testing.T
 	if !strings.Contains(rm.text, "couldn't target the on-screen session unambiguously") {
 		t.Errorf("text = %q, want it to explain the Tier 1→2 downgrade", rm.text)
 	}
-	if !strings.Contains(rm.text, "may not appear in the open window") {
-		t.Errorf("text = %q, want it to warn the open window may not update", rm.text)
+	// feat/inject-headless-exact-fallback: the message now names the EXACT
+	// session (shortID) the prompt was routed to, and calls it a
+	// "background turn" explicitly — the honest-UX requirement for routing
+	// an ambiguous inject to control.Redrive by exact session_id.
+	if !strings.Contains(rm.text, "background turn") {
+		t.Errorf("text = %q, want it to say the prompt landed as a background turn", rm.text)
+	}
+	if !strings.Contains(rm.text, shortID(l.SessionID)) {
+		t.Errorf("text = %q, want it to name the exact session (%s) the prompt was delivered to", rm.text, shortID(l.SessionID))
+	}
+	if !strings.Contains(rm.text, "won't appear in the open window") {
+		t.Errorf("text = %q, want it to warn the open window won't update", rm.text)
 	}
 }
 

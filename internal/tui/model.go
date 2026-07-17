@@ -1033,10 +1033,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if sel.Stall != domain.StallGone && !m.ttyPathPlausible(sel) {
-				if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+				if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous && !injectHeadlessFallbackEligible(sel.State) {
 					m.status, m.statusKind = msg, statusErr
 					return m, nil
 				}
+				// feat/inject-headless-exact-fallback: ambiguous AND eligible
+				// (idle/stalled) — do NOT refuse. Let the human type their
+				// prompt; sendPromptCmd's existing Tier1→Tier2 fallthrough
+				// (unchanged) will find Tier 1 still can't disambiguate and
+				// route this to `claude --resume <exact SessionID> -p
+				// <prompt>` — the same trusted, session-unique headless
+				// mechanism StallGone already always uses unconditionally,
+				// see injectHeadlessFallbackEligible's doc.
 			}
 			m.injectTarget = sel
 			m.mode = modeInjecting
@@ -1337,18 +1345,21 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		}
 		logActuationEvent(l, action, "tier2", true, "")
 		if l.Stall != domain.StallGone {
-			// Bug 2 (Option B, honesty fix): this branch is a DOWNGRADE, not
-			// StallGone's normal Tier-2 path — Tier 1 either found no
-			// backend or (most commonly, with N>1 sessions sharing a cwd on
-			// a backend with no per-session tty dispatch, e.g. cmux/orca —
-			// see docs/adr-vendor-independent-actuation.md §4 and
-			// ResolveActuationTarget's doc) couldn't disambiguate which
-			// on-screen session was meant, so it fell through to the
-			// headless re-drive instead of silently claiming success in the
-			// open window. Say so, rather than reusing StallGone's plain
-			// "output lands in the transcript" message — the human is
-			// watching a terminal that may not visibly update.
-			return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — couldn't target the on-screen session unambiguously; output lands in the transcript but may not appear in the open window", l.Project)}
+			// Bug 2 (Option B honesty fix, refined by
+			// feat/inject-headless-exact-fallback): this branch is a
+			// DOWNGRADE, not StallGone's normal Tier-2 path — Tier 1 either
+			// found no backend, or (most commonly, with N>1 sessions
+			// sharing a cwd on a backend with no per-session tty dispatch,
+			// e.g. cmux/orca — see docs/adr-vendor-independent-actuation.md
+			// §4 and ResolveActuationTarget's doc) couldn't disambiguate
+			// which on-screen session was meant, so it fell through to the
+			// SAME session's exact SessionID via the headless re-drive
+			// instead of silently claiming success in the open window (or,
+			// pre-feat/inject-headless-exact-fallback, refusing outright —
+			// see injectHeadlessFallbackEligible). Name the exact session
+			// the human's prompt actually reached (shortID) — the human is
+			// watching a terminal window that will NOT visibly update.
+			return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("delivered to %s's session %s as a background turn (tier 2) — couldn't target the on-screen session unambiguously, won't appear in the open window", l.Project, shortID(l.SessionID))}
 		}
 		return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)}
 	}
@@ -2720,6 +2731,58 @@ func (m Model) selected() (domain.Loop, bool) {
 		return loops[m.cursor], true
 	}
 	return domain.Loop{}, false
+}
+
+// injectHeadlessFallbackEligible reports whether an ambiguous inject target
+// (refuseIfAmbiguous's dead-end — N sessions share one cwd, no session-registry
+// tty to disambiguate by, e.g. orca, which has no CLI tty/tab-by-session
+// mapping at all) may instead fall through to the Tier 2 headless-exact
+// re-drive (feat/inject-headless-exact-fallback) once the human submits a
+// prompt, rather than being refused outright at "i" keypress time. This
+// gates ONLY whether the keypress-time guard lets the human type a prompt in
+// the first place — the actual routing mechanism is unchanged: sendPromptCmd's
+// existing Tier1→Tier2 fallthrough already sends any tier-1 miss to
+// `claude --resume <SessionID> -p <prompt>` by the loop's EXACT SessionID
+// (control.Redrive — the same trusted, session-unique, same-transcript
+// mechanism the 429/StallGone auto-redrive path already relies on), so it
+// can't misroute regardless of how many sibling sessions share the cwd.
+//
+// Deliberately an explicit ALLOWLIST, not a denylist that only excludes
+// StateRunning — so any future/unknown domain.LoopState value fails CLOSED
+// to the pre-existing dead-end refusal (the ADR's own fail-closed
+// discipline) instead of silently gaining a fallback nobody vetted it for:
+//
+//   - StateIdle: turn complete, nothing mid-flight — a headless resume turn
+//     is exactly what a human would otherwise type by hand once they attach.
+//   - StateStalled: silently stuck (429/no-output/token-out) — the SAME
+//     class of loop StallGone already always headless-redrives
+//     UNconditionally, ambiguity or not (see sendPromptCmd's Tier policy
+//     doc); this extends that already-trusted mechanism to the narrower
+//     "stalled AND the cwd chain is ambiguous too" case.
+//   - NEVER StateRunning: a live mid-turn session. `claude --resume`
+//     concurrent with an in-progress interactive turn is explicitly
+//     unverified territory (docs/adr-vendor-independent-actuation.md §4:
+//     "whether the open TUI re-renders it is unknown") — risks conflicting
+//     with or forking the transcript. Stays the dead-end refusal: attach
+//     (↵) and act manually.
+//   - Everything else (StateGate, StateDrift, StatePaused, and the
+//     Terminal() states StateDone/StateFailed/StateKilled) is OUT OF SCOPE
+//     for this slice, not silently included — GATE/DRIFT carry their own
+//     semantics (DRIFT already has its own hint-prompt re-drive flow via
+//     "r", untouched by this feature) and were never requested; the
+//     Terminal states are already refused earlier by their own dedicated
+//     guards (StateFailed/StateKilled) before this is ever reached, or are
+//     simply not valid inject targets to begin with (StateDone).
+//   - StallGone loops never reach this function at all — the "i" handler's
+//     own `sel.Stall != domain.StallGone` gate already routes them straight
+//     to Tier 2 unconditionally, ambiguity guard skipped entirely.
+func injectHeadlessFallbackEligible(state domain.LoopState) bool {
+	switch state {
+	case domain.StateIdle, domain.StateStalled:
+		return true
+	default:
+		return false
+	}
 }
 
 // refuseIfAmbiguous is the P0-1/P0-2 actuation guard: Locate/LocateClaude
