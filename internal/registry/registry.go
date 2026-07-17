@@ -49,10 +49,16 @@ const (
 )
 
 // Record is one goal-bound loop's persisted state.
+//
+// feat/panel-info (precise rename): Rubric was named Oracle until this
+// slice — see domain.Goal's doc for the full rationale. The JSON tag on
+// recordFile below stays "oracle" deliberately: an already-persisted
+// record on someone's disk must keep loading correctly after this rename,
+// not silently lose its rubric (see TestLoad_OracleJSONKeyCompat).
 type Record struct {
 	Goal           string
 	DoneCondition  string // completion condition from the wizard's "n" key; "" = oracle judges against Goal alone
-	Oracle         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
+	Rubric         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
 	Challenger     string // adversarial probe description — STORED ONLY, never executed (no challenger phase yet)
 	BoundAt        time.Time
 	MaxCycles      int
@@ -72,11 +78,13 @@ type Record struct {
 	Driven bool
 }
 
-// recordFile is Record's on-disk JSON shape.
+// recordFile is Record's on-disk JSON shape. The "oracle" JSON tag on
+// Rubric is INTENTIONALLY unchanged from before the Go field rename (see
+// Record's doc) — this is the on-disk compat seam.
 type recordFile struct {
 	Goal           string       `json:"goal"`
 	DoneCondition  string       `json:"doneCondition,omitempty"`
-	Oracle         string       `json:"oracle,omitempty"`
+	Rubric         string       `json:"oracle,omitempty"`
 	Challenger     string       `json:"challenger,omitempty"`
 	BoundAt        int64        `json:"boundAt"`
 	MaxCycles      int          `json:"maxCycles"`
@@ -89,12 +97,12 @@ type recordFile struct {
 // BindSpec is a loop's goal-bound contract, as collected by the wizard (the
 // tui's "n" key): what to do, how completion is verified, and the cycle
 // ceiling. A small value object rather than more positional string params
-// on Bind/WritePending — Goal/DoneCondition/Oracle/Challenger are all plain
+// on Bind/WritePending — Goal/DoneCondition/Rubric/Challenger are all plain
 // strings, easy to silently transpose if passed positionally.
 type BindSpec struct {
 	Goal          string
 	DoneCondition string
-	Oracle        string
+	Rubric        string
 	Challenger    string
 	MaxCycles     int // 0 = DefaultMaxCycles
 	// Driven opts this loop into LoopEngine at creation time — false (the
@@ -128,7 +136,7 @@ func Bind(dir, sessionID string, spec BindSpec) error {
 	return writeRecordFile(dir, sessionID, recordFile{
 		Goal:           spec.Goal,
 		DoneCondition:  spec.DoneCondition,
-		Oracle:         spec.Oracle,
+		Rubric:         spec.Rubric,
 		Challenger:     spec.Challenger,
 		BoundAt:        time.Now().Unix(),
 		MaxCycles:      maxCycles,
@@ -155,7 +163,7 @@ func recordFromFile(rf recordFile) Record {
 	r := Record{
 		Goal:           rf.Goal,
 		DoneCondition:  rf.DoneCondition,
-		Oracle:         rf.Oracle,
+		Rubric:         rf.Rubric,
 		Challenger:     rf.Challenger,
 		BoundAt:        time.Unix(rf.BoundAt, 0),
 		MaxCycles:      rf.MaxCycles,
@@ -194,7 +202,7 @@ func SaveVerdict(dir, sessionID string, verdict domain.Verdict, atCycle int) err
 	return writeRecordFile(dir, sessionID, recordFile{
 		Goal:           rec.Goal,
 		DoneCondition:  rec.DoneCondition,
-		Oracle:         rec.Oracle,
+		Rubric:         rec.Rubric,
 		Challenger:     rec.Challenger,
 		BoundAt:        rec.BoundAt.Unix(),
 		MaxCycles:      rec.MaxCycles,
@@ -252,7 +260,7 @@ type PendingSpawn struct {
 	Cwd           string
 	Goal          string
 	DoneCondition string
-	Oracle        string
+	Rubric        string
 	Challenger    string
 	MaxCycles     int
 	TS            time.Time
@@ -264,11 +272,13 @@ type PendingSpawn struct {
 	Driven bool
 }
 
+// pendingFile is PendingSpawn's on-disk JSON shape — same "oracle" JSON
+// tag compat seam as recordFile (see Record's doc).
 type pendingFile struct {
 	Cwd           string `json:"cwd"`
 	Goal          string `json:"goal"`
 	DoneCondition string `json:"doneCondition,omitempty"`
-	Oracle        string `json:"oracle,omitempty"`
+	Rubric        string `json:"oracle,omitempty"`
 	Challenger    string `json:"challenger,omitempty"`
 	MaxCycles     int    `json:"maxCycles,omitempty"`
 	TS            int64  `json:"ts"`
@@ -288,7 +298,7 @@ func WritePending(dir, cwd string, spec BindSpec) error {
 		Cwd:           cwd,
 		Goal:          spec.Goal,
 		DoneCondition: spec.DoneCondition,
-		Oracle:        spec.Oracle,
+		Rubric:        spec.Rubric,
 		Challenger:    spec.Challenger,
 		MaxCycles:     spec.MaxCycles,
 		TS:            time.Now().Unix(),
@@ -325,7 +335,7 @@ func listPending(dir string) map[string]PendingSpawn {
 			Cwd:           pf.Cwd,
 			Goal:          pf.Goal,
 			DoneCondition: pf.DoneCondition,
-			Oracle:        pf.Oracle,
+			Rubric:        pf.Rubric,
 			Challenger:    pf.Challenger,
 			MaxCycles:     pf.MaxCycles,
 			TS:            time.Unix(pf.TS, 0),
@@ -386,7 +396,7 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 		spec := BindSpec{
 			Goal:          p.Goal,
 			DoneCondition: p.DoneCondition,
-			Oracle:        p.Oracle,
+			Rubric:        p.Rubric,
 			Challenger:    p.Challenger,
 			MaxCycles:     p.MaxCycles,
 			Driven:        p.Driven,

@@ -50,15 +50,25 @@ const (
 	OutcomeNeedsHuman Outcome = "needs_human"
 )
 
-// Goal is what a loop pursues, plus its hard ceilings. DoneWhen/Oracle/
+// Goal is what a loop pursues, plus its hard ceilings. DoneWhen/Rubric/
 // Challenger are the rest of the wizard's loop contract (see the tui's "n"
-// key and internal/registry.BindSpec) — DoneWhen and Oracle together are
-// also the oracle's judging rubric (internal/oracle.Judge); Challenger is
-// stored only, not executed (no challenger phase exists yet).
+// key and internal/registry.BindSpec) — DoneWhen and Rubric together are
+// fed to the ORACLE as its judging rubric (internal/oracle.Judge);
+// Challenger is stored only, not executed (no challenger phase exists yet).
+//
+// feat/panel-info (precise rename): this field used to be named Oracle,
+// which conflated two different things — the CRITERIA a human hands the
+// judge ("how do I verify this is done") and the JUDGE ITSELF (the
+// internal/oracle package, the ORACLE row's rendered verdict, the header's
+// "oracle NN%" pass-rate band). Renamed to Rubric so "oracle" means
+// exclusively the judge/verdict from here on. The ONE place this rename
+// deliberately does NOT reach is the on-disk JSON key
+// (registry.recordFile/pendingFile keep `json:"oracle"` — see registry.go's
+// doc — so an already-persisted record loads unchanged).
 type Goal struct {
 	Text           string
 	DoneWhen       string // completion condition — what evidence makes it DONE; "" = oracle judges against Text alone
-	Oracle         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
+	Rubric         string // verification rubric (free text); "" = default "independent LLM judge against the complete condition"
 	Challenger     string // adversarial probe description — STORED ONLY, never executed
 	MaxCycles      int
 	BudgetTokens   int

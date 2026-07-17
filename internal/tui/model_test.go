@@ -202,9 +202,9 @@ func TestLayoutModeFor(t *testing.T) {
 
 // TestListRowWidths_NeverOverflows: for every inner width from the narrowest
 // this layout ever hands the FLEET panel up to a very wide one, the row's
-// fixed columns (marker+NAME+STATE[+LAST]) must sum to <= innerWidth — the
-// same "prove it fits, don't just assume the thresholds line up" guarantee
-// F1 established for the old columnWidths.
+// columns (marker+NAME+STATE[+CYCLE][+ORACLE][+LAST]) must sum to <=
+// innerWidth — the same "prove it fits, don't just assume the thresholds
+// line up" guarantee F1 established for the old columnWidths.
 // TestListRowWidths_NeverOverflows sweeps from wMarker+wState (the
 // structural floor this row format needs — marker+STATE alone, see
 // listRowWidths' doc) up to a very wide panel: the row must never exceed
@@ -214,25 +214,60 @@ func TestLayoutModeFor(t *testing.T) {
 // cols" caveat for the old columnWidths).
 func TestListRowWidths_NeverOverflows(t *testing.T) {
 	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
-		wName, showLast := listRowWidths(innerWidth)
+		wName, showCycle, showOracle, showLast := listRowWidths(innerWidth)
 		sum := wMarker + wName + wState
+		if showCycle {
+			sum += wCycle
+		}
+		if showOracle {
+			sum += wOracle
+		}
 		if showLast {
 			sum += wLast
 		}
 		if sum > innerWidth {
-			t.Errorf("innerWidth=%d: wMarker+wName(%d)+wState+wLast(shown=%v) = %d, want <= %d", innerWidth, wName, showLast, sum, innerWidth)
+			t.Errorf("innerWidth=%d: sum = %d (wName=%d cycle=%v oracle=%v last=%v), want <= %d",
+				innerWidth, sum, wName, showCycle, showOracle, showLast, innerWidth)
 		}
 	}
 }
 
-func TestListRowWidths_DropsLastWhenNoRoom(t *testing.T) {
-	_, showLast := listRowWidths(wMarker + wState + listNameFloor - 1)
-	if showLast {
-		t.Error("showLast = true with no room for it, want false (LAST dropped)")
+// TestListRowWidths_DropOrder_OracleThenCycleThenLast is feat/panel-info's
+// exact captain-specified degradation order: as width shrinks, ORACLE
+// drops FIRST, then CYCLE, then LAST — never any other order, never two
+// dropped at once when dropping one alone would fit.
+func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
+	full := wMarker + wState + wCycle + wOracle + wLast + listNameFloor
+	_, showCycle, showOracle, showLast := listRowWidths(full)
+	if !showCycle || !showOracle || !showLast {
+		t.Fatalf("precondition failed: at full width want all three shown, got cycle=%v oracle=%v last=%v", showCycle, showOracle, showLast)
 	}
-	_, showLast = listRowWidths(wMarker + wState + wLast + listNameFloor)
+
+	// one step narrower than "all three fit" — ORACLE (the least
+	// essential) must be the one to go, CYCLE and LAST both survive.
+	_, showCycle, showOracle, showLast = listRowWidths(full - 1)
+	if showOracle {
+		t.Error("showOracle = true with insufficient room, want false (ORACLE drops first)")
+	}
+	if !showCycle || !showLast {
+		t.Errorf("got cycle=%v last=%v, want both still shown once only ORACLE was dropped", showCycle, showLast)
+	}
+
+	// narrow enough that ORACLE+CYCLE together don't fit — CYCLE goes
+	// next, LAST still survives alone.
+	tight := wMarker + wState + wLast + listNameFloor
+	_, showCycle, showOracle, showLast = listRowWidths(tight)
+	if showOracle || showCycle {
+		t.Errorf("got cycle=%v oracle=%v, want both dropped at this width", showCycle, showOracle)
+	}
 	if !showLast {
-		t.Error("showLast = false with enough room, want true (LAST kept)")
+		t.Error("showLast = false, want true — LAST is the last of the three to drop")
+	}
+
+	// narrower still — even LAST alone doesn't fit.
+	_, showCycle, showOracle, showLast = listRowWidths(wMarker + wState + listNameFloor - 1)
+	if showCycle || showOracle || showLast {
+		t.Errorf("got cycle=%v oracle=%v last=%v, want all three dropped at this width", showCycle, showOracle, showLast)
 	}
 }
 
@@ -242,13 +277,192 @@ func TestListRowWidths_DropsLastWhenNoRoom(t *testing.T) {
 // doc on the structural floor this row format needs).
 func TestListRowWidths_NameWithinBounds(t *testing.T) {
 	for _, innerWidth := range []int{wMarker + wState + listNameFloor, 40, 100, 300} {
-		wName, _ := listRowWidths(innerWidth)
+		wName, _, _, _ := listRowWidths(innerWidth)
 		if wName < listNameFloor {
 			t.Errorf("innerWidth=%d: wName=%d, want >= listNameFloor (%d)", innerWidth, wName, listNameFloor)
 		}
 		if wName > nameCapWidth {
 			t.Errorf("innerWidth=%d: wName=%d, want <= nameCapWidth (%d)", innerWidth, wName, nameCapWidth)
 		}
+	}
+}
+
+// ── feat/panel-info: FLEET's ORACLE×N column ─────────────────────────────
+
+func TestOracleCompactLabel_NeverJudged_Dash(t *testing.T) {
+	l := domain.Loop{Goal: domain.Goal{Text: "goal"}} // bound, Last==nil
+	if got := oracleCompactLabel(l, 0); got != "—" {
+		t.Errorf("got %q, want %q", got, "—")
+	}
+}
+
+func TestOracleCompactLabel_Unbound_Dash(t *testing.T) {
+	l := domain.Loop{} // no goal at all, Last==nil
+	if got := oracleCompactLabel(l, 0); got != "—" {
+		t.Errorf("got %q, want %q", got, "—")
+	}
+}
+
+func TestOracleCompactLabel_DoneVerdict_CheckGlyphTimesCount(t *testing.T) {
+	l := domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeDone}}
+	if got := oracleCompactLabel(l, 3); got != "✓×3" {
+		t.Errorf("got %q, want %q", got, "✓×3")
+	}
+}
+
+func TestOracleCompactLabel_ProgressVerdict_CheckGlyphTimesCount(t *testing.T) {
+	// progress shares the "✓" glyph with done — oracleLabel's own DETAIL
+	// row does the same ("✓ progress" vs "✓ verified"); the compact FLEET
+	// column doesn't have room to distinguish the two in a 6-col cell,
+	// only rejected-vs-not.
+	l := domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeProgress}}
+	if got := oracleCompactLabel(l, 2); got != "✓×2" {
+		t.Errorf("got %q, want %q", got, "✓×2")
+	}
+}
+
+func TestOracleCompactLabel_RejectedVerdict_CrossGlyphTimesCount(t *testing.T) {
+	l := domain.Loop{Last: &domain.Verdict{Outcome: domain.OutcomeRejected}}
+	if got := oracleCompactLabel(l, 5); got != "✗×5" {
+		t.Errorf("got %q, want %q", got, "✗×5")
+	}
+}
+
+// TestFleetOracleCountsCmd_CountsTriggerOracleEventsPerSession is
+// fleetOracleCountsCmd's core contract: count TriggerOracle events per
+// BOUND session, off the event loop, for the whole fleet in one pass.
+func TestFleetOracleCountsCmd_CountsTriggerOracleEventsPerSession(t *testing.T) {
+	dir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return dir }
+
+	for i, ev := range []events.Event{
+		{TS: 1, SessionID: "s1", Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"},
+		{TS: 2, SessionID: "s1", Trigger: events.TriggerScan, ToState: "idle"},
+		{TS: 3, SessionID: "s1", Trigger: events.TriggerOracle, Detail: "rejected at cycle 2: no"},
+		{TS: 4, SessionID: "s2", Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"},
+	} {
+		if err := events.Append(dir, ev); err != nil {
+			t.Fatalf("Append #%d: %v", i, err)
+		}
+	}
+
+	loops := []domain.Loop{
+		{SessionID: "s1", Goal: domain.Goal{Text: "goal 1"}},
+		{SessionID: "s2", Goal: domain.Goal{Text: "goal 2"}},
+	}
+	msg := fleetOracleCountsCmd(loops)()
+
+	counts, ok := msg.(fleetOracleCountsMsg)
+	if !ok {
+		t.Fatalf("got %T, want fleetOracleCountsMsg", msg)
+	}
+	if counts["s1"] != 2 {
+		t.Errorf("counts[s1] = %d, want 2", counts["s1"])
+	}
+	if counts["s2"] != 1 {
+		t.Errorf("counts[s2] = %d, want 1", counts["s2"])
+	}
+}
+
+// TestFleetOracleCountsCmd_UnboundLoop_SkippedEntirely: an unbound loop
+// (no goal — was never, and will never be, judged) must not even trigger
+// an event-log read, let alone appear in the result map.
+func TestFleetOracleCountsCmd_UnboundLoop_SkippedEntirely(t *testing.T) {
+	dir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return dir }
+
+	loops := []domain.Loop{{SessionID: "unbound-1"}} // Goal.Text == ""
+	msg := fleetOracleCountsCmd(loops)()
+
+	counts, ok := msg.(fleetOracleCountsMsg)
+	if !ok {
+		t.Fatalf("got %T, want fleetOracleCountsMsg", msg)
+	}
+	if _, present := counts["unbound-1"]; present {
+		t.Error("expected unbound-1 to be entirely absent from the result map")
+	}
+}
+
+// TestUpdate_LoopsMsg_DispatchesFleetOracleCountsCmd is the wiring check:
+// a scan tick's batched cmd must include fleetOracleCountsCmd's work —
+// mirrors TestUpdate_LoopsMsg_DispatchesDetailCacheCmd's shape exactly.
+func TestUpdate_LoopsMsg_DispatchesFleetOracleCountsCmd(t *testing.T) {
+	dir := t.TempDir()
+	origHistoryDir := historyDirFn
+	defer func() { historyDirFn = origHistoryDir }()
+	historyDirFn = func() string { return dir }
+	if err := events.Append(dir, events.Event{TS: 1, SessionID: "s1", Trigger: events.TriggerOracle, Detail: "done at cycle 1: ok"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	m := New()
+	// State: StateRunning (not StateIdle) — deliberately, so
+	// triggerJudgments' policy does NOT ALSO decide this loop needs
+	// judging and dispatch a REAL judgeCmd (unmocked judgeFn would shell
+	// out to a real `claude` CLI when this test's batch loop below calls
+	// every sub-cmd to inspect its type). fleetOracleCountsCmd itself
+	// doesn't care about State, only Goal.Text != "" — see its doc.
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning, Goal: domain.Goal{Text: "goal"}}
+	_, cmd := m.Update(loopsMsg([]domain.Loop{l}))
+	if cmd == nil {
+		t.Fatal("expected a non-nil batched cmd from loopsMsg")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected loopsMsg's cmd to be a tea.Batch, got %T", cmd())
+	}
+	found := false
+	for _, sub := range batch {
+		if sub == nil {
+			continue
+		}
+		if counts, ok := sub().(fleetOracleCountsMsg); ok && counts["s1"] == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected loopsMsg's batched cmds to include fleetOracleCountsCmd's result for s1")
+	}
+}
+
+// TestUpdate_FleetOracleCountsMsg_PopulatesCache mirrors the gitStatsMsg/
+// detailCacheMsg handlers' own shape.
+func TestUpdate_FleetOracleCountsMsg_PopulatesCache(t *testing.T) {
+	m := New()
+	updated, cmd := m.Update(fleetOracleCountsMsg{"s1": 3, "s2": 0})
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Error("expected no follow-up cmd from fleetOracleCountsMsg")
+	}
+	if mm.fleetOracleCounts["s1"] != 3 {
+		t.Errorf("fleetOracleCounts[s1] = %d, want 3", mm.fleetOracleCounts["s1"])
+	}
+}
+
+// TestFleetPanelLines_ShowsCycleAndOracleColumns_AtGenerousWidth: an
+// end-to-end check that the new columns actually render through
+// fleetPanelLines, not just that the lower-level helpers work in
+// isolation.
+func TestFleetPanelLines_ShowsCycleAndOracleColumns_AtGenerousWidth(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "aboard", SessionID: "s1", State: domain.StateRunning, Cycle: 4,
+			Goal: domain.Goal{Text: "goal", MaxCycles: 12}, Last: &domain.Verdict{Outcome: domain.OutcomeDone}},
+	}
+	m.fleetOracleCounts = map[string]int{"s1": 3}
+	m.cursor = 0
+
+	lines := m.fleetPanelLines(120, 10)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "4/12") {
+		t.Errorf("expected the CYCLE column (4/12) present, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "✓×3") {
+		t.Errorf("expected the ORACLE×N column (✓×3) present, got:\n%s", joined)
 	}
 }
 
@@ -850,12 +1064,20 @@ func TestView_SelectedRowVisibleInFleetPanel(t *testing.T) {
 
 // manyLoopsForScrollTest builds n distinct, uniquely-named loops — enough to
 // force the FLEET panel to scroll at any of this layout's widths.
+//
+// feat/panel-info: the distinguishing digits are FIRST in the name
+// ("l037", not "loop-037") — with the FLEET row's new CYCLE/ORACLE columns
+// eating into the NAME budget at narrow widths, a shared 6-char prefix
+// ("loop-0", common to loop-000..loop-099) truncated identically for
+// every row, making TestView_SelectedRowVisibleInFleetPanel's width=45
+// case unable to tell rows apart at all. Putting the unique part first
+// means even an aggressively truncated NAME column still shows it.
 func manyLoopsForScrollTest(n int) []domain.Loop {
 	now := time.Now()
 	out := make([]domain.Loop, n)
 	for i := 0; i < n; i++ {
 		out[i] = domain.Loop{
-			Project:      fmt.Sprintf("loop-%03d", i),
+			Project:      fmt.Sprintf("l%03d", i),
 			SessionID:    fmt.Sprintf("sess%04d", i),
 			State:        domain.StateIdle,
 			LastActivity: now.Add(-time.Duration(i) * time.Minute),
@@ -1147,8 +1369,8 @@ func TestWizard_FullFlow_AllStepsFilled(t *testing.T) {
 	if m.spawnDoneWhen != "tests pass" {
 		t.Errorf("spawnDoneWhen = %q, want %q", m.spawnDoneWhen, "tests pass")
 	}
-	if m.spawnOracle != "run go test ./..." {
-		t.Errorf("spawnOracle = %q, want %q", m.spawnOracle, "run go test ./...")
+	if m.spawnRubric != "run go test ./..." {
+		t.Errorf("spawnRubric = %q, want %q", m.spawnRubric, "run go test ./...")
 	}
 	if m.spawnChallenger != "try to break it with -race" {
 		t.Errorf("spawnChallenger = %q, want %q", m.spawnChallenger, "try to break it with -race")
@@ -1164,7 +1386,7 @@ func TestWizard_DefaultsAtOptionalSteps(t *testing.T) {
 
 	m, _ = typeAndEnter(t, m, "fix the bug") // step 1: goal (required)
 	m, _ = typeAndEnter(t, m, "")            // step 2: done when — skipped
-	m, _ = typeAndEnter(t, m, "")            // step 3: oracle — skipped
+	m, _ = typeAndEnter(t, m, "")            // step 3: rubric — skipped
 	m, _ = typeAndEnter(t, m, "")            // step 4: challenger — skipped
 
 	// each of steps 2-4 returns textinput.Blink (a non-nil cmd) to advance
@@ -1173,8 +1395,8 @@ func TestWizard_DefaultsAtOptionalSteps(t *testing.T) {
 	if m.mode != modePrompting || m.spawnStep != wizardMaxCycles {
 		t.Fatalf("expected to be sitting at step 5 (max cycles), got mode=%v step=%v", m.mode, m.spawnStep)
 	}
-	if m.spawnDoneWhen != "" || m.spawnOracle != "" || m.spawnChallenger != "" {
-		t.Errorf("got doneWhen=%q oracle=%q challenger=%q, want all empty (skipped)", m.spawnDoneWhen, m.spawnOracle, m.spawnChallenger)
+	if m.spawnDoneWhen != "" || m.spawnRubric != "" || m.spawnChallenger != "" {
+		t.Errorf("got doneWhen=%q rubric=%q challenger=%q, want all empty (skipped)", m.spawnDoneWhen, m.spawnRubric, m.spawnChallenger)
 	}
 
 	m, cmd := typeAndEnter(t, m, "") // step 5: max cycles — default
@@ -2917,12 +3139,12 @@ func TestJudgeCmd_PassesDoneWhenAndOracleFromGoal(t *testing.T) {
 		return domain.Verdict{Outcome: domain.OutcomeProgress}, nil
 	}
 
-	spec := registry.BindSpec{Goal: "fix the bug", DoneCondition: "tests pass", Oracle: "run go test ./..."}
+	spec := registry.BindSpec{Goal: "fix the bug", DoneCondition: "tests pass", Rubric: "run go test ./..."}
 	if err := registry.Bind(dir, "s1", spec); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	l := domain.Loop{SessionID: "s1", Cycle: 1, Goal: domain.Goal{Text: "fix the bug", DoneWhen: "tests pass", Oracle: "run go test ./..."}}
+	l := domain.Loop{SessionID: "s1", Cycle: 1, Goal: domain.Goal{Text: "fix the bug", DoneWhen: "tests pass", Rubric: "run go test ./..."}}
 	judgeCmd(l)()
 
 	if gotDoneWhen != "tests pass" {
@@ -3302,6 +3524,78 @@ func TestRenderDetail_StageRowPresentForBoundLoop(t *testing.T) {
 	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
 	if !strings.Contains(out, "STAGE") {
 		t.Errorf("STAGE should render for a bound loop with a valid elapsed source:\n%s", out)
+	}
+}
+
+// ── feat/panel-info: RUBRIC/CHALL contract rows ("없으면 비워두기") ────────
+
+// TestRenderDetail_RubricAndChallFilled_ShowValues: a bound loop with both
+// fields set shows them verbatim.
+func TestRenderDetail_RubricAndChallFilled_ShowValues(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning,
+		Goal: domain.Goal{Text: "fix it", Rubric: "run go test ./...", Challenger: "adversarial probe"}}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "run go test ./...") {
+		t.Errorf("expected the RUBRIC value present:\n%s", out)
+	}
+	if !strings.Contains(out, "adversarial probe") {
+		t.Errorf("expected the CHALL value present:\n%s", out)
+	}
+}
+
+// TestRenderDetail_RubricAndChallEmpty_ShowDashNotHidden is the captain's
+// "없으면 비워두기" ask: a bound loop with NEITHER field set must still
+// show BOTH rows (with a "—" placeholder), not omit them — a predictable
+// row count regardless of what the wizard collected, unlike the OLD
+// behavior (RUBRIC hidden when empty, CHALLENGER never shown at all).
+func TestRenderDetail_RubricAndChallEmpty_ShowDashNotHidden(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning,
+		Goal: domain.Goal{Text: "fix it"}} // Rubric/Challenger both ""
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "RUBRIC") {
+		t.Errorf("expected the RUBRIC row to still be present:\n%s", out)
+	}
+	if !strings.Contains(out, "CHALL") {
+		t.Errorf("expected the CHALL row to still be present:\n%s", out)
+	}
+}
+
+// TestRenderDetail_UnboundLoop_NoRubricOrChallRow: an unbound loop (no
+// Goal.Text at all) shows neither row — there's no contract to display a
+// placeholder FOR.
+func TestRenderDetail_UnboundLoop_NoRubricOrChallRow(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateRunning}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "RUBRIC") {
+		t.Errorf("expected no RUBRIC row for an unbound loop:\n%s", out)
+	}
+	if strings.Contains(out, "CHALL") {
+		t.Errorf("expected no CHALL row for an unbound loop:\n%s", out)
+	}
+}
+
+func TestOrDash(t *testing.T) {
+	if got := orDash(""); got != "—" {
+		t.Errorf("orDash(\"\") = %q, want %q", got, "—")
+	}
+	if got := orDash("value"); got != "value" {
+		t.Errorf("orDash(%q) = %q, want unchanged", "value", got)
+	}
+}
+
+// TestDetailRow_KeyWidth_NoKeyExceedsDetailKeyWidth is a structural
+// regression pin: lipgloss WRAPS (does not overflow-in-place or truncate)
+// a .Width()-styled key longer than detailKeyWidth — verified empirically
+// while adding the CHALL row (an earlier "CHALLENGER" label silently broke
+// row alignment). Every detailRow KEY literal in this file must stay
+// within detailKeyWidth runes, checked here so a future row addition
+// can't reintroduce the same class of bug silently.
+func TestDetailRow_KeyWidth_NoKeyExceedsDetailKeyWidth(t *testing.T) {
+	keys := []string{"STATE", "NOTE", "CYCLE", "GOAL", "ORACLE", "RUBRIC", "CHALL", "STAGE", "BUDGET", "N/I", "LAST", "CWD", "LOG", "TAIL", "EVENTS"}
+	for _, k := range keys {
+		if len(k) > detailKeyWidth {
+			t.Errorf("key %q is %d runes, want <= detailKeyWidth (%d) — lipgloss wraps rather than overflowing", k, len(k), detailKeyWidth)
+		}
 	}
 }
 
@@ -4165,7 +4459,7 @@ func TestBuildSpawnPrompt_AllFieldsProvided(t *testing.T) {
 	got := buildSpawnPrompt("fix the bug", "tests pass", "run go test ./...", "try to break it with -race", 20)
 	want := "goal: fix the bug\n" +
 		"complete condition: tests pass\n" +
-		"oracle: run go test ./...\n" +
+		"rubric: run go test ./...\n" +
 		"challenger: try to break it with -race\n" +
 		"max_iteration: 20\n" +
 		"\n" +
@@ -4181,7 +4475,7 @@ func TestBuildSpawnPrompt_OptionalFieldsEmpty_UsesDefaultsAndOmitsChallenger(t *
 	got := buildSpawnPrompt("fix the bug", "", "", "", 12)
 	want := "goal: fix the bug\n" +
 		"complete condition: you judge the goal fully achieved\n" +
-		"oracle: an independent LLM judge verifies against the complete condition\n" +
+		"rubric: an independent LLM judge verifies against the complete condition\n" +
 		"max_iteration: 12\n" +
 		"\n" +
 		"Work in cycles toward the goal. Report progress concretely each cycle.\n" +
@@ -4211,7 +4505,7 @@ func TestWizardStepLabel_AllSteps(t *testing.T) {
 	}{
 		{wizardGoal, "goal:"},
 		{wizardDoneWhen, "complete condition:"},
-		{wizardOracle, "oracle:"},
+		{wizardRubric, "rubric:"},
 		{wizardChallenger, "challenger:"},
 		{wizardMaxCycles, "max_iteration [12]:"},
 	}
@@ -5685,7 +5979,7 @@ func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T)
 		return []byte(`{"session_id":"sess-boot-1","result":"cycle 1 done","is_error":false}`), nil
 	})
 
-	spec := registry.BindSpec{Goal: "fix the flaky test", DoneCondition: "tests pass", Oracle: "run go test", MaxCycles: 8}
+	spec := registry.BindSpec{Goal: "fix the flaky test", DoneCondition: "tests pass", Rubric: "run go test", MaxCycles: 8}
 	msg := bootstrapEngineCmd("/x/aboard", spec)()
 
 	rm, ok := msg.(bootstrapResultMsg)
@@ -5712,7 +6006,7 @@ func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T)
 	if !rec.Driven {
 		t.Error("Driven = false, want true — bootstrap must always create a DRIVEN record")
 	}
-	if rec.Goal != "fix the flaky test" || rec.DoneCondition != "tests pass" || rec.Oracle != "run go test" || rec.MaxCycles != 8 {
+	if rec.Goal != "fix the flaky test" || rec.DoneCondition != "tests pass" || rec.Rubric != "run go test" || rec.MaxCycles != 8 {
 		t.Errorf("got %+v, want the full contract bound", rec)
 	}
 
@@ -5840,10 +6134,10 @@ func TestBootstrapEngineCmd_ReusesBuildSpawnPromptVerbatim(t *testing.T) {
 		return []byte(`{"session_id":"s1"}`), nil
 	})
 
-	spec := registry.BindSpec{Goal: "ship it", DoneCondition: "tests pass", Oracle: "run tests", Challenger: "adversarial probe", MaxCycles: 5}
+	spec := registry.BindSpec{Goal: "ship it", DoneCondition: "tests pass", Rubric: "run tests", Challenger: "adversarial probe", MaxCycles: 5}
 	bootstrapEngineCmd("/x/aboard", spec)()
 
-	want := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+	want := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 	if gotPrompt != want {
 		t.Errorf("prompt sent to claude -p was NOT buildSpawnPrompt's output:\ngot:  %q\nwant: %q", gotPrompt, want)
 	}
