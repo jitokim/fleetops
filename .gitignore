@@ -1,0 +1,10 @@
+/fleetops
+/dist/
+*.out
+.DS_Store
+/.venv/
+/.claude/
+
+# local brand masters (X avatar source, not needed in repo)
+icon.png
+icon-256.png
