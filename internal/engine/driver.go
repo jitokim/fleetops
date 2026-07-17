@@ -95,15 +95,21 @@ func ShouldDrive(l domain.Loop, driven bool, inFlight bool) bool {
 }
 
 // NextWorkPrompt composes the work prompt for l's NEXT cycle from contract
-// (goal / doneCondition / oracle — the exact contract fields
+// (goal / doneCondition / rubric — the exact contract fields
 // internal/tui's buildSpawnPrompt already uses to compose cycle 1's prompt,
-// same defaults for an empty doneCondition/oracle) plus l's current cycle
+// same defaults for an empty doneCondition/rubric) plus l's current cycle
 // number, and — when available — the most recent oracle verdict's reason
 // fed back as corrective signal. This mirrors the manual DRIFT re-drive's
 // composeDriftPrompt pattern (internal/tui/model.go: "<original> \n\n
 // [operator correction] <hint>"), generalized from "an operator's typed
 // hint" to "the oracle's own verdict reason" — the engine has no operator
 // to ask, so the oracle's own words are the corrective signal instead.
+//
+// feat/panel-info (precise rename): the contract field and this function's
+// composed prompt line are both "rubric" now, not "oracle" — "oracle"
+// means exclusively the judge/verdict from here on (see domain.Goal's
+// doc). The "[oracle, last cycle]"/"independent oracle" lines below are
+// UNCHANGED — those really are about the judge, not the criteria.
 //
 // Pure string composition — no I/O, no registry/exec access. contract is
 // passed in explicitly (not looked up inside this function) so it stays
@@ -114,15 +120,15 @@ func NextWorkPrompt(l domain.Loop, contract registry.Record) string {
 	if done == "" {
 		done = "you judge the goal fully achieved"
 	}
-	oracleLine := contract.Oracle
-	if oracleLine == "" {
-		oracleLine = "an independent LLM judge verifies against the complete condition"
+	rubricLine := contract.Rubric
+	if rubricLine == "" {
+		rubricLine = "an independent LLM judge verifies against the complete condition"
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "goal: %s\n", contract.Goal)
 	fmt.Fprintf(&b, "complete condition: %s\n", done)
-	fmt.Fprintf(&b, "oracle: %s\n", oracleLine)
+	fmt.Fprintf(&b, "rubric: %s\n", rubricLine)
 	fmt.Fprintf(&b, "cycle: %d\n", l.Cycle)
 	b.WriteString("\nContinue working toward the goal. Report progress concretely this cycle.\n")
 	if l.Last != nil && l.Last.Reason != "" {

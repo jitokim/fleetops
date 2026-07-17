@@ -1376,7 +1376,7 @@ func TestEnrichFromRegistry_MapsFullContractOntoGoal(t *testing.T) {
 	spec := registry.BindSpec{
 		Goal:          "fix the flaky test",
 		DoneCondition: "go test ./... passes 5 times in a row",
-		Oracle:        "run go test ./... and check for PASS",
+		Rubric:        "run go test ./... and check for PASS",
 		Challenger:    "try to break it with -race",
 	}
 	if err := registry.Bind(dir, "sess-1", spec); err != nil {
@@ -1389,8 +1389,8 @@ func TestEnrichFromRegistry_MapsFullContractOntoGoal(t *testing.T) {
 	if out[0].Goal.DoneWhen != spec.DoneCondition {
 		t.Errorf("Goal.DoneWhen = %q, want %q", out[0].Goal.DoneWhen, spec.DoneCondition)
 	}
-	if out[0].Goal.Oracle != spec.Oracle {
-		t.Errorf("Goal.Oracle = %q, want %q", out[0].Goal.Oracle, spec.Oracle)
+	if out[0].Goal.Rubric != spec.Rubric {
+		t.Errorf("Goal.Rubric = %q, want %q", out[0].Goal.Rubric, spec.Rubric)
 	}
 	if out[0].Goal.Challenger != spec.Challenger {
 		t.Errorf("Goal.Challenger = %q, want %q", out[0].Goal.Challenger, spec.Challenger)

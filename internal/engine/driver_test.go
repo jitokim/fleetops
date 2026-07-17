@@ -132,19 +132,19 @@ func TestShouldDrive_InFlightWinsOverEverythingElse(t *testing.T) {
 
 // ── NextWorkPrompt: composition ─────────────────────────────────────────
 
-func TestNextWorkPrompt_ComposesGoalDoneWhenOracleAndCycle(t *testing.T) {
+func TestNextWorkPrompt_ComposesGoalDoneWhenRubricAndCycle(t *testing.T) {
 	l := domain.Loop{Cycle: 4}
 	contract := registry.Record{
 		Goal:          "fix the flaky tests",
 		DoneCondition: "a fresh test run passes with zero failures",
-		Oracle:        "rerun from scratch and show the fresh output",
+		Rubric:        "rerun from scratch and show the fresh output",
 	}
 	got := NextWorkPrompt(l, contract)
 
 	for _, want := range []string{
 		"goal: fix the flaky tests",
 		"complete condition: a fresh test run passes with zero failures",
-		"oracle: rerun from scratch and show the fresh output",
+		"rubric: rerun from scratch and show the fresh output",
 		"cycle: 4",
 	} {
 		if !strings.Contains(got, want) {
@@ -167,14 +167,14 @@ func TestNextWorkPrompt_EmptyDoneCondition_UsesDefault(t *testing.T) {
 	}
 }
 
-// TestNextWorkPrompt_EmptyOracle_UsesDefault mirrors buildSpawnPrompt's own
-// default oracle wording.
-func TestNextWorkPrompt_EmptyOracle_UsesDefault(t *testing.T) {
+// TestNextWorkPrompt_EmptyRubric_UsesDefault mirrors buildSpawnPrompt's own
+// default rubric wording.
+func TestNextWorkPrompt_EmptyRubric_UsesDefault(t *testing.T) {
 	l := domain.Loop{Cycle: 2}
 	contract := registry.Record{Goal: "ship it", DoneCondition: "tests pass"}
 	got := NextWorkPrompt(l, contract)
-	if !strings.Contains(got, "oracle: an independent LLM judge verifies against the complete condition") {
-		t.Errorf("got %q, want the default oracle wording", got)
+	if !strings.Contains(got, "rubric: an independent LLM judge verifies against the complete condition") {
+		t.Errorf("got %q, want the default rubric wording", got)
 	}
 }
 

@@ -30,8 +30,8 @@ func TestBind_LoadRoundTrip(t *testing.T) {
 	if rec.DoneCondition != "" {
 		t.Errorf("DoneCondition = %q, want empty (not supplied)", rec.DoneCondition)
 	}
-	if rec.Oracle != "" {
-		t.Errorf("Oracle = %q, want empty (not supplied)", rec.Oracle)
+	if rec.Rubric != "" {
+		t.Errorf("Rubric = %q, want empty (not supplied)", rec.Rubric)
 	}
 	if rec.Challenger != "" {
 		t.Errorf("Challenger = %q, want empty (not supplied)", rec.Challenger)
@@ -55,7 +55,7 @@ func TestBind_LoadRoundTrip_FullContract(t *testing.T) {
 	spec := BindSpec{
 		Goal:          "fix the flaky test",
 		DoneCondition: "go test ./... passes 5 times in a row",
-		Oracle:        "run go test ./... and check for PASS",
+		Rubric:        "run go test ./... and check for PASS",
 		Challenger:    "try to break it with -race",
 		MaxCycles:     20,
 	}
@@ -71,8 +71,8 @@ func TestBind_LoadRoundTrip_FullContract(t *testing.T) {
 	if rec.DoneCondition != spec.DoneCondition {
 		t.Errorf("DoneCondition = %q, want %q", rec.DoneCondition, spec.DoneCondition)
 	}
-	if rec.Oracle != spec.Oracle {
-		t.Errorf("Oracle = %q, want %q", rec.Oracle, spec.Oracle)
+	if rec.Rubric != spec.Rubric {
+		t.Errorf("Rubric = %q, want %q", rec.Rubric, spec.Rubric)
 	}
 	if rec.Challenger != spec.Challenger {
 		t.Errorf("Challenger = %q, want %q", rec.Challenger, spec.Challenger)
@@ -85,6 +85,54 @@ func TestBind_LoadRoundTrip_FullContract(t *testing.T) {
 func TestLoad_Unbound(t *testing.T) {
 	if _, ok := Load(t.TempDir(), "no-such-session"); ok {
 		t.Error("expected ok=false for an unbound session")
+	}
+}
+
+// TestLoad_OracleJSONKeyCompat is feat/panel-info's precise-rename load-
+// compat test: Record.Oracle became Record.Rubric (see Record's doc), but
+// the on-disk JSON key deliberately stayed "oracle" so an ALREADY-
+// PERSISTED record (written by any version of missionctl before this
+// rename) keeps loading its rubric text correctly — hand-writes a raw
+// on-disk record file using the OLD "oracle" key, bypassing Bind/
+// writeRecordFile entirely, to prove the read path alone honors it.
+func TestLoad_OracleJSONKeyCompat(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{"goal":"fix the bug","doneCondition":"tests pass","oracle":"run go test ./...","challenger":"","boundAt":1700000000,"maxCycles":12,"noImproveLimit":3,"noImprove":0}`
+	if err := os.WriteFile(filepath.Join(dir, "sess-1.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	rec, ok := Load(dir, "sess-1")
+	if !ok {
+		t.Fatal("expected the pre-rename record to load")
+	}
+	if rec.Rubric != "run go test ./..." {
+		t.Errorf("Rubric = %q, want %q (loaded from the old \"oracle\" JSON key)", rec.Rubric, "run go test ./...")
+	}
+	if rec.Goal != "fix the bug" || rec.DoneCondition != "tests pass" {
+		t.Errorf("got %+v, want the rest of the pre-rename record intact too", rec)
+	}
+}
+
+// TestSaveVerdict_WritesRubricUnderOracleJSONKey is the write-side half of
+// the same compat seam: a record saved by TODAY's code must still be
+// readable by anything (a human `cat`, an older missionctl binary) that
+// expects the "oracle" JSON key — Rubric must never leak onto a NEW key.
+func TestSaveVerdict_WritesRubricUnderOracleJSONKey(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal", Rubric: "run go test ./..."}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "sess-1.json"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"oracle":"run go test ./..."`) {
+		t.Errorf("on-disk record = %s, want the rubric text under the \"oracle\" JSON key", raw)
+	}
+	if strings.Contains(string(raw), `"rubric"`) {
+		t.Errorf("on-disk record = %s, want NO \"rubric\" JSON key at all — the field stays \"oracle\" on disk", raw)
 	}
 }
 
@@ -146,10 +194,10 @@ func TestSaveVerdict_DoneOrProgressResetsNoImprove(t *testing.T) {
 }
 
 func TestSaveVerdict_PreservesContractFields(t *testing.T) {
-	// SaveVerdict re-reads then re-writes the record — DoneCondition/Oracle/
+	// SaveVerdict re-reads then re-writes the record — DoneCondition/Rubric/
 	// Challenger must survive that round trip, not just Goal/caps.
 	dir := t.TempDir()
-	spec := BindSpec{Goal: "goal", DoneCondition: "tests pass", Oracle: "run tests", Challenger: "adversarial probe"}
+	spec := BindSpec{Goal: "goal", DoneCondition: "tests pass", Rubric: "run tests", Challenger: "adversarial probe"}
 	if err := Bind(dir, "sess-1", spec); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
@@ -157,7 +205,7 @@ func TestSaveVerdict_PreservesContractFields(t *testing.T) {
 		t.Fatalf("SaveVerdict: %v", err)
 	}
 	rec, _ := Load(dir, "sess-1")
-	if rec.DoneCondition != "tests pass" || rec.Oracle != "run tests" || rec.Challenger != "adversarial probe" {
+	if rec.DoneCondition != "tests pass" || rec.Rubric != "run tests" || rec.Challenger != "adversarial probe" {
 		t.Errorf("got %+v, want the contract fields preserved across SaveVerdict", rec)
 	}
 }
@@ -246,7 +294,7 @@ func TestMarkDriven_SetsAndClearsFlag(t *testing.T) {
 // record — MarkDriven is a single-field flip, not a rebuild.
 func TestMarkDriven_PreservesEveryOtherField(t *testing.T) {
 	dir := t.TempDir()
-	spec := BindSpec{Goal: "goal", DoneCondition: "tests pass", Oracle: "run tests", Challenger: "adversarial probe", MaxCycles: 20}
+	spec := BindSpec{Goal: "goal", DoneCondition: "tests pass", Rubric: "run tests", Challenger: "adversarial probe", MaxCycles: 20}
 	if err := Bind(dir, "sess-1", spec); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
@@ -259,7 +307,7 @@ func TestMarkDriven_PreservesEveryOtherField(t *testing.T) {
 	}
 
 	rec, _ := Load(dir, "sess-1")
-	if rec.DoneCondition != "tests pass" || rec.Oracle != "run tests" || rec.Challenger != "adversarial probe" || rec.MaxCycles != 20 {
+	if rec.DoneCondition != "tests pass" || rec.Rubric != "run tests" || rec.Challenger != "adversarial probe" || rec.MaxCycles != 20 {
 		t.Errorf("got %+v, want the contract fields untouched by MarkDriven", rec)
 	}
 	if rec.Verdict == nil || rec.Verdict.Outcome != domain.OutcomeRejected || rec.Verdict.Reason != "no evidence" || rec.Verdict.AtCycle != 3 {
@@ -326,7 +374,7 @@ func TestWritePending_ListPendingRoundTrip_FullContract(t *testing.T) {
 	spec := BindSpec{
 		Goal:          "fix the bug",
 		DoneCondition: "tests pass",
-		Oracle:        "run tests",
+		Rubric:        "run tests",
 		Challenger:    "try to break it",
 		MaxCycles:     7,
 	}
@@ -339,7 +387,7 @@ func TestWritePending_ListPendingRoundTrip_FullContract(t *testing.T) {
 		t.Fatalf("got %d pending, want 1", len(pending))
 	}
 	for _, p := range pending {
-		if p.DoneCondition != spec.DoneCondition || p.Oracle != spec.Oracle || p.Challenger != spec.Challenger || p.MaxCycles != spec.MaxCycles {
+		if p.DoneCondition != spec.DoneCondition || p.Rubric != spec.Rubric || p.Challenger != spec.Challenger || p.MaxCycles != spec.MaxCycles {
 			t.Errorf("got %+v, want the full contract carried through pending", p)
 		}
 	}

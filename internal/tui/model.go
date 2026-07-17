@@ -198,7 +198,7 @@ type wizardStep int
 const (
 	wizardGoal       wizardStep = iota // required; empty cancels
 	wizardDoneWhen                     // optional; completion condition
-	wizardOracle                       // optional; verification rubric
+	wizardRubric                       // optional; verification rubric (was wizardOracle — feat/panel-info's precise rename, see domain.Goal's doc)
 	wizardChallenger                   // optional; adversarial probe description, STORED ONLY
 	wizardMaxCycles                    // optional; empty = registry.DefaultMaxCycles
 	// wizardEngineDrive: single-key e/m/enter, LoopEngine MVP's opt-in
@@ -229,14 +229,16 @@ type Model struct {
 	spawnCwd  string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
 	spawnNote string // captured alongside spawnCwd: non-empty when the selected loop's cwd wasn't verified-real and spawn fell back to os.Getwd() (see the "n" handler and P1-3's CwdVerified gating)
 
-	// spawnStep/spawnGoal/spawnDoneWhen/spawnOracle/spawnChallenger/
+	// spawnStep/spawnGoal/spawnDoneWhen/spawnRubric/spawnChallenger/
 	// spawnMaxCycles hold the "n" key wizard's in-progress answers across
 	// its steps (see wizardStep) — spawnCwd/spawnNote above are captured
 	// once, before step 1, and don't change as the wizard advances.
+	// spawnRubric was spawnOracle until feat/panel-info's precise rename —
+	// see domain.Goal's doc.
 	spawnStep       wizardStep
 	spawnGoal       string
 	spawnDoneWhen   string
-	spawnOracle     string
+	spawnRubric     string
 	spawnChallenger string
 	spawnMaxCycles  int
 
@@ -311,6 +313,22 @@ type Model struct {
 	// either way (see renderStageRow).
 	gitStats map[string]gitStatsResult
 
+	// fleetOracleCounts caches EVERY loop's total judged-verdict count
+	// (TriggerOracle event count), keyed by SessionID — backs the FLEET
+	// panel's new ORACLE×N column (feat/panel-info). UNLIKE gitStats/
+	// detailCache above (which only ever compute for the SELECTED loop,
+	// since only DETAIL renders their data), this covers the WHOLE fleet:
+	// every visible row needs its own count. Still populated off the
+	// render path, once per scan tick (fleetOracleCountsCmd, dispatched
+	// alongside gitCmd/detailCmd in the loopsMsg handler) — NOT a
+	// per-render event-log read, which is exactly the class of bug fix/
+	// exit-gate-ux's architecture judge finding already eliminated
+	// elsewhere in this file; this column must not reintroduce it. A
+	// missing key (loop not yet scanned, or unbound) renders as the
+	// zero-value 0, which oracleCompactLabel treats as "never judged" —
+	// see its own doc.
+	fleetOracleCounts map[string]int
+
 	// detailCache caches the selected loop's event-log history and
 	// transcript LAST ERROR extraction, keyed by SessionID — the SAME
 	// off-loop tea.Cmd/Model-cache pattern as gitStats (see its doc),
@@ -384,13 +402,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// synchronous events.Read/claude.LastError calls in View().
 			detailCmd = detailCacheCmd(sel)
 		}
-		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd, detailCmd}, autoRedriveCmds...)
+		// feat/panel-info: UNLIKE gitCmd/detailCmd above, this one DOES
+		// cover the whole fleet, not just the selected loop — every FLEET
+		// row now renders an ORACLE×N column (see renderListRow), so every
+		// row needs its own judged-count, not only the one loop DETAIL
+		// happens to be showing. Still off the render path and still only
+		// once per scan tick — see fleetOracleCountsCmd's own doc for why
+		// this doesn't reintroduce the per-render event-log read
+		// fix/exit-gate-ux just finished eliminating.
+		cmds := append([]tea.Cmd{m.triggerJudgments(), emitTransitionsCmd(transitions), gitCmd, detailCmd, fleetOracleCountsCmd(newLoops)}, autoRedriveCmds...)
 		return m, tea.Batch(cmds...)
 	case gitStatsMsg:
 		if m.gitStats == nil {
 			m.gitStats = make(map[string]gitStatsResult)
 		}
 		m.gitStats[msg.sessionID] = msg.stats
+		return m, nil
+	case fleetOracleCountsMsg:
+		m.fleetOracleCounts = map[string]int(msg)
 		return m, nil
 	case detailCacheMsg:
 		if m.detailCache == nil {
@@ -820,7 +849,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spawnStep = wizardGoal
 			m.spawnGoal = ""
 			m.spawnDoneWhen = ""
-			m.spawnOracle = ""
+			m.spawnRubric = ""
 			m.spawnChallenger = ""
 			m.spawnMaxCycles = 0
 			m.spawnWorktreeEligible = false // set once checkWorktreeEligibilityCmd's result arrives
@@ -1228,12 +1257,12 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 
 	case wizardDoneWhen:
 		m.spawnDoneWhen = value
-		m.spawnStep = wizardOracle
+		m.spawnStep = wizardRubric
 		m.input = newWizardInput()
 		return m, textinput.Blink
 
-	case wizardOracle:
-		m.spawnOracle = value
+	case wizardRubric:
+		m.spawnRubric = value
 		m.spawnStep = wizardChallenger
 		m.input = newWizardInput()
 		return m, textinput.Blink
@@ -1304,7 +1333,7 @@ func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 	spec := registry.BindSpec{
 		Goal:          m.spawnGoal,
 		DoneCondition: m.spawnDoneWhen,
-		Oracle:        m.spawnOracle,
+		Rubric:        m.spawnRubric,
 		Challenger:    m.spawnChallenger,
 		MaxCycles:     m.spawnMaxCycles,
 	}
@@ -1324,7 +1353,7 @@ func (m Model) submitSpawnWizardEngineDrive() (tea.Model, tea.Cmd) {
 	spec := registry.BindSpec{
 		Goal:          m.spawnGoal,
 		DoneCondition: m.spawnDoneWhen,
-		Oracle:        m.spawnOracle,
+		Rubric:        m.spawnRubric,
 		Challenger:    m.spawnChallenger,
 		MaxCycles:     m.spawnMaxCycles,
 		Driven:        true, // bootstrapEngineCmd asserts this too (defense in depth) — see its doc
@@ -1381,7 +1410,7 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		if !ok {
 			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
 		}
-		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 
 		if spawner, supports := ctrl.(control.WorktreeSpawner); useWorktree && supports {
 			name := worktreeNameFromGoal(spec.Goal)
@@ -1519,7 +1548,7 @@ func bootstrapEngineCmd(cwd string, spec registry.BindSpec) tea.Cmd {
 
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapTimeout)
 		defer cancel()
-		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 		out, err := bootstrapClaudeFn(ctx, cwd, prompt)
 		if err != nil {
 			return bootstrapResultMsg{false, fmt.Sprintf("engine bootstrap failed: %v", err), ""}
@@ -1589,27 +1618,32 @@ func slugFromGoal(goal string, maxRunes int) string {
 // buildSpawnPrompt composes the LOOP CONTRACT block sent as the new
 // session's very first prompt. This is the SAME contract the wizard
 // collected (see the "n" key) that also becomes the oracle's judging rubric
-// (internal/oracle.Judge, via doneWhen/oracleText) — what the agent is told
+// (internal/oracle.Judge, via doneWhen/rubricText) — what the agent is told
 // and what it's judged against are one document, not two that can drift
 // apart. maxCycles is always shown resolved (never 0) — the wizard applies
 // registry.DefaultMaxCycles before calling this. challenger's line is
 // omitted entirely when empty: there's no challenger phase yet (see
 // DESIGN.md), so an empty line naming a check that never runs would be
 // actively misleading.
-func buildSpawnPrompt(goal, doneWhen, oracleText, challenger string, maxCycles int) string {
+//
+// feat/panel-info (precise rename): the criteria line is labeled "rubric:"
+// now, not "oracle:" — matching the wizard's renamed prompt and
+// domain.Goal.Rubric. "An independent oracle will verify..." at the end is
+// UNCHANGED — that sentence is genuinely about the judge, not the criteria.
+func buildSpawnPrompt(goal, doneWhen, rubricText, challenger string, maxCycles int) string {
 	done := doneWhen
 	if done == "" {
 		done = "you judge the goal fully achieved"
 	}
-	oracleLine := oracleText
-	if oracleLine == "" {
-		oracleLine = "an independent LLM judge verifies against the complete condition"
+	rubricLine := rubricText
+	if rubricLine == "" {
+		rubricLine = "an independent LLM judge verifies against the complete condition"
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "goal: %s\n", goal)
 	fmt.Fprintf(&b, "complete condition: %s\n", done)
-	fmt.Fprintf(&b, "oracle: %s\n", oracleLine)
+	fmt.Fprintf(&b, "rubric: %s\n", rubricLine)
 	if challenger != "" {
 		fmt.Fprintf(&b, "challenger: %s\n", challenger)
 	}
@@ -1739,7 +1773,7 @@ func (m *Model) triggerJudgments() tea.Cmd {
 func judgeCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		lastText, _ := claude.LastAssistantTextFull(l.Path) // ok=false just means an empty report is judged as-is
-		verdict, err := judgeFn(l.Goal.Text, l.Cwd, lastText, l.Goal.DoneWhen, l.Goal.Oracle)
+		verdict, err := judgeFn(l.Goal.Text, l.Cwd, lastText, l.Goal.DoneWhen, l.Goal.Rubric)
 		if err != nil {
 			return verdictMsg{sessionID: l.SessionID, err: err}
 		}
@@ -2831,6 +2865,13 @@ const (
 	wMarker = 2
 	wState  = 12
 	wLast   = 14
+	// wCycle/wOracle (feat/panel-info): the FLEET row's two new optional
+	// columns. wCycle fits "12/999"-style labels (cycleLabel's widest
+	// realistic output) comfortably; wOracle fits "✓×99"/"✗×99" (the
+	// ORACLE×N glyph+count, oracleCompactLabel) with a little breathing
+	// room. See listRowWidths for the drop-order these widths feed into.
+	wCycle  = 7
+	wOracle = 6
 )
 
 // nameFloorWidth/nameCapWidth bound the FLEET panel's NAME column: below the
@@ -3073,12 +3114,49 @@ func padLines(lines []string, n int) []string {
 	return out
 }
 
+// ── feat/panel-info: FLEET panel's ORACLE×N column cache ─────────────────
+//
+// fleetOracleCountsMsg reports fleetOracleCountsCmd's result: sessionID ->
+// total judged-verdict count, for EVERY loop in the fleet (not just the
+// selected one — see Model.fleetOracleCounts' doc for why this differs
+// from gitStats/detailCache's scope).
+type fleetOracleCountsMsg map[string]int
+
+// fleetOracleCountsCmd counts each loop's TriggerOracle events (its total
+// judged-verdict history) off the event loop, once per scan tick, for the
+// WHOLE fleet at once (one tea.Cmd, one event-log read per BOUND loop —
+// not one per FLEET row per render, which is exactly the per-render-event-
+// read class of bug fix/exit-gate-ux's architecture judge already
+// eliminated elsewhere; this column must not reintroduce it under a new
+// name). Unbound loops (no goal — never judged, never will be) are
+// skipped entirely: no event-log read is even attempted for them.
+func fleetOracleCountsCmd(loops []domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		dir := historyDirFn()
+		counts := make(map[string]int, len(loops))
+		for _, l := range loops {
+			if l.Goal.Text == "" {
+				continue
+			}
+			evs, _ := events.Read(dir, l.SessionID) // best-effort; nil on error just means "0 judged so far"
+			n := 0
+			for _, ev := range evs {
+				if ev.Trigger == events.TriggerOracle {
+					n++
+				}
+			}
+			counts[l.SessionID] = n
+		}
+		return fleetOracleCountsMsg(counts)
+	}
+}
+
 // listRowWidths computes the compact FLEET row's NAME width for a panel of
 // the given inner content width, dropping the LAST column first if there
 // isn't room for it — the same self-verifying "never return a layout that
 // doesn't fit" cascade the old columnWidths used, scoped down to this
-// layout's much smaller column set (marker+NAME+STATE[+LAST] — DOING/CYCLE/
-// ORACLE/BUDGET/N-I/NOTE all moved to the DETAIL panel, see renderDetail).
+// layout's much smaller column set (marker+NAME+STATE[+CYCLE][+ORACLE]
+// [+LAST] — BUDGET/N-I/NOTE stay DETAIL-only, see renderDetail).
 // Unlike an earlier version of this function, wName is never clamped UP to
 // listNameFloor when there isn't room — an unconditional floor is not a
 // guarantee (the exact class of bug F1 fixed in the old columnWidths): at a
@@ -3087,11 +3165,49 @@ func padLines(lines []string, n int) []string {
 // claim to cover is innerWidth < wMarker+wState (marker+STATE alone already
 // exceed it) — same spirit as F1's own acknowledged "not fully guaranteed
 // under ~40 cols" edge in the old system.
-func listRowWidths(innerWidth int) (wName int, showLast bool) {
-	showLast = innerWidth-(wMarker+wState+wLast) >= listNameFloor
+//
+// feat/panel-info: CYCLE and ORACLE (the ORACLE×N column) drop before LAST
+// as width shrinks — captain's exact "width degradation ORACLE→CYCLE→LAST"
+// order: ORACLE is the least essential of the three optional columns
+// (dropped first), LAST (last-activity recency) is the most established/
+// essential (dropped last, same priority LAST already had before this
+// change).
+func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast bool) {
+	showCycle, showOracle, showLast = true, true, true
+	fits := func() bool {
+		fixed := wMarker + wState
+		if showLast {
+			fixed += wLast
+		}
+		if showCycle {
+			fixed += wCycle
+		}
+		if showOracle {
+			fixed += wOracle
+		}
+		return innerWidth-fixed >= listNameFloor
+	}
+	// drop right-to-priority: ORACLE first, then CYCLE, then LAST — see
+	// this function's own doc for why this specific order.
+	if !fits() {
+		showOracle = false
+	}
+	if !fits() {
+		showCycle = false
+	}
+	if !fits() {
+		showLast = false
+	}
+
 	fixed := wMarker + wState
 	if showLast {
 		fixed += wLast
+	}
+	if showCycle {
+		fixed += wCycle
+	}
+	if showOracle {
+		fixed += wOracle
 	}
 	wName = innerWidth - fixed
 	if wName < 0 {
@@ -3100,13 +3216,17 @@ func listRowWidths(innerWidth int) (wName int, showLast bool) {
 	if wName > nameCapWidth {
 		wName = nameCapWidth
 	}
-	return wName, showLast
+	return wName, showCycle, showOracle, showLast
 }
 
-// renderListRow renders one FLEET panel row: marker+NAME+STATE[+LAST] — no
-// DOING/CYCLE/ORACLE/BUDGET/N-I/NOTE (see renderDetail for those). Selection
-// highlight and duplicate-label disambiguation match the old renderRow.
-func renderListRow(l domain.Loop, sel, dup bool, wName int, showLast bool, totalWidth int) string {
+// renderListRow renders one FLEET panel row: marker+NAME+STATE[+CYCLE]
+// [+ORACLE][+LAST] — no DOING/BUDGET/N-I/NOTE (see renderDetail for
+// those). Selection highlight and duplicate-label disambiguation match the
+// old renderRow. oracleCount is the loop's cached judged-verdict count
+// (Model.fleetOracleCounts, looked up by the caller — this function does
+// no I/O of its own, same discipline as everything else in this file's
+// render path).
+func renderListRow(l domain.Loop, sel, dup bool, wName int, showCycle, showOracle, showLast bool, oracleCount int, totalWidth int) string {
 	marker := " "
 	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
 	if sel {
@@ -3122,6 +3242,12 @@ func renderListRow(l domain.Loop, sel, dup bool, wName int, showLast bool, total
 		stInk.Width(wName).Render(trunc(label, wName-1)),
 		stateStyle(l).Width(wState).Render(stateLabel(l)),
 	}
+	if showCycle {
+		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
+	}
+	if showOracle {
+		cells = append(cells, oracleStyle(l).Width(wOracle).Render(oracleCompactLabel(l, oracleCount)))
+	}
 	if showLast {
 		cells = append(cells, stDim.Width(wLast).Render(rel(time.Since(l.LastActivity))))
 	}
@@ -3130,6 +3256,24 @@ func renderListRow(l domain.Loop, sel, dup bool, wName int, showLast bool, total
 		row = stSelRow.Render(padToWidth(row, totalWidth))
 	}
 	return row
+}
+
+// oracleCompactLabel is the FLEET panel's ORACLE×N column value: the
+// latest verdict's glyph (✓ done/progress, ✗ rejected) times the total
+// judged count so far — "✓×3", "✗×2" — or "—" for a loop that's unbound
+// or bound but never yet judged. count comes from the caller's
+// Model.fleetOracleCounts lookup (a per-scan cache — see its doc); this
+// function itself does no I/O, mirroring oracleLabel's own shape (the
+// DETAIL panel's fuller "✓ verified"/"✗ rejected" sibling).
+func oracleCompactLabel(l domain.Loop, count int) string {
+	if l.Last == nil {
+		return "—"
+	}
+	glyph := "✓"
+	if l.Last.Outcome == domain.OutcomeRejected {
+		glyph = "✗"
+	}
+	return fmt.Sprintf("%s×%d", glyph, count)
 }
 
 // fleetPanelLines builds the FLEET panel's content lines, scrolled (see
@@ -3151,13 +3295,13 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 	case len(visible) == 0:
 		return []string{stFaint.Render(fmt.Sprintf("no loops match filter %q.", m.filterQuery))}
 	}
-	wName, showLast := listRowWidths(innerWidth)
+	wName, showCycle, showOracle, showLast := listRowWidths(innerWidth)
 	dupLabels := duplicateLabels(visible)
 	start, end := visibleWindow(len(visible), m.cursor, innerHeight)
 	rows := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
 		l := visible[i]
-		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.Project], wName, showLast, innerWidth))
+		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.Project], wName, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
 	}
 	return rows
 }
@@ -3502,16 +3646,27 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	if l.Goal.Text != "" {
 		d.WriteString(detailRow("GOAL", stInk.Render(trunc(l.Goal.Text, valueWidth))))
 		d.WriteString(detailRow("ORACLE", renderOracleDetail(l)))
-		// RUBRIC: the wizard's "oracle:" contract field (how completion is
-		// verified) — distinct from the ORACLE row above, which shows the
-		// oracle's rendered VERDICT, not its rubric. Abbreviated from
-		// "ORACLE-RUBRIC" to fit the pane's fixed ~8-col key width
-		// (detailRow) without breaking column alignment. Challenger is
-		// intentionally not shown yet (no challenger phase exists to
-		// surface progress against — see DESIGN.md).
-		if l.Goal.Oracle != "" {
-			d.WriteString(detailRow("RUBRIC", stDim.Render(trunc(l.Goal.Oracle, valueWidth))))
-		}
+		// RUBRIC/CHALL: the wizard's two remaining free-text contract
+		// fields (how completion is verified; the adversarial probe
+		// description) — distinct from the ORACLE row above, which shows
+		// the oracle's rendered VERDICT, not the criteria it judges
+		// against. "CHALL" (not "CHALLENGER") is a hard requirement, not
+		// styling: detailRow's KEY column is a fixed detailKeyWidth (8)
+		// cols via lipgloss .Width() — verified empirically that content
+		// LONGER than the fixed width WRAPS to a second line rather than
+		// overflowing in place, which would break both this row's own
+		// alignment and silently shift every row's height accounting.
+		// feat/panel-info: both rows are now ALWAYS shown once a loop has a
+		// goal (previously RUBRIC was hidden when empty and CHALLENGER
+		// wasn't shown at all) — captain's "없으면 비워두기" ("leave it
+		// blank if there's nothing"): a predictable, always-present row
+		// with a "—" placeholder reads better than a contract section
+		// whose row COUNT silently varies loop to loop. The challenger
+		// field is still STORED ONLY (no challenger phase exists to
+		// surface progress against — see DESIGN.md) — this just makes the
+		// fact that none was set visible, rather than omitting the row.
+		d.WriteString(detailRow("RUBRIC", stDim.Render(trunc(orDash(l.Goal.Rubric), valueWidth))))
+		d.WriteString(detailRow("CHALL", stDim.Render(trunc(orDash(l.Goal.Challenger), valueWidth))))
 		if stage, ok := renderStageRow(l, data); ok {
 			d.WriteString(detailRow("STAGE", stInk.Render(trunc(stage, valueWidth))))
 		}
@@ -3633,6 +3788,17 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// orDash: s unchanged if non-empty, else "—" — feat/panel-info's "없으면
+// 비워두기" contract rows (RUBRIC/CHALLENGER): a row that's always present
+// once a loop has a goal, with a placeholder rather than being hidden when
+// its field is empty.
+func orDash(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return s
 }
 
 // renderStageRow builds the STAGE row's value — "6/12 · elapsed 04:12 ·
@@ -4148,8 +4314,8 @@ func wizardStepLabel(step wizardStep) string {
 		return "goal:"
 	case wizardDoneWhen:
 		return "complete condition:"
-	case wizardOracle:
-		return "oracle:"
+	case wizardRubric:
+		return "rubric:"
 	case wizardChallenger:
 		return "challenger:"
 	case wizardMaxCycles:
