@@ -244,6 +244,28 @@ func tmuxNewWindowCmd(cwd string) []string {
 	return []string{"tmux", "new-window", "-c", cwd, "-P", "-F", "#{pane_id}", "claude"}
 }
 
+// OpenTerminal implements control.TerminalOpener: opens a new tmux window in
+// cwd running command — the LoopEngine MVP's take-over attach
+// (docs/design-loop-engine-mvp.md, Slice 4). Reuses tmuxNewWindowCmd's exact
+// "-c cwd" shape, generalized from the hardcoded "claude" Spawn always runs
+// to an arbitrary command (take-over's "claude --resume <id>"); command is
+// already the complete shell invocation, and tmux interprets a single
+// trailing argv element as the shell-command to run in the new window's
+// pane (same convention `tmux new-window "claude --resume <id>"` documents)
+// — no -P/-F pane-id capture needed here, unlike Spawn, since there is no
+// follow-up send.
+func (tmuxController) OpenTerminal(cwd, command string) error {
+	argv := tmuxOpenTerminalCmd(cwd, command)
+	return exec.Command(argv[0], argv[1:]...).Run()
+}
+
+// tmuxOpenTerminalCmd builds the argv for OpenTerminal — pulled out as its
+// own pure function (same reasoning as tmuxNewWindowCmd/tmuxResumeCmds
+// above: directly unit-testable without a real tmux binary).
+func tmuxOpenTerminalCmd(cwd, command string) []string {
+	return []string{"tmux", "new-window", "-c", cwd, command}
+}
+
 // Interrupt stops the current turn without killing claude — a bare Esc.
 func (tmuxController) Interrupt(t Target) error {
 	return runWithTimeout(tmuxInterruptCmd(t.ID))

@@ -124,6 +124,30 @@ type WorktreeSpawner interface {
 	SpawnWorktree(repoCwd, name, prompt string) (worktreePath string, err error)
 }
 
+// TerminalOpener is another OPTIONAL capability, same shape/reasoning as
+// WorktreeSpawner (narrow interface, not a Controller method — don't bloat
+// every backend with a stub): opens a FRESH terminal running an arbitrary
+// command in cwd. Added for LoopEngine MVP Slice 4's take-over attach — a
+// Driven (engine-owned) loop has no existing terminal surface to Locate/
+// Focus into (headless bootstrap, see docs/design-loop-engine-mvp.md §3),
+// so handing it to a human means CREATING one, running `claude --resume
+// <id>` so the human inherits the exact session, not Spawn's "start a brand
+// new claude loop" (which begins a NEW session, wrong for take-over).
+//
+// orca and tmux both have a verified one-shot "run this command in a new
+// terminal" primitive (orca: `terminal create --command`, reusing the exact
+// create call Spawn already verified live, just swapping the fixed
+// "--command claude" for an arbitrary command; tmux: `new-window
+// "<command>"`, reusing tmuxNewWindowCmd's `-c cwd` shape). cmux has no
+// verified equivalent one-shot command-in-new-surface primitive today, so it
+// does NOT implement this — callers type-assert (same pattern as
+// WorktreeSpawner's ctrl.(control.WorktreeSpawner)) and fall back to the
+// manual "claude --resume <id>" hint when the resolved controller doesn't
+// support it, exactly like attach's own no-backend fallback.
+type TerminalOpener interface {
+	OpenTerminal(cwd, command string) error
+}
+
 // Resolve returns the first available controller: orca preferred (the
 // user's own environment), cmux then tmux as fallbacks; ok is false if
 // none of the three backends is available.

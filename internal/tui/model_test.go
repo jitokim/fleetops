@@ -6485,3 +6485,404 @@ func TestDriveCmd_ResumeResultMsg_ClearsActuating(t *testing.T) {
 		t.Errorf("statusKind = %v, want statusOK", m.statusKind)
 	}
 }
+
+// ── LoopEngine MVP Slice 4: provenance + kill adapter + take-over attach ──
+//
+// docs/design-loop-engine-mvp.md §4/§8. This is the final engine slice: a
+// Driven loop must be visually distinguishable (⚙, FLEET + DETAIL), killable
+// without a terminal surface (registry.MarkDriven false, not /exit), and
+// take-over-able (↵ opens a real terminal running `claude --resume <id>` and
+// clears Driven — the captain's HARD AC, "the payoff": a human can always
+// reclaim the wheel).
+
+// ── provenance marker (⚙) ──────────────────────────────────────────────────
+
+func TestFleetPanelLines_DrivenLoop_ShowsGearMarker(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "s1", ProjectDir: "-x-aboard", State: domain.StateIdle, Driven: true}}
+	lines := m.fleetPanelLines(80, 10)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "⚙") {
+		t.Errorf("expected the ⚙ provenance marker for a Driven loop:\n%s", joined)
+	}
+}
+
+func TestFleetPanelLines_ObservedLoop_NoGearMarker(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "s1", ProjectDir: "-x-aboard", State: domain.StateIdle, Driven: false}}
+	lines := m.fleetPanelLines(80, 10)
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "⚙") {
+		t.Errorf("did not expect the ⚙ marker for an observed loop:\n%s", joined)
+	}
+}
+
+// TestFleetPanelLines_DrivenAndSelected_BothGlyphsPresent proves the
+// 2-column marker cell holds the cursor "▸" and the Driven "⚙" glyph
+// simultaneously (they occupy DIFFERENT columns of wMarker, not the same
+// one) — a Driven row that's also the selected row must not lose either
+// signal.
+func TestFleetPanelLines_DrivenAndSelected_BothGlyphsPresent(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "aboard", SessionID: "s1", ProjectDir: "-x-aboard", State: domain.StateIdle, Driven: true}}
+	m.cursor = 0
+	lines := m.fleetPanelLines(80, 10)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "▸") {
+		t.Errorf("expected the cursor glyph still present on a selected AND Driven row:\n%s", joined)
+	}
+	if !strings.Contains(joined, "⚙") {
+		t.Errorf("expected the ⚙ marker still present on a selected AND Driven row:\n%s", joined)
+	}
+}
+
+func TestRenderDetail_DrivenLoop_ShowsDriveRow(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cycle: 2,
+		Driven: true, Goal: domain.Goal{Text: "ship it", MaxCycles: 8}}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "DRIVE") {
+		t.Errorf("expected the DRIVE row present for a Driven loop:\n%s", out)
+	}
+	if !strings.Contains(out, "engine-driven") {
+		t.Errorf("expected the DRIVE row's value text present:\n%s", out)
+	}
+	if !strings.Contains(out, "cycle 2/8") {
+		t.Errorf("expected the DRIVE row to show cycle N/max via cycleLabel:\n%s", out)
+	}
+}
+
+func TestRenderDetail_ObservedLoop_NoDriveRow(t *testing.T) {
+	l := domain.Loop{Project: "aboard", SessionID: "s1", State: domain.StateIdle, Cycle: 2,
+		Driven: false, Goal: domain.Goal{Text: "ship it"}}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "DRIVE") {
+		t.Errorf("did not expect a DRIVE row for an observed loop:\n%s", out)
+	}
+}
+
+// ── kill adapter for Driven loops (design doc §4) ─────────────────────────
+
+func TestKillCmd_DrivenLoop_ClearsDrivenInsteadOfTierOneExit(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir, origResolve := registryDirFn, historyDirFn, resolveActuationTargetFn
+	defer func() {
+		registryDirFn, historyDirFn, resolveActuationTargetFn = origRegDir, origHistoryDir, origResolve
+	}()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+	resolveCalled := false
+	resolveActuationTargetFn = func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+		resolveCalled = true
+		return nil, control.Target{}, false, false
+	}
+	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateIdle, Driven: true}
+	msg := killCmd(l)()
+
+	if resolveCalled {
+		t.Error("expected resolveActuationTargetFn NOT to be called for a Driven loop — no Tier-1 /exit send, it has no terminal surface")
+	}
+	km, ok := msg.(killResultMsg)
+	if !ok || !km.ok {
+		t.Fatalf("got %+v, want a successful killResultMsg", msg)
+	}
+	if !strings.Contains(km.text, "Driven cleared") {
+		t.Errorf("text = %q, want it to mention Driven being cleared", km.text)
+	}
+
+	rec, ok := registry.Load(registryDir, "sess-1")
+	if !ok {
+		t.Fatal("expected a record to exist")
+	}
+	if rec.Driven {
+		t.Error("expected Driven cleared in the registry after kill")
+	}
+}
+
+// TestKillCmd_DrivenLoop_EmitsKillEventMostRecentActuationIsKillRecognizes
+// proves the event this writes is in the EXACT shape
+// mostRecentActuationIsKill (internal/claude/scan.go) looks for — so the
+// next scan still promotes StateKilled for a Driven loop's kill exactly as
+// it would for an observed loop's.
+func TestKillCmd_DrivenLoop_EmitsKillEventMostRecentActuationIsKillRecognizes(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegDir, origHistoryDir }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateIdle, Driven: true}
+	killCmd(l)()
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want exactly 1: %#v", len(evs), evs)
+	}
+	if evs[0].Trigger != events.TriggerActuation || evs[0].Actor != events.ActorHuman {
+		t.Errorf("event = %+v, want Trigger=TriggerActuation Actor=ActorHuman (a human keypress, matching mostRecentActuationIsKill's filter)", evs[0])
+	}
+	if !strings.HasPrefix(evs[0].Detail, "kill ") {
+		t.Errorf("Detail = %q, want it prefixed \"kill \" (mostRecentActuationIsKill's exact match)", evs[0].Detail)
+	}
+}
+
+func TestKillCmd_DrivenLoop_MarkDrivenErrorSurfacesAsFailure(t *testing.T) {
+	registryDir := t.TempDir() // no Bind — MarkDriven errors on a missing record
+	origRegDir := registryDirFn
+	defer func() { registryDirFn = origRegDir }()
+	registryDirFn = func() string { return registryDir }
+
+	l := domain.Loop{SessionID: "sess-1", Project: "aboard", State: domain.StateIdle, Driven: true}
+	msg := killCmd(l)()
+
+	km, ok := msg.(killResultMsg)
+	if !ok || km.ok {
+		t.Fatalf("got %+v, want a failed killResultMsg", msg)
+	}
+}
+
+// TestUpdate_SecondKWithinWindow_DrivenLoop_SkipsAmbiguityGuard proves the
+// keypress-time ambiguity guard (refuseIfAmbiguous) is skipped for a Driven
+// loop's kill — it exists solely to protect an actual keystroke from
+// landing on the wrong sibling terminal, and killCmd's Driven branch never
+// sends one, so two Driven loops sharing an (irrelevant) ProjectDir must
+// not spuriously refuse the kill.
+func TestUpdate_SecondKWithinWindow_DrivenLoop_SkipsAmbiguityGuard(t *testing.T) {
+	registryDir := t.TempDir()
+	origRegDir := registryDirFn
+	defer func() { registryDirFn = origRegDir }()
+	registryDirFn = func() string { return registryDir }
+	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	m := New()
+	m.loops = []domain.Loop{
+		// two loops sharing a ProjectDir would normally trip refuseIfAmbiguous
+		// (see TestUpdate_SecondKWithinWindow_Ambiguous_Refuses-style tests
+		// elsewhere in this file) — irrelevant here since kill never dispatches
+		// into either terminal surface for a Driven loop.
+		{Project: "aboard", SessionID: "sess-1", ProjectDir: "-x-aboard", State: domain.StateIdle, Driven: true},
+		{Project: "aboard-2", SessionID: "sess-2", ProjectDir: "-x-aboard", State: domain.StateIdle, Driven: true},
+	}
+	m.cursor = 0
+
+	m, _ = updateModel(t, m, runeKey('k'))
+	m, cmd := updateModel(t, m, runeKey('k'))
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (killCmd) — the ambiguity guard must not refuse a Driven loop's kill")
+	}
+	if strings.Contains(m.status, "ambiguous") {
+		t.Errorf("status = %q, did not want an ambiguity refusal for a Driven kill", m.status)
+	}
+}
+
+// ── take-over attach: the captain's HARD AC ("the payoff") ────────────────
+
+// fakeTerminalOpenerController extends fakeController with
+// control.TerminalOpener support — a SEPARATE type (not a field toggle on
+// fakeController itself) so a plain *fakeController continues to correctly
+// simulate a backend WITHOUT TerminalOpener support (e.g. cmux, see its own
+// doc) via Go's ordinary interface type-assertion semantics — exactly the
+// real-world distinction takeOverCmd's own type-assert branches on.
+type fakeTerminalOpenerController struct {
+	*fakeController
+	openTerminalCalled  bool
+	openTerminalCwd     string
+	openTerminalCommand string
+	openTerminalErr     error
+}
+
+func (f *fakeTerminalOpenerController) OpenTerminal(cwd, command string) error {
+	f.openTerminalCalled = true
+	f.openTerminalCwd = cwd
+	f.openTerminalCommand = command
+	return f.openTerminalErr
+}
+
+func TestTakeOverCmd_DrivenLoop_OpensTerminalAndClearsDriven(t *testing.T) {
+	registryDir := t.TempDir()
+	historyDir := t.TempDir()
+	origRegDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegDir, origHistoryDir }()
+	registryDirFn = func() string { return registryDir }
+	historyDirFn = func() string { return historyDir }
+	if err := registry.Bind(registryDir, "s1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	fakeCtrl := &fakeTerminalOpenerController{fakeController: &fakeController{name: "orca"}}
+	withFakeControlResolve(t, fakeCtrl, true)
+
+	l := domain.Loop{Project: "aboard", SessionID: "s1", Cwd: "/x/aboard", State: domain.StateIdle, Driven: true}
+
+	msg := takeOverCmd(l)()
+
+	if !fakeCtrl.openTerminalCalled {
+		t.Fatal("expected OpenTerminal to be called")
+	}
+	if fakeCtrl.openTerminalCwd != "/x/aboard" {
+		t.Errorf("OpenTerminal cwd = %q, want the loop's cwd", fakeCtrl.openTerminalCwd)
+	}
+	if fakeCtrl.openTerminalCommand != "claude --resume s1" {
+		t.Errorf("OpenTerminal command = %q, want the manual resume hint (claude --resume <id>)", fakeCtrl.openTerminalCommand)
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok {
+		t.Fatalf("got %+v, want a successful attachResultMsg", msg)
+	}
+
+	rec, ok := registry.Load(registryDir, "s1")
+	if !ok {
+		t.Fatal("expected a record to exist")
+	}
+	if rec.Driven {
+		t.Error("expected Driven cleared after a successful take-over — the engine must stop driving it")
+	}
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["s1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want exactly 1: %#v", len(evs), evs)
+	}
+	if evs[0].Trigger != events.TriggerActuation || evs[0].Actor != events.ActorHuman {
+		t.Errorf("event = %+v, want Trigger=TriggerActuation Actor=ActorHuman (a human keypress take-over)", evs[0])
+	}
+	if !strings.HasPrefix(evs[0].Detail, "take-over ") {
+		t.Errorf("Detail = %q, want it prefixed \"take-over \"", evs[0].Detail)
+	}
+}
+
+func TestTakeOverCmd_NoBackend_ManualHintFallback_DrivenUntouched(t *testing.T) {
+	registryDir := t.TempDir()
+	origRegDir := registryDirFn
+	defer func() { registryDirFn = origRegDir }()
+	registryDirFn = func() string { return registryDir }
+	if err := registry.Bind(registryDir, "s1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	withFakeControlResolve(t, nil, false)
+
+	l := domain.Loop{Project: "aboard", SessionID: "s1", Cwd: "/x/aboard", State: domain.StateIdle, Driven: true}
+
+	msg := takeOverCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a failed attachResultMsg with a manual hint", msg)
+	}
+	if !strings.Contains(am.text, "claude --resume s1") {
+		t.Errorf("text = %q, want the manual resume hint", am.text)
+	}
+
+	rec, ok := registry.Load(registryDir, "s1")
+	if !ok {
+		t.Fatal("expected a record to exist")
+	}
+	if !rec.Driven {
+		t.Error("expected Driven UNTOUCHED when no backend is available — missionctl can't confirm a human actually took over by hand, so the engine keeps driving it headlessly")
+	}
+}
+
+// TestTakeOverCmd_BackendWithoutTerminalOpener_ManualHintFallback: a plain
+// *fakeController (no OpenTerminal method — same shape as an unenhanced
+// cmux resolve) must fall back exactly like the no-backend case, not panic
+// on the type assertion or silently degrade to some other action.
+func TestTakeOverCmd_BackendWithoutTerminalOpener_ManualHintFallback(t *testing.T) {
+	fakeCtrl := &fakeController{name: "cmux"}
+	withFakeControlResolve(t, fakeCtrl, true)
+	l := domain.Loop{Project: "aboard", SessionID: "s1", Cwd: "/x/aboard", State: domain.StateIdle, Driven: true}
+
+	msg := takeOverCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a failed attachResultMsg with a manual hint", msg)
+	}
+	if !strings.Contains(am.text, "claude --resume s1") {
+		t.Errorf("text = %q, want the manual resume hint", am.text)
+	}
+}
+
+// TestTakeOverCmd_OpenTerminalFails_DrivenNotCleared is the ordering proof:
+// clearing Driven BEFORE confirming the terminal opened would strand the
+// loop owned by neither the engine (no longer Driven) nor a human (no
+// terminal actually opened for them) — see takeOverCmd's own doc.
+func TestTakeOverCmd_OpenTerminalFails_DrivenNotCleared(t *testing.T) {
+	registryDir := t.TempDir()
+	origRegDir := registryDirFn
+	defer func() { registryDirFn = origRegDir }()
+	registryDirFn = func() string { return registryDir }
+	if err := registry.Bind(registryDir, "s1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	fakeCtrl := &fakeTerminalOpenerController{fakeController: &fakeController{name: "orca"}, openTerminalErr: errTestJudgeFailed}
+	withFakeControlResolve(t, fakeCtrl, true)
+
+	l := domain.Loop{Project: "aboard", SessionID: "s1", Cwd: "/x/aboard", State: domain.StateIdle, Driven: true}
+
+	msg := takeOverCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a failed attachResultMsg", msg)
+	}
+
+	rec, ok := registry.Load(registryDir, "s1")
+	if !ok {
+		t.Fatal("expected a record to exist")
+	}
+	if !rec.Driven {
+		t.Error("expected Driven UNTOUCHED when OpenTerminal fails")
+	}
+}
+
+// ── "enter" key dispatch: Driven → take-over, observed → attach (unchanged) ─
+
+func TestUpdate_EnterKey_DrivenLoop_DispatchesTakeOverNotAttach(t *testing.T) {
+	m := modelWithOneLoop()
+	m.loops[0].Driven = true
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd")
+	}
+	if !strings.Contains(m.status, "taking over") {
+		t.Errorf("status = %q, want it to mention taking over (not attaching)", m.status)
+	}
+}
+
+// TestUpdate_EnterKey_ObservedLoop_StillDispatchesAttach is the captain's
+// attach-preservation regression pin at the KEYPRESS level (the existing
+// TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude pins attachCmd's own
+// internals; this pins that the "enter" handler still ROUTES an observed
+// loop to it at all, unchanged by this slice's new Driven branch).
+func TestUpdate_EnterKey_ObservedLoop_StillDispatchesAttach(t *testing.T) {
+	m := modelWithOneLoop() // Driven defaults false
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd")
+	}
+	if !strings.Contains(m.status, "attaching") {
+		t.Errorf("status = %q, want it to mention attaching (observed-loop path unchanged)", m.status)
+	}
+}

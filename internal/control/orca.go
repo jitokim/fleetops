@@ -163,6 +163,38 @@ func (orcaController) Spawn(cwd, goal string) error {
 	return exec.CommandContext(ctxSend, argv[0], argv[1:]...).Run()
 }
 
+// takeOverCreateTimeout bounds OpenTerminal's one-shot `terminal create`
+// call — unlike Spawn (create + wait-for-boot + re-locate + send, several
+// exchanges over spawnWaitTimeout's 35s), OpenTerminal's command is already
+// the FULL invocation (e.g. "claude --resume <id>") baked into --command,
+// so there is nothing to wait for or send afterward — one short-timeout
+// exec is the whole operation.
+const (
+	takeOverCreateTimeout = 5 * time.Second
+	takeOverTitle         = "mctl take-over" // distinguishes this terminal from a plain spawn's spawnTitle, in case both ever coexist
+)
+
+// OpenTerminal implements control.TerminalOpener: creates a brand new orca
+// terminal in cwd running command — the LoopEngine MVP's take-over attach
+// (docs/design-loop-engine-mvp.md, Slice 4). Reuses the exact `terminal
+// create --worktree path:<cwd> --command <...> --title <...> --json` call
+// Spawn already verified live (see Spawn's own doc), just generalized from
+// the hardcoded "claude" command to an arbitrary one — command is already
+// the complete shell invocation, so unlike Spawn there is no follow-up
+// wait/re-locate/send step; the envelope-error check is the whole
+// verification this needs (same "not a worktree Orca knows about" failure
+// mode Spawn already surfaces for an unregistered cwd).
+func (orcaController) OpenTerminal(cwd, command string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), takeOverCreateTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "orca", "terminal", "create",
+		"--worktree", "path:"+cwd, "--command", command, "--title", takeOverTitle, "--json").Output()
+	if err != nil {
+		return fmt.Errorf("orca terminal create: %w", err)
+	}
+	return orcaEnvelopeErr(out, cwd)
+}
+
 // spawnWorktreeTimeout bounds the one-shot `orca worktree create --agent`
 // call. Unlike plain Spawn (create + wait + re-locate + send, several
 // exchanges), --agent/--prompt makes worktree create a single-shot agent

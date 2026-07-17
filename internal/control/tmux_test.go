@@ -254,6 +254,23 @@ func TestTmuxNewWindowCmd(t *testing.T) {
 	}
 }
 
+// feat/engine-provenance: OpenTerminal's argv — generalized from
+// tmuxNewWindowCmd's hardcoded "claude" to an arbitrary command (take-over's
+// "claude --resume <id>"), and unlike tmuxNewWindowCmd, no -P -F pane-id
+// capture (see OpenTerminal's doc — no follow-up send needed).
+func TestTmuxOpenTerminalCmd(t *testing.T) {
+	got := tmuxOpenTerminalCmd("/Users/imac/IdeaProjects/aboard", "claude --resume sess-1")
+	want := []string{"tmux", "new-window", "-c", "/Users/imac/IdeaProjects/aboard", "claude --resume sess-1"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 // ── tty-keyed dispatch (ADR Phase 2 §2.2/§3 step 2) ──────────────────
 
 func TestNormalizeTTY_StripsDevPrefix(t *testing.T) {

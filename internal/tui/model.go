@@ -818,6 +818,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = "select a loop to attach", statusNeutral
 				return m, nil
 			}
+			// feat/engine-provenance (design doc §4, the captain's take-over
+			// AC): a Driven loop has no existing terminal surface — ↵ means
+			// something structurally different for it than for an observed
+			// loop (open ONE, not find one). attachCmd itself stays
+			// completely untouched for the observed path (see its own doc's
+			// attach-preservation note); this is a SEPARATE dispatch, not a
+			// branch inside it.
+			if sel.Driven {
+				m.status, m.statusKind = fmt.Sprintf("taking over %s...", sel.Project), statusNeutral
+				return m, takeOverCmd(sel)
+			}
 			m.status, m.statusKind = fmt.Sprintf("attaching %s...", sel.Project), statusNeutral
 			return m, attachCmd(sel)
 		case "o":
@@ -884,10 +895,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			now := time.Now()
 			if m.pendingKillSession == sel.SessionID && now.Sub(m.pendingKillAt) <= killConfirmWindow {
 				m.pendingKillSession = ""
-				if !m.ttyPathPlausible(sel) {
-					if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
-						m.status, m.statusKind = msg, statusErr
-						return m, nil
+				// feat/engine-provenance: a Driven loop's kill never touches
+				// an existing terminal surface at all (killCmd's own Driven
+				// branch just clears the registry flag + logs an event) — the
+				// ambiguity guard exists solely to protect a real keystroke
+				// from landing on the wrong sibling surface, so it has
+				// nothing to check for this path and would only risk a
+				// spurious "N loops share this directory" refusal unrelated
+				// to what's actually about to happen.
+				if !sel.Driven {
+					if !m.ttyPathPlausible(sel) {
+						if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
+							m.status, m.statusKind = msg, statusErr
+							return m, nil
+						}
 					}
 				}
 				m.status, m.statusKind = fmt.Sprintf("killing %s...", sel.Project), statusNeutral
@@ -1172,6 +1193,54 @@ func attachCmd(l domain.Loop) tea.Cmd {
 // orca/cmux/tmux to focus) — at least point the human at where the loop lives.
 func manualAttachHint(cwd string) string {
 	return "cd " + cwd
+}
+
+// takeOverCmd hands a Driven (engine-owned) loop's wheel to the human — the
+// LoopEngine MVP's captain-mandated take-over AC (design doc §4). Unlike
+// attachCmd (Locate an EXISTING surface + Focus it), a Driven loop has no
+// terminal surface to find — headless bootstrap never created one (§3) — so
+// take-over CREATES one, running `claude --resume <sessionID>` so the human
+// inherits the exact session the engine was driving, via whichever backend
+// implements control.TerminalOpener (orca/tmux — cmux has no verified
+// equivalent yet, see TerminalOpener's own doc; type-asserted the same way
+// spawnCmd already type-asserts control.WorktreeSpawner).
+//
+// Driven is cleared (registry.MarkDriven false) ONLY after the terminal is
+// confirmed opened — never before, and never in the no-backend/unsupported
+// fallback branch. Ordering matters: clearing it first and then having
+// OpenTerminal fail would strand the loop owned by neither the engine (no
+// longer Driven) nor a human (no terminal actually opened for them).
+// engine.ShouldDrive already requires driven==true (see its own doc's
+// attach-preservation clause), so clearing Driven is the WHOLE pause
+// mechanism — no separate "stop driving" call needed, the next scan simply
+// never satisfies ShouldDrive for this session again.
+//
+// No backend, or a resolved backend that doesn't implement TerminalOpener
+// (e.g. cmux): falls back to the SAME manual hint attach's own no-backend
+// path uses ("claude --resume <id>") and leaves Driven untouched — the
+// engine keeps driving it exactly as before (control.Redrive needs no
+// terminal at all), since missionctl has no way to confirm a human actually
+// took over by hand.
+func takeOverCmd(l domain.Loop) tea.Cmd {
+	return func() tea.Msg {
+		command := manualResumeHint(l.SessionID)
+		ctrl, ok := controlResolveFn()
+		if !ok {
+			return attachResultMsg{false, "no orca/tmux/cmux — take over manually: " + command}
+		}
+		opener, supports := ctrl.(control.TerminalOpener)
+		if !supports {
+			return attachResultMsg{false, "no orca/tmux/cmux — take over manually: " + command}
+		}
+		if err := opener.OpenTerminal(l.Cwd, command); err != nil {
+			return attachResultMsg{false, fmt.Sprintf("take-over %s failed: %v", l.Project, err)}
+		}
+		if err := registry.MarkDriven(registryDirFn(), l.SessionID, false); err != nil {
+			return attachResultMsg{false, fmt.Sprintf("take-over %s opened a terminal but could not clear Driven: %v — the engine may still drive it; kill (k) to stop it", l.Project, err)}
+		}
+		logActuationEvent(l, "take-over", "terminal", true, "")
+		return attachResultMsg{true, fmt.Sprintf("took over %s via %s — engine stopped driving it", l.Project, ctrl.Name())}
+	}
 }
 
 // approveCmd accepts claude's default option at a gate (a bare Enter to the
@@ -1675,6 +1744,26 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// every guard gets re-checked at the actual dispatch site too.
 		if l.State == domain.StateKilled || l.Stall == domain.StallGone {
 			return killResultMsg{true, fmt.Sprintf("%s already killed/gone — it will age out of the window", l.Project)}
+		}
+		// feat/engine-provenance (design doc §4's kill adapter): a Driven
+		// (engine-owned, headless) loop has no terminal surface to /exit
+		// into — resolveActuationTargetFn below would just fail with a
+		// misleading "no unambiguous claude surface", since there was never
+		// a surface to find. Killing it instead means: clear Driven
+		// (MarkDriven false) so the engine never schedules it another cycle
+		// — ShouldDrive already requires driven==true, so this alone is the
+		// WHOLE "no further drive fires" guarantee, same free-pause
+		// mechanism take-over's own Driven-clear relies on — plus record a
+		// kill event in the SAME shape mostRecentActuationIsKill looks for
+		// (TriggerActuation/ActorHuman, Detail prefixed "kill ", via the
+		// unchanged logActuationEvent helper) so the next scan promotes
+		// StateKilled exactly as it would for an observed loop's kill.
+		if l.Driven {
+			if err := registry.MarkDriven(registryDirFn(), l.SessionID, false); err != nil {
+				return killResultMsg{false, fmt.Sprintf("kill %s failed: could not clear Driven — %v", l.Project, err)}
+			}
+			logActuationEvent(l, "kill", "engine", true, "")
+			return killResultMsg{true, fmt.Sprintf("killed %s — Driven cleared, state updates on next scan", l.Project)}
 		}
 		// Tier 1 only (tty → cwd) — killing has no headless Tier-2
 		// equivalent (there's no live conversation left to type "/exit"
@@ -3325,18 +3414,30 @@ func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast b
 // no I/O of its own, same discipline as everything else in this file's
 // render path).
 func renderListRow(l domain.Loop, sel, dup bool, wName int, showCycle, showOracle, showLast bool, oracleCount int, totalWidth int) string {
-	marker := " "
-	markerStyle := lipgloss.NewStyle().Foreground(cFaint)
+	// feat/engine-provenance: wMarker is 2 cols wide, but the cursor glyph
+	// below only ever occupies 1 of them — the second was always blank
+	// padding. Rather than widen the row for a Driven marker, that
+	// already-reserved second column is where it goes: two independently
+	// styled 1-rune cells concatenated (both ⚙/▸/◆/etc. are confirmed
+	// single-width via go-runewidth, same class of glyph this file already
+	// renders elsewhere — see stateLabel), so the combined string is exactly
+	// wMarker runes wide by construction, no .Width() padding call needed.
+	cursorGlyph, cursorColor := " ", cFaint
 	if sel {
-		marker = "▸"
-		markerStyle = lipgloss.NewStyle().Foreground(cAccent)
+		cursorGlyph, cursorColor = "▸", cAccent
 	}
+	drivenGlyph, drivenColor := " ", cFaint
+	if l.Driven {
+		drivenGlyph = "⚙" // dim, deliberately — a compact provenance hint, not a status alert
+	}
+	marker := lipgloss.NewStyle().Foreground(cursorColor).Render(cursorGlyph) +
+		lipgloss.NewStyle().Foreground(drivenColor).Render(drivenGlyph)
 	label := l.Project
 	if dup {
 		label += "·" + shortID(l.SessionID)
 	}
 	cells := []string{
-		markerStyle.Width(wMarker).Render(marker),
+		marker,
 		stInk.Width(wName).Render(trunc(label, wName-1)),
 		stateStyle(l).Width(wState).Render(stateLabel(l)),
 	}
@@ -3741,6 +3842,14 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 		d.WriteString(detailRow("NOTE", noteSt.Render(trunc(note, valueWidth))))
 	}
 	d.WriteString(detailRow("CYCLE", stInk.Render(cycleLabel(l))))
+	// feat/engine-provenance: the DETAIL-panel counterpart to the FLEET
+	// panel's ⚙ marker (renderListRow) — an observed loop omits this row
+	// entirely (l.Driven is only ever true for an engine-owned loop; see
+	// domain.Loop.Driven's doc), so a human scanning DETAIL sees ownership
+	// as a presence/absence signal, not a third state to parse.
+	if l.Driven {
+		d.WriteString(detailRow("DRIVE", stInk.Render(trunc("⚙ engine-driven (cycle "+cycleLabel(l)+")", valueWidth))))
+	}
 	if l.Goal.Text != "" {
 		d.WriteString(detailRow("GOAL", stInk.Render(trunc(l.Goal.Text, valueWidth))))
 		d.WriteString(detailRow("ORACLE", renderOracleDetail(l)))
