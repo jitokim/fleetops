@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -4361,6 +4363,180 @@ func TestUpdate_WizardWhere_IgnoresUnrelatedKeys(t *testing.T) {
 	}
 }
 
+// ── LoopEngine MVP Slice 2: wizardEngineDrive gating + routing ──────────
+//
+// Captain's standing spike discipline, verified here: the engine is
+// reachable ONLY behind the explicit env opt-in (engineEnabledFn) — when
+// it's off (the default), the wizard's behavior is byte-for-byte the
+// manual path that existed before this step did.
+
+// reachWizardEngineDrive drives the wizard through steps 1-5 with the
+// engine gate forced on (withEngineEnabled), landing at wizardEngineDrive
+// — mirrors reachWizardWhere's shape exactly.
+func reachWizardEngineDrive(t *testing.T, m Model) Model {
+	t.Helper()
+	withEngineEnabled(t, true)
+	m, _ = updateModel(t, m, runeKey('n'))
+	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	if m.mode != modePrompting || m.spawnStep != wizardEngineDrive {
+		t.Fatalf("precondition failed: mode=%v step=%v, want modePrompting at wizardEngineDrive", m.mode, m.spawnStep)
+	}
+	return m
+}
+
+// TestWizard_EngineDisabled_StepAbsent_ManualPathByteForByte is the
+// captain's exact "regression-test it" ask: with the engine gate off (the
+// default — no override at all here, proving the REAL default, not just an
+// explicit false), the wizard must behave EXACTLY as it did before
+// wizardEngineDrive existed — landing at wizardWhere when eligible, same
+// as TestWizard_ReachesWhereStep_WhenEligible.
+func TestWizard_EngineDisabled_StepAbsent_ManualPathByteForByte(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+	if m.spawnStep != wizardWhere {
+		t.Errorf("spawnStep = %v, want wizardWhere — engine-drive step must be entirely absent when disabled", m.spawnStep)
+	}
+}
+
+// TestWizard_EngineDisabled_NotEligible_SubmitsDirectly_ManualPathByteForByte
+// is the OTHER manual-path fork (no worktree-capable backend) under the
+// same engine-disabled default — mirrors TestWizard_SkipsWhereStep_WhenNotEligible
+// exactly, confirming that path is ALSO untouched.
+func TestWizard_EngineDisabled_NotEligible_SubmitsDirectly_ManualPathByteForByte(t *testing.T) {
+	m := modelWithOneLoop()
+	m, _ = updateModel(t, m, runeKey('n'))
+	m, _ = typeAndEnter(t, m, "goal")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, cmd := typeAndEnter(t, m, "")
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (submitted directly, no engine-drive step)", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) — the manual path, unchanged")
+	}
+}
+
+// TestWizard_EngineEnabled_ReachesEngineDriveStep: the step only appears
+// once the opt-in gate is on.
+func TestWizard_EngineEnabled_ReachesEngineDriveStep(t *testing.T) {
+	reachWizardEngineDrive(t, modelWithOneLoop()) // fails via t.Fatalf inside if the precondition isn't met
+}
+
+func TestUpdate_WizardEngineDrive_EKey_SubmitsBootstrap(t *testing.T) {
+	origBootstrap := bootstrapClaudeFn
+	defer func() { bootstrapClaudeFn = origBootstrap }()
+	bootstrapClaudeFn = func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+		return []byte(`{"session_id":"s-new"}`), nil
+	}
+	registryDirFn = func() string { return t.TempDir() }
+	historyDirFn = func() string { return t.TempDir() }
+
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, runeKey('e'))
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (bootstrapEngineCmd)")
+	}
+	if !strings.Contains(m.status, "bootstrapping") || !strings.Contains(m.status, "cycle 1") {
+		t.Errorf("status = %q, want the bootstrapping status line", m.status)
+	}
+}
+
+// TestUpdate_WizardEngineDrive_MKey_ContinuesManualPath_Eligible: 'm'
+// proceeds to EXACTLY wizardWhere, same as if wizardEngineDrive never
+// intercepted anything — the manual path continues unmodified past this
+// choice.
+func TestUpdate_WizardEngineDrive_MKey_ContinuesManualPath_Eligible(t *testing.T) {
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+	m.spawnWorktreeEligible = true
+
+	// 'm' advances to wizardWhere (like every other free-text-step
+	// advance, it returns textinput.Blink — a non-nil cmd — not a
+	// completed submission), so this test checks mode/step, not cmd-nilness.
+	m, _ = updateModel(t, m, runeKey('m'))
+
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Errorf("got mode=%v step=%v, want modePrompting at wizardWhere", m.mode, m.spawnStep)
+	}
+}
+
+// TestUpdate_WizardEngineDrive_EnterKey_SameAsM: enter is a synonym for
+// 'm' at this step (both mean "manual/observe only").
+func TestUpdate_WizardEngineDrive_EnterKey_SameAsM(t *testing.T) {
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+	m.spawnWorktreeEligible = true
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Errorf("got mode=%v step=%v, want modePrompting at wizardWhere (enter == m)", m.mode, m.spawnStep)
+	}
+}
+
+// TestUpdate_WizardEngineDrive_MKey_ContinuesManualPath_NotEligible: 'm'
+// with no worktree-capable backend submits DIRECTLY (current-dir spawn) —
+// the SAME ineligible-path behavior wizardMaxCycles used to run directly,
+// now reached via 'm' instead.
+func TestUpdate_WizardEngineDrive_MKey_ContinuesManualPath_NotEligible(t *testing.T) {
+	m := reachWizardEngineDrive(t, modelWithOneLoop()) // spawnWorktreeEligible left at its zero value (false)
+
+	m, cmd := updateModel(t, m, runeKey('m'))
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal (submitted directly)", m.mode)
+	}
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	}
+	if strings.Contains(m.status, "bootstrapping") {
+		t.Errorf("status = %q, want the manual spawn message, not bootstrap", m.status)
+	}
+}
+
+func TestUpdate_WizardEngineDrive_Esc_Cancels(t *testing.T) {
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal", m.mode)
+	}
+	if cmd != nil {
+		t.Error("expected no tea.Cmd from cancelling")
+	}
+}
+
+func TestUpdate_WizardEngineDrive_IgnoresUnrelatedKeys(t *testing.T) {
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, runeKey('x'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an unrelated key")
+	}
+	if m.mode != modePrompting || m.spawnStep != wizardEngineDrive {
+		t.Errorf("got mode=%v step=%v, want to remain at wizardEngineDrive", m.mode, m.spawnStep)
+	}
+}
+
+func TestRenderNewLoopPrompt_EngineDriveStep_ShowsChoiceLabel(t *testing.T) {
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+	got := renderNewLoopPrompt(m)
+	if !strings.Contains(got, "engine-drive") || !strings.Contains(got, "manual") {
+		t.Errorf("got %q, want the engine-drive/manual choice label", got)
+	}
+}
+
 func TestWhereStepLabel_BusyDirNudge(t *testing.T) {
 	m := New()
 	m.loops = []domain.Loop{{Project: "aboard", SessionID: "sess-1", Cwd: "/x/aboard", State: domain.StateRunning}}
@@ -5424,5 +5600,251 @@ func TestWithEngineEnabled_OverridesAndRestores(t *testing.T) {
 
 	if engineEnabledFn() {
 		t.Error("expected false after the subtest ended — withEngineEnabled's cleanup must restore the prior value")
+	}
+}
+
+// ── LoopEngine MVP Slice 2: bootstrap envelope parsing ───────────────────
+
+func TestParseBootstrapSessionID_ValidJSON(t *testing.T) {
+	got, ok := parseBootstrapSessionID([]byte(`{"session_id":"sess-abc-123","result":"done","is_error":false}`))
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got != "sess-abc-123" {
+		t.Errorf("got %q, want %q", got, "sess-abc-123")
+	}
+}
+
+func TestParseBootstrapSessionID_MissingSessionID_NotOK(t *testing.T) {
+	if _, ok := parseBootstrapSessionID([]byte(`{"result":"done","is_error":false}`)); ok {
+		t.Error("expected ok=false — no session_id field at all")
+	}
+}
+
+func TestParseBootstrapSessionID_EmptySessionID_NotOK(t *testing.T) {
+	if _, ok := parseBootstrapSessionID([]byte(`{"session_id":"","result":"done"}`)); ok {
+		t.Error("expected ok=false — an empty session_id must not count as found")
+	}
+}
+
+func TestParseBootstrapSessionID_NotJSONAtAll_NotOK(t *testing.T) {
+	if _, ok := parseBootstrapSessionID([]byte("claude: command not found")); ok {
+		t.Error("expected ok=false for stdout that isn't JSON at all (no session_id substring either)")
+	}
+}
+
+// TestParseBootstrapSessionID_ControlCharInResult_FallsBackToRegex is the
+// captain's exact live-verification caveat: claude -p --output-format
+// json's "result" field can carry a raw (unescaped) control character that
+// trips strict encoding/json parsing for the object as a WHOLE, even
+// though session_id itself — elsewhere in the same object — is perfectly
+// well-formed. The lenient regex fallback must still find it.
+func TestParseBootstrapSessionID_ControlCharInResult_FallsBackToRegex(t *testing.T) {
+	// a literal, unescaped 0x01 byte inside the "result" string value —
+	// invalid per strict JSON string-literal rules, but session_id is
+	// still extractable via the fallback regex.
+	raw := []byte("{\"session_id\":\"sess-ctrl-1\",\"result\":\"partial output \x01 more text\",\"is_error\":false}")
+
+	// sanity: confirm this fixture actually DOES fail strict decoding,
+	// otherwise this test would be exercising the wrong path.
+	var probe bootstrapEnvelope
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		t.Fatalf("test fixture is invalid: expected the raw control char to break strict JSON decoding, but it parsed cleanly as %+v", probe)
+	}
+
+	got, ok := parseBootstrapSessionID(raw)
+	if !ok {
+		t.Fatal("expected ok=true via the lenient regex fallback")
+	}
+	if got != "sess-ctrl-1" {
+		t.Errorf("got %q, want %q", got, "sess-ctrl-1")
+	}
+}
+
+// ── LoopEngine MVP Slice 2: bootstrapEngineCmd ───────────────────────────
+
+// withFakeBootstrapClaude overrides bootstrapClaudeFn for the duration of
+// one test, restoring the original on cleanup.
+func withFakeBootstrapClaude(t *testing.T, fn func(ctx context.Context, cwd, prompt string) ([]byte, error)) {
+	t.Helper()
+	orig := bootstrapClaudeFn
+	t.Cleanup(func() { bootstrapClaudeFn = orig })
+	bootstrapClaudeFn = fn
+}
+
+func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T) {
+	loopsDir, historyDir := t.TempDir(), t.TempDir()
+	origRegistryDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
+	registryDirFn = func() string { return loopsDir }
+	historyDirFn = func() string { return historyDir }
+
+	var gotCwd, gotPrompt string
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+		gotCwd, gotPrompt = cwd, prompt
+		return []byte(`{"session_id":"sess-boot-1","result":"cycle 1 done","is_error":false}`), nil
+	})
+
+	spec := registry.BindSpec{Goal: "fix the flaky test", DoneCondition: "tests pass", Oracle: "run go test", MaxCycles: 8}
+	msg := bootstrapEngineCmd("/x/aboard", spec)()
+
+	rm, ok := msg.(bootstrapResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want bootstrapResultMsg", msg)
+	}
+	if !rm.ok {
+		t.Fatalf("ok = false, want true; text = %q", rm.text)
+	}
+	if rm.sessionID != "sess-boot-1" {
+		t.Errorf("sessionID = %q, want %q", rm.sessionID, "sess-boot-1")
+	}
+	if gotCwd != "/x/aboard" {
+		t.Errorf("bootstrapClaudeFn was called with cwd=%q, want /x/aboard", gotCwd)
+	}
+	if !strings.Contains(gotPrompt, "fix the flaky test") || !strings.Contains(gotPrompt, "tests pass") {
+		t.Errorf("prompt = %q, want the composed contract (buildSpawnPrompt output)", gotPrompt)
+	}
+
+	rec, found := registry.Load(loopsDir, "sess-boot-1")
+	if !found {
+		t.Fatal("expected a registry record for sess-boot-1")
+	}
+	if !rec.Driven {
+		t.Error("Driven = false, want true — bootstrap must always create a DRIVEN record")
+	}
+	if rec.Goal != "fix the flaky test" || rec.DoneCondition != "tests pass" || rec.Oracle != "run go test" || rec.MaxCycles != 8 {
+		t.Errorf("got %+v, want the full contract bound", rec)
+	}
+
+	evs, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	sessEvs := evs["sess-boot-1"]
+	if len(sessEvs) != 1 {
+		t.Fatalf("got %d events for sess-boot-1, want 1", len(sessEvs))
+	}
+	if sessEvs[0].Trigger != events.TriggerEngine {
+		t.Errorf("Trigger = %v, want TriggerEngine", sessEvs[0].Trigger)
+	}
+	if sessEvs[0].Actor != events.ActorAuto {
+		t.Errorf("Actor = %v, want ActorAuto", sessEvs[0].Actor)
+	}
+	if !strings.Contains(sessEvs[0].Detail, "fix the flaky test") {
+		t.Errorf("Detail = %q, want it to mention the goal", sessEvs[0].Detail)
+	}
+}
+
+// TestBootstrapEngineCmd_CallerDrivenFalse_StillBindsDrivenTrue is the
+// defense-in-depth check: even if a (hypothetical, buggy) caller passes
+// spec.Driven=false, bootstrapEngineCmd must still Bind Driven=true — its
+// entire reason to exist is creating an engine-driven loop.
+func TestBootstrapEngineCmd_CallerDrivenFalse_StillBindsDrivenTrue(t *testing.T) {
+	loopsDir := t.TempDir()
+	origRegistryDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
+	registryDirFn = func() string { return loopsDir }
+	historyDirFn = func() string { return t.TempDir() }
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+		return []byte(`{"session_id":"sess-boot-2"}`), nil
+	})
+
+	spec := registry.BindSpec{Goal: "goal", Driven: false} // deliberately wrong, to prove the function doesn't trust it
+	bootstrapEngineCmd("/x/aboard", spec)()
+
+	rec, found := registry.Load(loopsDir, "sess-boot-2")
+	if !found {
+		t.Fatal("expected a registry record")
+	}
+	if !rec.Driven {
+		t.Error("Driven = false, want true — bootstrapEngineCmd must assert Driven=true regardless of the caller's spec")
+	}
+}
+
+func TestBootstrapEngineCmd_ExecError_NoRecordCreated(t *testing.T) {
+	loopsDir := t.TempDir()
+	origRegistryDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
+	registryDirFn = func() string { return loopsDir }
+	historyDirFn = func() string { return t.TempDir() }
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+		return nil, errTestJudgeFailed // any non-nil error — the sentinel already used elsewhere in this file for exactly this purpose
+	})
+
+	spec := registry.BindSpec{Goal: "goal"}
+	msg := bootstrapEngineCmd("/x/aboard", spec)()
+
+	rm, ok := msg.(bootstrapResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want bootstrapResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("ok = true, want false — the exec call failed")
+	}
+	if !strings.Contains(rm.text, "engine bootstrap failed") {
+		t.Errorf("text = %q, want it to explain the failure", rm.text)
+	}
+	if rm.sessionID != "" {
+		t.Errorf("sessionID = %q, want empty on failure", rm.sessionID)
+	}
+
+	entries, _ := os.ReadDir(loopsDir)
+	if len(entries) != 0 {
+		t.Errorf("got %d files in loopsDir, want 0 — no phantom record on exec failure", len(entries))
+	}
+}
+
+func TestBootstrapEngineCmd_NoSessionIDInResponse_NoRecordCreated(t *testing.T) {
+	loopsDir := t.TempDir()
+	origRegistryDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
+	registryDirFn = func() string { return loopsDir }
+	historyDirFn = func() string { return t.TempDir() }
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+		return []byte(`{"result":"something went sideways","is_error":true}`), nil // no session_id at all
+	})
+
+	spec := registry.BindSpec{Goal: "goal"}
+	msg := bootstrapEngineCmd("/x/aboard", spec)()
+
+	rm, ok := msg.(bootstrapResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want bootstrapResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("ok = true, want false — no session_id means no loop was identifiable")
+	}
+	if !strings.Contains(rm.text, "no session_id") {
+		t.Errorf("text = %q, want it to explain the missing session_id", rm.text)
+	}
+
+	entries, _ := os.ReadDir(loopsDir)
+	if len(entries) != 0 {
+		t.Errorf("got %d files in loopsDir, want 0 — no phantom record when session_id is missing", len(entries))
+	}
+}
+
+// TestBootstrapEngineCmd_ReusesBuildSpawnPromptVerbatim confirms the
+// contract sent to claude -p is EXACTLY buildSpawnPrompt's output for the
+// same fields — one contract document, not a bootstrap-specific
+// reimplementation that could drift from the manual path's.
+func TestBootstrapEngineCmd_ReusesBuildSpawnPromptVerbatim(t *testing.T) {
+	origRegistryDir, origHistoryDir := registryDirFn, historyDirFn
+	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
+	registryDirFn = func() string { return t.TempDir() }
+	historyDirFn = func() string { return t.TempDir() }
+
+	var gotPrompt string
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+		gotPrompt = prompt
+		return []byte(`{"session_id":"s1"}`), nil
+	})
+
+	spec := registry.BindSpec{Goal: "ship it", DoneCondition: "tests pass", Oracle: "run tests", Challenger: "adversarial probe", MaxCycles: 5}
+	bootstrapEngineCmd("/x/aboard", spec)()
+
+	want := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+	if gotPrompt != want {
+		t.Errorf("prompt sent to claude -p was NOT buildSpawnPrompt's output:\ngot:  %q\nwant: %q", gotPrompt, want)
 	}
 }
