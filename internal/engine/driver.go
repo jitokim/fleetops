@@ -115,11 +115,22 @@ func ShouldDrive(l domain.Loop, driven bool, inFlight bool) bool {
 // internal/tui's buildSpawnPrompt already uses to compose cycle 1's prompt,
 // same defaults for an empty doneCondition/rubric) plus l's current cycle
 // number, and — when available — the most recent oracle verdict's reason
-// fed back as corrective signal. This mirrors the manual DRIFT re-drive's
+// fed back as a progress note.
+//
+// feat/engine-cycle correction (was misleading before this comment fix): the
+// reason-feedback line below can ONLY ever carry a *progress* verdict's
+// note, never a rejection correction. ShouldDrive only calls this from
+// l.State == StateIdle, and a REJECTED verdict is promoted to StateDrift by
+// the scanner before the next scan's triggerDrives ever runs (§2's
+// "Deciding" row in the design doc) — so a rejected loop is never StateIdle
+// when NextWorkPrompt is composed for it; it halts at DRIFT for a human
+// instead. The superficial resemblance to the manual DRIFT re-drive's
 // composeDriftPrompt pattern (internal/tui/model.go: "<original> \n\n
-// [operator correction] <hint>"), generalized from "an operator's typed
-// hint" to "the oracle's own verdict reason" — the engine has no operator
-// to ask, so the oracle's own words are the corrective signal instead.
+// [operator correction] <hint>") is that: a resemblance, not the same
+// mechanism — composeDriftPrompt fires on a human's re-drive OUT of DRIFT,
+// which this function is never involved in. Autonomous drive-through-
+// rejection (the engine re-driving a DRIFT loop itself) is explicitly
+// deferred (design doc §8) pending its own fail-closed review.
 //
 // feat/panel-info (precise rename): the contract field and this function's
 // composed prompt line are both "rubric" now, not "oracle" — "oracle"
@@ -148,6 +159,8 @@ func NextWorkPrompt(l domain.Loop, contract registry.Record) string {
 	fmt.Fprintf(&b, "cycle: %d\n", l.Cycle)
 	b.WriteString("\nContinue working toward the goal. Report progress concretely this cycle.\n")
 	if l.Last != nil && l.Last.Reason != "" {
+		// Always a PROGRESS verdict's note here — see the doc comment above:
+		// a rejected verdict never reaches this function from StateIdle.
 		fmt.Fprintf(&b, "\n[oracle, last cycle] %s\n", l.Last.Reason)
 	}
 	b.WriteString("Declare DONE only when the complete condition is met — state the evidence.\n")
