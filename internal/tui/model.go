@@ -5,6 +5,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -106,6 +107,17 @@ type spawnResultMsg struct {
 	text string
 }
 
+// bootstrapResultMsg reports the outcome of LoopEngine MVP's headless
+// bootstrap (the "n" wizard's 'e' choice) — computed off the event loop by
+// bootstrapEngineCmd, mirroring spawnResultMsg's ok/text shape.
+// sessionID is only meaningful when ok=true (the loop that got Bound); ""
+// on failure, since no record was created to key anything on.
+type bootstrapResultMsg struct {
+	ok        bool
+	text      string
+	sessionID string
+}
+
 // worktreeEligibilityMsg reports whether the resolved backend implements
 // control.WorktreeSpawner — computed off the event loop (control.Resolve
 // does real exec calls) by checkWorktreeEligibilityCmd, fired at "n"
@@ -189,7 +201,17 @@ const (
 	wizardOracle                       // optional; verification rubric
 	wizardChallenger                   // optional; adversarial probe description, STORED ONLY
 	wizardMaxCycles                    // optional; empty = registry.DefaultMaxCycles
-	wizardWhere                        // single-key w/d/enter; only reached when the backend supports worktree spawn — see advanceSpawnWizard
+	// wizardEngineDrive: single-key e/m/enter, LoopEngine MVP's opt-in
+	// choice (docs/design-loop-engine-mvp.md; docs/specs/seed-loop-engine-
+	// mvp-2026-07-17.md). Reached ONLY when engineEnabledFn() (env
+	// MISSIONCTL_ENGINE=1) is true — the captain's opt-in-spike gate #2
+	// (env AND this per-loop choice, both required). When the engine is
+	// disabled, this step is skipped entirely: advanceSpawnWizard falls
+	// straight through from wizardMaxCycles to wizardWhere exactly as it
+	// did before this field existed — byte-for-byte the same manual path
+	// (see TestAdvanceSpawnWizard_EngineDisabled_SkipsStraightToWhere).
+	wizardEngineDrive
+	wizardWhere // single-key w/d/enter; only reached when the backend supports worktree spawn — see advanceSpawnWizard
 )
 
 type Model struct {
@@ -434,6 +456,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.mode == modePrompting {
+			if m.spawnStep == wizardEngineDrive {
+				// single-key step (LoopEngine MVP) — same shape as
+				// wizardWhere just below: route keys directly rather than
+				// falling into the generic free-text switch.
+				switch key {
+				case "esc":
+					m.mode = modeNormal
+					m.input.Blur()
+					m.status, m.statusKind = "cancelled", statusNeutral
+					return m, nil
+				case "e":
+					return m.submitSpawnWizardEngineDrive()
+				case "m", "enter":
+					// EXISTING manual path, unchanged: proceed to exactly
+					// the worktree-eligibility check wizardMaxCycles used
+					// to run directly before this step existed.
+					if !m.spawnWorktreeEligible {
+						return m.submitSpawnWizard(false)
+					}
+					m.spawnStep = wizardWhere
+					return m, textinput.Blink
+				}
+				return m, nil // ignore any other key at this single-key step
+			}
 			if m.spawnStep == wizardWhere {
 				// single-key step — no textinput involved, so route keys
 				// directly instead of falling into the generic
@@ -859,6 +905,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusKind = statusErr
 		}
+	case bootstrapResultMsg:
+		m.status = msg.text
+		if msg.ok {
+			m.statusKind = statusOK
+		} else {
+			m.statusKind = statusErr
+		}
 	case worktreeEligibilityMsg:
 		m.spawnWorktreeEligible = bool(msg)
 	case killResultMsg:
@@ -1199,6 +1252,17 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 		}
 		m.spawnMaxCycles = maxCycles
 
+		// LoopEngine MVP: the engine-drive choice is offered ONLY when the
+		// opt-in env gate is on — engineEnabledFn's zero-cost check, same
+		// "don't offer a choice that doesn't exist" reasoning as the
+		// worktree-eligibility skip just below. Engine disabled (the
+		// common case today) → falls straight through to the EXACT same
+		// worktree-eligibility check that ran here before this field
+		// existed — byte-for-byte the manual path.
+		if engineEnabledFn() {
+			m.spawnStep = wizardEngineDrive
+			return m, textinput.Blink
+		}
 		if !m.spawnWorktreeEligible {
 			// no backend supports worktree-isolated spawn (tmux/cmux, or no
 			// backend resolved at all) — offering a choice that always
@@ -1245,6 +1309,27 @@ func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 		MaxCycles:     m.spawnMaxCycles,
 	}
 	return m, spawnCmd(m.spawnCwd, spec, useWorktree)
+}
+
+// submitSpawnWizardEngineDrive finishes the wizard via the 'e' (engine-
+// drive) choice at wizardEngineDrive — LoopEngine MVP's bootstrap path,
+// sibling to submitSpawnWizard's existing manual path above. Skips
+// wizardWhere entirely: the headless bootstrap (bootstrapEngineCmd) always
+// runs in cwd directly — no worktree choice for an engine-driven loop yet
+// (worktree isolation for engine loops is an explicit seed-spec non-goal).
+func (m Model) submitSpawnWizardEngineDrive() (tea.Model, tea.Cmd) {
+	m.mode = modeNormal
+	m.input.Blur()
+	m.status, m.statusKind = fmt.Sprintf("engine: bootstrapping %s… (cycle 1)", slugFromGoal(m.spawnGoal, 24)), statusNeutral
+	spec := registry.BindSpec{
+		Goal:          m.spawnGoal,
+		DoneCondition: m.spawnDoneWhen,
+		Oracle:        m.spawnOracle,
+		Challenger:    m.spawnChallenger,
+		MaxCycles:     m.spawnMaxCycles,
+		Driven:        true, // bootstrapEngineCmd asserts this too (defense in depth) — see its doc
+	}
+	return m, bootstrapEngineCmd(m.spawnCwd, spec)
 }
 
 // checkWorktreeEligibilityCmd resolves the current backend and reports
@@ -1340,11 +1425,144 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 	}
 }
 
+// ── LoopEngine MVP Slice 2: headless bootstrap ───────────────────────────
+//
+// docs/design-loop-engine-mvp.md §3; docs/specs/seed-loop-engine-mvp-2026-
+// 07-17.md. Bootstrap = run the wizard's contract as a HEADLESS cycle 1
+// (`claude -p <contract> --output-format json`), read session_id back
+// SYNCHRONOUSLY from that call's own output, and Bind DETERMINISTICALLY —
+// no BindPending cwd/timestamp race at all, unlike spawnCmd's manual path
+// above (we have the exact session_id, not a "probably this one" match).
+// Scope, per the seed spec's build order: this slice runs cycle 1 and then
+// RESTS — no auto-cycling (triggerDrives/driveCmd are a later slice). The
+// bootstrapped loop shows up in the very next scan as an ordinary bound
+// loop with Driven=true; its State derives from its transcript exactly
+// like any other loop (the scanner stays the SOLE owner of State — this
+// function never classifies anything itself).
+
+// bootstrapTimeout bounds the headless claude -p bootstrap call.
+// Deliberately generous compared to judgeTimeout's 2 minutes (internal/
+// oracle) — cycle 1 does REAL WORK, not a cheap haiku judgment.
+const bootstrapTimeout = 5 * time.Minute
+
+// bootstrapEnvelope is claude -p --output-format json's top-level shape —
+// the fields bootstrap cares about. SessionID is the only one this slice
+// actually consumes; Result/IsError/Usage are captured for completeness
+// (a future slice's provenance/diagnostics) but unused here.
+type bootstrapEnvelope struct {
+	SessionID string          `json:"session_id"`
+	Result    string          `json:"result"`
+	IsError   bool            `json:"is_error"`
+	Usage     json.RawMessage `json:"usage,omitempty"`
+}
+
+// bootstrapSessionIDRe is parseBootstrapSessionID's lenient fallback —
+// same regex-tolerance idiom as internal/oracle's fencedJSON/
+// extractJSONObject: session_id is always a plain ASCII token, so
+// extracting it directly is safe even when a raw control character
+// elsewhere in the envelope (e.g. inside "result"'s text — live-observed,
+// per the captain's verification notes) trips encoding/json's strict
+// string-literal validation for the object as a WHOLE.
+var bootstrapSessionIDRe = regexp.MustCompile(`"session_id"\s*:\s*"([^"]+)"`)
+
+// parseBootstrapSessionID extracts session_id from claude -p
+// --output-format json's raw stdout: a strict decode first (the common,
+// well-formed case), falling back to a direct regex extraction if strict
+// parsing fails. ok=false only when NEITHER path finds a non-empty
+// session_id — bootstrapEngineCmd must never create a phantom record in
+// that case.
+func parseBootstrapSessionID(raw []byte) (string, bool) {
+	var env bootstrapEnvelope
+	if err := json.Unmarshal(raw, &env); err == nil && env.SessionID != "" {
+		return env.SessionID, true
+	}
+	if m := bootstrapSessionIDRe.FindSubmatch(raw); m != nil {
+		return string(m[1]), true
+	}
+	return "", false
+}
+
+// bootstrapClaudeFn runs `claude -p <prompt> --output-format json` in cwd
+// and returns its raw stdout — the ONE real exec call bootstrapEngineCmd
+// makes, isolated behind a func var (same seam shape as judgeFn/redriveFn:
+// an entire side-effecting call, swappable, not just a directory/session
+// lookup) so tests can verify Bind/event-emission/status-line behavior
+// without invoking a real claude CLI.
+var bootstrapClaudeFn = func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json")
+	cmd.Dir = cwd
+	return cmd.Output()
+}
+
+// bootstrapEngineCmd runs cwd's contract as a headless cycle 1 and, only
+// on success, Binds the result. Runs off the event loop, same non-blocking
+// discipline as every other tea.Cmd in this file — bootstrapTimeout's 5
+// minutes must never block Update/View.
+//
+// spec.Driven is asserted true HERE, regardless of what the caller passed
+// in — defensive, fail-closed duplication of submitSpawnWizardEngineDrive's
+// own Driven:true (this function's ENTIRE reason to exist is creating an
+// engine-driven loop; trusting the caller alone isn't enough — a future
+// caller bug leaving Driven false here would silently create a bound-but-
+// never-driven record with no way to ever be picked up by ShouldDrive).
+//
+// buildSpawnPrompt is reused VERBATIM — the exact same contract document
+// the manual spawn path's cycle 1 sends, and what the oracle later judges
+// against; one document, not two that could drift apart.
+//
+// Failure (no session_id in the envelope, the claude -p call itself
+// errors/times out, or the subsequent Bind fails) surfaces a clear status
+// and creates NO record.
+func bootstrapEngineCmd(cwd string, spec registry.BindSpec) tea.Cmd {
+	return func() tea.Msg {
+		spec.Driven = true
+
+		ctx, cancel := context.WithTimeout(context.Background(), bootstrapTimeout)
+		defer cancel()
+		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Oracle, spec.Challenger, spec.MaxCycles)
+		out, err := bootstrapClaudeFn(ctx, cwd, prompt)
+		if err != nil {
+			return bootstrapResultMsg{false, fmt.Sprintf("engine bootstrap failed: %v", err), ""}
+		}
+
+		sessionID, ok := parseBootstrapSessionID(out)
+		if !ok {
+			return bootstrapResultMsg{false, "engine bootstrap: no session_id in response — no loop created", ""}
+		}
+
+		if err := registry.Bind(registryDirFn(), sessionID, spec); err != nil {
+			return bootstrapResultMsg{false, fmt.Sprintf("engine bootstrap: cycle 1 ran (session %s) but binding failed: %v", sessionID, err), ""}
+		}
+		_ = events.Append(historyDirFn(), events.Event{
+			TS:        time.Now().UnixNano(),
+			SessionID: sessionID,
+			FromState: "",
+			ToState:   "",
+			Trigger:   events.TriggerEngine,
+			Detail:    "bootstrap: " + trunc(spec.Goal, 200),
+			Actor:     events.ActorAuto,
+		})
+		return bootstrapResultMsg{true, fmt.Sprintf("engine loop bootstrapped (session %s, cycle 1 complete)", sessionID), sessionID}
+	}
+}
+
 // worktreeNameFromGoal builds the `orca worktree create --name` value from
 // the wizard's goal: "mctl-" + a lowercase [a-z0-9-] slug of the goal's
-// first ~24 runes. Pure function so the slugging is directly testable.
+// first ~24 runes.
 func worktreeNameFromGoal(goal string) string {
-	const maxRunes = 24
+	return "mctl-" + slugFromGoal(goal, 24)
+}
+
+// slugFromGoal lowercases goal and keeps only [a-z0-9], collapsing every
+// other run of characters to a single dash, capped to the first maxRunes
+// INPUT runes (not output length) — "loop" if nothing alnum survives. Pure
+// function so the slugging is directly testable. Shared core: originally
+// worktreeNameFromGoal's own body (still its sole caller for the "mctl-"-
+// prefixed worktree name); LoopEngine MVP's engine-drive bootstrap reuses
+// it bare (no prefix) for the "engine: bootstrapping <slug>…" status line
+// — same "compact, filesystem/terminal-safe label from free-text goal"
+// need, not a new concept.
+func slugFromGoal(goal string, maxRunes int) string {
 	runes := []rune(strings.ToLower(goal))
 	if len(runes) > maxRunes {
 		runes = runes[:maxRunes]
@@ -1365,7 +1583,7 @@ func worktreeNameFromGoal(goal string) string {
 	if slug == "" {
 		slug = "loop"
 	}
-	return "mctl-" + slug
+	return slug
 }
 
 // buildSpawnPrompt composes the LOOP CONTRACT block sent as the new
@@ -3903,16 +4121,27 @@ func renderStatusLine(status string, kind statusKind) string {
 // special-cased to render just the label — see whereStepLabel, which needs
 // Model context (fleet/eligibility) that a plain wizardStep can't carry.
 func renderNewLoopPrompt(m Model) string {
-	if m.spawnStep == wizardWhere {
+	switch m.spawnStep {
+	case wizardWhere:
 		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.whereStepLabel())
+	case wizardEngineDrive:
+		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + engineDriveStepLabel)
 	}
 	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ "+wizardStepLabel(m.spawnStep)+" ") + m.input.View()
 }
 
+// engineDriveStepLabel is wizardEngineDrive's single-key prompt (LoopEngine
+// MVP) — same "no free-text input, so it needs its own label, not
+// wizardStepLabel's" shape as whereStepLabel, but a package-level constant
+// rather than a method since (unlike whereStepLabel's busy-dir nudge) this
+// label needs no Model context at all.
+const engineDriveStepLabel = "drive? [e] engine-drive · [m] manual (observe only):"
+
 // wizardStepLabel is each free-text wizard step's prompt label —
 // max_iteration's carries the default inline ("[12]"), since there's no
 // separate placeholder shown on the input (see newWizardInput). Does not
-// cover wizardWhere (see whereStepLabel).
+// cover wizardWhere (see whereStepLabel) or wizardEngineDrive (see
+// engineDriveStepLabel) — both single-key steps with no free-text input.
 func wizardStepLabel(step wizardStep) string {
 	switch step {
 	case wizardGoal:
