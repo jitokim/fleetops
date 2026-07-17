@@ -100,6 +100,26 @@ type Loop struct {
 	GateTS       int64     // unix NANOSECONDS of the gate marker this loop's StateGate was derived from, if any — lets approveCmd compare-and-swap delete only the marker it actually decided on (see gate.DeleteMarkerIfTS; nanosecond precision is what lets the CAS distinguish two markers landing in the same second)
 	Note         string    // governor-set annotation (internal/engine.Check via the scanner's applyGovernor) — the tui's NOTE column prefers this over stall/drift text when set; "" leaves NOTE's existing stall/drift behavior untouched
 	BoundAt      time.Time // when this loop was bound (internal/registry.Record.BoundAt, copied in by enrichFromRegistry) — zero value for an unbound loop; feat/detail-panel-v2's STAGE row prefers this for "elapsed", falling back to the event log's first entry when zero
+
+	// Driven is the durable "this session is engine-owned" flag (LoopEngine
+	// MVP, docs/design-loop-engine-mvp.md §1's ownership table — see
+	// docs/specs/seed-loop-engine-mvp-2026-07-17.md for the locked ACs).
+	// The scanner stays the SOLE owner of State; Driven is a SEPARATE,
+	// registry-persisted fact copied onto Loop the same way BoundAt already
+	// is, not a second state machine. false for every loop today — this
+	// field exists but is not yet populated: slice 1 (this one) only adds
+	// it + the pure ShouldDrive/NextWorkPrompt decision core, which take
+	// "driven" as an explicit bool parameter rather than reading this field
+	// directly (see engine.ShouldDrive's doc for why). A later slice wires
+	// registry.Record.Driven → this field via enrichFromRegistry, mirroring
+	// BoundAt's own copy-in, and starts actually setting it true at
+	// engine-bootstrap. Also doubles as the take-over pause switch: the
+	// captain-mandated attach AC has a Driven-loop attach clear this to
+	// false so a human interactively driving the session (via `claude
+	// --resume <id>` in a real terminal) can never race the engine into
+	// firing a concurrent cycle — ShouldDrive's driven==false clause
+	// already covers that pause with no extra code (see its doc).
+	Driven bool
 }
 
 // BudgetFrac is the fraction of the token budget consumed (0..1).

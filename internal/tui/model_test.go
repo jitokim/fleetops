@@ -2511,25 +2511,101 @@ func TestUpdate_RKey_AfterActuatingCleared_CanDispatchAgain(t *testing.T) {
 
 // fakeController is a minimal control.Controller test double — only Resume
 // is exercised by sendPromptCmd; the rest are unused stubs.
+//
+// locateCalled/locateClaudeCalled/focusCalled (feat/engine-driver's
+// attach-preservation AC) track which methods attachCmd actually invokes,
+// configurable via locateTarget/locateOK/focusErr — every OTHER existing
+// test leaves these at their zero values (false/empty/nil), which
+// reproduces the exact same stub behavior these methods always had.
 type fakeController struct {
 	name             string
 	resumeCalled     bool
 	resumeErr        error
 	lastResumePrompt string // feat/drift-guided-redrive: captures what Resume was actually sent, for asserting hint composition
+
+	locateCalled       bool
+	locateClaudeCalled bool
+	locateTarget       control.Target
+	locateOK           bool
+	focusCalled        bool
+	focusErr           error
 }
 
-func (f *fakeController) Name() string                               { return f.name }
-func (f *fakeController) Available() bool                            { return true }
-func (f *fakeController) Locate(string) (control.Target, bool)       { return control.Target{}, false }
-func (f *fakeController) LocateClaude(string) (control.Target, bool) { return control.Target{}, false }
-func (f *fakeController) Approve(control.Target) error               { return nil }
-func (f *fakeController) Focus(control.Target) error                 { return nil }
-func (f *fakeController) Interrupt(control.Target) error             { return nil }
-func (f *fakeController) Spawn(string, string) error                 { return nil }
+func (f *fakeController) Name() string                   { return f.name }
+func (f *fakeController) Available() bool                { return true }
+func (f *fakeController) Approve(control.Target) error   { return nil }
+func (f *fakeController) Interrupt(control.Target) error { return nil }
+func (f *fakeController) Spawn(string, string) error     { return nil }
+func (f *fakeController) Locate(string) (control.Target, bool) {
+	f.locateCalled = true
+	return f.locateTarget, f.locateOK
+}
+func (f *fakeController) LocateClaude(string) (control.Target, bool) {
+	f.locateClaudeCalled = true
+	return control.Target{}, false
+}
+func (f *fakeController) Focus(control.Target) error {
+	f.focusCalled = true
+	return f.focusErr
+}
 func (f *fakeController) Resume(t control.Target, prompt string) error {
 	f.resumeCalled = true
 	f.lastResumePrompt = prompt
 	return f.resumeErr
+}
+
+// ── attachCmd: the captain-mandated attach-preservation AC ────────────────
+//
+// feat/engine-driver's seed spec locks a top-level AC: an OBSERVED loop's
+// `↵` attach behavior must NEVER regress across any engine slice —
+// unchanged Locate (not the stricter LocateClaude) → Focus, exactly as
+// today. This is slice 1's only touch of attachCmd: a testability seam
+// (controlResolveFn) with ZERO behavior change, so this pin can actually
+// run hermetically instead of only against a real (never-available-in-CI)
+// orca/tmux/cmux backend.
+
+func withFakeControlResolve(t *testing.T, ctrl control.Controller, ok bool) {
+	t.Helper()
+	orig := controlResolveFn
+	t.Cleanup(func() { controlResolveFn = orig })
+	controlResolveFn = func() (control.Controller, bool) { return ctrl, ok }
+}
+
+func TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude(t *testing.T) {
+	fakeCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%1"}, locateOK: true}
+	withFakeControlResolve(t, fakeCtrl, true)
+	l := domain.Loop{Project: "aboard", SessionID: "s1", ProjectDir: "-x-aboard", State: domain.StateRunning}
+
+	msg := attachCmd(l)()
+
+	if !fakeCtrl.locateCalled {
+		t.Error("expected Locate to be called")
+	}
+	if fakeCtrl.locateClaudeCalled {
+		t.Error("expected LocateClaude NOT to be called — attach uses the permissive Locate, same as before the engine existed")
+	}
+	if !fakeCtrl.focusCalled {
+		t.Error("expected Focus to be called once Locate found a surface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok {
+		t.Fatalf("got %+v, want a successful attachResultMsg", msg)
+	}
+}
+
+func TestAttachCmd_NoBackendAvailable_ManualHintFallback(t *testing.T) {
+	withFakeControlResolve(t, nil, false)
+	l := domain.Loop{Project: "aboard", SessionID: "s1", Cwd: "/Users/imac/aboard", State: domain.StateRunning}
+
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a failed attachResultMsg with a manual hint", msg)
+	}
+	if !strings.Contains(am.text, "cd /Users/imac/aboard") {
+		t.Errorf("text = %q, want the manual attach hint", am.text)
+	}
 }
 
 func TestUpdate_ArrowKeysWhileInjecting_RouteToInputNotCursor(t *testing.T) {
