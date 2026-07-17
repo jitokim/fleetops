@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -248,7 +249,17 @@ const (
 	// did before this field existed — byte-for-byte the same manual path
 	// (see TestAdvanceSpawnWizard_EngineDisabled_SkipsStraightToWhere).
 	wizardEngineDrive
-	wizardWhere // single-key w/d/enter; only reached when the backend supports worktree spawn — see advanceSpawnWizard
+	// wizardWhere: single-key w/d/s/c/enter, ALWAYS reached on the manual
+	// path (even when the backend can't do worktree spawn — [w] is simply
+	// not offered then). It both picks worktree-vs-dir AND is the one place
+	// the spawn target directory is shown and can be changed ([c] → wizardDir
+	// free-text, [s] → the selected loop's verified cwd) — the spawn base is
+	// otherwise ALWAYS the directory fleetops was launched from, never
+	// silently inherited from the list cursor (that inheritance is exactly
+	// what used to send a new loop into whatever repo/worktree the cursor
+	// happened to sit on).
+	wizardWhere
+	wizardDir // free-text absolute/~ path, entered via [c] from wizardWhere or wizardEngineDrive; returns to spawnDirReturn
 )
 
 type Model struct {
@@ -271,15 +282,20 @@ type Model struct {
 	// real.
 	demo bool
 
-	mode      mode
-	input     textinput.Model
-	spawnCwd  string // captured when "n" is pressed: target loop's Cwd, or os.Getwd()
-	spawnNote string // captured alongside spawnCwd: non-empty when the selected loop's cwd wasn't verified-real and spawn fell back to os.Getwd() (see the "n" handler and P1-3's CwdVerified gating)
+	mode     mode
+	input    textinput.Model
+	spawnCwd string // the wizard's spawn target dir: os.Getwd() at "n" (the dir fleetops runs in), changed ONLY by an explicit wizard choice ([c]/[s] at wizardWhere, [c] at wizardEngineDrive) — never inherited from the list cursor
+
+	// spawnDirReturn is which single-key step ([c] at wizardWhere or
+	// wizardEngineDrive) opened the wizardDir free-text step, so a valid
+	// path entry can return there with the label re-rendered against the
+	// new spawnCwd.
+	spawnDirReturn wizardStep
 
 	// spawnStep/spawnGoal/spawnDoneWhen/spawnRubric/spawnChallenger/
 	// spawnMaxCycles hold the "n" key wizard's in-progress answers across
-	// its steps (see wizardStep) — spawnCwd/spawnNote above are captured
-	// once, before step 1, and don't change as the wizard advances.
+	// its steps (see wizardStep) — spawnCwd above is captured before step 1
+	// and changes only via the explicit wizardDir/[s] choices.
 	// spawnRubric was spawnOracle until feat/panel-info's precise rename —
 	// see domain.Goal's doc.
 	spawnStep       wizardStep
@@ -291,16 +307,17 @@ type Model struct {
 	spawnMaxCycles  int
 
 	// spawnWorktreeEligible/spawnHostsClaudeRepo drive the final wizardWhere
-	// step's default and whether it's shown at all:
+	// step's default and whether [w] is offered:
 	//   - spawnWorktreeEligible: does the resolved backend implement
 	//     control.WorktreeSpawner (orca only)? Computed OFF the event loop
 	//     (control.Resolve does real exec calls) by checkWorktreeEligibilityCmd,
 	//     fired at "n" keypress time — by the time a human types through 4-5
 	//     wizard steps the result has almost always arrived, but the
 	//     zero-value (false) is a safe fallback if it hasn't.
-	//   - spawnHostsClaudeRepo: true when "n" was pressed with a loop
-	//     selected (independent evidence claude has actually run in
-	//     spawnCwd) — see the "n" handler.
+	//   - spawnHostsClaudeRepo: true when a fleet loop's Cwd matches the
+	//     CURRENT spawnCwd (independent evidence claude has actually run
+	//     there) — recomputed whenever spawnCwd changes (see
+	//     dirHostsClaudeRepo).
 	spawnWorktreeEligible bool
 	spawnHostsClaudeRepo  bool
 
@@ -724,13 +741,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				case "e":
 					return m.submitSpawnWizardEngineDrive()
+				case "c":
+					// explicit spawn-dir change — engine-drive spawns
+					// headless in spawnCwd with no wizardWhere step, so the
+					// dir must be changeable from here too.
+					return m.enterWizardDir(wizardEngineDrive)
 				case "m", "enter":
-					// EXISTING manual path, unchanged: proceed to exactly
-					// the worktree-eligibility check wizardMaxCycles used
-					// to run directly before this step existed.
-					if !m.spawnWorktreeEligible {
-						return m.submitSpawnWizard(false)
-					}
+					// manual path: always show wizardWhere — it's now also
+					// the step that displays (and can change) the spawn dir,
+					// so it must not be skipped even when the backend can't
+					// do worktree spawn.
 					m.spawnStep = wizardWhere
 					return m, textinput.Blink
 				}
@@ -747,7 +767,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status, m.statusKind = "cancelled", statusNeutral
 					return m, nil
 				case "w":
-					return m.submitSpawnWizard(true) // explicit: attempt worktree if the backend can do it at all
+					if !m.spawnWorktreeEligible {
+						return m, nil // [w] isn't offered — don't promise an isolation the backend can't deliver
+					}
+					return m.submitSpawnWizard(true)
+				case "c":
+					return m.enterWizardDir(wizardWhere)
+				case "s":
+					// explicit opt-in to the OLD implicit behavior: spawn in
+					// the selected loop's directory. Only a verified-real cwd
+					// qualifies (P1-3: a dead loop's Cwd is a lossy decode of
+					// ProjectDir and could point anywhere).
+					if sel, ok := m.selected(); ok && sel.CwdVerified && sel.Cwd != "" {
+						m.spawnCwd = sel.Cwd
+						m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(sel.Cwd)
+					}
+					return m, nil // stay on wizardWhere — the label re-renders with the new target
 				case "enter":
 					return m.submitSpawnWizard(m.spawnWorktreeEligible && m.spawnHostsClaudeRepo) // default
 				case "d":
@@ -836,8 +871,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status, m.statusKind = fmt.Sprintf("already re-driving %s…", m.injectTarget.Project), statusNeutral
 					return m, nil
 				}
+				// feat/inject-headless-exact-fallback: the ambiguity/
+				// eligibility guard is the ONE keypress-time gate
+				// sendPromptCmd does NOT re-check (its Tier1→Tier2
+				// fallthrough is unconditional), and loop state can change
+				// while the human types (fleet refresh messages still flow
+				// during modeInjecting — only KEYS are captured) — e.g. an
+				// Idle target picked up by a human typing in its own pane,
+				// now mid-turn. Re-resolve the target from the CURRENT
+				// fleet snapshot and re-run the same guard, so a target
+				// that was eligible at keypress but went Running while
+				// typing is refused here rather than headlessly re-driven
+				// into a live interactive turn (the exact hazard
+				// injectHeadlessFallbackEligible exists to exclude).
+				headlessBound := false
+				if fresh, ok := m.loopBySessionID(m.injectTarget.SessionID); ok {
+					m.injectTarget = fresh
+					if fresh.Stall != domain.StallGone && !m.ttyPathPlausible(fresh) {
+						if msg, ambiguous := m.refuseIfAmbiguous(fresh); ambiguous {
+							if !injectHeadlessFallbackEligible(fresh.State) {
+								m.status, m.statusKind = msg, statusErr
+								return m, nil
+							}
+							headlessBound = true
+						}
+					}
+				}
 				if m.injectTarget.Stall == domain.StallGone {
 					m.status, m.statusKind = fmt.Sprintf("re-driving %s headlessly (tier 2)... this can take a few minutes", m.injectTarget.Project), statusNeutral
+				} else if headlessBound {
+					// Honest interim status (same discipline as the Tier 2
+					// result message): this prompt is all but certain to
+					// route headlessly — don't imply an in-place injection
+					// the open window will never show.
+					m.status, m.statusKind = fmt.Sprintf("injecting into %s headlessly (tier 2)... this can take a few minutes", m.injectTarget.Project), statusNeutral
 				} else {
 					m.status, m.statusKind = fmt.Sprintf("injecting into %s...", m.injectTarget.Project), statusNeutral
 				}
@@ -1085,28 +1152,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return logClosedMsg{err}
 			})
 		case "n":
+			// The spawn base is ALWAYS the directory fleetops was launched
+			// from — never the list cursor's loop. Inheriting the selected
+			// loop's cwd here (the old behavior) meant "n" spawned into
+			// whatever repo/worktree the cursor happened to sit on, which is
+			// exactly the surprise wizardWhere's [s]/[c] choices now make
+			// explicit instead.
 			cwd, err := os.Getwd()
 			if err != nil {
 				cwd = "."
 			}
-			spawnNote := ""
-			sel, selOK := m.selected()
-			hostsClaudeRepo := selOK && sel.Cwd != "" // independent evidence claude has run in sel.Cwd — see wizardWhere's default
-			if selOK && sel.Cwd != "" {
-				// Only spawn into a loop's cwd once it's been confirmed
-				// against a live process's real lsof path (see
-				// applyLiveness/CwdVerified) — a dead loop's Cwd is at best
-				// a lossy decode of ProjectDir (ambiguous when the real
-				// directory name itself contains "-") and could point
-				// spawn at the wrong directory entirely (P1-3).
-				if sel.CwdVerified {
-					cwd = sel.Cwd
-				} else {
-					spawnNote = fmt.Sprintf(" (%s's cwd wasn't verified — using %s instead)", sel.Project, cwd)
-				}
-			}
 			m.spawnCwd = cwd
-			m.spawnNote = spawnNote
 			m.spawnStep = wizardGoal
 			m.spawnGoal = ""
 			m.spawnName = ""
@@ -1115,7 +1171,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spawnChallenger = ""
 			m.spawnMaxCycles = 0
 			m.spawnWorktreeEligible = false // set once checkWorktreeEligibilityCmd's result arrives
-			m.spawnHostsClaudeRepo = hostsClaudeRepo
+			m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(cwd)
 			m.mode = modePrompting
 			m.input = newWizardInput()
 			return m, tea.Batch(textinput.Blink, checkWorktreeEligibilityCmd())
@@ -1575,6 +1631,73 @@ func newWizardInput() textinput.Model {
 	return input
 }
 
+// enterWizardDir opens the [c] change-dir free-text step from one of the two
+// single-key steps (wizardWhere / wizardEngineDrive), remembering where to
+// return on a valid entry. The input is prefilled with the current target so
+// the human edits a visible path rather than typing one blind.
+func (m Model) enterWizardDir(returnTo wizardStep) (tea.Model, tea.Cmd) {
+	m.spawnDirReturn = returnTo
+	m.spawnStep = wizardDir
+	m.input = newWizardInput()
+	m.input.SetValue(m.spawnCwd)
+	m.input.CursorEnd()
+	return m, textinput.Blink
+}
+
+// dirHostsClaudeRepo reports whether any loop in the current fleet has run
+// in dir — the independent "claude has actually run here" evidence that
+// makes worktree spawn wizardWhere's enter-default. Recomputed whenever the
+// wizard's target dir changes (pure, no exec).
+func (m Model) dirHostsClaudeRepo(dir string) bool {
+	for _, l := range m.loops {
+		if l.Cwd != "" && l.Cwd == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveSpawnDir turns wizardDir's free-text answer into an absolute
+// existing directory: "~" expands to the home dir, relative paths resolve
+// against fleetops' own cwd, and anything that doesn't stat as a directory
+// is rejected (the wizard re-prompts rather than letting spawn fail later
+// with a murkier backend error).
+func resolveSpawnDir(value string) (string, error) {
+	path := value
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot expand ~: %v", err)
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("bad path %q: %v", value, err)
+	}
+	st, err := os.Stat(abs)
+	if err != nil || !st.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", abs)
+	}
+	return abs, nil
+}
+
+// displayDir abbreviates the home-dir prefix to "~" for the wizard's
+// status-line labels — pure formatting, never fed back into any path use.
+func displayDir(dir string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return dir
+	}
+	if dir == home {
+		return "~"
+	}
+	if strings.HasPrefix(dir, home+string(filepath.Separator)) {
+		return "~" + dir[len(home):]
+	}
+	return dir
+}
+
 // parseMaxCycles parses the wizard's max_iteration step: "" means "use the
 // default", anything else must be a positive integer. Pulled out of
 // advanceSpawnWizard as its own pure function so the parsing/defaulting
@@ -1655,14 +1778,31 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 			m.spawnStep = wizardEngineDrive
 			return m, textinput.Blink
 		}
-		if !m.spawnWorktreeEligible {
-			// no backend supports worktree-isolated spawn (tmux/cmux, or no
-			// backend resolved at all) — offering a choice that always
-			// degrades to the same outcome would just be confusing, so
-			// skip straight to a current-dir spawn.
-			return m.submitSpawnWizard(false)
-		}
+		// ALWAYS show wizardWhere, even when no backend supports
+		// worktree-isolated spawn (tmux/cmux, or no backend resolved at
+		// all): it stopped being just the w/d choice — it's the one step
+		// that shows the spawn target dir and offers [c]/[s] to change it,
+		// and skipping it would commit the spawn to a dir the human never
+		// saw. When ineligible, [w] simply isn't offered (see
+		// whereStepLabel).
 		m.spawnStep = wizardWhere
+		return m, textinput.Blink
+
+	case wizardDir:
+		// [c]'s free-text path entry. Empty input keeps the current target
+		// (a change-of-mind escape that doesn't cancel the whole wizard);
+		// anything else must resolve to an existing directory or the step
+		// re-prompts.
+		if value != "" {
+			dir, err := resolveSpawnDir(value)
+			if err != nil {
+				m.status, m.statusKind = err.Error()+" — try again", statusErr
+				return m, nil // re-prompt: stay on wizardDir
+			}
+			m.spawnCwd = dir
+			m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(dir)
+		}
+		m.spawnStep = m.spawnDirReturn
 		return m, textinput.Blink
 
 	default:
@@ -1684,12 +1824,12 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 	m.mode = modeNormal
 	m.input.Blur()
-	note := m.spawnNote
+	note := ""
 	if m.spawnDoneWhen == "" {
 		note += " (no done condition — oracle judges against the goal only)"
 	}
 	if useWorktree {
-		m.status, m.statusKind = fmt.Sprintf("spawning loop in a new worktree...%s", note), statusNeutral
+		m.status, m.statusKind = fmt.Sprintf("spawning loop in a new worktree of %s...%s", m.spawnCwd, note), statusNeutral
 	} else {
 		m.status, m.statusKind = fmt.Sprintf("spawning loop in %s...%s", m.spawnCwd, note), statusNeutral
 	}
@@ -4865,17 +5005,20 @@ func renderNewLoopPrompt(m Model) string {
 	case wizardWhere:
 		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.whereStepLabel())
 	case wizardEngineDrive:
-		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + engineDriveStepLabel)
+		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.engineDriveStepLabel())
 	}
 	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ "+wizardStepLabel(m.spawnStep)+" ") + m.input.View()
 }
 
 // engineDriveStepLabel is wizardEngineDrive's single-key prompt (LoopEngine
 // MVP) — same "no free-text input, so it needs its own label, not
-// wizardStepLabel's" shape as whereStepLabel, but a package-level constant
-// rather than a method since (unlike whereStepLabel's busy-dir nudge) this
-// label needs no Model context at all.
-const engineDriveStepLabel = "drive? [e] engine-drive · [m] manual (observe only):"
+// wizardStepLabel's" shape as whereStepLabel. A method (not the constant it
+// used to be) because it now shows the spawn target dir: engine-drive spawns
+// headless in spawnCwd without ever reaching wizardWhere, so this is the
+// engine path's only chance to see — and [c]hange — where the loop will run.
+func (m Model) engineDriveStepLabel() string {
+	return fmt.Sprintf("drive? [e] engine-drive · [m] manual (observe only) · [c] change dir — in %s:", displayDir(m.spawnCwd))
+}
 
 // wizardStepLabel is each free-text wizard step's prompt label —
 // max_iteration's carries the default inline ("[12]"), since there's no
@@ -4896,17 +5039,32 @@ func wizardStepLabel(step wizardStep) string {
 		return "challenger:"
 	case wizardMaxCycles:
 		return fmt.Sprintf("max_iteration [%d]:", registry.DefaultMaxCycles)
+	case wizardDir:
+		return "dir (absolute or ~ path; empty keeps current):"
 	default:
 		return ""
 	}
 }
 
-// whereStepLabel builds the wizard's final "where to spawn" prompt, with a
-// busy-directory nudge appended when the target directory already hosts
-// >=1 fleet loop (independent of — and a stronger UX nudge than —
-// spawnHostsClaudeRepo, which only gates the w/enter default).
+// whereStepLabel builds the wizard's final "where to spawn" prompt. It
+// always names the target directory — the spawn base must be visible BEFORE
+// the human commits, never discovered from the status line after. [w] is
+// offered only when the backend can actually isolate; [s] only when the
+// selected loop has a verified-real cwd that differs from the current
+// target (the explicit replacement for the old silent inheritance). The
+// busy-directory nudge appends when the target already hosts >=1 fleet loop
+// (independent of — and a stronger UX nudge than — spawnHostsClaudeRepo,
+// which only gates the w/enter default).
 func (m Model) whereStepLabel() string {
-	label := "where? [w] new worktree · [d] this dir:"
+	label := "where?"
+	if m.spawnWorktreeEligible {
+		label += " [w] new worktree ·"
+	}
+	label += " [d] this dir · [c] change dir"
+	if sel, ok := m.selected(); ok && sel.CwdVerified && sel.Cwd != "" && sel.Cwd != m.spawnCwd {
+		label += fmt.Sprintf(" · [s] %s's dir", sel.Project)
+	}
+	label += fmt.Sprintf(" — in %s:", displayDir(m.spawnCwd))
 	if m.spawnDirBusyCount() >= 1 {
 		label += " (dir busy — worktree recommended)"
 	}
