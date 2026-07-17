@@ -99,9 +99,11 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 }
 
 // enrichFromRegistry attaches goal-bound metadata (Goal.Text/MaxCycles/
-// NoImproveLimit, Last verdict, NoImprove) from the registry to each loop
-// that has a record — observed (non-spawned) sessions have none and are
-// left untouched (Goal.Text stays "", which the TUI treats as "unbound").
+// NoImproveLimit, Last verdict, NoImprove, Driven) from the registry to
+// each loop that has a record — observed (non-spawned) sessions have none
+// and are left untouched (Goal.Text stays "", which the TUI treats as
+// "unbound"; Driven stays false, since an unbound loop was never handed to
+// the engine).
 //
 // A bound loop whose latest verdict was rendered AT this exact cycle
 // (Verdict.AtCycle == Cycle — i.e. nothing has happened since it was
@@ -127,6 +129,14 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		loops[i].NoImprove = rec.NoImprove
 		loops[i].Last = rec.Verdict
 		loops[i].BoundAt = rec.BoundAt
+		// LoopEngine MVP (docs/design-loop-engine-mvp.md §1): Driven is
+		// copied onto the in-memory Loop the SAME way BoundAt already is —
+		// registry stays the durable source of truth, Loop.Driven is a
+		// per-scan PROJECTION of it, never a second place engine-ownership
+		// can independently drift. An unbound loop (the `!ok` continue
+		// above) never reaches here, so it keeps Loop.Driven's zero value
+		// (false) — exactly right, since it was never handed to the engine.
+		loops[i].Driven = rec.Driven
 
 		// A live gate always wins over a stale verdict: the loop is blocked
 		// on a human decision RIGHT NOW, which is more urgent and more

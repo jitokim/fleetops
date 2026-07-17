@@ -28,6 +28,35 @@ func TestAppend_ThenReadAll_RoundTrips(t *testing.T) {
 	}
 }
 
+// TestTriggerEngine_RoundTripsThroughAppendAndReadAll is LoopEngine MVP's
+// durable-ownership slice: TriggerEngine must serialize/deserialize
+// exactly like every other Trigger value (same JSON round-trip
+// TestAppend_ThenReadAll_RoundTrips already exercises for TriggerScan),
+// paired with ActorAuto — the provenance combination that lets the EVENTS
+// timeline and `missionctl report` tell an engine-fired cycle apart from a
+// human's r/i/a/k/p keypress (which is always TriggerActuation/ActorHuman).
+func TestTriggerEngine_RoundTripsThroughAppendAndReadAll(t *testing.T) {
+	dir := t.TempDir()
+	ev := Event{TS: 1000, SessionID: "sess-1", FromState: "idle", ToState: "running", Trigger: TriggerEngine, Detail: "cycle 4", Actor: ActorAuto}
+	if err := Append(dir, ev); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	got, err := ReadAll(dir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs, ok := got["sess-1"]
+	if !ok || len(evs) != 1 {
+		t.Fatalf("got %#v, want exactly one event for sess-1", got)
+	}
+	if evs[0] != ev {
+		t.Errorf("round-tripped event = %#v, want %#v", evs[0], ev)
+	}
+	if evs[0].Trigger != "engine" {
+		t.Errorf("Trigger serialized as %q, want the stable string %q", evs[0].Trigger, "engine")
+	}
+}
+
 func TestAppend_MultipleEvents_SameSession_AllPersisted(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 3; i++ {

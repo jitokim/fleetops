@@ -42,6 +42,20 @@ const (
 	TriggerActuation Trigger = "actuation" // a TUI-driven action: resume/inject/approve/interrupt/kill/spawn
 	TriggerOracle    Trigger = "oracle"    // a judgeCmd verdict
 	TriggerGovernor  Trigger = "governor"  // the governor (internal/engine.Check) stopping a loop
+
+	// TriggerEngine marks a cycle LoopEngine itself fired — as distinct
+	// from TriggerActuation (a human's r/i/a/k/p keypress) even though
+	// mechanically a driven cycle is the SAME control.Redrive call a
+	// manual "r" makes. This is the provenance line: every driven cycle's
+	// event carries Actor=ActorAuto (never ActorHuman) and
+	// Trigger=TriggerEngine (never TriggerActuation), so the EVENTS
+	// timeline and `missionctl report` can tell "a human drove this" from
+	// "the engine drove this" apart at a glance, without inspecting Detail
+	// text. Reserved here (docs/design-loop-engine-mvp.md §4/§10 Slice 1 —
+	// "durable ownership") — not yet emitted by anything; the engine's
+	// actual drive command (a later slice, docs/specs/seed-loop-engine-mvp-
+	// 2026-07-17.md's Slice 4) is the first emitter.
+	TriggerEngine Trigger = "engine"
 )
 
 // Actor is who/what caused the event.

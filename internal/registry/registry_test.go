@@ -168,6 +168,142 @@ func TestSaveVerdict_UnboundSessionErrors(t *testing.T) {
 	}
 }
 
+// ── LoopEngine MVP: Driven durability ────────────────────────────────────
+
+func TestBind_DrivenTrue_RoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	rec, ok := Load(dir, "sess-1")
+	if !ok {
+		t.Fatal("expected a record to load")
+	}
+	if !rec.Driven {
+		t.Error("Driven = false, want true (BindSpec.Driven must round-trip)")
+	}
+}
+
+// TestBind_DrivenOmitted_DefaultsFalse is the opt-in-spike's off-by-default
+// contract: a BindSpec that never mentions Driven at all (the zero value —
+// every EXISTING caller today, since none of them offer an engine-drive
+// choice yet) must produce a NOT-driven record. No engine cycle may ever
+// fire for a loop unless it was explicitly created engine-driven.
+func TestBind_DrivenOmitted_DefaultsFalse(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	rec, _ := Load(dir, "sess-1")
+	if rec.Driven {
+		t.Error("Driven = true, want false — a BindSpec that never opts in must not be driven")
+	}
+}
+
+// TestSaveVerdict_PreservesDriven is the captain's exact ask: a driven
+// record must survive SaveVerdict's load-mutate-write round trip, not
+// silently un-drive itself the first time the oracle judges a cycle.
+func TestSaveVerdict_PreservesDriven(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal", Driven: true}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeProgress}, 1); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+	rec, _ := Load(dir, "sess-1")
+	if !rec.Driven {
+		t.Error("Driven = false after SaveVerdict, want true (must survive the round trip)")
+	}
+}
+
+func TestMarkDriven_SetsAndClearsFlag(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if rec, _ := Load(dir, "sess-1"); rec.Driven {
+		t.Fatal("precondition failed: expected Driven=false right after an un-driven Bind")
+	}
+
+	if err := MarkDriven(dir, "sess-1", true); err != nil {
+		t.Fatalf("MarkDriven(true): %v", err)
+	}
+	if rec, _ := Load(dir, "sess-1"); !rec.Driven {
+		t.Error("Driven = false after MarkDriven(true), want true")
+	}
+
+	if err := MarkDriven(dir, "sess-1", false); err != nil {
+		t.Fatalf("MarkDriven(false): %v", err)
+	}
+	if rec, _ := Load(dir, "sess-1"); rec.Driven {
+		t.Error("Driven = true after MarkDriven(false), want false — the take-over pause path")
+	}
+}
+
+// TestMarkDriven_PreservesEveryOtherField: flipping Driven must not
+// disturb the goal/contract/verdict/no-improve state already on the
+// record — MarkDriven is a single-field flip, not a rebuild.
+func TestMarkDriven_PreservesEveryOtherField(t *testing.T) {
+	dir := t.TempDir()
+	spec := BindSpec{Goal: "goal", DoneCondition: "tests pass", Oracle: "run tests", Challenger: "adversarial probe", MaxCycles: 20}
+	if err := Bind(dir, "sess-1", spec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "no evidence"}, 3); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+
+	if err := MarkDriven(dir, "sess-1", true); err != nil {
+		t.Fatalf("MarkDriven: %v", err)
+	}
+
+	rec, _ := Load(dir, "sess-1")
+	if rec.DoneCondition != "tests pass" || rec.Oracle != "run tests" || rec.Challenger != "adversarial probe" || rec.MaxCycles != 20 {
+		t.Errorf("got %+v, want the contract fields untouched by MarkDriven", rec)
+	}
+	if rec.Verdict == nil || rec.Verdict.Outcome != domain.OutcomeRejected || rec.Verdict.Reason != "no evidence" || rec.Verdict.AtCycle != 3 {
+		t.Errorf("Verdict = %+v, want the existing verdict untouched by MarkDriven", rec.Verdict)
+	}
+	if rec.NoImprove != 1 {
+		t.Errorf("NoImprove = %d, want 1 (unaffected by MarkDriven)", rec.NoImprove)
+	}
+}
+
+func TestMarkDriven_UnboundSessionErrors(t *testing.T) {
+	if err := MarkDriven(t.TempDir(), "never-bound", true); err == nil {
+		t.Error("expected an error marking Driven on a session with no registry record")
+	}
+}
+
+// TestWritePending_BindPending_DrivenSurvivesRoundTrip is the pending-spawn
+// plumbing check: a spawn request created with the engine-drive choice
+// must still be driven once its session is matched and Bound — not lost
+// in the WritePending → BindPending → Bind hop.
+func TestWritePending_BindPending_DrivenSurvivesRoundTrip(t *testing.T) {
+	loopsDir, pendingDir, historyDir := t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Now()
+	if err := WritePending(pendingDir, "/x/aboard", BindSpec{Goal: "fix it", Driven: true}); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+	loops := []domain.Loop{
+		// LastActivity must be safely AFTER the pending's own internal
+		// time.Now() TS (WritePending stamps it, not this test) for
+		// BindPending's match window — same margin
+		// TestBindPending_HyphenatedWorktreePathBinds uses.
+		{SessionID: "sess-1", ProjectDir: domain.EncodeCwd("/x/aboard"), LastActivity: now.Add(time.Minute)},
+	}
+	BindPending(loopsDir, pendingDir, loops, now, historyDir)
+
+	rec, ok := Load(loopsDir, "sess-1")
+	if !ok {
+		t.Fatal("expected sess-1 to be bound")
+	}
+	if !rec.Driven {
+		t.Error("Driven = false after BindPending, want true — the engine-drive choice must survive the pending round trip")
+	}
+}
+
 func TestWritePending_ListPendingRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	if err := WritePending(dir, "/x/aboard", BindSpec{Goal: "fix the bug"}); err != nil {
