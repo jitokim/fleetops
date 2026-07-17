@@ -2491,6 +2491,80 @@ func TestUpdate_IKey_ResolvableInPlace_FullRoundTrip_UsesTierOneNotHeadless(t *t
 	}
 }
 
+// TestUpdate_InjectSubmit_TargetWentRunningWhileTyping_Refuses pins the
+// submit-time re-check: eligibility is judged at "i" keypress, but fleet
+// refresh messages still flow while the human types (modeInjecting only
+// captures KEYS) — if the Idle/Stalled target goes Running mid-typing,
+// Enter must NOT headlessly re-drive into the now-live interactive turn.
+// sendPromptCmd's Tier1→Tier2 fallthrough is unconditional, so this
+// submit-time guard is the only protection against that race.
+func TestUpdate_InjectSubmit_TargetWentRunningWhileTyping_Refuses(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir() // cursor 0 = sess-1, StateStalled (eligible at keypress)
+	var redriveCalled bool
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false
+		},
+		func(sessionID, prompt string) error {
+			redriveCalled = true
+			return nil
+		},
+	)
+
+	m, _ = updateModel(t, m, runeKey('i'))
+	if m.mode != modeInjecting {
+		t.Fatalf("precondition failed: mode = %v, want modeInjecting (Stalled ambiguous is eligible)", m.mode)
+	}
+
+	// Mid-typing fleet rescan: sess-1 is now mid-turn (Running), still
+	// ambiguous with sess-2, still no registry tty.
+	m, _ = updateModel(t, m, loopsMsg([]domain.Loop{
+		{Project: "myproject", SessionID: "sess-1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", CwdVerified: true, State: domain.StateRunning},
+		{Project: "myproject", SessionID: "sess-2", ProjectDir: "-x-myproject", Cwd: "/x/myproject", CwdVerified: true, State: domain.StateStalled},
+	}))
+
+	m, cmd := typeAndEnter(t, m, "keep going")
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — the submit-time re-check must refuse, not dispatch")
+	}
+	if redriveCalled {
+		t.Error("redriveFn must NOT be called for a target that went Running while typing")
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
+	}
+	if m.mode != modeNormal {
+		t.Errorf("mode = %v, want modeNormal after the refusal", m.mode)
+	}
+}
+
+// TestUpdate_InjectSubmit_AmbiguousEligible_InterimStatusSaysHeadless pins
+// the honest interim status (same discipline as the Tier 2 result message):
+// an ambiguous-but-eligible target is all but certain to route headlessly,
+// so the "working…" status must not imply an in-place injection the open
+// window will never show.
+func TestUpdate_InjectSubmit_AmbiguousEligible_InterimStatusSaysHeadless(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+			return nil, control.Target{}, true, false
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+
+	m, _ = updateModel(t, m, runeKey('i'))
+	m, cmd := typeAndEnter(t, m, "run the tests again")
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd (injectCmd)")
+	}
+	if !strings.Contains(m.status, "headlessly (tier 2)") {
+		t.Errorf("interim status = %q, want it to say the prompt is routing headlessly (tier 2)", m.status)
+	}
+	if m.statusKind != statusNeutral {
+		t.Errorf("statusKind = %v, want statusNeutral for the interim status", m.statusKind)
+	}
+}
+
 // modelWithThreeOrcaLoopsSharingWorktree models the real motivating case for
 // this feature: orca has no CLI tty/tab-by-session mapping at all
 // (confirmed live — see docs/adr-vendor-independent-actuation.md §4 and
@@ -3257,9 +3331,11 @@ func TestUpdate_IKey_EnterWithText_DispatchesInjectCmd(t *testing.T) {
 }
 
 func TestUpdate_IKey_TargetSnapshottedAtKeypress_SurvivesRescan(t *testing.T) {
-	// the injection target is captured at "i" keypress time, NOT re-resolved
-	// at submit time — a mid-typing rescan (loopsMsg) that reorders/removes
-	// loops must not retarget the pending injection.
+	// the injection target is captured at "i" keypress time — a mid-typing
+	// rescan (loopsMsg) that reorders/removes loops must not RETARGET the
+	// pending injection. (Submit does refresh the SAME session's data by
+	// SessionID — never by cursor — for its ambiguity/eligibility re-check;
+	// a session that vanished from the fleet keeps its snapshot, as here.)
 	m := modelWithOneLoop() // selects "myproject"/sess-1
 	m, _ = updateModel(t, m, runeKey('i'))
 	if m.injectTarget.SessionID != "sess-1" {

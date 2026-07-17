@@ -271,7 +271,13 @@ through automatically:
    are no longer ambiguous to each other.
 2. **Tier 1b — cwd-based match (orca/cmux/tmux).** The existing
    `Locate`/`LocateClaude` chain, unchanged — still guarded against
-   ambiguity when more than one loop shares a directory.
+   ambiguity when more than one loop shares a directory. For an **idle or
+   stalled** loop that guard is no longer a dead end: `i` (inject) lets you
+   type the prompt anyway and routes it via Tier 2's session-unique headless
+   re-drive (exact session id — it cannot hit a sibling). A **running**
+   (mid-turn) loop still refuses, because a concurrent headless turn against
+   a live interactive session is unverified territory — attach (`↵`) and act
+   there instead.
 3. **Tier 2 — headless re-drive (every backend, every host).**
    `claude --resume <id> -p "<prompt>"` continues the SAME session as a
    fresh background turn, appending to the SAME transcript the cockpit
