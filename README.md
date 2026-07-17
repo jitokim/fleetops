@@ -83,7 +83,6 @@ look at the UI, or for screenshotting it without leaking real paths/goals.
 | `k` | kill — press twice within 3s to confirm (sends `/exit`) |
 | `n` | spawn a new loop: prompts for a goal, starts `claude` in the selected loop's directory (or cwd) |
 | `o` | open the session log in `less` |
-| `d` | dismiss: hide the selected loop from the list until restart (doesn't touch the session) |
 | `q` | quit |
 
 ## How it works
