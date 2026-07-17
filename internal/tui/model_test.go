@@ -1210,7 +1210,12 @@ func modelWithOneLoop() Model {
 	return m
 }
 
-func TestUpdate_NKey_EntersPromptingModeWithSelectedCwd(t *testing.T) {
+func TestUpdate_NKey_UsesLaunchDirNotSelectedLoop(t *testing.T) {
+	// The spawn base must be the dir fleetops runs in — NEVER silently
+	// inherited from whatever loop the list cursor happens to sit on (that
+	// inheritance is how a new loop ended up in an unrelated repo's
+	// worktree). The selected loop's dir is still reachable, but only via
+	// wizardWhere's explicit [s] choice.
 	m := modelWithOneLoop()
 
 	m, _ = updateModel(t, m, runeKey('n'))
@@ -1218,8 +1223,9 @@ func TestUpdate_NKey_EntersPromptingModeWithSelectedCwd(t *testing.T) {
 	if m.mode != modePrompting {
 		t.Fatalf("mode = %v, want modePrompting", m.mode)
 	}
-	if m.spawnCwd != "/x/myproject" {
-		t.Errorf("spawnCwd = %q, want the selected loop's Cwd %q", m.spawnCwd, "/x/myproject")
+	wd, _ := os.Getwd()
+	if m.spawnCwd != wd {
+		t.Errorf("spawnCwd = %q, want os.Getwd() %q — not the selected loop's Cwd", m.spawnCwd, wd)
 	}
 	if !m.input.Focused() {
 		t.Error("expected the text input to be focused after entering prompting mode")
@@ -1239,10 +1245,10 @@ func TestUpdate_NKey_NoSelectionFallsBackToGetwd(t *testing.T) {
 	}
 }
 
-func TestUpdate_NKey_SelectedCwdNotVerified_FallsBackWithNote(t *testing.T) {
-	// P1-3: a dead loop's Cwd is at best a lossy decode of ProjectDir — spawn
-	// must not trust it unless applyLiveness confirmed it against a live
-	// process's real lsof path (CwdVerified).
+func TestUpdate_NKey_UnverifiedSelectionNeverLeaksIntoSpawnCwd(t *testing.T) {
+	// P1-3 still holds under the launch-dir default: an unverified Cwd (a
+	// lossy decode of ProjectDir) must never become the spawn base — and
+	// with inheritance gone entirely, neither does a verified one.
 	m := New()
 	m.loops = []domain.Loop{{Project: "myproject", SessionID: "sess-1", Cwd: "/x/myproject", CwdVerified: false, State: domain.StateStalled}}
 	m.cursor = 0
@@ -1250,13 +1256,10 @@ func TestUpdate_NKey_SelectedCwdNotVerified_FallsBackWithNote(t *testing.T) {
 	m, _ = updateModel(t, m, runeKey('n'))
 
 	if m.spawnCwd == "/x/myproject" {
-		t.Error("expected spawnCwd NOT to use the unverified Cwd")
+		t.Error("expected spawnCwd NOT to use the selected loop's Cwd")
 	}
 	if m.spawnCwd == "" {
 		t.Error("expected spawnCwd to fall back to a non-empty cwd (os.Getwd)")
-	}
-	if m.spawnNote == "" {
-		t.Error("expected a spawnNote explaining the fallback")
 	}
 }
 
@@ -1270,12 +1273,11 @@ func typeAndEnter(t *testing.T, m Model, s string) (Model, tea.Cmd) {
 	return updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 }
 
-func TestUpdate_SpawnNote_SurfacesInStatusOnSubmit(t *testing.T) {
-	// the note set at "n" keypress time must actually reach the user —
-	// View() replaces the status line with the prompt the instant
-	// modePrompting is entered, so the note can only surface later, at the
-	// "enter"-submit status message (which fires at the END of the wizard,
-	// step 5).
+func TestUpdate_NoDoneCondition_NudgeSurfacesInStatusOnSubmit(t *testing.T) {
+	// the nudge must actually reach the user — View() replaces the status
+	// line with the prompt while prompting, so it can only surface at the
+	// submit status message (which now fires at the wizardWhere step, after
+	// the 5 free-text answers).
 	m := New()
 	m.loops = []domain.Loop{{Project: "myproject", SessionID: "sess-1", Cwd: "/x/myproject", CwdVerified: false, State: domain.StateStalled}}
 	m.cursor = 0
@@ -1286,13 +1288,14 @@ func TestUpdate_SpawnNote_SurfacesInStatusOnSubmit(t *testing.T) {
 	m, _ = typeAndEnter(t, m, "")     // step 3: done-when, skipped
 	m, _ = typeAndEnter(t, m, "")     // step 4: oracle, skipped
 	m, _ = typeAndEnter(t, m, "")     // step 5: challenger, skipped
-	m, cmd := typeAndEnter(t, m, "")  // step 6: max_iteration, default
+	m, _ = typeAndEnter(t, m, "")     // step 6: max_iteration, default
+	if m.spawnStep != wizardWhere {
+		t.Fatalf("spawnStep = %v, want wizardWhere before the final submit", m.spawnStep)
+	}
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // where: default (current dir — ineligible backend)
 
 	if cmd == nil {
 		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
-	}
-	if !strings.Contains(m.status, "wasn't verified") {
-		t.Errorf("status = %q, want it to surface the spawnNote about the unverified cwd", m.status)
 	}
 	if !strings.Contains(m.status, "no done condition") {
 		t.Errorf("status = %q, want it to nudge about the missing done condition", m.status)
@@ -1382,7 +1385,11 @@ func TestWizard_FullFlow_AllStepsFilled(t *testing.T) {
 	m, _ = typeAndEnter(t, m, "tests pass")                 // step 3: done when
 	m, _ = typeAndEnter(t, m, "run go test ./...")          // step 4: oracle
 	m, _ = typeAndEnter(t, m, "try to break it with -race") // step 5: challenger
-	m, cmd := typeAndEnter(t, m, "20")                      // step 6: max cycles
+	m, _ = typeAndEnter(t, m, "20")                         // step 6: max cycles
+	if m.spawnStep != wizardWhere {
+		t.Fatalf("spawnStep = %v, want wizardWhere before the final submit", m.spawnStep)
+	}
+	m, cmd := updateModel(t, m, runeKey('d')) // where: this dir
 
 	if m.mode != modeNormal {
 		t.Errorf("mode = %v, want modeNormal after the full wizard", m.mode)
@@ -1430,9 +1437,13 @@ func TestWizard_DefaultsAtOptionalSteps(t *testing.T) {
 		t.Errorf("got doneWhen=%q rubric=%q challenger=%q, want all empty (skipped)", m.spawnDoneWhen, m.spawnRubric, m.spawnChallenger)
 	}
 
-	m, cmd := typeAndEnter(t, m, "") // step 5: max cycles — default
+	m, _ = typeAndEnter(t, m, "") // step 5: max cycles — default
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Fatalf("got mode=%v step=%v, want modePrompting at wizardWhere after step 5", m.mode, m.spawnStep)
+	}
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // where: default
 	if cmd == nil {
-		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) once step 5 is answered")
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) once the where step is answered")
 	}
 	if m.mode != modeNormal {
 		t.Errorf("mode = %v, want modeNormal after the wizard completes", m.mode)
@@ -1507,12 +1518,13 @@ func TestUpdate_TypeThenEnter_SubmitsSpawn(t *testing.T) {
 		t.Fatalf("spawnStep = %v, want wizardName", m.spawnStep)
 	}
 
-	// steps 2-6 all skipped/defaulted — the LAST enter must submit.
+	// steps 2-6 all skipped/defaulted, then the where step's enter submits.
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
-	m, cmd := typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "")
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // wizardWhere: default
 
 	if m.mode != modeNormal {
 		t.Errorf("mode = %v, want modeNormal after submit", m.mode)
@@ -4948,6 +4960,7 @@ func TestWizardStepLabel_AllSteps(t *testing.T) {
 		{wizardChallenger, "challenger:"},
 		{wizardName, "name (fleet list label, optional):"},
 		{wizardMaxCycles, "max_iteration [12]:"},
+		{wizardDir, "dir (absolute or ~ path; empty keeps current):"},
 	}
 	for _, c := range cases {
 		if got := wizardStepLabel(c.step); got != c.want {
@@ -4978,10 +4991,12 @@ func reachWizardWhere(t *testing.T, m Model) Model {
 	return m
 }
 
-func TestWizard_SkipsWhereStep_WhenNotEligible(t *testing.T) {
+func TestWizard_ShowsWhereStep_EvenWhenNotEligible(t *testing.T) {
 	// the zero-value default (spawnWorktreeEligible=false, e.g. no backend
-	// resolved, or tmux/cmux) — the wizard must submit directly from
-	// wizardMaxCycles rather than showing a choice that always degrades.
+	// resolved, or tmux/cmux) — wizardWhere must STILL be shown: it's the
+	// step that displays the spawn target dir and offers [c]/[s] to change
+	// it, so skipping it would commit the spawn to a dir the human never
+	// saw. [w] just isn't offered.
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
 	m, _ = typeAndEnter(t, m, "goal")
@@ -4989,13 +5004,24 @@ func TestWizard_SkipsWhereStep_WhenNotEligible(t *testing.T) {
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
-	m, cmd := typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "") // step 6: max cycles (name step shifted everything by one)
 
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Fatalf("got mode=%v step=%v, want modePrompting at wizardWhere even when ineligible", m.mode, m.spawnStep)
+	}
+	if strings.Contains(m.whereStepLabel(), "new worktree") {
+		t.Errorf("whereStepLabel() = %q, want no [w] option when the backend can't isolate", m.whereStepLabel())
+	}
+	if !strings.Contains(m.whereStepLabel(), "change dir") {
+		t.Errorf("whereStepLabel() = %q, want the [c] change-dir option", m.whereStepLabel())
+	}
+
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if m.mode != modeNormal {
-		t.Errorf("mode = %v, want modeNormal (wizardWhere skipped)", m.mode)
+		t.Errorf("mode = %v, want modeNormal after enter", m.mode)
 	}
 	if cmd == nil {
-		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) — submits directly when ineligible")
+		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
 	}
 	if strings.Contains(m.status, "new worktree") {
 		t.Errorf("status = %q, want the current-dir spawn message", m.status)
@@ -5042,10 +5068,14 @@ func TestUpdate_WizardWhere_WKey_SubmitsWorktreeSpawn(t *testing.T) {
 }
 
 func TestUpdate_WizardWhere_EnterKey_DefaultsToWorktree_WhenHostsClaudeRepo(t *testing.T) {
-	// modelWithOneLoop selects a loop with Cwd set, so spawnHostsClaudeRepo
-	// is true — combined with the forced-eligible backend, enter's default
-	// must resolve to worktree.
-	m := reachWizardWhere(t, modelWithOneLoop())
+	// a fleet loop's Cwd matching the spawn target (the launch dir) is the
+	// "claude has actually run here" evidence — combined with the
+	// forced-eligible backend, enter's default must resolve to worktree.
+	wd, _ := os.Getwd()
+	m := New()
+	m.loops = []domain.Loop{{Project: "myproject", SessionID: "sess-1", Cwd: wd, CwdVerified: true, State: domain.StateRunning}}
+	m.cursor = 0
+	m = reachWizardWhere(t, m)
 
 	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 
@@ -5099,6 +5129,169 @@ func TestUpdate_WizardWhere_IgnoresUnrelatedKeys(t *testing.T) {
 	}
 }
 
+// ── explicit spawn-dir choice: [c]/[s] at wizardWhere, wizardDir step ────
+
+func TestUpdate_WizardWhere_WKey_IgnoredWhenNotEligible(t *testing.T) {
+	// [w] isn't offered when the backend can't isolate — pressing it anyway
+	// must not submit a "worktree" spawn that would silently degrade to a
+	// current-dir one.
+	m := reachWizardWhere(t, modelWithOneLoop())
+	m.spawnWorktreeEligible = false
+
+	m, cmd := updateModel(t, m, runeKey('w'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — [w] must be inert when ineligible")
+	}
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Errorf("got mode=%v step=%v, want to remain at wizardWhere", m.mode, m.spawnStep)
+	}
+}
+
+func TestUpdate_WizardWhere_CKey_OpensDirStep_Prefilled(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, _ = updateModel(t, m, runeKey('c'))
+
+	if m.spawnStep != wizardDir {
+		t.Fatalf("spawnStep = %v, want wizardDir", m.spawnStep)
+	}
+	if m.input.Value() != m.spawnCwd {
+		t.Errorf("input prefill = %q, want the current target %q", m.input.Value(), m.spawnCwd)
+	}
+}
+
+func TestUpdate_WizardDir_ValidPath_UpdatesTargetAndReturnsToWhere(t *testing.T) {
+	dir := t.TempDir()
+	m := reachWizardWhere(t, modelWithOneLoop())
+	m, _ = updateModel(t, m, runeKey('c'))
+
+	m.input.SetValue(dir)
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.spawnStep != wizardWhere {
+		t.Errorf("spawnStep = %v, want back at wizardWhere", m.spawnStep)
+	}
+	if m.spawnCwd != dir {
+		t.Errorf("spawnCwd = %q, want the entered dir %q", m.spawnCwd, dir)
+	}
+}
+
+func TestUpdate_WizardDir_InvalidPath_RePrompts(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+	before := m.spawnCwd
+	m, _ = updateModel(t, m, runeKey('c'))
+
+	m.input.SetValue("/definitely/not/a/real/dir-xyz")
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — an invalid dir must not advance")
+	}
+	if m.spawnStep != wizardDir {
+		t.Errorf("spawnStep = %v, want to stay at wizardDir (re-prompt)", m.spawnStep)
+	}
+	if m.statusKind != statusErr || !strings.Contains(m.status, "not a directory") {
+		t.Errorf("status = %q (kind %v), want a not-a-directory error", m.status, m.statusKind)
+	}
+	if m.spawnCwd != before {
+		t.Errorf("spawnCwd = %q, want unchanged %q", m.spawnCwd, before)
+	}
+}
+
+func TestUpdate_WizardDir_Empty_KeepsCurrentTarget(t *testing.T) {
+	m := reachWizardWhere(t, modelWithOneLoop())
+	before := m.spawnCwd
+	m, _ = updateModel(t, m, runeKey('c'))
+
+	m.input.SetValue("")
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.spawnStep != wizardWhere {
+		t.Errorf("spawnStep = %v, want back at wizardWhere", m.spawnStep)
+	}
+	if m.spawnCwd != before {
+		t.Errorf("spawnCwd = %q, want unchanged %q", m.spawnCwd, before)
+	}
+}
+
+func TestUpdate_WizardDir_TildeExpands(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no home dir")
+	}
+	m := reachWizardWhere(t, modelWithOneLoop())
+	m, _ = updateModel(t, m, runeKey('c'))
+
+	m.input.SetValue("~")
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.spawnCwd != home {
+		t.Errorf("spawnCwd = %q, want the expanded home dir %q", m.spawnCwd, home)
+	}
+}
+
+func TestUpdate_WizardWhere_SKey_UsesSelectedVerifiedDir(t *testing.T) {
+	// the explicit replacement for the old silent inheritance: [s] adopts
+	// the selected loop's verified cwd as the spawn target — and stays on
+	// wizardWhere so the re-rendered label shows the new target before the
+	// human commits.
+	m := reachWizardWhere(t, modelWithOneLoop())
+
+	m, cmd := updateModel(t, m, runeKey('s'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — [s] only retargets, never submits")
+	}
+	if m.spawnStep != wizardWhere {
+		t.Errorf("spawnStep = %v, want to remain at wizardWhere", m.spawnStep)
+	}
+	if m.spawnCwd != "/x/myproject" {
+		t.Errorf("spawnCwd = %q, want the selected loop's verified Cwd %q", m.spawnCwd, "/x/myproject")
+	}
+	if !m.spawnHostsClaudeRepo {
+		t.Error("expected spawnHostsClaudeRepo recomputed true for the adopted dir")
+	}
+}
+
+func TestUpdate_WizardWhere_SKey_IgnoredWhenUnverified(t *testing.T) {
+	// P1-3 gating carries over to the explicit path: an unverified Cwd (a
+	// lossy decode) must not become the spawn target even on request.
+	m := New()
+	m.loops = []domain.Loop{{Project: "myproject", SessionID: "sess-1", Cwd: "/x/myproject", CwdVerified: false, State: domain.StateStalled}}
+	m.cursor = 0
+	m = reachWizardWhere(t, m)
+	before := m.spawnCwd
+
+	m, _ = updateModel(t, m, runeKey('s'))
+
+	if m.spawnCwd != before {
+		t.Errorf("spawnCwd = %q, want unchanged %q (unverified selection)", m.spawnCwd, before)
+	}
+}
+
+func TestUpdate_WizardEngineDrive_CKey_OpensDirStep_ReturnsToEngineDrive(t *testing.T) {
+	// engine-drive spawns headless in spawnCwd without ever reaching
+	// wizardWhere — [c] here is the engine path's only dir control, and a
+	// valid entry must return to the engine-drive choice, not wizardWhere.
+	dir := t.TempDir()
+	m := reachWizardEngineDrive(t, modelWithOneLoop())
+
+	m, _ = updateModel(t, m, runeKey('c'))
+	if m.spawnStep != wizardDir {
+		t.Fatalf("spawnStep = %v, want wizardDir", m.spawnStep)
+	}
+	m.input.SetValue(dir)
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.spawnStep != wizardEngineDrive {
+		t.Errorf("spawnStep = %v, want back at wizardEngineDrive", m.spawnStep)
+	}
+	if m.spawnCwd != dir {
+		t.Errorf("spawnCwd = %q, want the entered dir %q", m.spawnCwd, dir)
+	}
+}
+
 // ── LoopEngine MVP Slice 2: wizardEngineDrive gating + routing ──────────
 //
 // The standing spike discipline, verified here: the engine is
@@ -5138,11 +5331,11 @@ func TestWizard_EngineDisabled_StepAbsent_ManualPathByteForByte(t *testing.T) {
 	}
 }
 
-// TestWizard_EngineDisabled_NotEligible_SubmitsDirectly_ManualPathByteForByte
+// TestWizard_EngineDisabled_NotEligible_ReachesWhere_ManualPathByteForByte
 // is the OTHER manual-path fork (no worktree-capable backend) under the
-// same engine-disabled default — mirrors TestWizard_SkipsWhereStep_WhenNotEligible
-// exactly, confirming that path is ALSO untouched.
-func TestWizard_EngineDisabled_NotEligible_SubmitsDirectly_ManualPathByteForByte(t *testing.T) {
+// same engine-disabled default — mirrors TestWizard_ShowsWhereStep_EvenWhenNotEligible
+// exactly, confirming that path is ALSO the same with the engine gate off.
+func TestWizard_EngineDisabled_NotEligible_ReachesWhere_ManualPathByteForByte(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('n'))
 	m, _ = typeAndEnter(t, m, "goal")
@@ -5150,10 +5343,14 @@ func TestWizard_EngineDisabled_NotEligible_SubmitsDirectly_ManualPathByteForByte
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
 	m, _ = typeAndEnter(t, m, "")
-	m, cmd := typeAndEnter(t, m, "")
+	m, _ = typeAndEnter(t, m, "") // step 6: max cycles (name step shifted everything by one)
 
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Fatalf("got mode=%v step=%v, want modePrompting at wizardWhere (no engine-drive step)", m.mode, m.spawnStep)
+	}
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if m.mode != modeNormal {
-		t.Errorf("mode = %v, want modeNormal (submitted directly, no engine-drive step)", m.mode)
+		t.Errorf("mode = %v, want modeNormal after enter", m.mode)
 	}
 	if cmd == nil {
 		t.Fatal("expected a non-nil tea.Cmd (spawnCmd) — the manual path, unchanged")
@@ -5222,22 +5419,18 @@ func TestUpdate_WizardEngineDrive_EnterKey_SameAsM(t *testing.T) {
 }
 
 // TestUpdate_WizardEngineDrive_MKey_ContinuesManualPath_NotEligible: 'm'
-// with no worktree-capable backend submits DIRECTLY (current-dir spawn) —
-// the SAME ineligible-path behavior wizardMaxCycles used to run directly,
-// now reached via 'm' instead.
+// with no worktree-capable backend still proceeds to wizardWhere — the dir
+// visibility/choice step is never skipped on the manual path.
 func TestUpdate_WizardEngineDrive_MKey_ContinuesManualPath_NotEligible(t *testing.T) {
 	m := reachWizardEngineDrive(t, modelWithOneLoop()) // spawnWorktreeEligible left at its zero value (false)
 
-	m, cmd := updateModel(t, m, runeKey('m'))
+	m, _ = updateModel(t, m, runeKey('m'))
 
-	if m.mode != modeNormal {
-		t.Errorf("mode = %v, want modeNormal (submitted directly)", m.mode)
-	}
-	if cmd == nil {
-		t.Fatal("expected a non-nil tea.Cmd (spawnCmd)")
+	if m.mode != modePrompting || m.spawnStep != wizardWhere {
+		t.Errorf("got mode=%v step=%v, want modePrompting at wizardWhere", m.mode, m.spawnStep)
 	}
 	if strings.Contains(m.status, "bootstrapping") {
-		t.Errorf("status = %q, want the manual spawn message, not bootstrap", m.status)
+		t.Errorf("status = %q, want no bootstrap status on the manual path", m.status)
 	}
 }
 
@@ -5292,6 +5485,64 @@ func TestWhereStepLabel_NoBusyNudge_WhenDirEmpty(t *testing.T) {
 
 	if strings.Contains(m.whereStepLabel(), "dir busy") {
 		t.Errorf("whereStepLabel() = %q, want no busy nudge (no loop shares spawnCwd)", m.whereStepLabel())
+	}
+}
+
+func TestWhereStepLabel_ShowsTargetDir(t *testing.T) {
+	// the spawn target must be visible BEFORE the human commits — the whole
+	// point of the where step carrying the dir now.
+	m := New()
+	m.spawnCwd = "/x/myproject"
+
+	if !strings.Contains(m.whereStepLabel(), "/x/myproject") {
+		t.Errorf("whereStepLabel() = %q, want it to name the target dir", m.whereStepLabel())
+	}
+}
+
+func TestWhereStepLabel_OffersW_OnlyWhenEligible(t *testing.T) {
+	m := New()
+	m.spawnCwd = "/x/myproject"
+
+	if strings.Contains(m.whereStepLabel(), "new worktree") {
+		t.Errorf("whereStepLabel() = %q, want no [w] option when ineligible", m.whereStepLabel())
+	}
+	m.spawnWorktreeEligible = true
+	if !strings.Contains(m.whereStepLabel(), "new worktree") {
+		t.Errorf("whereStepLabel() = %q, want the [w] option when eligible", m.whereStepLabel())
+	}
+}
+
+func TestWhereStepLabel_OffersSelectedDir_OnlyWhenVerifiedAndDifferent(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{Project: "myproject", SessionID: "sess-1", Cwd: "/x/myproject", CwdVerified: true, State: domain.StateRunning}}
+	m.cursor = 0
+	m.spawnCwd = "/somewhere/else"
+
+	if !strings.Contains(m.whereStepLabel(), "[s] myproject's dir") {
+		t.Errorf("whereStepLabel() = %q, want the [s] option (verified, different dir)", m.whereStepLabel())
+	}
+
+	m.spawnCwd = "/x/myproject" // same dir — [s] would be a no-op
+	if strings.Contains(m.whereStepLabel(), "[s]") {
+		t.Errorf("whereStepLabel() = %q, want no [s] option when the target already IS the selected dir", m.whereStepLabel())
+	}
+
+	m.spawnCwd = "/somewhere/else"
+	m.loops[0].CwdVerified = false // lossy decode — never offered
+	if strings.Contains(m.whereStepLabel(), "[s]") {
+		t.Errorf("whereStepLabel() = %q, want no [s] option for an unverified cwd", m.whereStepLabel())
+	}
+}
+
+func TestEngineDriveStepLabel_ShowsTargetDir(t *testing.T) {
+	m := New()
+	m.spawnCwd = "/x/myproject"
+
+	if !strings.Contains(m.engineDriveStepLabel(), "/x/myproject") {
+		t.Errorf("engineDriveStepLabel() = %q, want it to name the target dir", m.engineDriveStepLabel())
+	}
+	if !strings.Contains(m.engineDriveStepLabel(), "change dir") {
+		t.Errorf("engineDriveStepLabel() = %q, want the [c] change-dir option", m.engineDriveStepLabel())
 	}
 }
 
