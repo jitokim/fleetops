@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -389,6 +390,161 @@ func TestCreate_DanglingSymlinkAtTargetRefuses(t *testing.T) {
 
 	if _, err := create(clone, at); !errors.Is(err, ErrPathExists) {
 		t.Fatalf("create over a dangling symlink = %v, want ErrPathExists", err)
+	}
+}
+
+// ── pre-branch fetch ─────────────────────────────────────────────────────
+
+// Resolving origin/<default> settles WHICH branch, but the branch is still cut
+// from whatever commit the LOCAL ref holds. This is the other half of the
+// PR #48 fix: a commit pushed to origin AFTER the clone must land in the new
+// worktree, which only happens if the ref is fetched first.
+func TestCreate_FetchesBaseSoANewOriginCommitIsIncluded(t *testing.T) {
+	isolateGitEnv(t)
+	clone, originPath := newRepoWithOrigin(t, "trunk")
+
+	// A second clone pushes a commit the first clone has never seen.
+	other := filepath.Join(t.TempDir(), "other")
+	if out, err := exec.Command("git", "clone", originPath, other).CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	writeFile(t, filepath.Join(other, "pushed-later.txt"), "landed after the first clone\n")
+	git(t, other, "add", ".")
+	git(t, other, "commit", "-m", "pushed later")
+	git(t, other, "push", "origin", "trunk")
+
+	got, err := Create(clone)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got.StaleBase {
+		t.Fatalf("fetch was reported stale against a reachable local remote: %s", got.StaleReason)
+	}
+	if _, err := os.Stat(filepath.Join(got.Path, "pushed-later.txt")); err != nil {
+		t.Fatal("the worktree is missing a commit that was on origin — the base was not fetched first")
+	}
+}
+
+func TestCreate_SuccessfulFetchReportsNoStaleness(t *testing.T) {
+	isolateGitEnv(t)
+	clone, _ := newRepoWithOrigin(t, "trunk")
+
+	got, err := Create(clone)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got.StaleBase || got.StaleReason != "" {
+		t.Fatalf("StaleBase = %v (%q), want a clean fetch", got.StaleBase, got.StaleReason)
+	}
+}
+
+// FAIL SOFT: an unreachable remote must not turn a working offline spawn into
+// a hard failure. The worktree is still created from the local ref.
+func TestCreate_UnreachableRemoteStillCreatesWorktree(t *testing.T) {
+	isolateGitEnv(t)
+	clone, _ := newRepoWithOrigin(t, "trunk")
+	// Point origin at a path that does not exist — the local origin/trunk ref
+	// survives, so the base is still resolvable, but the fetch cannot succeed.
+	git(t, clone, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
+
+	got, err := Create(clone)
+	if err != nil {
+		t.Fatalf("Create failed on an unreachable remote: %v (it must fail soft)", err)
+	}
+	if st, err := os.Stat(got.Path); err != nil || !st.IsDir() {
+		t.Fatalf("worktree dir %q was not created: %v", got.Path, err)
+	}
+	if got.Base != "origin/trunk" {
+		t.Fatalf("Base = %q, want origin/trunk from the local ref", got.Base)
+	}
+}
+
+// …but it must SAY so. Cutting from a possibly stale base is acceptable;
+// cutting from one while implying it is fresh is not.
+func TestCreate_FailedFetchReportsStaleBaseWithAReason(t *testing.T) {
+	isolateGitEnv(t)
+	clone, _ := newRepoWithOrigin(t, "trunk")
+	git(t, clone, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
+
+	got, err := Create(clone)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !got.StaleBase {
+		t.Fatal("a failed fetch was not reported as a possibly stale base")
+	}
+	if got.StaleReason == "" {
+		t.Fatal("StaleBase is set but carries no reason to show the human")
+	}
+}
+
+// A fetch failure must never abort the spawn — pinned at the unit level too,
+// independently of what a real git does with an unreachable remote.
+func TestCreate_FetchFailureIsNotFatal(t *testing.T) {
+	root := t.TempDir()
+	fakeGit(t, map[string]func([]string) (string, error){
+		"rev-parse":    func([]string) (string, error) { return root, nil },
+		"remote":       func([]string) (string, error) { return "origin", nil },
+		"symbolic-ref": func([]string) (string, error) { return "origin/main", nil },
+		"fetch": func([]string) (string, error) {
+			return "", errors.New("fatal: could not read Username: terminal prompts disabled")
+		},
+		"worktree": func([]string) (string, error) { return "", nil },
+	})
+
+	got, err := Create(root)
+	if err != nil {
+		t.Fatalf("Create: %v (a failed fetch must not abort the spawn)", err)
+	}
+	if !got.StaleBase {
+		t.Fatal("StaleBase not set after a failed fetch")
+	}
+	if !strings.Contains(got.StaleReason, "could not read Username") {
+		t.Fatalf("StaleReason = %q, want git's own message", got.StaleReason)
+	}
+}
+
+// The fetch asks for the ONE ref about to be branched from, not every branch —
+// on a large repo a full fetch turns a spawn into a long wait.
+func TestCreate_FetchesOnlyTheBaseBranch(t *testing.T) {
+	root := t.TempDir()
+	var fetchArgs []string
+	fakeGit(t, map[string]func([]string) (string, error){
+		"rev-parse":    func([]string) (string, error) { return root, nil },
+		"remote":       func([]string) (string, error) { return "origin", nil },
+		"symbolic-ref": func([]string) (string, error) { return "origin/trunk", nil },
+		"fetch":        func(args []string) (string, error) { fetchArgs = args; return "", nil },
+		"worktree":     func([]string) (string, error) { return "", nil },
+	})
+
+	if _, err := Create(root); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	want := []string{"fetch", "origin", "trunk"}
+	if !reflect.DeepEqual(fetchArgs, want) {
+		t.Fatalf("fetch args = %#v, want %#v", fetchArgs, want)
+	}
+}
+
+// The fetch happens BEFORE the branch is cut — fetching afterwards would
+// update the ref but leave the worktree on the old commit, which is the bug
+// wearing a disguise.
+func TestCreate_FetchHappensBeforeWorktreeAdd(t *testing.T) {
+	root := t.TempDir()
+	var order []string
+	fakeGit(t, map[string]func([]string) (string, error){
+		"rev-parse":    func([]string) (string, error) { return root, nil },
+		"remote":       func([]string) (string, error) { return "origin", nil },
+		"symbolic-ref": func([]string) (string, error) { return "origin/main", nil },
+		"fetch":        func([]string) (string, error) { order = append(order, "fetch"); return "", nil },
+		"worktree":     func([]string) (string, error) { order = append(order, "worktree"); return "", nil },
+	})
+
+	if _, err := Create(root); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !reflect.DeepEqual(order, []string{"fetch", "worktree"}) {
+		t.Fatalf("call order = %v, want fetch before worktree add", order)
 	}
 }
 

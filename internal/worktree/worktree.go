@@ -39,7 +39,9 @@
 //     gap that nearly reverted a version bump in this repo once (PR #48, a
 //     branch cut from a stale base). Passing the base explicitly is the whole
 //     point; see defaultBase for why the branch is resolved from the remote
-//     rather than hardcoded to "main".
+//     rather than hardcoded to "main", and fetchBase for why the local ref is
+//     refreshed first — resolving the branch NAME is only half the fix if the
+//     local ref it points at is a week old.
 package worktree
 
 import (
@@ -94,10 +96,13 @@ const defaultRemote = "origin"
 // never drift into disagreeing about what a worktree is called.
 const nameTimestampLayout = "20060102-150405"
 
-// gitTimeout bounds a single git invocation. Generous enough for ls-remote,
-// which may contact the network (see defaultBase), and bounded so a hung
-// remote can never wedge the caller — the same never-hang discipline
-// internal/control applies to every exec it makes.
+// gitTimeout bounds a single git invocation. Generous enough for the two calls
+// that may contact the network — ls-remote (see defaultBase) and fetch (see
+// fetchBase) — and bounded so a hung or unreachable remote can never wedge the
+// caller, the same never-hang discipline internal/control applies to every
+// exec it makes. A fetch that hits this deadline is treated exactly like any
+// other fetch failure: proceed from the local ref, and report the base as
+// possibly stale.
 const gitTimeout = 30 * time.Second
 
 // Result describes the worktree that was created. Base is carried so callers
@@ -108,6 +113,13 @@ type Result struct {
 	Path   string // absolute path of the new worktree directory
 	Branch string // the branch created, e.g. "wt-20260719-011612"
 	Base   string // the explicit base it was cut from, e.g. "origin/main"
+	// StaleBase reports that the pre-branch `git fetch` FAILED, so Base was
+	// resolved from a local ref that may be arbitrarily out of date (see
+	// fetchBase). The spawn still happened — this is a caveat to surface, not
+	// an error — but callers MUST pass it on to the human rather than implying
+	// a fresh base. StaleReason carries the underlying failure for the message.
+	StaleBase   bool
+	StaleReason string
 }
 
 // gitFn runs `git -C dir args...` and returns its trimmed stdout. An
@@ -159,6 +171,7 @@ func create(repoDir string, now time.Time) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	staleReason := fetchBase(root, base)
 	name := BranchName(now)
 	path := SiblingPath(root, name)
 	if err := ensureFree(path); err != nil {
@@ -167,7 +180,48 @@ func create(repoDir string, now time.Time) (Result, error) {
 	if _, err := gitFn(root, "worktree", "add", "-b", name, path, base); err != nil {
 		return Result{}, fmt.Errorf("worktree: git worktree add: %w", err)
 	}
-	return Result{Path: path, Branch: name, Base: base}, nil
+	return Result{
+		Path:        path,
+		Branch:      name,
+		Base:        base,
+		StaleBase:   staleReason != "",
+		StaleReason: staleReason,
+	}, nil
+}
+
+// fetchBase updates the local ref for base before anything is branched from
+// it, and reports why it could not when it fails ("" on success).
+//
+// Resolving origin/<default-branch> settles WHICH branch, but the branch is
+// still cut from whatever commit the LOCAL ref happens to hold — and nobody
+// has necessarily fetched. An unfetched week-old ref reproduces the exact
+// stale-base failure this convention exists to prevent (PR #48), one layer
+// down. Fetching closes it.
+//
+// FAIL SOFT, deliberately. A fetch needs the network, credentials and a
+// reachable remote, none of which a worktree strictly requires — turning a
+// working offline spawn into a hard failure would be a clear regression for
+// anyone on a plane or behind an expired token. So a failed fetch proceeds
+// from the local ref and returns a reason, which Create carries out on
+// Result.StaleBase for the caller to SAY OUT LOUD. Cutting from a possibly
+// stale base is acceptable; cutting from one while implying it is fresh is
+// not.
+//
+// The refspec is explicit (`fetch origin <branch>`) rather than a bare
+// `fetch origin`: only the ref about to be branched from needs updating, and
+// on a large repo fetching every branch turns a spawn into a long wait.
+func fetchBase(root, base string) string {
+	branch := strings.TrimPrefix(base, defaultRemote+"/")
+	if branch == "" || branch == base {
+		// base is not in the expected "origin/<branch>" shape, so there is no
+		// refspec to build. Nothing was fetched — say so rather than claiming
+		// a fresh base.
+		return "base " + base + " is not an " + defaultRemote + "/<branch> ref"
+	}
+	if _, err := gitFn(root, "fetch", defaultRemote, branch); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // ensureFree refuses when path is already taken. Lstat, not Stat, so a

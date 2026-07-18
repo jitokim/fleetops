@@ -2216,9 +2216,25 @@ func spawnIntoGitWorktree(ctrl control.Controller, cwd string, spec registry.Bin
 	if err := registry.WritePending(registry.PendingDir(), wt.Path, spec); err != nil {
 		// best-effort, same posture as the plain-spawn path: the loop really
 		// did start, it just won't get ORACLE/N-I tracking.
-		return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s) via %s (goal not recorded: %v)", wt.Branch, wt.Base, ctrl.Name(), err)}
+		return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s (goal not recorded: %v)", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name(), err)}
 	}
-	return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s) via %s", wt.Branch, wt.Base, ctrl.Name())}
+	return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name())}
+}
+
+// staleBaseNote renders the caveat for a worktree whose pre-branch fetch
+// failed — the base came from a local ref that may be out of date.
+//
+// It is appended to a SUCCESS message on purpose: the spawn genuinely worked
+// and must not be reported as a failure (an offline machine still deserves a
+// working spawn). But the fresh-base guarantee is the whole reason this path
+// resolves an explicit base, so when it could not be honoured the human has to
+// be told plainly rather than left to infer it from silence. Empty when the
+// fetch succeeded, so the common case reads clean.
+func staleBaseNote(wt worktree.Result) string {
+	if !wt.StaleBase {
+		return ""
+	}
+	return fmt.Sprintf(" ⚠ base may be STALE — fetch failed: %s", wt.StaleReason)
 }
 
 // ── LoopEngine: headless bootstrap ───────────────────────────────────────
