@@ -114,6 +114,57 @@ func TestITerm2Raise_EmptyWindowID_DegradesNoExec(t *testing.T) {
 	}
 }
 
+// TestITerm2Raise_UntrustedWindowID_DegradesNoExec is the injection pin. The
+// GUID is interpolated into a double-quoted AppleScript literal, so a WindowID
+// carrying a quote (or any AppleScript metacharacter) could close the literal
+// and append statements — `do shell script` would then be arbitrary local code
+// execution. WindowID comes from $ITERM_SESSION_ID via a world-writable-ish
+// registry file, so it is untrusted input: anything failing the GUID whitelist
+// must degrade exactly like an empty WindowID (ErrNoFocusSurface, NO exec).
+func TestITerm2Raise_UntrustedWindowID_DegradesNoExec(t *testing.T) {
+	hostile := map[string]string{
+		"closes the quoted literal": `w0t0p0:X" & (do shell script "touch /tmp/pwned") & "`,
+		"bare quote":                `w0t0p0:a"b`,
+		"embedded newline":          "w0t0p0:a\nactivate",
+		"backslash escape":          `w0t0p0:a\"b`,
+		"whitespace":                "w0t0p0:a b",
+		"empty guid after colon":    "w0t0p0:",
+		"ampersand concat":          `w0t0p0:a&b`,
+		"paren call":                `w0t0p0:a(b)`,
+	}
+	for name, windowID := range hostile {
+		t.Run(name, func(t *testing.T) {
+			captured := withFakeITerm2Focus(t, func([]string) error {
+				t.Fatal("iterm2FocusFn must never be called for an untrusted WindowID")
+				return nil
+			})
+
+			err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: windowID})
+			if !errors.Is(err, ErrNoFocusSurface) {
+				t.Errorf("Raise(%q) = %v, want ErrNoFocusSurface", windowID, err)
+			}
+			if *captured != nil {
+				t.Errorf("execed %v, want no exec for %q", *captured, windowID)
+			}
+		})
+	}
+}
+
+// TestITerm2GUIDPattern_AcceptsRealGUIDs guards against a whitelist so strict
+// it rejects the ids iTerm2 actually emits (which would silently disable focus).
+func TestITerm2GUIDPattern_AcceptsRealGUIDs(t *testing.T) {
+	for _, guid := range []string{
+		"ABC-123-GUID",
+		"A0B1C2D3-4E5F-6789-ABCD-EF0123456789",
+		"bareguid",
+		"0",
+	} {
+		if !itermGUIDPattern.MatchString(guid) {
+			t.Errorf("itermGUIDPattern rejected a legitimate session GUID %q", guid)
+		}
+	}
+}
+
 func equalArgv(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

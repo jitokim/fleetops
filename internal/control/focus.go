@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/jitokim/fleetops/internal/sessions"
@@ -74,11 +75,26 @@ var iterm2FocusFn = func(argv []string) error {
 // the first non-multiplexer FocusAdapter (design §4).
 type iterm2FocusAdapter struct{}
 
-// Raise selects the iTerm2 session named by entry.WindowID. An empty WindowID
-// degrades (ErrNoFocusSurface, no exec) rather than running a script that could
-// match the wrong session — attach then falls through to its next step.
+// itermGUIDPattern is the WHITELIST every session GUID must match before it may
+// be interpolated into the osascript below: ASCII alphanumerics and hyphens
+// only, which is exactly the shape iTerm2 emits (a UUID). A whitelist, not
+// escaping — AppleScript string quoting is its own DSL with its own escape
+// rules, and getting it subtly wrong on untrusted input is how `do shell script`
+// turns a focus keypress into arbitrary local code execution. WindowID reaches
+// us from $ITERM_SESSION_ID via ~/.fleetops/sessions/<id>.json, so anything able
+// to write that file or set that env var controls this string: it is untrusted.
+var itermGUIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+
+// Raise selects the iTerm2 session named by entry.WindowID. Two degrade paths,
+// both ErrNoFocusSurface with NO exec so attach falls through to its next step:
+// an empty WindowID (nothing to raise), and a GUID that fails
+// itermGUIDPattern — we never build a script out of an untrusted id, and never
+// exec one. Refusing beats sanitizing: the worst case is a degraded attach.
 func (iterm2FocusAdapter) Raise(entry sessions.SessionEntry) error {
 	if entry.WindowID == "" {
+		return ErrNoFocusSurface
+	}
+	if !itermGUIDPattern.MatchString(iterm2SessionGUID(entry.WindowID)) {
 		return ErrNoFocusSurface
 	}
 	return iterm2FocusFn(iterm2FocusArgv(entry.WindowID))
