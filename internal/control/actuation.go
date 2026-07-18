@@ -89,9 +89,12 @@ var pidTTYFn = func(pid int) string {
 // message: "no orca/tmux/cmux"). backendAvailable=true with found=false means
 // backends were available but none could locate/disambiguate a claude surface
 // — including the cross-backend ambiguity refusal above (caller's message:
-// "no unambiguous claude surface"). Callers only use ctrl/target when
-// found=true.
-func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Controller, target Target, backendAvailable, found bool) {
+// "no unambiguous claude surface"). Callers only use act when found=true.
+//
+// It returns a target-BOUND Actuator rather than the (Controller, Target) pair
+// it used to: see Actuator's doc for why that pair was one level too wide, and
+// why narrowing it is what lets a non-multiplexer host participate at all.
+func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actuator, backendAvailable, found bool) {
 	// Availability is probed ONCE, up front, and both tiers iterate the result.
 	// Available() is a live subprocess (LookPath + a bounded liveness probe per
 	// backend), so re-asking per tier cost up to 3 spawns per backend on every
@@ -101,7 +104,7 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 	// relied on.
 	avail := availableBackends()
 	if len(avail) == 0 {
-		return nil, Target{}, false, false
+		return nil, false, false
 	}
 
 	// Tier 1a — session-unique tty. Validate the registry binding once, then
@@ -109,7 +112,7 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
 		for _, c := range avail {
 			if t, ok := tierOneA(c, entry.TTY); ok {
-				return c, t, true, true
+				return boundController{ctrl: c, target: t}, true, true
 			}
 		}
 	}
@@ -127,9 +130,9 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 		}
 	}
 	if matches == 1 {
-		return matchedCtrl, matchedTarget, true, true
+		return boundController{ctrl: matchedCtrl, target: matchedTarget}, true, true
 	}
-	return nil, Target{}, true, false
+	return nil, true, false
 }
 
 // availableBackends returns the backends usable right now, in the shared

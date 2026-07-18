@@ -1483,14 +1483,14 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		}
 
 		if l.Stall != domain.StallGone {
-			ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+			act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 			if backendAvailable && found {
-				if err := ctrl.Resume(target, prompt); err != nil {
-					logActuationEvent(l, action, "tier1", false, err.Error())
+				if err := act.Resume(prompt); err != nil {
+					logActuationEvent(l, action, act.Tier(), false, err.Error())
 					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
 				}
-				logActuationEvent(l, action, "tier1", true, "")
-				return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, ctrl.Name(), note)}
+				logActuationEvent(l, action, act.Tier(), true, "")
+				return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
 			}
 		}
 
@@ -1750,15 +1750,15 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// Tier 1 only (tty → cwd) — approving a gate has no headless Tier-2
 		// equivalent (there's no "press Enter" over `claude --resume -p`;
 		// that starts a brand new turn, not an in-place keypress).
-		ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
 			return approveResultMsg{false, "no orca/tmux/cmux — approve manually: attach and press Enter"}
 		}
 		if !found {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
 		}
-		if err := ctrl.Approve(target); err != nil {
-			logActuationEvent(l, "approve", "tier1", false, err.Error())
+		if err := act.Approve(); err != nil {
+			logActuationEvent(l, "approve", act.Tier(), false, err.Error())
 			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
 		}
 		// Compare-and-swap delete: only remove the marker THIS decision was
@@ -1766,8 +1766,8 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// NEW marker that landed between this loop's scan snapshot and this
 		// approve call (see gate.DeleteMarkerIfTS).
 		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
-		logActuationEvent(l, "approve", "tier1", true, "")
-		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, ctrl.Name())}
+		logActuationEvent(l, "approve", act.Tier(), true, "")
+		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, act.Backend())}
 	}
 }
 
@@ -2345,15 +2345,15 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// Tier 1 only (tty → cwd) — killing has no headless Tier-2
 		// equivalent (there's no live conversation left to type "/exit"
 		// into via a fresh --resume -p turn).
-		ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
 			return killResultMsg{false, "no orca/tmux/cmux — kill manually: type /exit in " + l.Project}
 		}
 		if !found {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
 		}
-		if err := ctrl.Resume(target, "/exit"); err != nil {
-			logActuationEvent(l, "kill", "tier1", false, err.Error())
+		if err := act.Resume("/exit"); err != nil {
+			logActuationEvent(l, "kill", act.Tier(), false, err.Error())
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
 		}
 		// fix/killed-state: the event is written HERE, immediately once
@@ -2365,7 +2365,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// status line deliberately does NOT optimistically set local model
 		// state itself (that would be a fake, unverified state the next
 		// scan could immediately contradict).
-		logActuationEvent(l, "kill", "tier1", true, "")
+		logActuationEvent(l, "kill", act.Tier(), true, "")
 		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
 	}
 }
@@ -2384,18 +2384,18 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		// Tier 1 only (tty → cwd) — interrupting has no headless Tier-2
 		// equivalent (there's no in-flight turn to interrupt via a fresh
 		// --resume -p call; that would start a brand new turn instead).
-		ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
 			return interruptResultMsg{false, "no orca/tmux/cmux — stop manually: press Esc in " + l.Project}
 		}
 		if !found {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
 		}
-		if err := ctrl.Interrupt(target); err != nil {
-			logActuationEvent(l, "interrupt", "tier1", false, err.Error())
+		if err := act.Interrupt(); err != nil {
+			logActuationEvent(l, "interrupt", act.Tier(), false, err.Error())
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
 		}
-		logActuationEvent(l, "interrupt", "tier1", true, "")
+		logActuationEvent(l, "interrupt", act.Tier(), true, "")
 		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
 	}
 }
