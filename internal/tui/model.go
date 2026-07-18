@@ -60,13 +60,22 @@ var (
 	sessionsDirFn            = sessions.SessionsDir
 	historyDirFn             = events.HistoryDir
 	notifySendFn             = notify.Send
-	// controlResolveFn is control.Resolve by default — attachCmd's own seam
-	// (feat/engine-driver: the attach-preservation requirement needs
-	// a regression test pinning that an OBSERVED loop's attach path calls
-	// Locate, never LocateClaude — control.Resolve() do real exec/Available
-	// probes, so attachCmd needed the same overridable-seam treatment every
-	// other actuation path above already has).
+	// controlResolveFn is control.Resolve by default — the CREATION/CAPABILITY
+	// resolver seam. takeOverCmd still uses it (open a fresh terminal via
+	// whichever backend is available); attach does NOT — see
+	// controlResolveForLocateFn. Kept as an overridable seam because
+	// control.Resolve does real exec/Available probes, so tests can't rely on
+	// a real orca/tmux/cmux backend being installed.
 	controlResolveFn = control.Resolve
+	// controlResolveForLocateFn is control.ResolveForLocate by default —
+	// attachCmd's ATTACH resolver seam. Split from controlResolveFn on purpose:
+	// attach must follow whichever backend can actually Locate the loop's
+	// surface (orca is always Available on the captain's machine and would
+	// otherwise always win via Resolve() even when the loop lives in a
+	// tmux/cmux surface it can't Locate). Locate-based, NEVER LocateClaude —
+	// the attach-preservation invariant a bare shell tab is a valid jump
+	// target (see TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude).
+	controlResolveForLocateFn = control.ResolveForLocate
 )
 
 type loopsMsg []domain.Loop
@@ -1510,13 +1519,15 @@ func manualResumeHint(sessionID string) string {
 // change to this function. See TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude.
 func attachCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
-		ctrl, ok := controlResolveFn()
+		// ResolveForLocate picks whichever available backend can actually
+		// Locate the surface (not just whichever is installed first) and hands
+		// back the Target it located — so we Focus that Target directly rather
+		// than Locate a second time. ok=false collapses both "no backend
+		// available" and "no backend could locate a surface"; the manual-hint
+		// fallback is identical for both.
+		ctrl, target, ok := controlResolveForLocateFn(l.ProjectDir)
 		if !ok {
-			return attachResultMsg{false, "no orca/tmux/cmux — attach manually: " + manualAttachHint(l.Cwd)}
-		}
-		target, ok := ctrl.Locate(l.ProjectDir)
-		if !ok {
-			return attachResultMsg{false, "surface not found — attach manually: " + manualAttachHint(l.Cwd)}
+			return attachResultMsg{false, "no orca/tmux/cmux surface — attach manually: " + manualAttachHint(l.Cwd)}
 		}
 		if err := ctrl.Focus(target); err != nil {
 			return attachResultMsg{false, fmt.Sprintf("attach %s failed: %v", l.Project, err)}

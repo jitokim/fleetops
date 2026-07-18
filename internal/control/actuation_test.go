@@ -208,6 +208,298 @@ func TestTierOneA_ResolvedDoesNotImplementTTYLocator_ReturnsNotFound(t *testing.
 	}
 }
 
+// --- multi-backend resolution: ResolveForLocate + ResolveActuationTarget ---
+//
+// These pin the locate-based (not install-order-based) selection across ALL
+// available backends, against fully-configurable fake Controllers so they run
+// hermetically regardless of which real multiplexer binaries are installed.
+
+// fakeResolveCtl is a configurable control.Controller test double. Every probe
+// method fails the test if it is called while the backend is unavailable —
+// the cost-guard invariant that no resolver may probe an unavailable backend.
+type fakeResolveCtl struct {
+	t              *testing.T
+	name           string
+	available      bool
+	locateOK       bool
+	locateClaudeOK bool
+}
+
+func (f *fakeResolveCtl) Name() string    { return f.name }
+func (f *fakeResolveCtl) Available() bool { return f.available }
+func (f *fakeResolveCtl) Locate(string) (Target, bool) {
+	if !f.available {
+		f.t.Errorf("Locate probed on unavailable backend %q — resolvers must gate on Available() first", f.name)
+	}
+	return Target{Backend: f.name, ID: f.name + ":loc"}, f.locateOK
+}
+func (f *fakeResolveCtl) LocateClaude(string) (Target, bool) {
+	if !f.available {
+		f.t.Errorf("LocateClaude probed on unavailable backend %q — resolvers must gate on Available() first", f.name)
+	}
+	return Target{Backend: f.name, ID: f.name + ":claude"}, f.locateClaudeOK
+}
+func (f *fakeResolveCtl) Resume(Target, string) error { return nil }
+func (f *fakeResolveCtl) Focus(Target) error          { return nil }
+func (f *fakeResolveCtl) Approve(Target) error        { return nil }
+func (f *fakeResolveCtl) Spawn(string, string) error  { return nil }
+func (f *fakeResolveCtl) Interrupt(Target) error      { return nil }
+
+// fakeResolveTTYCtl adds TTYLocator on top of fakeResolveCtl — the cmux/tmux
+// shape (a per-terminal tty is reachable); orca's shape is fakeResolveCtl
+// alone (no TTYLocator).
+type fakeResolveTTYCtl struct {
+	*fakeResolveCtl
+	locateByTTYOK bool
+}
+
+func (f *fakeResolveTTYCtl) LocateByTTY(string) (Target, bool) {
+	if !f.available {
+		f.t.Errorf("LocateByTTY probed on unavailable backend %q — resolvers must gate on Available() first", f.name)
+	}
+	return Target{Backend: f.name, ID: f.name + ":tty"}, f.locateByTTYOK
+}
+
+// withBackends swaps the package-level backend list for the duration of one
+// test, restoring it afterwards.
+func withBackends(t *testing.T, bs ...Controller) {
+	t.Helper()
+	orig := backends
+	t.Cleanup(func() { backends = orig })
+	backends = bs
+}
+
+func TestResolveForLocate_LocateBased_TmuxWinsOverInstalledOrca(t *testing.T) {
+	// orca is available but cannot Locate the surface; tmux can. Locate-based
+	// selection must pick tmux — orca no longer wins purely by install order.
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateOK: false}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateOK: true}
+	withBackends(t, orca, tmux)
+
+	ctrl, target, ok := ResolveForLocate("-x-proj")
+
+	if !ok {
+		t.Fatal("expected ok=true — tmux can Locate the surface")
+	}
+	if ctrl.Name() != "tmux" {
+		t.Errorf("resolved %q, want tmux (locate-based, not install order)", ctrl.Name())
+	}
+	if target.Backend != "tmux" {
+		t.Errorf("target.Backend = %q, want tmux (the located Target must be returned directly)", target.Backend)
+	}
+}
+
+func TestResolveForLocate_BothLocate_PrefersByOrderNeverRefuses(t *testing.T) {
+	// Attach is permissive: when two backends both Locate a surface, the first
+	// by install order wins and it NEVER refuses on ambiguity (unlike the
+	// typed/destructive path).
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateOK: true}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateOK: true}
+	withBackends(t, orca, tmux)
+
+	ctrl, _, ok := ResolveForLocate("-x-proj")
+
+	if !ok {
+		t.Fatal("expected ok=true — attach must not refuse on ambiguity")
+	}
+	if ctrl.Name() != "orca" {
+		t.Errorf("resolved %q, want orca (first-by-order wins on ties)", ctrl.Name())
+	}
+}
+
+func TestResolveForLocate_OnlyOrcaAvailableAndLocates_ResolvesOrca(t *testing.T) {
+	// Unchanged single-backend path: orca is the only available backend and it
+	// Locates → orca.
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateOK: true}
+	withBackends(t, orca)
+
+	ctrl, _, ok := ResolveForLocate("-x-proj")
+
+	if !ok || ctrl.Name() != "orca" {
+		t.Fatalf("resolved (%v, ok=%v), want orca ok=true", ctrl, ok)
+	}
+}
+
+func TestResolveForLocate_AllAvailableNoneLocate_NotOK(t *testing.T) {
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateOK: false}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateOK: false}
+	withBackends(t, orca, tmux)
+
+	_, _, ok := ResolveForLocate("-x-proj")
+
+	if ok {
+		t.Error("expected ok=false — available backends, but none can Locate a surface")
+	}
+}
+
+func TestResolveForLocate_NoBackendAvailable_NotOK(t *testing.T) {
+	orca := &fakeResolveCtl{t: t, name: "orca", available: false}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: false}
+	withBackends(t, orca, tmux)
+
+	_, _, ok := ResolveForLocate("-x-proj")
+
+	if ok {
+		t.Error("expected ok=false — no backend available at all")
+	}
+}
+
+func TestResolveActuationTarget_TierOneB_ExactlyOneBackendLocatesClaude(t *testing.T) {
+	// No registry tty (empty sessions dir) → Tier 1a skipped; Tier 1b probes
+	// all available backends. orca cannot LocateClaude, tmux can → found via
+	// tmux.
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateClaudeOK: false}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateClaudeOK: true}
+	withBackends(t, orca, tmux)
+
+	ctrl, target, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+
+	if !found {
+		t.Fatal("expected found=true — exactly one backend (tmux) LocatesClaude")
+	}
+	if !backendAvailable {
+		t.Error("expected backendAvailable=true")
+	}
+	if ctrl.Name() != "tmux" {
+		t.Errorf("resolved %q, want tmux", ctrl.Name())
+	}
+	if target.Backend != "tmux" {
+		t.Errorf("target.Backend = %q, want tmux", target.Backend)
+	}
+}
+
+func TestResolveActuationTarget_TierOneB_CrossBackendAmbiguity_Refuses(t *testing.T) {
+	// orca AND tmux both return a claude surface for the same cwd → this is
+	// cross-backend ambiguity and must REFUSE, never silently pick one.
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateClaudeOK: true}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateClaudeOK: true}
+	withBackends(t, orca, tmux)
+
+	ctrl, _, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+
+	if found {
+		t.Error("expected found=false — two distinct backends match the same cwd (ambiguous)")
+	}
+	if !backendAvailable {
+		t.Error("expected backendAvailable=true — backends ARE available, they just disagree")
+	}
+	if ctrl != nil {
+		t.Error("expected ctrl=nil on ambiguity refusal — nothing must be actuated")
+	}
+}
+
+func TestResolveActuationTarget_AllAvailableNoneLocate_NotFoundButBackendAvailable(t *testing.T) {
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true}
+	withBackends(t, orca, tmux)
+
+	_, _, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+
+	if found {
+		t.Error("expected found=false")
+	}
+	if !backendAvailable {
+		t.Error("expected backendAvailable=true — backends available, just no surface")
+	}
+}
+
+func TestResolveActuationTarget_NoBackendAvailable_BackendUnavailable(t *testing.T) {
+	orca := &fakeResolveCtl{t: t, name: "orca", available: false}
+	tmux := &fakeResolveCtl{t: t, name: "tmux", available: false}
+	withBackends(t, orca, tmux)
+
+	_, _, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+
+	if found {
+		t.Error("expected found=false")
+	}
+	if backendAvailable {
+		t.Error("expected backendAvailable=false — NO backend available at all")
+	}
+}
+
+func TestResolveActuationTarget_TierOneA_MultiBackend_ResolvesViaTmuxTTY(t *testing.T) {
+	// Valid pid↔tty binding. orca has no TTYLocator, cmux's LocateByTTY misses,
+	// tmux's hits → Tier 1a resolves via tmux across all available backends
+	// (not just Resolve()'s preferred pick).
+	dir := t.TempDir()
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	pidTTYFn = func(int) string { return "ttys012" } // binding confirmed
+
+	orca := &fakeResolveCtl{t: t, name: "orca", available: true} // no TTYLocator
+	cmux := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "cmux", available: true}, locateByTTYOK: false}
+	tmux := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "tmux", available: true}, locateByTTYOK: true}
+	withBackends(t, orca, cmux, tmux)
+
+	ctrl, target, backendAvailable, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
+
+	if !found {
+		t.Fatal("expected found=true — tmux's LocateByTTY hits")
+	}
+	if !backendAvailable {
+		t.Error("expected backendAvailable=true")
+	}
+	if ctrl.Name() != "tmux" {
+		t.Errorf("resolved %q, want tmux", ctrl.Name())
+	}
+	if target.ID != "tmux:tty" {
+		t.Errorf("target.ID = %q, want tmux:tty (resolved via Tier 1a LocateByTTY)", target.ID)
+	}
+}
+
+func TestResolveActuationTarget_BindingInvalid_SkipsTierOneA_FallsToTierOneB(t *testing.T) {
+	// pid↔tty binding fails → Tier 1a must be skipped even though a backend's
+	// LocateByTTY WOULD hit; it falls to Tier 1b (LocateClaude). Proven by the
+	// resolved target coming from the ":claude" (Tier 1b) path, not ":tty".
+	dir := t.TempDir()
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	pidTTYFn = func(int) string { return "ttys999" } // MISMATCH → binding invalid
+
+	orca := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "orca", available: true, locateClaudeOK: true}, locateByTTYOK: true}
+	withBackends(t, orca)
+
+	ctrl, target, _, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
+
+	if !found {
+		t.Fatal("expected found=true via Tier 1b")
+	}
+	if ctrl.Name() != "orca" {
+		t.Errorf("resolved %q, want orca", ctrl.Name())
+	}
+	if target.ID != "orca:claude" {
+		t.Errorf("target.ID = %q, want orca:claude — Tier 1a must have been skipped (binding invalid)", target.ID)
+	}
+}
+
+func TestResolveActuationTarget_UnavailableBackendNeverProbed(t *testing.T) {
+	// Cost guard: an unavailable backend's Locate/LocateClaude/LocateByTTY must
+	// never be called. The unavailable fake fails the test if probed; ordering
+	// it first would expose a resolver that forgot to gate on Available().
+	dir := t.TempDir()
+	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "ttys012"}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	origPidTTY := pidTTYFn
+	defer func() { pidTTYFn = origPidTTY }()
+	pidTTYFn = func(int) string { return "ttys012" } // binding valid, so Tier 1a runs too
+
+	unavail := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "orca", available: false}, locateByTTYOK: true}
+	avail := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "tmux", available: true, locateOK: true, locateClaudeOK: true}, locateByTTYOK: true}
+	withBackends(t, unavail, avail)
+
+	// Exercise every resolver; the unavailable fake would t.Errorf if probed.
+	ResolveForLocate("-x-proj")
+	ResolveActuationTarget(dir, "sess-1", "-x-proj")
+}
+
 func TestRedriveArgv(t *testing.T) {
 	got := redriveArgv("sess-abc123", "do the thing")
 	want := []string{"claude", "--resume", "sess-abc123", "-p", "do the thing", "--output-format", "json"}

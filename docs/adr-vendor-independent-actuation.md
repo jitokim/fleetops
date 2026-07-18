@@ -140,6 +140,24 @@ session from the registry entry rather than one global `Resolve()`:
   actuation. tmux is the most-trusted member of this tier (documented,
   stable contract, no reverse-engineering ever required); orca and cmux
   stay first-class but explicitly best-effort against undocumented CLIs.
+
+  **Backend selection is locate-based, not install-order-based (revised).**
+  The original Tier-1 dispatch tied each actuation to whichever single backend
+  `Resolve()` picked in fixed install order (orca→cmux→tmux). On a machine
+  where orca is always installed/available, that made orca always win even for
+  a loop physically hosted in a tmux/cmux surface orca cannot Locate — attach
+  then failed outright, and Tier 1a silently skipped a session hosted in a
+  non-preferred backend. Revised: every actuation resolver now probes across
+  **all available backends** and selects by who can actually reach the
+  surface, not by install order. Attach (`ResolveForLocate`) takes the first
+  backend that Locates and is permissive (first-by-order wins on ties, never
+  refuses). The typed/destructive path (`ResolveActuationTarget`) probes every
+  available backend's `LocateByTTY` (Tier 1a, first hit wins — tty is
+  session-unique) and every available backend's `LocateClaude` (Tier 1b,
+  counting matches and **refusing on cross-backend ambiguity** — ≥2 distinct
+  backends matching the same cwd). `Resolve()` itself is unchanged and remains
+  the creation/capability resolver (spawn, terminal-open, capability checks),
+  where install order is the correct tiebreak.
 - **Tier 2 — vendor-independent re-drive via `claude --resume &lt;id&gt; -p
   "&lt;prompt&gt;"`.** Rather than typing into the human's on-screen TUI,
   continue the session as a fresh headless turn against the same persisted
@@ -214,6 +232,20 @@ capability tier does this session get."
 - Whether orca's CLI exposes a per-terminal tty directly (would let orca
   join the clean tty-based path instead of staying cwd/title-matched
   best-effort).
+
+**Reversal (revised — see §2.2 "Backend selection is locate-based"):** an
+earlier revision of this ADR proposed tying Tier 1a to whichever single
+backend `Resolve()` picked in install order, and recorded that as an
+"accepted trade for a single, predictable rule rather than probing every
+installed backend on every actuation." That trade is **withdrawn.** It was
+wrong in practice: on the captain's machine orca is always available, so
+`Resolve()` always returned orca even when the loop lived in a tmux/cmux
+surface orca cannot Locate — attach failed and Tier 1a skipped legitimately
+reachable sessions. Every resolver now probes all available backends and
+selects locate-based (accepting up to a 3× `Locate`/`LocateClaude` fan-out
+among available backends). The Tier 1b fan-out cost is intentional: it is
+what makes the cross-backend ambiguity refusal possible, so it must not be
+"optimized" back to a single first-hit probe.
 
 ## 5. Alternatives considered and rejected
 

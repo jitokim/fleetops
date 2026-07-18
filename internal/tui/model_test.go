@@ -3244,9 +3244,28 @@ func withFakeControlResolve(t *testing.T, ctrl control.Controller, ok bool) {
 	controlResolveFn = func() (control.Controller, bool) { return ctrl, ok }
 }
 
+// withFakeControlResolveForLocate fakes attachCmd's ATTACH-resolver seam. It
+// DELEGATES to ctrl.Locate (never LocateClaude) exactly as the real
+// control.ResolveForLocate does, so the attach-preservation pin
+// (TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude) still observes the
+// Locate-not-LocateClaude invariant through the fake controller after the seam
+// split.
+func withFakeControlResolveForLocate(t *testing.T, ctrl control.Controller, ok bool) {
+	t.Helper()
+	orig := controlResolveForLocateFn
+	t.Cleanup(func() { controlResolveForLocateFn = orig })
+	controlResolveForLocateFn = func(projectDir string) (control.Controller, control.Target, bool) {
+		if !ok || ctrl == nil {
+			return nil, control.Target{}, false
+		}
+		target, located := ctrl.Locate(projectDir)
+		return ctrl, target, located
+	}
+}
+
 func TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude(t *testing.T) {
 	fakeCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%1"}, locateOK: true}
-	withFakeControlResolve(t, fakeCtrl, true)
+	withFakeControlResolveForLocate(t, fakeCtrl, true)
 	l := domain.Loop{Project: "myproject", SessionID: "s1", ProjectDir: "-x-myproject", State: domain.StateRunning}
 
 	msg := attachCmd(l)()
@@ -3267,7 +3286,7 @@ func TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude(t *testing.T) {
 }
 
 func TestAttachCmd_NoBackendAvailable_ManualHintFallback(t *testing.T) {
-	withFakeControlResolve(t, nil, false)
+	withFakeControlResolveForLocate(t, nil, false)
 	l := domain.Loop{Project: "myproject", SessionID: "s1", Cwd: "/home/user/myproject", State: domain.StateRunning}
 
 	msg := attachCmd(l)()
@@ -3278,6 +3297,36 @@ func TestAttachCmd_NoBackendAvailable_ManualHintFallback(t *testing.T) {
 	}
 	if !strings.Contains(am.text, "cd /home/user/myproject") {
 		t.Errorf("text = %q, want the manual attach hint", am.text)
+	}
+}
+
+// TestAttachCmd_CaptainTopology_FocusesLocatedTmuxSurface pins the fix's
+// user-visible payoff at the attach level: on the captain's machine orca is
+// always available, but the loop lives in a tmux surface. ResolveForLocate
+// hands attachCmd the tmux Target directly, and attachCmd Focuses THAT (no
+// second Locate), reporting the tmux backend — orca never gets to win by
+// install order.
+func TestAttachCmd_CaptainTopology_FocusesLocatedTmuxSurface(t *testing.T) {
+	tmuxCtrl := &fakeController{name: "tmux", focusErr: nil}
+	tmuxTarget := control.Target{Backend: "tmux", ID: "%3"}
+	orig := controlResolveForLocateFn
+	t.Cleanup(func() { controlResolveForLocateFn = orig })
+	controlResolveForLocateFn = func(projectDir string) (control.Controller, control.Target, bool) {
+		return tmuxCtrl, tmuxTarget, true // as if orca couldn't Locate, tmux did
+	}
+	l := domain.Loop{Project: "api", ProjectDir: "-x-api", Cwd: "/home/user/api", State: domain.StateRunning}
+
+	msg := attachCmd(l)()
+
+	if !tmuxCtrl.focusCalled {
+		t.Error("expected Focus to be called on the located tmux surface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok {
+		t.Fatalf("got %+v, want a successful attachResultMsg", msg)
+	}
+	if !strings.Contains(am.text, "via tmux") {
+		t.Errorf("text = %q, want it to report the tmux backend (locate-based, not orca by install order)", am.text)
 	}
 }
 

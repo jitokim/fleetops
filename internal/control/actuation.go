@@ -3,9 +3,10 @@
 // replaces cwd-guessing as the PRIMARY way to find where a typed action
 // should land. tty is session-unique — two sessions sharing a project
 // directory stop being ambiguous — so this tier needs no ambiguity guard;
-// the existing cwd-based Controller.Resolve()+LocateClaude chain stays as
-// the fallback for sessions with no (or a stale) registry entry, and it
-// keeps its own ambiguity refusal unchanged.
+// the cwd-based LocateClaude chain stays as the fallback for sessions with no
+// (or a stale) registry entry. That fallback now probes every available
+// backend (not just Resolve()'s single pick) and refuses on cross-backend
+// ambiguity — see ResolveActuationTarget's Tier 1b doc.
 package control
 
 import (
@@ -54,53 +55,92 @@ var pidTTYFn = func(pid int) string {
 // (resume/approve/interrupt/kill/inject) should land, per the ADR's tier
 // policy:
 //
-//   - Tier 1a — the session registry's tty (internal/sessions), dispatched
-//     to WHICHEVER backend Resolve() picks, if (and only if) that backend
-//     implements TTYLocator (see control.go's doc — verified per-backend,
-//     e.g. cmux's tree carries tty directly; orca's terminal list/show
-//     schema carries none, confirmed live). Tried only when the registry has
-//     an entry, it carries a tty, AND a live `ps` confirms the recorded pid
-//     CURRENTLY controls that SAME tty right now (pidTTYFn) — never trust a
-//     possibly-stale registry record on its own. Proving the pid merely
-//     exists is NOT enough: ttys are OS-recycled, so a SIGKILL'd session can
-//     leak a registry entry whose tty gets reassigned to a completely
-//     different, unrelated live claude pane, and/or whose pid gets reused by
-//     any other process — pid-existence alone would pass in both cases and
-//     misroute an action onto the wrong session. Re-validating the BINDING
-//     (this exact pid ↔ this exact tty, right now) is what ADR §3 step 2
-//     means by "re-validate tty↔pid against live ps at actuation time."
-//     Session-unique once the binding checks out: no ambiguity guard applies
-//     on this path. NOTE: this ties Tier 1a to Resolve()'s single preferred
-//     backend (orca→cmux→tmux) — a session actually hosted in a NON-preferred
-//     backend's surface (e.g. a tmux pane on a machine where orca is also
-//     installed and preferred) won't be found via Tier 1a even if that other
-//     backend implements TTYLocator; it falls to Tier 1b/2 instead. Accepted
-//     trade for a single, predictable "whichever backend is resolved" rule
-//     rather than probing every installed backend on every actuation.
-//   - Tier 1b — the existing cwd-based Resolve()+LocateClaude chain,
-//     unchanged, including its own internal ">1 match" ambiguity refusal.
+//   - Tier 1a — the session registry's tty (internal/sessions), probed across
+//     EVERY available backend that implements TTYLocator (see control.go's doc
+//     — verified per-backend, e.g. cmux's tree carries tty directly; orca's
+//     terminal list/show schema carries none, confirmed live). The registry
+//     binding is validated ONCE, backend-independently, before any backend is
+//     probed: tried only when the registry has an entry, it carries a tty, AND
+//     a live `ps` confirms the recorded pid CURRENTLY controls that SAME tty
+//     right now (pidTTYFn) — never trust a possibly-stale registry record on
+//     its own. Proving the pid merely exists is NOT enough: ttys are
+//     OS-recycled, so a SIGKILL'd session can leak a registry entry whose tty
+//     gets reassigned to a completely different, unrelated live claude pane,
+//     and/or whose pid gets reused by any other process — pid-existence alone
+//     would pass in both cases and misroute an action onto the wrong session.
+//     Re-validating the BINDING (this exact pid ↔ this exact tty, right now) is
+//     what ADR §3 step 2 means by "re-validate tty↔pid against live ps at
+//     actuation time." Once the binding checks out the tty is session-unique,
+//     so the FIRST backend whose LocateByTTY hits wins with no ambiguity guard
+//     — probing across all backends (not just Resolve()'s single preferred
+//     one) is what lets a session hosted in a NON-preferred backend's surface
+//     (e.g. a tmux pane on a machine where orca is also installed and
+//     preferred) still be found by Tier 1a instead of silently falling to
+//     Tier 1b/2.
+//   - Tier 1b — the cwd-based LocateClaude probe, now run across EVERY
+//     available backend (not just Resolve()'s single pick). Because cwd is
+//     many-to-one this CANNOT stop at the first hit: it must count matches and
+//     REFUSE (found=false) when two or more DISTINCT backends each return a
+//     claude surface for the same projectDir — the cross-backend analogue of
+//     LocateClaude's own single-backend ">1 match" refusal. Exactly one
+//     matching backend → use it; zero → not found.
 //
-// backendAvailable=false means no backend resolved AT ALL (caller's message:
-// "no orca/tmux/cmux"). backendAvailable=true with found=false means a
-// backend resolved but couldn't locate/disambiguate a surface (caller's
-// message: "no unambiguous claude surface"). Callers only use ctrl/target
-// when found=true.
+// backendAvailable=false means NO backend is available AT ALL (caller's
+// message: "no orca/tmux/cmux"). backendAvailable=true with found=false means
+// backends were available but none could locate/disambiguate a claude surface
+// — including the cross-backend ambiguity refusal above (caller's message:
+// "no unambiguous claude surface"). Callers only use ctrl/target when
+// found=true.
 func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Controller, target Target, backendAvailable, found bool) {
-	resolved, resolvedOK := Resolve()
+	if !anyBackendAvailable() {
+		return nil, Target{}, false, false
+	}
 
+	// Tier 1a — session-unique tty. Validate the registry binding once, then
+	// probe every available TTYLocator backend; first hit wins (no ambiguity).
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
-		if resolvedOK {
-			if t, ok := tierOneA(resolved, entry.TTY); ok {
-				return resolved, t, true, true
+		for _, c := range backends {
+			if !c.Available() {
+				continue
+			}
+			if t, ok := tierOneA(c, entry.TTY); ok {
+				return c, t, true, true
 			}
 		}
 	}
 
-	if !resolvedOK {
-		return nil, Target{}, false, false
+	// Tier 1b — cwd is many-to-one, so probe ALL available backends and count
+	// matches; >=2 distinct backends matching is cross-backend ambiguity and
+	// must refuse, never silently pick one.
+	var matchedCtrl Controller
+	var matchedTarget Target
+	matches := 0
+	for _, c := range backends {
+		if !c.Available() {
+			continue
+		}
+		if t, ok := c.LocateClaude(projectDir); ok {
+			matchedCtrl, matchedTarget = c, t
+			matches++
+		}
 	}
-	t, locateOK := resolved.LocateClaude(projectDir)
-	return resolved, t, true, locateOK
+	if matches == 1 {
+		return matchedCtrl, matchedTarget, true, true
+	}
+	return nil, Target{}, true, false
+}
+
+// anyBackendAvailable reports whether at least one backend is usable right now
+// — the single "is actuation possible at all" gate for backendAvailable.
+// Deliberately its own tiny helper (not an inlined loop) so the
+// backendAvailable=false contract lives in exactly one place.
+func anyBackendAvailable() bool {
+	for _, c := range backends {
+		if c.Available() {
+			return true
+		}
+	}
+	return false
 }
 
 // tierOneA type-asserts resolved as a TTYLocator and, if it implements the
