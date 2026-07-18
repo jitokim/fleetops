@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/jitokim/fleetops/internal/fsatomic"
 )
 
 // HiddenFile is ~/.fleetops/hidden.json — a single file alongside the loops/
@@ -110,15 +112,16 @@ func Add(path, sessionID string) (map[string]bool, error) {
 // recoverable by hand instead of being silently replaced by a single id.
 const corruptedFileSuffix = ".bad"
 
-// write persists set to path atomically: marshal to a sorted list, write a
-// sibling temp file, fsync-free rename over path (rename is atomic on the same
-// filesystem, which the sibling temp guarantees). On any error before the
-// rename the temp file is removed so no ".tmp" litter survives a failure.
+// hiddenTmpPrefix names write's sibling temp file, so a stray temp surviving a
+// hard kill is identifiable as this registry's.
+const hiddenTmpPrefix = ".hidden-*.tmp"
+
+// write persists set to path: marshal to a sorted list, then hand the bytes to
+// fsatomic.WriteFile, which owns the temp-file + rename dance (and the
+// ~/.fleetops directory mode) shared with internal/sessions. Sorting is this
+// package's own concern — deterministic on-disk order keeps hidden.json
+// diffing stably by hand.
 func write(path string, set map[string]bool) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
 	ids := make([]string, 0, len(set))
 	for id := range set {
 		ids = append(ids, id)
@@ -128,23 +131,5 @@ func write(path string, set map[string]bool) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".hidden-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
+	return fsatomic.WriteFile(path, data, hiddenTmpPrefix)
 }

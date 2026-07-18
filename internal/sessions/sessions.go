@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/jitokim/fleetops/internal/fsatomic"
 )
 
 // SessionsDir is ~/.fleetops/sessions (override for tests by passing an
@@ -90,45 +92,22 @@ func WriteSession(dir, sessionID string, entry SessionEntry) error {
 	if !validSessionID(sessionID) {
 		return fmt.Errorf("sessions: invalid session id %q", sessionID)
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(dir, sessionID+".json"), data)
+	return fsatomic.WriteFile(filepath.Join(dir, sessionID+".json"), data, sessionTmpPrefix)
 }
 
-// atomicWrite writes data to path via a sibling temp file + rename, mirroring
-// hidden.write (internal/hidden): rename is atomic on the same filesystem —
-// which a sibling temp guarantees — so a crash mid-write can never leave a
-// half-written record that would then fail-load. On any error before the
-// rename the temp is removed, so no ".tmp" litter survives a failure. Adopted
-// (over the previous bare os.WriteFile) now that the record carries more fields
-// and a resume can rewrite it in rapid succession — a torn record would cost
-// the loop its host_app/window_id and silently degrade attach.
-func atomicWrite(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".session-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
-}
+// sessionTmpPrefix names WriteSession's sibling temp file, so a stray temp
+// surviving a hard kill is identifiable as this registry's.
+//
+// The write goes through fsatomic (temp + rename) rather than a bare
+// os.WriteFile because the record carries several fields now and a resume can
+// rewrite it in rapid succession — a torn record would cost the loop its
+// host_app/window_id and silently degrade attach. internal/hidden shares the
+// same writer for the same reason.
+const sessionTmpPrefix = ".session-*.tmp"
 
 // ReadSession loads sessionID's entry. A missing or malformed file is an
 // error (unlike ListSessions, which skips them) — callers that want
