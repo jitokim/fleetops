@@ -1441,7 +1441,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 //     below).
 //  2. Tier 2 — vendor-independent headless re-drive (redriveFn), reached
 //     when Tier 1 didn't resolve a surface, when a resolved Tier 1h host
-//     send REFUSED (see the dispatch below), OR when l.Stall is StallGone.
+//     send REFUSED (see the dispatch below — EXCEPT on a timeout, whose
+//     delivery is unknown and so must not be retried), OR when l.Stall is
+//     StallGone.
 //     StallGone no longer refuses: the claude process behind the ON-SCREEN
 //     terminal is gone, but `claude --resume <id> -p <prompt>` restarts the
 //     SAME conversation headlessly — that IS the restart the old manual
@@ -1509,6 +1511,17 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 				// fallback that does not exist.
 				if !control.IsHostSendTier(act) {
 					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
+				}
+				// ...with ONE exception: a deadline kill (see
+				// control.ErrSendDeliveryUnknown) is the single 1h failure that
+				// may have already delivered, because it interrupted a script
+				// that was running rather than one that never started. Falling
+				// through would risk re-sending the same prompt into a session
+				// that already got it. Stop here and say the honest thing —
+				// the outcome is UNKNOWN, so the human, not the runtime, makes
+				// the call about retrying.
+				if errors.Is(err, control.ErrSendDeliveryUnknown) {
+					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("%s %s: delivery UNKNOWN — the host send timed out and may or may not have landed. Attach (↵) and check before retrying; NOT re-driven, to avoid sending it twice", action, l.Project)}
 				}
 			}
 		}

@@ -2898,6 +2898,50 @@ func TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive(t *testing.T) {
 	}
 }
 
+// TestSendPromptCmd_TierOneHTimeout_DoesNotRedrive is the double-delivery
+// guard, and the one carve-out in the Tier 1h degrade.
+//
+// Every other 1h failure happens before osascript can write, so a redrive
+// provably cannot duplicate anything. A DEADLINE kill is different in kind: the
+// script was running and we stopped it, so the write may already have landed.
+// Re-driving would then deliver the same prompt twice — a duplicate injection
+// or re-send, with a transcript that reads as if the human pressed the key
+// twice.
+//
+// The repo's rule is that fleetops never claims more than it knows, so this
+// must resolve to neither "sent" nor a plain failure that quietly triggers a
+// retry: the operator is told the outcome is UNKNOWN and decides.
+func TestSendPromptCmd_TierOneHTimeout_DoesNotRedrive(t *testing.T) {
+	redriveCalled := false
+	timedOut := fmt.Errorf("%w (signal: killed)", control.ErrSendDeliveryUnknown)
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: timedOut}, true, true
+		},
+		func(sessionID, prompt string) error { redriveCalled = true; return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
+
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	if redriveCalled {
+		t.Fatal("a timed-out Tier 1h send fell through to Tier 2 — risks delivering the same prompt twice")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("a timeout must not be reported as a success — nothing confirmed the write landed")
+	}
+	if !strings.Contains(rm.text, "UNKNOWN") {
+		t.Errorf("text = %q, want it to say the delivery outcome is unknown", rm.text)
+	}
+	if !strings.Contains(rm.text, "Attach") {
+		t.Errorf("text = %q, want it to tell the operator to go look before retrying", rm.text)
+	}
+}
+
 // TestSendPromptCmd_TierOneMultiplexerSendFails_IsTerminal is the other half of
 // the classification: a MULTIPLEXER send that fails must NOT be retried on
 // Tier 2. `tmux send-keys` offers no fail-closed guarantee, so a redrive after

@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"errors"
 	"os/exec"
 	"strings"
@@ -578,6 +579,61 @@ func TestBoundSendAdapter_PropagatesErrorAndReportsTier(t *testing.T) {
 	}
 	if act.Tier() != actuationTierHostSend {
 		t.Errorf("Tier() = %q, want %q", act.Tier(), actuationTierHostSend)
+	}
+}
+
+// TestClassifySendExecError_DeadlineIsUnknownDelivery: a deadline kill is the
+// ONE exec failure that may have landed — osascript was interrupted while
+// running, not prevented from starting. It must be separated from the
+// provably-undelivered failures so callers do not retry it blindly.
+//
+// The classification reads ctx.Err(), not err, because CommandContext surfaces
+// a deadline kill as an ordinary "signal: killed" ExitError — indistinguishable
+// from a script that died on its own.
+func TestClassifySendExecError_DeadlineIsUnknownDelivery(t *testing.T) {
+	killed := errors.New("signal: killed")
+
+	err := classifySendExecError(context.DeadlineExceeded, killed)
+
+	if !errors.Is(err, ErrSendDeliveryUnknown) {
+		t.Errorf("classifySendExecError = %v, want ErrSendDeliveryUnknown", err)
+	}
+	if !strings.Contains(err.Error(), "UNKNOWN") {
+		t.Errorf("message %q must say the delivery outcome is unknown", err)
+	}
+	// Neither a clean success nor a clean failure: it must not be mistakable
+	// for one of the safe-to-retry sentinels.
+	if errors.Is(err, ErrSendNoSession) || errors.Is(err, ErrSendUnrecognizedVerdict) || errors.Is(err, ErrNoSendSurface) {
+		t.Error("a timeout must not masquerade as a provably-undelivered failure")
+	}
+}
+
+// TestClassifySendExecError_NonDeadlineFailuresStayPlain: a denied Automation
+// grant, iTerm2 not running, a launch failure — all happen BEFORE the script
+// can write, so they provably delivered nothing and must keep their existing
+// (degradable) shape, stderr diagnosis included.
+func TestClassifySendExecError_NonDeadlineFailuresStayPlain(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "echo 'Not authorized to send Apple events to iTerm2. (-1743)' >&2; exit 1")
+	_, execErr := cmd.Output()
+	if execErr == nil {
+		t.Fatal("expected the probe command to fail")
+	}
+
+	// No deadline: ctx.Err() is nil, which is the live code's normal case.
+	err := classifySendExecError(nil, execErr)
+
+	if errors.Is(err, ErrSendDeliveryUnknown) {
+		t.Errorf("error = %v, want it NOT flagged as unknown-delivery", err)
+	}
+	if !strings.Contains(err.Error(), "-1743") {
+		t.Errorf("error = %q, want the stderr diagnosis preserved", err)
+	}
+	if got := classifySendExecError(nil, nil); got != nil {
+		t.Errorf("classifySendExecError(nil, nil) = %v, want nil", got)
+	}
+	// A cancelled (not timed-out) context is also not a deadline.
+	if err := classifySendExecError(context.Canceled, execErr); errors.Is(err, ErrSendDeliveryUnknown) {
+		t.Error("only a DEADLINE means unknown delivery; a plain cancellation does not")
 	}
 }
 

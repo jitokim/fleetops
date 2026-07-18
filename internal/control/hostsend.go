@@ -84,6 +84,24 @@ var ErrSendUnrecognizedVerdict = errors.New("control: the host returned an unrec
 // versus re-attach).
 var ErrSendNoRecordedTTY = errors.New("control: this loop has no recorded tty — nothing to verify the host session against; attach (↵) and act manually")
 
+// ErrSendDeliveryUnknown reports that osascript was KILLED at the
+// actuationTimeout deadline, so whether the `write` reached the pty is
+// genuinely unknowable from here.
+//
+// It is deliberately neither a success nor a plain failure, because this repo's
+// rule is that fleetops never claims more than it knows. Every other exec
+// failure — a denied Automation grant (-1743), iTerm2 not running, a launch
+// failure — happens BEFORE the script can write, so those provably delivered
+// nothing and are safe to retry on another tier. A deadline kill is the one
+// case that can land mid-`write`: the process was making progress and we
+// stopped it. Retrying that on Tier 2 would risk delivering the same prompt
+// TWICE (a duplicate injection, a duplicate re-send — wasted turns and a
+// transcript that reads as if the operator pressed the key twice), and
+// reporting it as a clean failure would be the lie that makes the retry
+// automatic. So it fails LOUD instead: the operator is told the outcome is
+// unknown and to go look before pressing anything again.
+var ErrSendDeliveryUnknown = errors.New("control: the host send timed out — delivery is UNKNOWN, it may or may not have landed; attach (↵) and check before retrying")
+
 // hostAppSendAdapters maps a $TERM_PROGRAM marker to its SendAdapter, mirroring
 // hostAppFocusAdapters exactly. Multiplexers deliberately do NOT appear here —
 // they are addressed by Tier 1a/1b through Controller, and adding one here
@@ -130,7 +148,29 @@ var iterm2SendFn = func(argv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), actuationTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).Output()
-	return string(out), withCommandStderr(err)
+	return string(out), classifySendExecError(ctx.Err(), err)
+}
+
+// classifySendExecError separates the ONE exec failure whose delivery is
+// unknowable from all the ones that provably delivered nothing.
+//
+// It reads ctx.Err() rather than inspecting err, because CommandContext reports
+// a deadline kill as an ordinary *exec.ExitError ("signal: killed") — from the
+// error alone a timeout is indistinguishable from a script that exited on its
+// own. The context is the only witness to WHY the process died.
+//
+// A pure function taking the context's error rather than the context itself, so
+// the classification is directly unit-testable without racing a real 5s
+// deadline (same seam discipline as withCommandStderr, which still handles the
+// provably-undelivered side).
+func classifySendExecError(ctxErr, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return fmt.Errorf("%w (%v)", ErrSendDeliveryUnknown, err)
+	}
+	return withCommandStderr(err)
 }
 
 // withCommandStderr folds a failed command's stderr into its error.
@@ -144,8 +184,9 @@ var iterm2SendFn = func(argv []string) (string, error) {
 // populates Stderr precisely so this is possible; design §5.3's honest-failure
 // claim depends on it.)
 //
-// Non-ExitError failures (LookPath, a context deadline) already carry their own
-// text and pass through untouched.
+// Non-ExitError failures (LookPath and friends) already carry their own text
+// and pass through untouched. The deadline case never reaches here — see
+// classifySendExecError.
 func withCommandStderr(err error) error {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
@@ -291,8 +332,10 @@ func iterm2SendVerdict(argv []string) error {
 	out, err := iterm2SendFn(argv)
 	if err != nil {
 		// A real exec failure: a revoked Automation grant (-1743), iTerm2 not
-		// running, or the actuationTimeout deadline. Surfaced as-is, never
-		// swallowed — deciding it is non-fatal is the caller's job.
+		// running, or the actuationTimeout deadline (already separated out as
+		// ErrSendDeliveryUnknown by classifySendExecError, because that one
+		// alone may have delivered). Surfaced as-is, never swallowed —
+		// deciding what is safe to do next is the caller's job.
 		return err
 	}
 	switch strings.TrimSpace(out) {
