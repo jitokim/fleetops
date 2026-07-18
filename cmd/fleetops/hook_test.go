@@ -59,13 +59,12 @@ func TestSessionStartHook_WritesEntry(t *testing.T) {
 }
 
 // TestSessionStartHook_PopulatesHostWindowFromEnv confirms the hook records
-// $TERM_PROGRAM as HostApp and the first window marker ($ITERM_SESSION_ID) as
-// WindowID (design §2 population).
+// $TERM_PROGRAM as HostApp and that host's OWN window id as WindowID.
 func TestSessionStartHook_PopulatesHostWindowFromEnv(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TERM_PROGRAM", "iTerm.app")
 	t.Setenv("ITERM_SESSION_ID", "w0t1p0:ABC-123")
-	t.Setenv("TMUX_PANE", "%9") // ITERM_SESSION_ID wins — it comes first
+	t.Setenv("TMUX_PANE", "%9") // ignored: the host is iTerm2, so its id wins
 
 	withStdin(t, `{"session_id":"host-win","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
 
@@ -77,10 +76,65 @@ func TestSessionStartHook_PopulatesHostWindowFromEnv(t *testing.T) {
 		t.Errorf("HostApp = %q, want iTerm.app", entry.HostApp)
 	}
 	if entry.WindowID != "w0t1p0:ABC-123" {
-		t.Errorf("WindowID = %q, want the first non-empty marker ($ITERM_SESSION_ID)", entry.WindowID)
+		t.Errorf("WindowID = %q, want the iTerm2 host's own marker ($ITERM_SESSION_ID)", entry.WindowID)
 	}
 	if entry.SocketPath != "" {
 		t.Errorf("SocketPath = %q, want empty (out of scope for this slice)", entry.SocketPath)
+	}
+}
+
+// TestResolveHostWindow_NestedTmuxInITerm2_NoForeignWindowID is the
+// mismatched-pair pin and the common nested case: claude runs in tmux inside
+// iTerm2, so tmux sets $TERM_PROGRAM=tmux while the OUTER iTerm2's
+// $ITERM_SESSION_ID is still inherited in the environment. Resolving the two
+// fields independently records HostApp=tmux with an iTerm2 window id — one
+// record describing two different terminals. WindowID must come from the
+// resolved host, never from whichever marker happens to be set.
+func TestResolveHostWindow_NestedTmuxInITerm2_NoForeignWindowID(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "tmux")
+	t.Setenv("ITERM_SESSION_ID", "w0t1p0:OUTER-ITERM-GUID") // leaked from the outer iTerm2
+	t.Setenv("TMUX_PANE", "%9")
+
+	hostApp, windowID := resolveHostWindow()
+
+	if hostApp != "tmux" {
+		t.Errorf("HostApp = %q, want tmux", hostApp)
+	}
+	if strings.Contains(windowID, "ITERM") {
+		t.Fatalf("WindowID = %q — a tmux-hosted session must never carry the outer iTerm2 window id", windowID)
+	}
+	if windowID != "%9" {
+		t.Errorf("WindowID = %q, want tmux's own $TMUX_PANE", windowID)
+	}
+}
+
+// TestResolveHostWindow_UnknownHost_ReturnsEmptyPair: an unrecognized
+// $TERM_PROGRAM has no window var we know how to read, so it yields no pair at
+// all rather than borrowing another terminal's id.
+func TestResolveHostWindow_UnknownHost_ReturnsEmptyPair(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "Apple_Terminal")
+	t.Setenv("ITERM_SESSION_ID", "w0t1p0:NOT-OURS")
+	t.Setenv("TMUX_PANE", "%9")
+
+	if hostApp, windowID := resolveHostWindow(); hostApp != "" || windowID != "" {
+		t.Errorf("resolveHostWindow() = (%q,%q), want an empty pair for an unrecognized host", hostApp, windowID)
+	}
+}
+
+// TestResolveHostWindow_HostWithoutItsOwnMarker_EmptyWindowID: iTerm2 without
+// $ITERM_SESSION_ID must NOT fall back to $TMUX_PANE.
+func TestResolveHostWindow_HostWithoutItsOwnMarker_EmptyWindowID(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("ITERM_SESSION_ID", "")
+	t.Setenv("TMUX_PANE", "%9")
+
+	hostApp, windowID := resolveHostWindow()
+
+	if hostApp != "iTerm.app" {
+		t.Errorf("HostApp = %q, want iTerm.app", hostApp)
+	}
+	if windowID != "" {
+		t.Errorf("WindowID = %q, want empty — $TMUX_PANE is not iTerm2's window id", windowID)
 	}
 }
 
