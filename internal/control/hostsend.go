@@ -24,16 +24,21 @@ import (
 // and lets a future host implement one without the other.
 //
 // Methods per MECHANISM, not per verb: the whole verb table reduces to "type
-// text, then submit" and (added next) "deliver a raw Esc." Every text-shaped
-// verb is SendText with a different payload — resume/inject send the prompt,
-// kill sends the literal "/exit" (kill is NOT a control character in this
-// codebase, see killCmd), and approve sends "" for a bare submit.
+// text, then submit" and "deliver a raw Esc." Every text-shaped verb is
+// SendText with a different payload — resume/inject send the prompt, kill sends
+// the literal "/exit" (kill is NOT a control character in this codebase, see
+// killCmd), and approve sends "" for a bare submit.
 type SendAdapter interface {
 	// Name reports the mechanism for human-facing status text ("iterm2").
 	Name() string
 	// SendText types text into the session and submits it. An empty text is a
 	// meaningful call: a bare submit (approve).
 	SendText(entry sessions.SessionEntry, text string) error
+	// Interrupt delivers a raw Esc without submitting — stop the current turn,
+	// leave the process alive. The one control-character path; kept a separate
+	// method (and a separate file) rather than a SendText payload so it stays
+	// individually reviewable.
+	Interrupt(entry sessions.SessionEntry) error
 }
 
 // ErrNoSendSurface reports that an adapter REFUSED before executing anything:
@@ -90,6 +95,7 @@ type boundSendAdapter struct {
 
 func (b boundSendAdapter) Resume(prompt string) error { return b.adapter.SendText(b.entry, prompt) }
 func (b boundSendAdapter) Approve() error             { return b.adapter.SendText(b.entry, "") }
+func (b boundSendAdapter) Interrupt() error           { return b.adapter.Interrupt(b.entry) }
 func (b boundSendAdapter) Backend() string            { return b.adapter.Name() }
 func (b boundSendAdapter) Tier() string               { return actuationTierHostSend }
 
@@ -281,6 +287,8 @@ func iterm2SendScript(guid, writeStmt string) string {
 		"end run"
 }
 
-// Compile-time assurance the adapter satisfies the interface. boundSendAdapter
-// becomes a full Actuator once the interrupt path lands.
-var _ SendAdapter = iterm2SendAdapter{}
+// Compile-time assurance the adapter and its binding satisfy their interfaces.
+var (
+	_ SendAdapter = iterm2SendAdapter{}
+	_ Actuator    = boundSendAdapter{}
+)

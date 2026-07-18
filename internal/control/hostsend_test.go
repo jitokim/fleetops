@@ -400,15 +400,21 @@ func TestITerm2SendScript_ReadOnlyTraversal(t *testing.T) {
 
 // ── boundSendAdapter: the verb → mechanism mapping ────────────────────────
 
-// fakeSendAdapter records what the binding asked of it.
+// fakeSendAdapter records what the binding asked of it — which mechanism, and
+// with which payload.
 type fakeSendAdapter struct {
-	sentTexts []string
-	sendErr   error
+	sentTexts       []string
+	interruptCalled bool
+	sendErr         error
 }
 
 func (f *fakeSendAdapter) Name() string { return "fakehost" }
 func (f *fakeSendAdapter) SendText(_ sessions.SessionEntry, text string) error {
 	f.sentTexts = append(f.sentTexts, text)
+	return f.sendErr
+}
+func (f *fakeSendAdapter) Interrupt(sessions.SessionEntry) error {
+	f.interruptCalled = true
 	return f.sendErr
 }
 
