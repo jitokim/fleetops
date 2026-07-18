@@ -1859,6 +1859,189 @@ func TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable(t *testing.T) {
 	}
 }
 
+// ── the drift-hint flow must survive the drift/gone demotion ─────────────
+
+// The regression guard. Before the liveness fix, a drifted+dead loop was
+// still displayed StateDrift, so "r" opened the hint input. After it, the
+// loop reads StateStalled/StallGone — and if "r" keyed only on State it
+// would fall through to the StallGone branch, whose resumeCmd resends the
+// exact prompt the oracle just rejected, verbatim, on one keypress.
+func TestDriftRedriveEligible_GoneWithFreshRejection_True(t *testing.T) {
+	l := domain.Loop{
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 16,
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 16},
+	}
+	if !driftRedriveEligible(l) {
+		t.Error("want true — the loop is gone but its fresh rejection is exactly what made it DRIFT before the demotion")
+	}
+}
+
+func TestDriftRedriveEligible_LiveDrift_True(t *testing.T) {
+	if !driftRedriveEligible(domain.Loop{State: domain.StateDrift}) {
+		t.Error("want true — the unchanged case")
+	}
+}
+
+// The stale-verdict failure case: a loop that has moved on since it was
+// judged must not widen the hint flow beyond what it covered before
+// (enrichFromRegistry only promotes to StateDrift when AtCycle == Cycle).
+func TestDriftRedriveEligible_GoneWithStaleRejection_False(t *testing.T) {
+	l := domain.Loop{
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 20,
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 16},
+	}
+	if driftRedriveEligible(l) {
+		t.Error("want false — the loop advanced past that verdict; it is due to be judged again")
+	}
+}
+
+func TestDriftRedriveEligible_GoneWithoutRejection_False(t *testing.T) {
+	l := domain.Loop{
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 5,
+		Last: &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 5},
+	}
+	if driftRedriveEligible(l) {
+		t.Error("want false — a progress verdict is not drift; plain gone loops keep the plain re-drive")
+	}
+}
+
+func TestDriftRedriveEligible_GoneWithNoVerdict_False(t *testing.T) {
+	l := domain.Loop{State: domain.StateStalled, Stall: domain.StallGone, Cycle: 5}
+	if driftRedriveEligible(l) {
+		t.Error("want false — an observed session that simply died was never drifted")
+	}
+}
+
+// A live, never-judged loop must not be pulled into the hint flow either.
+func TestDriftRedriveEligible_LiveIdle_False(t *testing.T) {
+	if driftRedriveEligible(domain.Loop{State: domain.StateIdle}) {
+		t.Error("want false")
+	}
+}
+
+// End to end through the key handler: "r" on a gone+drifted loop opens the
+// hint input rather than firing a blind resend.
+func TestUpdate_RKey_GoneDriftedLoop_OpensHintInputNotBlindResend(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{
+		Project: "myproject", SessionID: "sess-1", ProjectDir: "-x-myproject",
+		Cwd: "/x/myproject", CwdVerified: true,
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 16,
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 16},
+	}}
+	m.cursor = 0
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if m.mode != modeDriftHint {
+		t.Errorf("mode = %v, want modeDriftHint — the oracle's reason must not be thrown away by an unconfirmed verbatim resend", m.mode)
+	}
+	if m.driftHintTarget.SessionID != "sess-1" {
+		t.Errorf("driftHintTarget = %q, want sess-1", m.driftHintTarget.SessionID)
+	}
+}
+
+// The counterpart: a gone loop that was never drifted still takes the
+// plain Tier 2 re-drive, unchanged.
+func TestUpdate_RKey_GoneUndriftedLoop_StillPlainHeadlessRedrive(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{
+		Project: "myproject", SessionID: "sess-1", ProjectDir: "-x-myproject",
+		Cwd: "/x/myproject", CwdVerified: true,
+		State: domain.StateStalled, Stall: domain.StallGone,
+	}}
+	m.cursor = 0
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if m.mode == modeDriftHint {
+		t.Error("mode = modeDriftHint, want the unchanged plain headless re-drive for a loop with no rejected verdict")
+	}
+}
+
+// ── issue #49 part 2: the ambiguity refusal's remedy must be applicable ──
+
+// The reported case: a fleetops-spawned loop, dead 40 minutes,
+// oracle-drifted. It was told to attach and to install hooks. Neither can
+// reach a process that is gone.
+func TestAmbiguityRemedy_ProcessGone_AdvisesNeitherAttachNorHooks(t *testing.T) {
+	l := domain.Loop{Project: "fleetops", Stall: domain.StallGone, BoundAt: time.Now()}
+
+	got := ambiguityRemedy(l)
+
+	if strings.Contains(got, "hooks install") {
+		t.Errorf("remedy = %q, must not advise `fleetops hooks install` for a dead process", got)
+	}
+	if !strings.Contains(got, "gone") {
+		t.Errorf("remedy = %q, want it to say the process is gone", got)
+	}
+	if !strings.Contains(got, "r/i") {
+		t.Errorf("remedy = %q, want it to point at the headless re-drive, which needs no surface and no live process", got)
+	}
+}
+
+// A fleetops-spawned (registry-bound) loop that is still ALIVE: attach is
+// genuinely available, but `hooks install` still cannot help, because
+// registration happens at SessionStart and this session is already running.
+func TestAmbiguityRemedy_SpawnedAndAlive_AdvisesAttachNotHooks(t *testing.T) {
+	l := domain.Loop{Project: "fleetops", BoundAt: time.Now()}
+
+	got := ambiguityRemedy(l)
+
+	if strings.Contains(got, "run `fleetops hooks install` so injects") {
+		t.Errorf("remedy = %q, must not advise installing hooks as the fix for an already-running session", got)
+	}
+	if !strings.Contains(got, "attach (↵)") {
+		t.Errorf("remedy = %q, want attach offered — the process is alive", got)
+	}
+	if !strings.Contains(got, "session start") {
+		t.Errorf("remedy = %q, want it to explain why hooks can't retroactively register this session", got)
+	}
+}
+
+// The unchanged case, so the branching can't be satisfied by deleting the
+// original advice: an observed session (no registry record) that is alive.
+// Installing hooks genuinely is what gets its successors targeted by
+// session.
+func TestAmbiguityRemedy_ObservedAndAlive_KeepsOriginalAdvice(t *testing.T) {
+	l := domain.Loop{Project: "fleetops"} // zero BoundAt — never bound, never spawned by us
+
+	got := ambiguityRemedy(l)
+
+	if !strings.Contains(got, "attach (↵)") || !strings.Contains(got, "fleetops hooks install") {
+		t.Errorf("remedy = %q, want the original two-part advice, which is correct for this case", got)
+	}
+}
+
+// Wiring: the branch actually reaches the status line the human reads, not
+// just the helper. Same fixture as
+// TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable, with the selected
+// loop marked as fleetops-spawned.
+func TestUpdate_RKey_AmbiguousSpawnedLoop_DoesNotAdviseHooksInstall(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].BoundAt = time.Now()
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if !strings.Contains(m.status, "session-registry tty") {
+		t.Fatalf("status = %q, want the ambiguity refusal (fixture no longer triggers it?)", m.status)
+	}
+	if strings.Contains(m.status, "run `fleetops hooks install` so injects") {
+		t.Errorf("status = %q, want no hooks-install advice for a loop fleetops spawned itself", m.status)
+	}
+}
+
+// Precedence: liveness outranks origin. A dead spawned loop gets the dead
+// branch, not the spawned one.
+func TestAmbiguityRemedy_GoneOutranksSpawned(t *testing.T) {
+	gone := ambiguityRemedy(domain.Loop{Project: "fleetops", Stall: domain.StallGone, BoundAt: time.Now()})
+	alive := ambiguityRemedy(domain.Loop{Project: "fleetops", BoundAt: time.Now()})
+
+	if gone == alive {
+		t.Errorf("a gone loop and a live one got the same remedy %q — liveness must be consulted first", gone)
+	}
+}
+
 func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
 	// the counterpart case: exactly one loop shares this directory, so the
 	// guard must NOT refuse.
@@ -7993,6 +8176,77 @@ func TestKillCmd_DrivenLoop_EmitsKillEventMostRecentActuationIsKillRecognizes(t 
 	}
 	if !strings.HasPrefix(evs[0].Detail, "kill ") {
 		t.Errorf("Detail = %q, want it prefixed \"kill \" (mostRecentActuationIsKill's exact match)", evs[0].Detail)
+	}
+	if evs[0].Outcome != events.OutcomeOK {
+		t.Errorf("Outcome = %q, want %q (issue #50: the derivation reads this, not the prose)", evs[0].Outcome, events.OutcomeOK)
+	}
+}
+
+// ── issue #50: logActuationEvent's structured outcome ────────────────────
+
+func TestActuationOutcome_Classification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"success", nil, events.OutcomeOK},
+		{"plain failure", errors.New("no such pane"), events.OutcomeFailed},
+		{"delivery timeout", control.ErrSendDeliveryUnknown, events.OutcomeUnknown},
+		{"wrapped delivery timeout", fmt.Errorf("tier1h: %w", control.ErrSendDeliveryUnknown), events.OutcomeUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := actuationOutcome(tc.err); got != tc.want {
+				t.Errorf("actuationOutcome(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// The failure path end to end: a kill whose /exit send errored writes an
+// event whose Detail still matches "kill " (unchanged, for the EVENTS
+// panel) but whose Outcome says it did not land — which is what keeps
+// mostRecentActuationIsKill from promoting the loop to StateKilled.
+func TestLogActuationEvent_FailedKill_RecordsFailedOutcome(t *testing.T) {
+	historyDir := t.TempDir()
+	orig := historyDirFn
+	defer func() { historyDirFn = orig }()
+	historyDirFn = func() string { return historyDir }
+
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateIdle}
+	logActuationEvent(l, "kill", "tier1h", errors.New("no such pane"))
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	if evs[0].Outcome != events.OutcomeFailed {
+		t.Errorf("Outcome = %q, want %q", evs[0].Outcome, events.OutcomeFailed)
+	}
+	if !strings.HasPrefix(evs[0].Detail, "kill ") || !strings.Contains(evs[0].Detail, "no such pane") {
+		t.Errorf("Detail = %q, want the unchanged human-readable \"kill <tier> failed: <err>\" shape", evs[0].Detail)
+	}
+}
+
+func TestLogActuationEvent_UnknownDelivery_RecordsUnknownOutcome(t *testing.T) {
+	historyDir := t.TempDir()
+	orig := historyDirFn
+	defer func() { historyDirFn = orig }()
+	historyDirFn = func() string { return historyDir }
+
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateIdle}
+	logActuationEvent(l, "kill", "tier1h", fmt.Errorf("send: %w", control.ErrSendDeliveryUnknown))
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got["sess-1"][0].Outcome != events.OutcomeUnknown {
+		t.Errorf("Outcome = %q, want %q — a timed-out send is neither confirmed sent nor confirmed failed", got["sess-1"][0].Outcome, events.OutcomeUnknown)
 	}
 }
 

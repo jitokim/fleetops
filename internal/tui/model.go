@@ -1088,7 +1088,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ambiguity guard still applies at THIS keypress time (fail
 			// fast before the human even starts typing a hint), same as
 			// every other actuation dispatch in this file.
-			if sel.State == domain.StateDrift {
+			if driftRedriveEligible(sel) {
 				if !m.ttyPathPlausible(sel) {
 					if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
 						m.status, m.statusKind = msg, statusErr
@@ -1491,10 +1491,10 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			if backendAvailable && found {
 				err := act.Resume(prompt)
 				if err == nil {
-					logActuationEvent(l, action, act.Tier(), true, "")
+					logActuationEvent(l, action, act.Tier(), nil)
 					return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
 				}
-				logActuationEvent(l, action, act.Tier(), false, err.Error())
+				logActuationEvent(l, action, act.Tier(), err)
 				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
 				// resolves optimistically — the registry says the loop lives in
 				// an iTerm2 session, and only the send itself can discover the
@@ -1533,10 +1533,10 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
 		if err := redriveFn(l.SessionID, prompt); err != nil {
-			logActuationEvent(l, action, "tier2", false, err.Error())
+			logActuationEvent(l, action, "tier2", err)
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
-		logActuationEvent(l, action, "tier2", true, "")
+		logActuationEvent(l, action, "tier2", nil)
 		if l.Stall != domain.StallGone {
 			// Bug 2 (Option B honesty fix, refined by
 			// feat/inject-headless-exact-fallback): this branch is a
@@ -1762,7 +1762,7 @@ func takeOverCmd(l domain.Loop) tea.Cmd {
 		if err := registry.MarkDriven(registryDirFn(), l.SessionID, false); err != nil {
 			return attachResultMsg{false, fmt.Sprintf("take-over %s opened a terminal but could not clear Driven: %v — the engine may still drive it; kill (k) to stop it", l.Project, err)}
 		}
-		logActuationEvent(l, "take-over", "terminal", true, "")
+		logActuationEvent(l, "take-over", "terminal", nil)
 		return attachResultMsg{true, fmt.Sprintf("took over %s via %s — engine stopped driving it", l.Project, ctrl.Name())}
 	}
 }
@@ -1795,7 +1795,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
 		}
 		if err := act.Approve(); err != nil {
-			logActuationEvent(l, "approve", act.Tier(), false, err.Error())
+			logActuationEvent(l, "approve", act.Tier(), err)
 			// Unknown delivery is not a failure — see unknownDeliveryText.
 			if errors.Is(err, control.ErrSendDeliveryUnknown) {
 				return approveResultMsg{false, unknownDeliveryText("approve", l.Project, "the Enter", "a")}
@@ -1807,7 +1807,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// NEW marker that landed between this loop's scan snapshot and this
 		// approve call (see gate.DeleteMarkerIfTS).
 		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
-		logActuationEvent(l, "approve", act.Tier(), true, "")
+		logActuationEvent(l, "approve", act.Tier(), nil)
 		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, act.Backend())}
 	}
 }
@@ -2380,7 +2380,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 			if err := registry.MarkDriven(registryDirFn(), l.SessionID, false); err != nil {
 				return killResultMsg{false, fmt.Sprintf("kill %s failed: could not clear Driven — %v", l.Project, err)}
 			}
-			logActuationEvent(l, "kill", "engine", true, "")
+			logActuationEvent(l, "kill", "engine", nil)
 			return killResultMsg{true, fmt.Sprintf("killed %s — Driven cleared, state updates on next scan", l.Project)}
 		}
 		// Tier 1 only (tty → host send → cwd) — killing has no headless Tier-2
@@ -2394,7 +2394,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
 		}
 		if err := act.Resume("/exit"); err != nil {
-			logActuationEvent(l, "kill", act.Tier(), false, err.Error())
+			logActuationEvent(l, "kill", act.Tier(), err)
 			// Unknown delivery is not a failure — see unknownDeliveryText.
 			// This is the site that motivated the distinction: "kill failed"
 			// reads as "press k again," and a second "/exit" into a session
@@ -2413,7 +2413,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// status line deliberately does NOT optimistically set local model
 		// state itself (that would be a fake, unverified state the next
 		// scan could immediately contradict).
-		logActuationEvent(l, "kill", act.Tier(), true, "")
+		logActuationEvent(l, "kill", act.Tier(), nil)
 		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
 	}
 }
@@ -2440,14 +2440,14 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
 		}
 		if err := act.Interrupt(); err != nil {
-			logActuationEvent(l, "interrupt", act.Tier(), false, err.Error())
+			logActuationEvent(l, "interrupt", act.Tier(), err)
 			// Unknown delivery is not a failure — see unknownDeliveryText.
 			if errors.Is(err, control.ErrSendDeliveryUnknown) {
 				return interruptResultMsg{false, unknownDeliveryText("stop", l.Project, "the Esc", "p")}
 			}
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
 		}
-		logActuationEvent(l, "interrupt", act.Tier(), true, "")
+		logActuationEvent(l, "interrupt", act.Tier(), nil)
 		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
 	}
 }
@@ -3074,12 +3074,27 @@ func unknownDeliveryText(verb, project, what, key string) string {
 // it happens). Only called at a point where a tier was actually dispatched
 // — the early "no backend"/"ambiguous" refusal branches never reach a tier,
 // so callers simply don't call this for those (nothing was "taken" to log).
-func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText string) {
+//
+// err is the actuation's result — nil means it was confirmed dispatched.
+// It is classified into the event's STRUCTURED Outcome field (see
+// events.Outcome*), which is what derivations must read; Detail keeps its
+// existing human-readable "<action> <tier> ok|failed: <err>" shape for the
+// EVENTS panel and `fleetops report`, and is no longer load-bearing for any
+// derivation (issue #50: mostRecentActuationIsKill used to match a prefix
+// that a FAILED kill's detail also satisfies).
+//
+// ErrSendDeliveryUnknown (the host send timed out) is classified
+// OutcomeUnknown, not OutcomeFailed — the same distinction killCmd already
+// makes in what it tells the human ("delivery UNKNOWN — it may or may not
+// have landed"). Recording it as "failed" would assert something we did not
+// observe, which is the exact class of over-claim this field exists to stop.
+func logActuationEvent(l domain.Loop, action, tier string, err error) {
+	outcome := actuationOutcome(err)
 	detail := action + " " + tier
-	if ok {
+	if err == nil {
 		detail += " ok"
 	} else {
-		detail += " failed: " + errText
+		detail += " failed: " + err.Error()
 	}
 	_ = events.Append(historyDirFn(), events.Event{
 		TS:        time.Now().UnixNano(),
@@ -3089,7 +3104,21 @@ func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText stri
 		Trigger:   events.TriggerActuation,
 		Detail:    detail,
 		Actor:     events.ActorHuman,
+		Outcome:   outcome,
 	})
+}
+
+// actuationOutcome classifies an actuation's error into an events.Outcome*
+// value — the one place the "a timeout is not a failure" rule is written.
+func actuationOutcome(err error) string {
+	switch {
+	case err == nil:
+		return events.OutcomeOK
+	case errors.Is(err, control.ErrSendDeliveryUnknown):
+		return events.OutcomeUnknown
+	default:
+		return events.OutcomeFailed
+	}
 }
 
 // pagerCmd builds the argv for the "o" key's log pager: -R renders color
@@ -3173,19 +3202,116 @@ func injectHeadlessFallbackEligible(state domain.LoopState) bool {
 // Callers must check this immediately before dispatching resumeCmd/killCmd/
 // approveCmd/interruptCmd — NOT attachCmd/o, which are read-only/navigation
 // and safe regardless of which sibling surface they land on.
+// driftRedriveEligible reports whether "r" should open the drift-hint input
+// (composeDriftPrompt) rather than blindly resending the last prompt.
+//
+// It exists because of a regression the drift/gone precedence fix would
+// otherwise have caused. That fix stops a dead drifted loop from being
+// displayed as StateDrift — correctly, it is gone — but "r" keyed its
+// hint flow off `State == StateDrift`, so the same loop silently fell
+// through to the StallGone branch below, whose resumeCmd resends
+// claude.LastUserPrompt VERBATIM: the exact prompt the oracle just
+// rejected, on one keypress, with no input and no confirmation. That is
+// precisely what feat/drift-guided-redrive was built to stop (see
+// composeDriftPrompt's own doc), and the population it would have hit is
+// the reported incident's: drifted AND dead.
+//
+// So eligibility is re-expressed against the facts that SURVIVE the
+// demotion. The second clause reconstructs exactly the condition
+// enrichFromRegistry uses to promote a loop to StateDrift in the first
+// place (a rejected verdict rendered against the CURRENT cycle,
+// scan.go's verdict mapping) — deliberately including AtCycle == Cycle,
+// so a stale rejection the loop has since moved past does not widen the
+// hint flow beyond what it covered before.
+//
+// One knowingly-accepted edge: enrichFromRegistry also declines the
+// StateDrift promotion for a loop sitting in a live GATE, and that
+// exclusion is not reconstructible here (the gate state is destroyed by
+// the same liveness demotion). A gone loop that was gated with a fresh
+// rejection now reaches the hint flow where it previously did not. It is
+// gone, so there is no live gate left to protect, and a hint prompt is
+// the better of the two outcomes anyway.
+func driftRedriveEligible(l domain.Loop) bool {
+	if l.State == domain.StateDrift {
+		return true
+	}
+	if l.Stall != domain.StallGone || l.Last == nil {
+		return false
+	}
+	return l.Last.Outcome == domain.OutcomeRejected && l.Last.AtCycle == l.Cycle
+}
+
 func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 	n := m.sameProjectDirCount(l.ProjectDir)
 	if n <= 1 {
 		return "", false
 	}
-	// Bug 2 (Option B, honesty fix): this refusal is reached specifically
-	// because l had no usable session-registry tty (ttyPathPlausible was
-	// false — see its own doc) AND the cwd-based Tier 1b fallback can't
-	// disambiguate N sessions sharing one directory. Tell the human the
-	// actual fix (install the hooks so this session gets a tty entry, which
-	// makes Tier 1a session-unique — see docs/adr-vendor-independent-actuation.md
-	// §2.1), not just the manual-attach workaround.
-	return fmt.Sprintf("ambiguous: %d loops share %s's directory, none has a session-registry tty — attach (↵) or run `fleetops hooks install` so injects can target by session", n, l.Project), true
+	// The refusal itself is honest — fail-closed beats killing the wrong
+	// loop. The REMEDY has to be too, which means consulting l rather than
+	// emitting a constant; see ambiguityRemedy.
+	return fmt.Sprintf("ambiguous: %d loops share %s's directory, none has a session-registry tty — %s", n, l.Project, ambiguityRemedy(l)), true
+}
+
+// ambiguityRemedy picks what to actually advise for the loop that hit the
+// cwd-ambiguity refusal (issue #49, part 2).
+//
+// This used to be a compile-time constant — "attach (↵) or run `fleetops
+// hooks install` so injects can target by session" — emitted identically
+// for a live loop and a dead one, and for a session fleetops spawned as
+// well as one a human started elsewhere. Both halves were wrong for the
+// reported case (a fleetops-spawned loop, dead 40 minutes, oracle-drifted):
+// attaching cannot help a process that is gone, and `hooks install` cannot
+// retroactively register an ALREADY-RUNNING session, because registration
+// happens at SessionStart. The operator was told to do two things that
+// could not change the outcome.
+//
+// The branches, in precedence order, each on a fact the caller already
+// handed us:
+//
+//   - process gone (Stall == StallGone) — nothing to reach at all, so
+//     neither remedy applies. What DOES work is the headless path: "r"/"i"
+//     re-drive via `claude --resume <exact session id> -p`, which needs no
+//     surface and no live process, and "x" retires the row.
+//
+//   - fleetops holds a CONTRACT for this loop (BoundAt non-zero ⇔ a
+//     registry.Record exists — written either by the "n" wizard's spawn →
+//     WritePending → BindPending path or directly by bootstrapEngineCmd).
+//     Installing hooks cannot fix THIS session; only a fresh session
+//     registers. Attach is genuinely available, so offer it and say what
+//     actually restores session-exact targeting.
+//
+//     Claiming only what this supports: a contract is strong evidence
+//     fleetops started the loop, not proof. BindPending matches a pending
+//     spawn to the most-recently-active unbound loop in the cwd with no
+//     session-identity check, and a shared cwd is precisely the
+//     precondition for this refusal — so a record can in principle land on
+//     a session fleetops did not start. The advice survives that: the
+//     "hooks can't retroactively register a running session" half is true
+//     of ANY already-running session, owned or not. Stage 2's Origin
+//     accessor is where this gets a name that means what it says.
+//
+//   - otherwise: an observed session with no registry entry, alive. The
+//     original advice is correct here and is kept verbatim.
+//
+// Deliberately NOT consulted: whether the hooks are in fact installed.
+// Nothing in the TUI knows that today, and guessing would just move the
+// dishonesty. The owned branch sidesteps it by not advising hooks at all.
+//
+// Note on the first branch: every current caller pre-filters StallGone
+// before reaching refuseIfAmbiguous (and the one that did not — "r" on a
+// StateDrift loop — stops producing dead loops now that drift no longer
+// survives the liveness pass). It is kept because this is a helper shared
+// by seven call sites each carrying its own hand-written pre-filter, and
+// the invariant belongs in the one place that authors the sentence rather
+// than in seven places that must remember to.
+func ambiguityRemedy(l domain.Loop) string {
+	if l.Stall == domain.StallGone {
+		return "and this one's process is already gone, so neither reaches it — r/i re-drive it headlessly, or x to forget it permanently"
+	}
+	if !l.BoundAt.IsZero() {
+		return "attach (↵) to act manually; `fleetops hooks install` can't help — registration happens at session start, so only a fresh loop gets session-exact targeting"
+	}
+	return "attach (↵) or run `fleetops hooks install` so injects can target by session"
 }
 
 // sameProjectDirCount counts how many loops in the current fleet (not just

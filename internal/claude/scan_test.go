@@ -949,7 +949,7 @@ func TestApplyLiveness_DrivenLoopKilled_WinsOverDormancy(t *testing.T) {
 	now := time.Now()
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "engine-1",
-		Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1056,20 +1056,184 @@ func TestApplyLiveness_StateDone_NotDroppedNorDemoted(t *testing.T) {
 	}
 }
 
-func TestApplyLiveness_StateDrift_NotDroppedNorDemoted(t *testing.T) {
+// Stage 1 / defect #1 (design-loop-state-model.md §4): drift is NOT final.
+// It means "the oracle rejected this, re-drive it" — a claim about a loop
+// that is still supposed to be workable. A dead process can't be re-driven
+// in place, so the observed death outranks the interpretation. This test
+// replaces an earlier one that asserted the opposite (the exemption arm
+// used to read `case StateDone, StateDrift:`), which is the bug: tonight's
+// incident screen showed ✗ DRIFT for a loop dead 40 minutes.
+func TestApplyLiveness_StateDriftAndProcessGone_BecomesGone(t *testing.T) {
 	now := time.Now()
 	loops := []domain.Loop{
 		{SessionID: "drift-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateDrift, LastActivity: now},
 	}
-	live := map[string]int{}
+	live := map[string]int{} // no live claude in this dir
 
 	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
 
 	if len(out) != 1 {
-		t.Fatalf("got %d loops, want 1 (StateDrift must survive)", len(out))
+		t.Fatalf("got %d loops, want 1 (a gone drift loop is kept, not dropped — it's an incident)", len(out))
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone — an observed death outranks a non-final oracle interpretation", out[0].State, out[0].Stall)
+	}
+}
+
+// The other half of the precedence rule: "final beats non-final" — a
+// converged loop whose process exited is done, NOT gone. Guards against a
+// naive "OS facts always win" reading of the fix above.
+func TestApplyLiveness_StateDoneAndProcessGone_StaysDone(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "done-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateDone, LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State != domain.StateDone {
+		t.Errorf("State = %v, want StateDone — a converged loop's process exiting is the expected epilogue, not news", out[0].State)
+	}
+	if out[0].Stall != domain.StallNone {
+		t.Errorf("Stall = %v, want StallNone (untouched)", out[0].Stall)
+	}
+}
+
+// The third final state, and the one that was actually broken. Unlike
+// StateKilled, StateFailed genuinely IS an input to applyLiveness:
+// applyGovernor sets it inside enrichFromRegistry, which DiscoverLoops runs
+// one pass earlier. So before this arm existed, a governor-stopped loop
+// whose process then exited was demoted FAILED → STALLED/gone, losing the
+// governor's conclusion while keeping its note. A pre-existing violation of
+// the ladder's rung 1, surfaced (not caused) by Stage 1.
+func TestApplyLiveness_StateFailedAndProcessGone_StaysFailed(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "failed-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject",
+			State: domain.StateFailed, Note: "stopped: no improvement", LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State != domain.StateFailed {
+		t.Errorf("State = %v, want StateFailed — the governor stopped this deliberately; the process exiting afterwards doesn't make that judgment less true", out[0].State)
+	}
+	if out[0].Stall != domain.StallNone {
+		t.Errorf("Stall = %v, want StallNone (untouched)", out[0].Stall)
+	}
+}
+
+// The rule the three arms share, asserted as the rule rather than three
+// times as instances: every LoopState.Terminal() state survives an observed
+// death intact, and every non-terminal one is demoted. This is what keeps
+// the code's Terminal() guard and domain's Terminal() definition from
+// drifting apart — add a terminal state and this test covers it for free.
+func TestApplyLiveness_ProcessGone_TerminalStatesSurviveNonTerminalDemoted(t *testing.T) {
+	// Every LoopState except StateIdle, which is excluded on purpose: it
+	// has its own older rule (a cleanly-finished loop is DROPPED, not
+	// demoted — see TestApplyLiveness_ZeroLiveProcesses_* and the Driven
+	// dormancy exception), so it is neither a survivor nor a demotion and
+	// would not fit this assertion's shape.
+	all := []domain.LoopState{
+		domain.StateRunning, domain.StateGate, domain.StateStalled,
+		domain.StateDrift, domain.StateDone, domain.StateFailed,
+		domain.StatePaused, domain.StateKilled,
+	}
+	for _, st := range all {
+		t.Run(string(st), func(t *testing.T) {
+			loops := []domain.Loop{
+				{SessionID: "s1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: st, LastActivity: time.Now()},
+			}
+
+			out := applyLiveness(loops, map[string]int{}, true, t.TempDir(), time.Now(), ActiveWindow)
+
+			if len(out) != 1 {
+				t.Fatalf("got %d loops, want 1", len(out))
+			}
+			if st.Terminal() {
+				if out[0].State != st {
+					t.Errorf("State = %v, want unchanged %v — final beats non-final", out[0].State, st)
+				}
+				return
+			}
+			if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+				t.Errorf("State = %v Stall = %v, want StateStalled/StallGone — among non-final states, observed beats inferred", out[0].State, out[0].Stall)
+			}
+		})
+	}
+}
+
+// Same guard for the human's own final word. Note the fixture goes through
+// the PRODUCTION route: StateKilled is never an INPUT to applyLiveness
+// (nothing upstream produces it — classifyLoop and enrichFromRegistry
+// can't), it is derived here from a kill on record. So "killed + dead
+// stays killed" is really "the kill-on-record check still outranks the
+// liveness demotion", which Stage 1 must not have disturbed: the
+// mostRecentActuationIsKill branch runs BEFORE the switch, and drift
+// leaving the exemption arm changes nothing about it.
+func TestApplyLiveness_KilledOnRecordAndProcessGone_StaysKilledNotGone(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "killed-one",
+		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "killed-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateDrift, LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State != domain.StateKilled || out[0].Stall != domain.StallNone {
+		t.Errorf("got State=%v Stall=%v, want StateKilled/StallNone — a human's kill is final and outranks the gone demotion", out[0].State, out[0].Stall)
+	}
+}
+
+// The failure case that keeps the fix honest: drift with a live process
+// backing it is still DRIFT. Liveness only demotes when the process is
+// actually observed gone.
+func TestApplyLiveness_StateDriftAndProcessAlive_StaysDrift(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "drift-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateDrift, LastActivity: now},
+	}
+	live := map[string]int{"/x/myproject": 1}
+
+	out := applyLiveness(loops, live, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
 	}
 	if out[0].State != domain.StateDrift || out[0].Stall != domain.StallNone {
-		t.Errorf("got %+v, want State=StateDrift Stall=StallNone (untouched by liveness)", out[0])
+		t.Errorf("got State=%v Stall=%v, want StateDrift/StallNone — nothing observed contradicts the verdict", out[0].State, out[0].Stall)
+	}
+}
+
+// The probe-failed case must not manufacture a death: with ok=false the
+// whole fleet is left alone, so drift stays drift even with zero live
+// processes reported (scan.go's P1-2 guard).
+func TestApplyLiveness_StateDriftAndProbeFailed_StaysDrift(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "drift-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateDrift, LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, false, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 || out[0].State != domain.StateDrift {
+		t.Errorf("got %+v, want the drift loop untouched — a failed probe is not evidence of death", out)
 	}
 }
 
@@ -1085,7 +1249,7 @@ func TestApplyLiveness_DriftLoopKilledAndGone_BecomesKilled(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1116,7 +1280,7 @@ func TestApplyLiveness_IdleLoopKilledAndGone_BecomesKilled_NotDropped(t *testing
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "idle-one",
 		FromState: "idle", ToState: "idle", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1142,7 +1306,7 @@ func TestApplyLiveness_KillEventButProcessStillAlive_NotKilled(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1181,7 +1345,7 @@ func TestApplyLiveness_KillEventOutsideActiveWindow_Ignored(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-48 * time.Hour).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1190,8 +1354,16 @@ func TestApplyLiveness_KillEventOutsideActiveWindow_Ignored(t *testing.T) {
 	}
 	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, 24*time.Hour)
 
-	if out[0].State != domain.StateDrift {
-		t.Errorf("State = %v, want unchanged StateDrift (the kill event is outside the active window)", out[0].State)
+	// Stage 1: the drift loop is now demoted to gone by the liveness pass
+	// (the drift exemption is gone — see
+	// TestApplyLiveness_StateDriftAndProcessGone_BecomesGone). What this
+	// test pins is unchanged: the stale kill event must NOT produce
+	// StateKilled.
+	if out[0].State == domain.StateKilled {
+		t.Errorf("State = %v, want anything but StateKilled (the kill event is outside the active window)", out[0].State)
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone (ordinary process-gone treatment)", out[0].State, out[0].Stall)
 	}
 }
 
@@ -1205,14 +1377,14 @@ func TestApplyLiveness_LaterResumeAfterKill_NotTreatedAsKilled(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Hour).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append kill: %v", err)
 	}
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "resume tier2 ok", Actor: events.ActorHuman,
+		Detail: "resume tier2 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append resume: %v", err)
 	}
@@ -1221,14 +1393,137 @@ func TestApplyLiveness_LaterResumeAfterKill_NotTreatedAsKilled(t *testing.T) {
 	}
 	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
 
-	if out[0].State != domain.StateDrift {
-		t.Errorf("State = %v, want unchanged StateDrift (most recent actuation was a resume, not a kill)", out[0].State)
+	// As above: post-Stage-1 the gone drift loop lands on StateStalled/
+	// StallGone. The assertion that matters here is that the STALE kill
+	// does not win over the later resume.
+	if out[0].State == domain.StateKilled {
+		t.Errorf("State = %v, want anything but StateKilled (most recent actuation was a resume, not a kill)", out[0].State)
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone (ordinary process-gone treatment)", out[0].State, out[0].Stall)
 	}
 }
 
 func TestMostRecentActuationIsKill_NoEvents_False(t *testing.T) {
 	if mostRecentActuationIsKill(t.TempDir(), "no-such-session", time.Now(), ActiveWindow) {
 		t.Error("expected false when there's no history at all")
+	}
+}
+
+// ── issue #50: a kill that FAILED is not a kill ──────────────────────────
+
+// The defect itself. logActuationEvent writes a failed kill's Detail as
+// "kill <tier> failed: <err>", which the old HasPrefix(Detail, "kill ")
+// matched — so a kill the human was told had failed still promoted the
+// loop to StateKilled once its process was later observed gone.
+func TestMostRecentActuationIsKill_FailedKill_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1h failed: no such pane", Actor: events.ActorHuman,
+		Outcome: events.OutcomeFailed,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — the user was told the kill FAILED; we must not record it as a kill")
+	}
+}
+
+// The delivery-timeout case, decided explicitly: OutcomeUnknown is neither
+// confirmed-sent nor confirmed-failed, and StateKilled is an assertion that
+// a human ended this loop — an unconfirmed send does not license it.
+func TestMostRecentActuationIsKill_UnknownDeliveryKill_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1h failed: send delivery unknown", Actor: events.ActorHuman,
+		Outcome: events.OutcomeUnknown,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — delivery UNKNOWN must not be asserted as a landed kill")
+	}
+}
+
+// Back-compat, stated as a decision rather than discovered later: a kill
+// event written before Event.Outcome existed carries "", and is treated as
+// "not confirmed" rather than as success.
+func TestMostRecentActuationIsKill_LegacyEventWithoutOutcome_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, // no Outcome — pre-#50 record
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — an event with no structured outcome is not a confirmed kill")
+	}
+}
+
+// The success case, so the filter can't be satisfied by refusing everything.
+func TestMostRecentActuationIsKill_SucceededKill_True(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if !mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected true — a confirmed-dispatched kill is a kill")
+	}
+}
+
+// A SUCCEEDED non-kill actuation must not be read as a kill either: the
+// outcome filter narrows, it does not replace, the action check.
+func TestMostRecentActuationIsKill_SucceededResume_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "resume tier2 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — a successful resume is not a kill")
+	}
+}
+
+// End to end through the pass that consumes it: a failed kill leaves the
+// gone loop reading STALLED/gone, not KILLED — and therefore still
+// killable, which is the user-visible half of #50.
+func TestApplyLiveness_FailedKillAndProcessGone_NotKilled(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "s1",
+		Trigger: events.TriggerActuation, Detail: "kill tier1h failed: no such pane",
+		Actor: events.ActorHuman, Outcome: events.OutcomeFailed,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateRunning, LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State == domain.StateKilled {
+		t.Error("State = killed, but the kill demonstrably did not land — fleetops must not assert a human ended this loop")
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone (ordinary process-gone treatment)", out[0].State, out[0].Stall)
 	}
 }
 
@@ -2023,5 +2318,51 @@ func TestEnrichFromRegistry_NameCopiedOntoLoop(t *testing.T) {
 
 	if out[0].Name != "bugfix loop" {
 		t.Errorf("Name = %q, want %q (registry display name must surface onto the loop)", out[0].Name, "bugfix loop")
+	}
+}
+
+// The two passes composed, in DiscoverLoops' own order — the design
+// (design-loop-state-model.md §2.1) warned that enrichFromRegistry
+// overwrites the scanner's inferred State one pass BEFORE applyLiveness
+// runs, and asked whether that destroys the input the drift/gone fix needs.
+// It does not: enrich clobbers the ACTIVITY (idle/running), which the fix
+// never consults — the demotion keys off the verdict-derived StateDrift
+// itself. This reproduces the reported incident end to end: a rejected
+// verdict at the current cycle, no live process, screen must read gone.
+//
+// It also pins the half the fix is careful not to lose: the rejected
+// verdict survives on Loop.Last, which is what the ORACLE column renders,
+// so "gone" is displayed WITH its drift verdict rather than instead of it.
+func TestEnrichThenLiveness_RejectedVerdictAndProcessGone_ShowsGoneKeepingVerdict(t *testing.T) {
+	loopsDir := t.TempDir()
+	if err := registry.Bind(loopsDir, "sess-1", registry.BindSpec{Goal: "ship it", MaxCycles: 99}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(loopsDir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "not done"}, 16); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+	now := time.Now()
+	historyDir := t.TempDir()
+
+	// the scanner's own inference from the transcript tail
+	loops := []domain.Loop{
+		{SessionID: "sess-1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateIdle, Cycle: 16, LastActivity: now.Add(-40 * time.Minute)},
+	}
+
+	loops = enrichFromRegistry(loops, loopsDir, historyDir)
+	if loops[0].State != domain.StateDrift {
+		t.Fatalf("after enrich: State = %v, want StateDrift (fixture no longer reproduces the incident)", loops[0].State)
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone — the incident screen must read gone, not ✗ DRIFT", out[0].State, out[0].Stall)
+	}
+	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeRejected {
+		t.Errorf("Last = %+v, want the rejected verdict preserved for the ORACLE column — gone must not erase what it was doing", out[0].Last)
 	}
 }

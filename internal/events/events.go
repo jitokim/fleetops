@@ -74,6 +74,17 @@ const (
 // event if it happens). Detail is a short, emitter-specific free-text
 // string (a stall kind, a verdict outcome + cycle, an actuation's tier and
 // outcome) — optional, "" when there's nothing more to say than from/to.
+//
+// Outcome is the STRUCTURED result of an attempted action, for emitters
+// that attempt something that can fail (today: TriggerActuation). It exists
+// because derivations were reading outcome back out of Detail's prose —
+// internal/claude's mostRecentActuationIsKill matched
+// strings.HasPrefix(Detail, "kill "), which also matches the "kill <tier>
+// failed: <err>" that logActuationEvent writes for a kill the user was told
+// FAILED (issue #50). Prose is not a place to keep structure. Consumers that
+// care whether an action LANDED must read this field and must treat "" (an
+// event written before this field existed, or by an emitter that has no
+// outcome to report) as "not confirmed" rather than as success.
 type Event struct {
 	TS        int64   `json:"ts"` // unix nanoseconds
 	SessionID string  `json:"session_id"`
@@ -82,7 +93,20 @@ type Event struct {
 	Trigger   Trigger `json:"trigger"`
 	Detail    string  `json:"detail,omitempty"`
 	Actor     Actor   `json:"actor"`
+	Outcome   string  `json:"outcome,omitempty"`
 }
+
+// Event.Outcome values. Deliberately three, not two: an actuation whose
+// delivery TIMED OUT is neither confirmed-sent nor confirmed-failed, and
+// collapsing it into either direction is the same over-claim that motivated
+// this field. See internal/control.ErrSendDeliveryUnknown and the TUI's
+// unknownDeliveryText, which already treat that case as its own thing in the
+// message shown to the human.
+const (
+	OutcomeOK      = "ok"      // the action was confirmed dispatched
+	OutcomeFailed  = "failed"  // the action demonstrably did not land
+	OutcomeUnknown = "unknown" // dispatch timed out — it may or may not have landed
+)
 
 // maxFileSize: once a session's history file would exceed this, Append
 // rotates it first (rename to ".1", start the live file fresh again) — a

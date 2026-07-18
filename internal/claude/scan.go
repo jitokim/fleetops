@@ -270,11 +270,17 @@ const drivenDormantStale = 15 * time.Minute
 //     SAME StateStalled/StallGone treatment as any other presumed-dead
 //     loop (never dropped either way, once Driven: dropping would let a
 //     truly stuck engine loop silently vanish instead of surfacing it).
-//   - StateDone / StateDrift (the oracle already rendered a verdict this
-//     cycle — see enrichFromRegistry) → left alone, dropped or demoted by
-//     neither rule: that's the terminal record of a judgment, not an
-//     incident, regardless of whether the terminal later closed.
-//   - anything else (StateStalled, or StateRunning past the live count —
+//   - any LoopState.Terminal() state — StateDone (the oracle converged
+//     it), StateFailed (the governor stopped it), StateKilled (a human
+//     ended it) → left alone, dropped or demoted by neither rule: that's
+//     the FINAL record of a judgment, not an incident, and the process
+//     exiting afterwards is the expected epilogue.
+//     StateDrift is NOT covered by this (it used to share an arm with
+//     StateDone): drift is non-final, it asks for a re-drive, and a dead
+//     process can't be re-driven in place — so it takes the
+//     reclassification below. See the guard's own comment and
+//     design-loop-state-model.md §4.
+//   - anything else (StateDrift, StateStalled, or StateRunning past the live count —
 //     e.g. a process that just died mid-turn) → kept, reclassified
 //     StateStalled/StallGone: a mid-work death IS an incident. Applies to
 //     Driven loops exactly the same as observed ones — the dormancy
@@ -342,7 +348,7 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 		// by coincidence of arithmetic. Treat it as zero evidence instead:
 		// every loop sharing this ProjectDir goes through the SAME
 		// "presumed dead" scrutiny below (kill-check, idle-drop,
-		// done/drift exemption, else Gone) that an under-backed group
+		// terminal-state exemption, else Gone) that an under-backed group
 		// already gets — never silently exempted.
 		if collidedProjectDir[pd] {
 			k = 0
@@ -356,6 +362,43 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 				loops[i].Stall = domain.StallNone
 				continue // wins over every rule below — see doc
 			}
+			// Rung 1 of the precedence ladder
+			// (design-loop-state-model.md §4): A SETTLED ENDING IS
+			// FINAL. done/failed/killed are LoopState.Terminal(), and
+			// for all three the process subsequently exiting is the
+			// EXPECTED epilogue, not new information — the oracle
+			// converged it, the governor stopped it, or a human ended
+			// it, and none of those judgments becomes less true because
+			// the OS reaped the process afterwards. So the observed
+			// death adds nothing and the ending stands.
+			//
+			// Expressed as Terminal() rather than as a list of case
+			// arms deliberately: the rule IS "final beats non-final",
+			// and a second hand-written enumeration of which states are
+			// final is exactly how the two lists drift apart.
+			//
+			// StateDrift deliberately does NOT get this treatment (it
+			// used to share an arm with StateDone — defect #1). Drift is
+			// NOT final. It means "the oracle rejected the agent's
+			// claim, re-drive this loop", which is a statement about a
+			// loop still supposed to be workable, and a dead process
+			// cannot be re-driven in place. So the second half of the
+			// rule applies — among NON-final states, observed beats
+			// inferred — and drift falls through to the demotion below.
+			//
+			// The rejected verdict itself is not lost, though it is
+			// demoted: enrichFromRegistry already copied it onto
+			// Loop.Last, and the ORACLE row and the VERDICTS block are
+			// state-independent, so both still render it. What DOES
+			// change is the callout, which dispatches on State — the
+			// drift callout headlining the oracle's reason is replaced
+			// by the gone/restart callout, so the reason moves from
+			// headline to detail. That is the intended trade: "this
+			// process is dead" is the more actionable headline, and the
+			// reason stays one glance away.
+			if loops[i].State.Terminal() {
+				continue
+			}
 			switch loops[i].State {
 			case domain.StateIdle:
 				if loops[i].Driven {
@@ -367,8 +410,6 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 					continue
 				}
 				drop[i] = true
-			case domain.StateDone, domain.StateDrift:
-				// oracle-judged and settled; leave as-is.
 			default:
 				loops[i].State = domain.StateStalled
 				loops[i].Stall = domain.StallGone
@@ -389,9 +430,44 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 }
 
 // mostRecentActuationIsKill reports whether sessionID's most recent
-// actor=human actuation event within `within` of now was a kill attempt
-// (logActuationEvent's "kill <tier> ok|failed: ..." detail format — see
-// internal/tui). Deliberately the MOST RECENT one, not "was there ever a
+// actor=human actuation event within `within` of now was a kill that was
+// CONFIRMED DISPATCHED.
+//
+// Issue #50: this used to be strings.HasPrefix(Detail, "kill ") with no
+// success filter, and logActuationEvent writes a failed kill's Detail as
+// "kill <tier> failed: <err>" — which that prefix also matches. So a kill
+// the human was explicitly told had FAILED still promoted the loop to
+// StateKilled once its process was later observed gone (for any reason),
+// after which `k` refused it as already killed. "The human pressed k" is
+// not "the kill landed."
+//
+// The fix is structural, not a longer string match: the outcome now
+// travels in Event.Outcome, and only events.OutcomeOK counts. Two
+// consequences, both deliberate:
+//
+//   - events.OutcomeUnknown (ErrSendDeliveryUnknown — the host send timed
+//     out) does NOT count. It is genuinely neither confirmed-sent nor
+//     confirmed-failed, and StateKilled is an ASSERTION that a human ended
+//     this loop; an unconfirmed send does not license it. Declining to
+//     assert costs only that the loop reads "gone" rather than "killed"
+//     once its process exits, and it keeps `k` available for the human the
+//     TUI just told to "attach and check before pressing k again" — whereas
+//     counting it would make the loop unkillable on the strength of
+//     something we did not observe.
+//   - events written before Outcome existed carry "", so they do not count
+//     either. A kill recorded by an older build stops being replayed as
+//     StateKilled; the loop shows the ordinary gone treatment instead. That
+//     is a bounded, one-time, fail-toward-not-claiming regression (the
+//     window is `within`, 24h by default) and is the correct direction for
+//     a field whose whole purpose is to stop claiming more than we know.
+//
+// Residual, named rather than hidden: WHICH ACTION the event records is
+// still read out of Detail's prefix. That is a weaker dependency (the
+// action word is chosen by logActuationEvent's callers from a fixed set and
+// is always first) and is not what let the bug through, but structuring it
+// too would be the right follow-up.
+//
+// Deliberately the MOST RECENT one, not "was there ever a
 // kill": if a kill was followed by a later successful resume/inject
 // actuation (reviving the session before this fix landed, or via a race),
 // that later actuation — not the stale kill — is what should win. events.Read
@@ -420,7 +496,10 @@ func mostRecentActuationIsKill(historyDir, sessionID string, now time.Time, with
 			lastActuation = ev
 		}
 	}
-	return lastActuation != nil && strings.HasPrefix(lastActuation.Detail, "kill ")
+	if lastActuation == nil {
+		return false
+	}
+	return lastActuation.Outcome == events.OutcomeOK && strings.HasPrefix(lastActuation.Detail, "kill ")
 }
 
 // isHiddenProjectDir reports whether an encoded project dir contains a
