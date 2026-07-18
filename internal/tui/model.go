@@ -1088,7 +1088,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ambiguity guard still applies at THIS keypress time (fail
 			// fast before the human even starts typing a hint), same as
 			// every other actuation dispatch in this file.
-			if sel.State == domain.StateDrift {
+			if driftRedriveEligible(sel) {
 				if !m.ttyPathPlausible(sel) {
 					if msg, ambiguous := m.refuseIfAmbiguous(sel); ambiguous {
 						m.status, m.statusKind = msg, statusErr
@@ -3202,6 +3202,45 @@ func injectHeadlessFallbackEligible(state domain.LoopState) bool {
 // Callers must check this immediately before dispatching resumeCmd/killCmd/
 // approveCmd/interruptCmd — NOT attachCmd/o, which are read-only/navigation
 // and safe regardless of which sibling surface they land on.
+// driftRedriveEligible reports whether "r" should open the drift-hint input
+// (composeDriftPrompt) rather than blindly resending the last prompt.
+//
+// It exists because of a regression the drift/gone precedence fix would
+// otherwise have caused. That fix stops a dead drifted loop from being
+// displayed as StateDrift — correctly, it is gone — but "r" keyed its
+// hint flow off `State == StateDrift`, so the same loop silently fell
+// through to the StallGone branch below, whose resumeCmd resends
+// claude.LastUserPrompt VERBATIM: the exact prompt the oracle just
+// rejected, on one keypress, with no input and no confirmation. That is
+// precisely what feat/drift-guided-redrive was built to stop (see
+// composeDriftPrompt's own doc), and the population it would have hit is
+// the reported incident's: drifted AND dead.
+//
+// So eligibility is re-expressed against the facts that SURVIVE the
+// demotion. The second clause reconstructs exactly the condition
+// enrichFromRegistry uses to promote a loop to StateDrift in the first
+// place (a rejected verdict rendered against the CURRENT cycle,
+// scan.go's verdict mapping) — deliberately including AtCycle == Cycle,
+// so a stale rejection the loop has since moved past does not widen the
+// hint flow beyond what it covered before.
+//
+// One knowingly-accepted edge: enrichFromRegistry also declines the
+// StateDrift promotion for a loop sitting in a live GATE, and that
+// exclusion is not reconstructible here (the gate state is destroyed by
+// the same liveness demotion). A gone loop that was gated with a fresh
+// rejection now reaches the hint flow where it previously did not. It is
+// gone, so there is no live gate left to protect, and a hint prompt is
+// the better of the two outcomes anyway.
+func driftRedriveEligible(l domain.Loop) bool {
+	if l.State == domain.StateDrift {
+		return true
+	}
+	if l.Stall != domain.StallGone || l.Last == nil {
+		return false
+	}
+	return l.Last.Outcome == domain.OutcomeRejected && l.Last.AtCycle == l.Cycle
+}
+
 func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 	n := m.sameProjectDirCount(l.ProjectDir)
 	if n <= 1 {
@@ -3233,12 +3272,24 @@ func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 //     neither remedy applies. What DOES work is the headless path: "r"/"i"
 //     re-drive via `claude --resume <exact session id> -p`, which needs no
 //     surface and no live process, and "x" retires the row.
-//   - fleetops-spawned (BoundAt non-zero ⇔ a registry.Record exists ⇔ this
-//     loop came through the "n" wizard's spawn → WritePending → BindPending
-//     path, which is the only way a Record is ever created). Installing
-//     hooks cannot fix THIS session; only a fresh session registers. Attach
-//     is genuinely available, so offer it and say what actually restores
-//     session-exact targeting.
+//
+//   - fleetops holds a CONTRACT for this loop (BoundAt non-zero ⇔ a
+//     registry.Record exists — written either by the "n" wizard's spawn →
+//     WritePending → BindPending path or directly by bootstrapEngineCmd).
+//     Installing hooks cannot fix THIS session; only a fresh session
+//     registers. Attach is genuinely available, so offer it and say what
+//     actually restores session-exact targeting.
+//
+//     Claiming only what this supports: a contract is strong evidence
+//     fleetops started the loop, not proof. BindPending matches a pending
+//     spawn to the most-recently-active unbound loop in the cwd with no
+//     session-identity check, and a shared cwd is precisely the
+//     precondition for this refusal — so a record can in principle land on
+//     a session fleetops did not start. The advice survives that: the
+//     "hooks can't retroactively register a running session" half is true
+//     of ANY already-running session, owned or not. Stage 2's Origin
+//     accessor is where this gets a name that means what it says.
+//
 //   - otherwise: an observed session with no registry entry, alive. The
 //     original advice is correct here and is kept verbatim.
 //
@@ -3255,7 +3306,7 @@ func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 // than in seven places that must remember to.
 func ambiguityRemedy(l domain.Loop) string {
 	if l.Stall == domain.StallGone {
-		return "and this one's process is already gone, so neither reaches it — r/i re-drive it headlessly, or x to remove it"
+		return "and this one's process is already gone, so neither reaches it — r/i re-drive it headlessly, or x to forget it permanently"
 	}
 	if !l.BoundAt.IsZero() {
 		return "attach (↵) to act manually; `fleetops hooks install` can't help — registration happens at session start, so only a fresh loop gets session-exact targeting"

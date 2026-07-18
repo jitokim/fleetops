@@ -387,11 +387,18 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 				// still supposed to be workable. A dead process cannot
 				// be re-driven in place, so the OS fact outranks that
 				// interpretation and drift falls through to `default`
-				// below → StateStalled/StallGone. The rejected verdict
-				// itself is not lost: enrichFromRegistry already copied
-				// it onto Loop.Last, which is what the ORACLE column
-				// renders, so the screen reads "gone" with the drift
-				// verdict still beside it.
+				// below → StateStalled/StallGone.
+				//
+				// The rejected verdict itself is not lost, though it is
+				// demoted: enrichFromRegistry already copied it onto
+				// Loop.Last, and the ORACLE row and the VERDICTS block
+				// are state-independent, so both still render it. What
+				// DOES change is the callout, which dispatches on State
+				// — the drift callout headlining the oracle's reason is
+				// replaced by the gone/restart callout, so the reason
+				// moves from headline to detail. That is the intended
+				// trade: "this process is dead" is the more actionable
+				// headline, and the reason stays one glance away.
 			default:
 				loops[i].State = domain.StateStalled
 				loops[i].Stall = domain.StallGone

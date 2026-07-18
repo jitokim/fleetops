@@ -1859,6 +1859,106 @@ func TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable(t *testing.T) {
 	}
 }
 
+// ── the drift-hint flow must survive the drift/gone demotion ─────────────
+
+// The regression guard. Before the liveness fix, a drifted+dead loop was
+// still displayed StateDrift, so "r" opened the hint input. After it, the
+// loop reads StateStalled/StallGone — and if "r" keyed only on State it
+// would fall through to the StallGone branch, whose resumeCmd resends the
+// exact prompt the oracle just rejected, verbatim, on one keypress.
+func TestDriftRedriveEligible_GoneWithFreshRejection_True(t *testing.T) {
+	l := domain.Loop{
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 16,
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 16},
+	}
+	if !driftRedriveEligible(l) {
+		t.Error("want true — the loop is gone but its fresh rejection is exactly what made it DRIFT before the demotion")
+	}
+}
+
+func TestDriftRedriveEligible_LiveDrift_True(t *testing.T) {
+	if !driftRedriveEligible(domain.Loop{State: domain.StateDrift}) {
+		t.Error("want true — the unchanged case")
+	}
+}
+
+// The stale-verdict failure case: a loop that has moved on since it was
+// judged must not widen the hint flow beyond what it covered before
+// (enrichFromRegistry only promotes to StateDrift when AtCycle == Cycle).
+func TestDriftRedriveEligible_GoneWithStaleRejection_False(t *testing.T) {
+	l := domain.Loop{
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 20,
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 16},
+	}
+	if driftRedriveEligible(l) {
+		t.Error("want false — the loop advanced past that verdict; it is due to be judged again")
+	}
+}
+
+func TestDriftRedriveEligible_GoneWithoutRejection_False(t *testing.T) {
+	l := domain.Loop{
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 5,
+		Last: &domain.Verdict{Outcome: domain.OutcomeProgress, AtCycle: 5},
+	}
+	if driftRedriveEligible(l) {
+		t.Error("want false — a progress verdict is not drift; plain gone loops keep the plain re-drive")
+	}
+}
+
+func TestDriftRedriveEligible_GoneWithNoVerdict_False(t *testing.T) {
+	l := domain.Loop{State: domain.StateStalled, Stall: domain.StallGone, Cycle: 5}
+	if driftRedriveEligible(l) {
+		t.Error("want false — an observed session that simply died was never drifted")
+	}
+}
+
+// A live, never-judged loop must not be pulled into the hint flow either.
+func TestDriftRedriveEligible_LiveIdle_False(t *testing.T) {
+	if driftRedriveEligible(domain.Loop{State: domain.StateIdle}) {
+		t.Error("want false")
+	}
+}
+
+// End to end through the key handler: "r" on a gone+drifted loop opens the
+// hint input rather than firing a blind resend.
+func TestUpdate_RKey_GoneDriftedLoop_OpensHintInputNotBlindResend(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{
+		Project: "myproject", SessionID: "sess-1", ProjectDir: "-x-myproject",
+		Cwd: "/x/myproject", CwdVerified: true,
+		State: domain.StateStalled, Stall: domain.StallGone, Cycle: 16,
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, AtCycle: 16},
+	}}
+	m.cursor = 0
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if m.mode != modeDriftHint {
+		t.Errorf("mode = %v, want modeDriftHint — the oracle's reason must not be thrown away by an unconfirmed verbatim resend", m.mode)
+	}
+	if m.driftHintTarget.SessionID != "sess-1" {
+		t.Errorf("driftHintTarget = %q, want sess-1", m.driftHintTarget.SessionID)
+	}
+}
+
+// The counterpart: a gone loop that was never drifted still takes the
+// plain Tier 2 re-drive, unchanged.
+func TestUpdate_RKey_GoneUndriftedLoop_StillPlainHeadlessRedrive(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{{
+		Project: "myproject", SessionID: "sess-1", ProjectDir: "-x-myproject",
+		Cwd: "/x/myproject", CwdVerified: true,
+		State: domain.StateStalled, Stall: domain.StallGone,
+	}}
+	m.cursor = 0
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if m.mode == modeDriftHint {
+		t.Error("mode = modeDriftHint, want the unchanged plain headless re-drive for a loop with no rejected verdict")
+	}
+}
+
 // ── issue #49 part 2: the ambiguity refusal's remedy must be applicable ──
 
 // The reported case: a fleetops-spawned loop, dead 40 minutes,
