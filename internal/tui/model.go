@@ -1440,7 +1440,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 //     resolveActuationTargetFn — skipped entirely for a StallGone loop (see
 //     below).
 //  2. Tier 2 — vendor-independent headless re-drive (redriveFn), reached
-//     when Tier 1 didn't resolve a surface, OR when l.Stall is StallGone.
+//     when Tier 1 didn't resolve a surface, when a resolved Tier 1h host
+//     send REFUSED (see the dispatch below), OR when l.Stall is StallGone.
 //     StallGone no longer refuses: the claude process behind the ON-SCREEN
 //     terminal is gone, but `claude --resume <id> -p <prompt>` restarts the
 //     SAME conversation headlessly — that IS the restart the old manual
@@ -1485,12 +1486,30 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		if l.Stall != domain.StallGone {
 			act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 			if backendAvailable && found {
-				if err := act.Resume(prompt); err != nil {
-					logActuationEvent(l, action, act.Tier(), false, err.Error())
+				err := act.Resume(prompt)
+				if err == nil {
+					logActuationEvent(l, action, act.Tier(), true, "")
+					return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
+				}
+				logActuationEvent(l, action, act.Tier(), false, err.Error())
+				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
+				// resolves optimistically — the registry says the loop lives in
+				// an iTerm2 session, and only the send itself can discover the
+				// tab was closed, moved, or now hosts a different tty. Before
+				// Tier 1h existed such a loop fell to Tier 2 and the prompt
+				// landed; reporting the failure as terminal here would be a
+				// capability REGRESSION for exactly the sessions the tier was
+				// meant to help. Safe because 1h never half-delivers
+				// (control.IsHostSendTier documents why), so the redrive below
+				// cannot double-send.
+				//
+				// Only r/i degrade: they have a Tier 2 (a headless redrive of
+				// the same session). k/p/a have none, so their call sites keep
+				// reporting a 1h failure as terminal rather than inventing a
+				// fallback that does not exist.
+				if !control.IsHostSendTier(act) {
 					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
 				}
-				logActuationEvent(l, action, act.Tier(), true, "")
-				return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
 			}
 		}
 
@@ -1506,7 +1525,9 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			// Bug 2 (Option B honesty fix, refined by
 			// feat/inject-headless-exact-fallback): this branch is a
 			// DOWNGRADE, not StallGone's normal Tier-2 path — Tier 1 either
-			// found no backend, or (most commonly, with N>1 sessions
+			// found no backend, or a resolved Tier 1h
+			// host send refused (the iTerm2 tab was closed, or its tty
+			// moved), or (most commonly, with N>1 sessions
 			// sharing a cwd on a backend with no per-session tty dispatch,
 			// e.g. cmux/orca — see docs/adr-vendor-independent-actuation.md
 			// §4 and ResolveActuationTarget's doc) couldn't disambiguate

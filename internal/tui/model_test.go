@@ -2853,6 +2853,77 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 	}
 }
 
+// TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive is the
+// capability-regression guard for the iTerm2 Tier 1h slice.
+//
+// Tier 1h resolves OPTIMISTICALLY (the registry says the loop lives in an
+// iTerm2 session) and only discovers a closed tab / moved tty at SEND time.
+// Before 1h existed, such a loop resolved nothing and the prompt landed via
+// Tier 2. Reporting the 1h failure as terminal would therefore have made "r"/
+// "i" strictly WORSE for exactly the sessions this tier was added to serve.
+//
+// Safe precisely because a 1h failure never half-delivers (see
+// control.IsHostSendTier), so the redrive cannot double-send.
+func TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive(t *testing.T) {
+	for _, sendErr := range []error{
+		control.ErrSendNoSession,    // the tab was closed
+		control.ErrSendTTYMismatch,  // the session moved / tab recycled
+		control.ErrNoSendSurface,    // refused before exec
+		errors.New("exit status 1"), // osascript itself failed
+	} {
+		t.Run(sendErr.Error(), func(t *testing.T) {
+			redriveCalled := false
+			act := &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: sendErr}
+			withFakeActuationSeams(t,
+				func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+					return act, true, true
+				},
+				func(sessionID, prompt string) error { redriveCalled = true; return nil },
+			)
+			l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
+
+			msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+			if !act.resumeCalled {
+				t.Fatal("Tier 1h was never attempted")
+			}
+			if !redriveCalled {
+				t.Fatal("a failed Tier 1h send did not fall through to Tier 2 — capability regression")
+			}
+			rm, ok := msg.(resumeResultMsg)
+			if !ok || !rm.ok {
+				t.Fatalf("got %+v, want a successful (degraded) resumeResultMsg", msg)
+			}
+		})
+	}
+}
+
+// TestSendPromptCmd_TierOneMultiplexerSendFails_IsTerminal is the other half of
+// the classification: a MULTIPLEXER send that fails must NOT be retried on
+// Tier 2. `tmux send-keys` offers no fail-closed guarantee, so a redrive after
+// it could deliver the same prompt twice.
+func TestSendPromptCmd_TierOneMultiplexerSendFails_IsTerminal(t *testing.T) {
+	redriveCalled := false
+	act := &fakeActuator{backend: "tmux", resumeErr: errors.New("send-keys: no such pane")}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return act, true, true
+		},
+		func(sessionID, prompt string) error { redriveCalled = true; return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
+
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	if redriveCalled {
+		t.Error("a failed multiplexer send fell through to Tier 2 — risks a double delivery")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || rm.ok {
+		t.Fatalf("got %+v, want a failed resumeResultMsg", msg)
+	}
+}
+
 // TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy pins Bug 2's
 // Option B honesty fix: a non-StallGone loop that downgrades from Tier 1 to
 // Tier 2 (couldn't disambiguate the on-screen session — the common case with

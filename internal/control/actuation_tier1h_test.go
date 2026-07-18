@@ -287,6 +287,12 @@ func (f *entryCapturingSendAdapter) Interrupt(entry sessions.SessionEntry) error
 // misses (or refuses on a tty mismatch) must report an ERROR. Resolution
 // happens before the host is consulted, so the honest failure has to arrive at
 // send time — it must never be swallowed into a silent success.
+//
+// Surfacing the error is NOT the same as it being terminal. What the caller
+// does next is the caller's policy and lives at the TUI dispatch site: r/i
+// degrade to Tier 2 (see IsHostSendTier, and
+// TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive), k/p/a have no
+// Tier 2 and report it. This layer's only job is to tell the truth.
 func TestTierOneH_SendFailureSurfacesAsError(t *testing.T) {
 	for name, wantErr := range map[string]error{
 		"session closed": ErrSendNoSession,

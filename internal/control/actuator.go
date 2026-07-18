@@ -48,6 +48,23 @@ const (
 	actuationTierHostSend    = "tier1h"
 )
 
+// IsHostSendTier reports whether act dispatches through Tier 1h (an in-place
+// host send) rather than through a multiplexer.
+//
+// Exported for exactly ONE caller — the TUI's actuation dispatch — because a
+// Tier 1h failure is DEGRADABLE in a way no other tier's is. Every 1h failure
+// mode refuses BEFORE delivering a keystroke: a whitelist refusal never execs
+// at all, and `miss` / `ttymismatch` / an unrecognized verdict / a non-zero
+// osascript all mean the `write` did not run (the script returns "ok" only on
+// the line after it). So a caller may fall through to another tier without
+// risking a double delivery. A multiplexer `send-keys` offers no such
+// guarantee, which is why this is keyed on the TIER and not on a list of error
+// values: an error nobody anticipated must still degrade here, and must still
+// be terminal there.
+func IsHostSendTier(act Actuator) bool {
+	return act != nil && act.Tier() == actuationTierHostSend
+}
+
 // boundController adapts a (Controller, Target) pair to Actuator by closing
 // over the target — the entire multiplexer side of the Actuator migration.
 // Every backend (orca/cmux/tmux) keeps its existing Controller methods
