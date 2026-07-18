@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -3335,6 +3336,141 @@ func TestAttachCmd_CaptainTopology_FocusesLocatedTmuxSurface(t *testing.T) {
 	}
 	if !strings.Contains(am.text, "via tmux") {
 		t.Errorf("text = %q, want it to report the tmux backend (locate-based, not orca by install order)", am.text)
+	}
+}
+
+// ── attachCmd step 1: host_app FocusAdapter (design §4) ────────────────────
+
+// fakeFocusAdapter is a control.FocusAdapter test double that records whether
+// Raise was called and with which entry, and returns a configurable error.
+type fakeFocusAdapter struct {
+	raiseCalled bool
+	raiseEntry  sessions.SessionEntry
+	raiseErr    error
+}
+
+func (f *fakeFocusAdapter) Raise(entry sessions.SessionEntry) error {
+	f.raiseCalled = true
+	f.raiseEntry = entry
+	return f.raiseErr
+}
+
+// withFakeAttachEntry makes attachCmd see a fixed SessionEntry for any session.
+func withFakeAttachEntry(t *testing.T, entry sessions.SessionEntry, err error) {
+	t.Helper()
+	orig := sessionEntryFn
+	t.Cleanup(func() { sessionEntryFn = orig })
+	sessionEntryFn = func(string) (sessions.SessionEntry, error) { return entry, err }
+}
+
+// withFakeFocusAdapter makes attachCmd's step-1 resolver return adapter for
+// hostApp (and nothing for any other host_app).
+func withFakeFocusAdapter(t *testing.T, hostApp string, adapter control.FocusAdapter) {
+	t.Helper()
+	orig := resolveFocusAdapterFn
+	t.Cleanup(func() { resolveFocusAdapterFn = orig })
+	resolveFocusAdapterFn = func(h string) (control.FocusAdapter, bool) {
+		if h == hostApp {
+			return adapter, true
+		}
+		return nil, false
+	}
+}
+
+// TestAttachCmd_ITerm2Entry_RaisesViaFocusAdapter is step (a): a loop whose
+// registry entry carries an iTerm2 host_app + a window_id is raised through the
+// FocusAdapter — step 1 wins, the multiplexer path is never consulted.
+func TestAttachCmd_ITerm2Entry_RaisesViaFocusAdapter(t *testing.T) {
+	adapter := &fakeFocusAdapter{}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	// If step 2 were reached it would panic the test by being unexpectedly hit:
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%1"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !adapter.raiseCalled {
+		t.Fatal("expected FocusAdapter.Raise to be called for an iTerm2 entry")
+	}
+	if adapter.raiseEntry.WindowID != "w0t1p0:GUID" {
+		t.Errorf("Raise got WindowID %q, want the recorded one", adapter.raiseEntry.WindowID)
+	}
+	if muxCtrl.focusCalled {
+		t.Error("step 2 (multiplexer Focus) must NOT run once step 1 raised the window")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via iTerm.app") {
+		t.Fatalf("got %+v, want a successful attach reporting the iTerm.app host", msg)
+	}
+}
+
+// TestAttachCmd_NoAdapterButMultiplexerLocatable_UsesResolveForLocate is step
+// (b): an entry with no recognized host_app (legacy/multiplexer loop) falls
+// through to today's ResolveForLocate+Focus path, unchanged.
+func TestAttachCmd_NoAdapterButMultiplexerLocatable_UsesResolveForLocate(t *testing.T) {
+	// Zero entry (no host_app) — the shape of a pre-schema-extension record.
+	withFakeAttachEntry(t, sessions.SessionEntry{}, nil)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%3"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !muxCtrl.locateCalled || !muxCtrl.focusCalled {
+		t.Error("expected the multiplexer ResolveForLocate+Focus path to run for a no-adapter loop")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux", msg)
+	}
+}
+
+// TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer confirms an adapter
+// that reports ErrNoFocusSurface (window gone) degrades to step 2 rather than
+// hard-failing.
+func TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%7"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !adapter.raiseCalled {
+		t.Error("expected Raise to be attempted")
+	}
+	if !muxCtrl.focusCalled {
+		t.Error("expected degrade to the multiplexer Focus path on ErrNoFocusSurface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux after degrade", msg)
+	}
+}
+
+// TestAttachCmd_ITerm2RaiseError_ReportsFailure confirms a genuine Raise
+// failure (not ErrNoFocusSurface) is surfaced as a failed attach, not silently
+// swallowed into step 2.
+func TestAttachCmd_ITerm2RaiseError_ReportsFailure(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: errors.New("osascript boom")}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if muxCtrl.focusCalled {
+		t.Error("a real Raise failure must NOT fall through to the multiplexer path")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok || !strings.Contains(am.text, "failed") {
+		t.Fatalf("got %+v, want a failed attach reporting the Raise error", msg)
 	}
 }
 

@@ -6,6 +6,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -81,6 +82,23 @@ var (
 	// the attach-preservation invariant a bare shell tab is a valid jump
 	// target (see TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude).
 	controlResolveForLocateFn = control.ResolveForLocate
+	// resolveFocusAdapterFn is control.ResolveFocusAdapter by default —
+	// attachCmd's STEP 1 seam (design §4). Given a loop's recorded host_app it
+	// returns the FocusAdapter that can Raise the loop's own window (iTerm2
+	// today), or (nil,false) to degrade to step 2. Overridable so attach's
+	// host_app routing is unit-testable with a fake adapter, without a real
+	// iTerm2/osascript on the machine.
+	resolveFocusAdapterFn = control.ResolveFocusAdapter
+	// sessionEntryFn reads the selected loop's identity record so attachCmd can
+	// resolve its host_app/window_id for step 1. sessions.ReadSession (against
+	// sessionsDirFn) by default; overridable so attach's FocusAdapter routing is
+	// testable without a real ~/.fleetops/sessions file. A miss (no record — a
+	// loop from before the schema extension, or a headless one) yields a zero
+	// SessionEntry: empty HostApp/WindowID, so attach degrades to step 2 exactly
+	// as it did before this seam existed.
+	sessionEntryFn = func(sessionID string) (sessions.SessionEntry, error) {
+		return sessions.ReadSession(sessionsDirFn(), sessionID)
+	}
 )
 
 type loopsMsg []domain.Loop
@@ -1547,25 +1565,52 @@ func manualResumeHint(sessionID string) string {
 	return "claude --resume " + sessionID
 }
 
-// attachCmd brings the terminal surface hosting l to the front, via
-// whichever multiplexer backend is available. Works for any loop state (not
-// just stalled) — "jump to it" is useful for a running loop too. Runs off
-// the event loop, same non-blocking pattern as resumeCmd.
+// attachCmd brings the terminal surface hosting l to the front. Works for any
+// loop state (not just stalled) — "jump to it" is useful for a running loop
+// too. Runs off the event loop, same non-blocking pattern as resumeCmd.
 //
-// feat/engine-driver (attach-preservation requirement): this is
-// the OBSERVED-loop path and it must NEVER regress across any engine
-// slice — Locate (not LocateClaude) on purpose, unchanged from before the
-// engine existed. An engine-driven loop (no terminal surface at all) is a
-// DIFFERENT path, added in a later slice as a take-over action, not a
-// change to this function. See TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude.
+// Resolution order (design §4 "Attach resolution order"), a pure superset of
+// the pre-FocusAdapter behavior:
+//
+//  1. The loop's recorded host_app has a FocusAdapter AND a window_id is
+//     present → Raise that host's own window directly (iTerm2 today). A
+//     genuine Raise failure is reported; ErrNoFocusSurface degrades to step 2.
+//  2. else ResolveForLocate(projectDir) → Focus — today's multiplexer path,
+//     UNCHANGED. This is the orca/cmux/tmux adapter family: a loop hosted in a
+//     multiplexer that didn't record a recognized host_app/window_id still
+//     attaches exactly as before.
+//  3. else the manual attach hint ("cd <cwd>").
+//
+// feat/engine-driver (attach-preservation requirement): step 2 stays Locate
+// (not the stricter LocateClaude), unchanged from before the engine existed —
+// a bare shell tab sharing the directory is a valid jump target. An
+// engine-driven loop (no terminal surface at all) is a DIFFERENT path
+// (takeOverCmd), not a change here. See
+// TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude.
 func attachCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
-		// ResolveForLocate picks whichever available backend can actually
-		// Locate the surface (not just whichever is installed first) and hands
-		// back the Target it located — so we Focus that Target directly rather
-		// than Locate a second time. ok=false collapses both "no backend
+		// Step 1 — the loop's own host window, if the registry knows it and a
+		// FocusAdapter can raise it. A missing/legacy record yields a zero entry
+		// (empty host_app) that simply falls through to step 2.
+		entry, _ := sessionEntryFn(l.SessionID)
+		if adapter, ok := resolveFocusAdapterFn(entry.HostApp); ok && entry.WindowID != "" {
+			switch err := adapter.Raise(entry); {
+			case err == nil:
+				return attachResultMsg{true, fmt.Sprintf("attached %s via %s", l.Project, entry.HostApp)}
+			case errors.Is(err, control.ErrNoFocusSurface):
+				// Nothing to raise (e.g. the window is gone) — degrade, don't
+				// fail: fall through to the multiplexer/hint path below.
+			default:
+				return attachResultMsg{false, fmt.Sprintf("attach %s failed: %v", l.Project, err)}
+			}
+		}
+
+		// Step 2 — today's multiplexer path, unchanged. ResolveForLocate picks
+		// whichever available backend can actually Locate the surface (not just
+		// whichever is installed first) and hands back the Target it located, so
+		// we Focus that Target directly. ok=false collapses both "no backend
 		// available" and "no backend could locate a surface"; the manual-hint
-		// fallback is identical for both.
+		// fallback (step 3) is identical for both.
 		ctrl, target, ok := controlResolveForLocateFn(l.ProjectDir)
 		if !ok {
 			return attachResultMsg{false, "no orca/tmux/cmux surface — attach manually: " + manualAttachHint(l.Cwd)}
