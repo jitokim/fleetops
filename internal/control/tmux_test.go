@@ -242,7 +242,7 @@ func TestTmuxInterruptCmd(t *testing.T) {
 }
 
 func TestTmuxNewWindowCmd(t *testing.T) {
-	got := tmuxNewWindowCmd("/home/user/myproject")
+	got := tmuxNewWindowCmd("/home/user/myproject", []string{"claude"})
 	// -d keeps the new window in the background so spawning a loop never yanks
 	// the cockpit's own tmux client off the cockpit and into the new session
 	// (the "creating a loop auto-jumps into attach" hijack). Unlike
@@ -262,7 +262,7 @@ func TestTmuxNewWindowCmd(t *testing.T) {
 // independently of exact arg order: Spawn's new-window MUST carry -d, and
 // OpenTerminal's must NOT (take-over intentionally focuses the session).
 func TestTmuxNewWindowCmd_IsDetached(t *testing.T) {
-	if !containsArg(tmuxNewWindowCmd("/x"), "-d") {
+	if !containsArg(tmuxNewWindowCmd("/x", []string{"claude"}), "-d") {
 		t.Error("Spawn's tmux new-window must be detached (-d) so it doesn't hijack the cockpit into the new session")
 	}
 	if containsArg(tmuxOpenTerminalCmd("/x", "claude --resume s"), "-d") {

@@ -16,6 +16,7 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/jitokim/fleetops/internal/control"
 	"github.com/jitokim/fleetops/internal/tui"
 )
 
@@ -97,6 +98,18 @@ func newModel(demo bool) tea.Model {
 }
 
 func runTUI(demo bool) {
+	if demo {
+		// --demo ignores ~/.fleetops/settings.json entirely and always spawns
+		// with the built-in ["claude"]. Demo mode's contract is "nothing real",
+		// which has to include the person's own configuration: a demo that
+		// picked up their spawn.command would behave differently on every
+		// machine and would leak their local setup into any screenshot or
+		// recording. The TUI already refuses every spawning key in demo mode
+		// (isDemoBlockedKey), so this is defence in depth — it makes the
+		// guarantee a property of the mechanism rather than of the current
+		// keymap.
+		control.UseDefaultSpawnCommand()
+	}
 	p := tea.NewProgram(newModel(demo), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fleetops:", err)

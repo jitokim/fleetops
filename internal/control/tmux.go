@@ -217,7 +217,7 @@ const spawnBootWait = 8 * time.Second
 // Spawn opens a new tmux window running claude in cwd, waits for it to boot
 // (pragmatic fixed delay, see spawnBootWait), then sends the goal + Enter.
 func (tmuxController) Spawn(cwd, goal string) error {
-	argv := tmuxNewWindowCmd(cwd)
+	argv := tmuxNewWindowCmd(cwd, spawnCommandFn())
 	out, err := exec.Command(argv[0], argv[1:]...).Output()
 	if err != nil {
 		return err
@@ -238,8 +238,21 @@ func (tmuxController) Spawn(cwd, goal string) error {
 }
 
 // tmuxNewWindowCmd builds the argv that opens a new tmux window running
-// claude in cwd, printing just the new pane's id to stdout (-P -F) so Spawn
+// spawnArgv in cwd, printing just the new pane's id to stdout (-P -F) so Spawn
 // can target it directly.
+//
+// spawnArgv is the configured spawn command (internal/settings, default
+// ["claude"]) and is appended as SEPARATE argv elements, never joined into a
+// string. tmux runs a multi-argument command directly with execvp instead of
+// handing it to a shell, so there is no word splitting or quoting layer — and
+// the pane's foreground process stays literally "claude", which is what
+// LocateClaude matches `#{pane_current_command}` against (see isClaudeComm).
+// Joining the argv into one string would have made every configured loop
+// invisible to actuation, since the pane would report a shell instead.
+//
+// tmux stops parsing its own options at the first non-option argument (the
+// command name), so the command's own flags — "--agent", "--dangerously-skip-
+// permissions" — are passed to it rather than interpreted by tmux.
 //
 // -d creates the window in the BACKGROUND (detached): tmux new-window without
 // it makes the new window the client's current window, so when the fleetops
@@ -250,8 +263,8 @@ func (tmuxController) Spawn(cwd, goal string) error {
 // below targets the captured pane id, which -P -F still reports for a detached
 // window — focus is irrelevant to it). Take-over (OpenTerminal) deliberately
 // does NOT pass -d: there the human explicitly asked to jump into the session.
-func tmuxNewWindowCmd(cwd string) []string {
-	return []string{"tmux", "new-window", "-d", "-c", cwd, "-P", "-F", "#{pane_id}", "claude"}
+func tmuxNewWindowCmd(cwd string, spawnArgv []string) []string {
+	return append([]string{"tmux", "new-window", "-d", "-c", cwd, "-P", "-F", "#{pane_id}"}, spawnArgv...)
 }
 
 // OpenTerminal implements control.TerminalOpener: opens a new tmux window in
