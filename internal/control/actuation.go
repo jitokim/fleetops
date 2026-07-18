@@ -77,6 +77,14 @@ var pidTTYFn = func(pid int) string {
 //     (e.g. a tmux pane on a machine where orca is also installed and
 //     preferred) still be found by Tier 1a instead of silently falling to
 //     Tier 1b/2.
+//   - Tier 1h — the HOST terminal writes to the session in place, keyed by the
+//     registry entry's host_app + window_id (see SendAdapter). Reuses Tier 1a's
+//     already-computed binding validation, so it costs no extra `ps`. Ordered
+//     between 1a and 1b on purpose — see the inline comment at the dispatch
+//     site for the wrong-pane safety argument. Unlike every other tier, 1h
+//     verifies its target binding a SECOND time inside the actuation itself
+//     (the host reports the session's own tty in the same round trip), which is
+//     why a resolved 1h actuator can still honestly refuse at send time.
 //   - Tier 1b — the cwd-based LocateClaude probe, now run across EVERY
 //     available backend (not just Resolve()'s single pick). Because cwd is
 //     many-to-one this CANNOT stop at the first hit: it must count matches and
@@ -107,13 +115,43 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 		return nil, false, false
 	}
 
-	// Tier 1a — session-unique tty. Validate the registry binding once, then
-	// probe every available TTYLocator backend; first hit wins (no ambiguity).
+	// Tiers 1a and 1h share ONE registry read and ONE pid↔tty binding probe:
+	// both require the same guarantee (this pid controls this tty right now),
+	// and re-probing would cost a second `ps` on every actuation keypress.
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
+		// Tier 1a — session-unique tty. Probe every available TTYLocator
+		// backend; first hit wins (no ambiguity guard needed).
 		for _, c := range avail {
 			if t, ok := tierOneA(c, entry.TTY); ok {
 				return boundController{ctrl: c, target: t}, true, true
 			}
+		}
+		// Tier 1h — the host terminal writes to the session in place, keyed by
+		// the registry's host_app + window_id.
+		//
+		// AFTER 1a, deliberately, and this is a SAFETY property rather than a
+		// preference. The dangerous case is a multiplexer running INSIDE an
+		// iTerm2 window: if the hook recorded HostApp "iTerm.app" for such a
+		// session, writing to the iTerm2 session would deliver keystrokes to
+		// whichever pane is currently active in that window. Letting 1a win
+		// first means a multiplexer that can address the precise pane always
+		// does. (The adapter's own tty guard then refuses the residual case;
+		// defense in depth is the house style here.)
+		//
+		// BEFORE 1b, deliberately. 1h is session-EXACT — the window id comes
+		// from that very session's own $ITERM_SESSION_ID — whereas 1b is
+		// cwd-based and many-to-one. A strictly more precise tier must never be
+		// shadowed by a guessing one.
+		//
+		// No ambiguity guard, for the same reason Tier 1a has none: the
+		// identifier is session-unique by construction. Ambiguity is a cwd
+		// disease.
+		//
+		// An unknown or empty host_app resolves nothing and falls straight
+		// through to 1b, which is what keeps this a pure superset for existing
+		// orca/cmux/tmux users.
+		if adapter, ok := ResolveSendAdapter(entry.HostApp); ok {
+			return boundSendAdapter{adapter: adapter, entry: entry}, true, true
 		}
 	}
 
