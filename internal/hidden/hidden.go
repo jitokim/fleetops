@@ -50,14 +50,22 @@ type hiddenFile struct {
 // malformed file yields an EMPTY set (never an error): fail-open, show every
 // loop. The returned map is always non-nil, so callers can index it directly.
 func Load(path string) map[string]bool {
+	set, _ := load(path)
+	return set
+}
+
+// load is Load plus the one bit Load throws away: whether the empty set came
+// from a file that EXISTS but could not be parsed. Reading is fail-open either
+// way, but Add must tell the two apart — see corruptedFileSuffix.
+func load(path string) (set map[string]bool, corrupt bool) {
 	out := make(map[string]bool)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return out // missing/unreadable → empty (fail-open, show every loop)
+		return out, false // missing/unreadable → empty (fail-open, show every loop)
 	}
 	var hf hiddenFile
 	if err := json.Unmarshal(data, &hf); err != nil {
-		return out // corrupt → empty (fail-open), never crash on garbage
+		return out, true // corrupt → empty (fail-open), never crash on garbage
 	}
 	for _, id := range hf.Hidden {
 		if id == "" {
@@ -65,7 +73,7 @@ func Load(path string) map[string]bool {
 		}
 		out[id] = true
 	}
-	return out
+	return out, false
 }
 
 // Add tombstones sessionID: it re-reads the current set from disk (so a
@@ -73,11 +81,21 @@ func Load(path string) map[string]bool {
 // rewrites path. Returns the resulting set so the caller can adopt it as its
 // in-memory copy, keeping memory and disk in lockstep. A no-op sessionID ("")
 // is rejected so an empty tombstone can never be written.
+// A corrupt file gets preserved alongside as <path>.bad first: fail-open on
+// READ is right (never hide a loop behind an unreadable file), but fail-open
+// then OVERWRITE is data loss — Load returns the empty set for garbage, so a
+// plain rewrite would replace every prior tombstone with just this one id.
+// Renaming keeps the bytes recoverable while still letting the hide succeed.
 func Add(path, sessionID string) (map[string]bool, error) {
 	if path == "" {
 		return nil, &os.PathError{Op: "hidden.Add", Path: path, Err: os.ErrInvalid}
 	}
-	set := Load(path)
+	set, corrupt := load(path)
+	if corrupt {
+		if err := os.Rename(path, path+corruptedFileSuffix); err != nil {
+			return nil, err // couldn't preserve it → refuse rather than destroy
+		}
+	}
 	if sessionID != "" {
 		set[sessionID] = true
 	}
@@ -86,6 +104,11 @@ func Add(path, sessionID string) (map[string]bool, error) {
 	}
 	return set, nil
 }
+
+// corruptedFileSuffix names the copy Add sets aside before it overwrites a
+// hidden.json it could not parse, so the tombstones inside a damaged file stay
+// recoverable by hand instead of being silently replaced by a single id.
+const corruptedFileSuffix = ".bad"
 
 // write persists set to path atomically: marshal to a sorted list, write a
 // sibling temp file, fsync-free rename over path (rename is atomic on the same
