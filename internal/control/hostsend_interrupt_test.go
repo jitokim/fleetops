@@ -107,11 +107,6 @@ func TestITerm2Interrupt_UntrustedIdentifiers_RefusesNoExec(t *testing.T) {
 			e.TTY = "ttys006\nactivate"
 			return e
 		}(),
-		"empty tty": func() sessions.SessionEntry {
-			e := sendEntry()
-			e.TTY = ""
-			return e
-		}(),
 	}
 	for name, entry := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -129,6 +124,28 @@ func TestITerm2Interrupt_UntrustedIdentifiers_RefusesNoExec(t *testing.T) {
 				t.Errorf("execed %v, want ZERO exec", *captured)
 			}
 		})
+	}
+}
+
+// TestITerm2Interrupt_NoRecordedTTY_RefusesWithItsOwnReason: the interrupt path
+// shares iterm2SendTarget, so it must give the absent-tty case the same
+// distinct refusal the text path does — re-asserted here because a separate
+// entry point is exactly where such a gap would hide.
+func TestITerm2Interrupt_NoRecordedTTY_RefusesWithItsOwnReason(t *testing.T) {
+	captured := withFakeITerm2Send(t, func([]string) (string, error) {
+		t.Fatal("iterm2SendFn must NEVER be called without a recorded tty")
+		return "", nil
+	})
+
+	entry := sendEntry()
+	entry.TTY = ""
+	err := iterm2SendAdapter{}.Interrupt(entry)
+
+	if !errors.Is(err, ErrSendNoRecordedTTY) {
+		t.Errorf("Interrupt = %v, want ErrSendNoRecordedTTY", err)
+	}
+	if *captured != nil {
+		t.Errorf("execed %v, want ZERO exec", *captured)
 	}
 }
 

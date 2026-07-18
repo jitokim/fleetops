@@ -74,6 +74,16 @@ var ErrSendTTYMismatch = errors.New("control: session found but its tty no longe
 // and that is worth diagnosing rather than mistaking for a closed tab.
 var ErrSendUnrecognizedVerdict = errors.New("control: the host returned an unrecognized verdict — the send did NOT happen; iTerm2/osascript may have changed")
 
+// ErrSendNoRecordedTTY reports that the registry entry has no tty at all
+// ("tty":"" — observed in the wild for sessions started without a controlling
+// terminal). Tier 1h's whole safety argument is comparing the host's reported
+// tty against a recorded one, so with nothing to compare there is nothing to
+// verify and the send is REFUSED before any exec. Its own sentinel rather than
+// a generic refusal: an absent record and a moved tab need different words, and
+// the operator's fix is different (restart the loop so the hook records a tty,
+// versus re-attach).
+var ErrSendNoRecordedTTY = errors.New("control: this loop has no recorded tty — nothing to verify the host session against; attach (↵) and act manually")
+
 // hostAppSendAdapters maps a $TERM_PROGRAM marker to its SendAdapter, mirroring
 // hostAppFocusAdapters exactly. Multiplexers deliberately do NOT appear here —
 // they are addressed by Tier 1a/1b through Controller, and adding one here
@@ -197,16 +207,27 @@ func (a iterm2SendAdapter) SendText(entry sessions.SessionEntry, text string) er
 // used — deriving separately per site is precisely how a whitelist and its
 // consumer drift apart (focus.go's Raise documents the same hazard).
 //
-// Refusal is total and happens BEFORE any exec: an empty WindowID, an empty
-// TTY, or either failing its whitelist all return ErrNoSendSurface with zero
-// subprocesses spawned. Refusing beats sanitizing — the worst case is that
-// Tier 1h declines and the loop degrades to an already-shipped tier.
+// Refusal is total and happens BEFORE any exec, with zero subprocesses
+// spawned: an empty WindowID or either value failing its whitelist returns
+// ErrNoSendSurface, and an empty TTY returns ErrSendNoRecordedTTY (a different
+// fact, see there). Refusing beats sanitizing — the worst case is that Tier 1h
+// declines and the loop degrades to an already-shipped tier.
 func iterm2SendTarget(entry sessions.SessionEntry) (guid, tty string, err error) {
 	guid = iterm2SessionGUID(entry.WindowID)
 	if !itermGUIDPattern.MatchString(guid) {
 		return "", "", ErrNoSendSurface
 	}
 	tty = normalizeTTY(entry.TTY)
+	// An EMPTY recorded tty is its own case, checked before the whitelist,
+	// because it is a different fact with a different fix. Entries with
+	// "tty":"" exist in the wild (a session with no controlling terminal at
+	// SessionStart time), and they are not a malformed/hostile value — there is
+	// simply nothing to bind against. Folded into the generic refusal it would
+	// eventually reach the operator as a tty MISMATCH, blaming a moved tab for
+	// a record that never had one, forever.
+	if tty == "" {
+		return "", "", ErrSendNoRecordedTTY
+	}
 	if !itermTTYPattern.MatchString(tty) {
 		return "", "", ErrNoSendSurface
 	}

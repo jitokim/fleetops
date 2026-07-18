@@ -204,14 +204,14 @@ func TestITerm2SendText_UntrustedWindowID_RefusesNoExec(t *testing.T) {
 // inject — but a value that is not a device name cannot address a real session
 // either, and refusing early is the house style (defense in depth).
 func TestITerm2SendText_UntrustedTTY_RefusesNoExec(t *testing.T) {
+	// An empty/"/dev/"-only tty is NOT hostile, just absent — it gets its own
+	// refusal, see TestITerm2SendText_NoRecordedTTY_RefusesWithItsOwnReason.
 	hostile := map[string]string{
-		"empty":            "",
 		"quote":            `ttys006"`,
 		"space":            "ttys006 x",
 		"newline":          "ttys006\nactivate",
 		"path traversal":   "../../dev/ttys006",
 		"slash":            "dev/ttys006",
-		"only dev prefix":  "/dev/",
 		"applescript frag": `x" & (do shell script "id") & "`,
 	}
 	for name, tty := range hostile {
@@ -230,6 +230,37 @@ func TestITerm2SendText_UntrustedTTY_RefusesNoExec(t *testing.T) {
 			}
 			if *captured != nil {
 				t.Errorf("execed %v, want ZERO exec for tty %q", *captured, tty)
+			}
+		})
+	}
+}
+
+// TestITerm2SendText_NoRecordedTTY_RefusesWithItsOwnReason: registry entries
+// with "tty":"" exist in the wild. That is an ABSENT record, not a malformed
+// one, and not a moved tab — Tier 1h has nothing to verify the host session
+// against, so it refuses before any exec and says exactly that. Reported as a
+// generic refusal it would eventually surface as a tty MISMATCH and blame a
+// moved tab for a record that never had a tty at all.
+func TestITerm2SendText_NoRecordedTTY_RefusesWithItsOwnReason(t *testing.T) {
+	for name, tty := range map[string]string{"empty": "", "only dev prefix": "/dev/"} {
+		t.Run(name, func(t *testing.T) {
+			captured := withFakeITerm2Send(t, func([]string) (string, error) {
+				t.Fatal("iterm2SendFn must NEVER be called without a recorded tty")
+				return "", nil
+			})
+
+			entry := sendEntry()
+			entry.TTY = tty
+			err := iterm2SendAdapter{}.SendText(entry, "hello")
+
+			if !errors.Is(err, ErrSendNoRecordedTTY) {
+				t.Errorf("SendText(TTY=%q) = %v, want ErrSendNoRecordedTTY", tty, err)
+			}
+			if errors.Is(err, ErrSendTTYMismatch) {
+				t.Error("an absent tty must not be reported as a MISMATCH — nothing moved")
+			}
+			if *captured != nil {
+				t.Errorf("execed %v, want ZERO exec", *captured)
 			}
 		})
 	}
