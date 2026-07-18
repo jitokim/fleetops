@@ -8091,6 +8091,25 @@ func withHiddenFile(t *testing.T) string {
 	return path
 }
 
+// withDeletableSession is the shared fixture for the "x" (delete) tests: a
+// temp hide-file, a temp sessions dir, and a registry entry for sess-1 — the
+// thing "x" must remove on a confirmed press and must NOT touch otherwise. It
+// returns that entry's path so a test can assert on its presence.
+//
+// The record goes through sessions.WriteSession rather than a hand-written
+// JSON literal so the on-disk shape and the <id>.json filename convention stay
+// owned by the package that defines them; a literal here would keep passing
+// while silently ceasing to represent a real record.
+func withDeletableSession(t *testing.T) string {
+	t.Helper()
+	withHiddenFile(t)
+	sessionsDir := withSessionsDir(t)
+	if err := sessions.WriteSession(sessionsDir, "sess-1", sessions.SessionEntry{PID: 1, TTY: "ttys001"}); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(sessionsDir, "sess-1.json")
+}
+
 // withUnwritableHiddenFile points hiddenFileFn at a path that can never be
 // written (its "directory" is actually a regular file), so hidden.Add always
 // errors — the only way to exercise hideSession's persistence-failure branch.
@@ -8288,12 +8307,7 @@ func confirmDelete(t *testing.T, m Model) Model {
 // hand-editing hidden.json, while the strictly-more-reversible "k" already
 // required two presses.
 func TestUpdate_XKey_SinglePress_DeletesNothing(t *testing.T) {
-	withHiddenFile(t)
-	sessionsDir := withSessionsDir(t)
-	regPath := filepath.Join(sessionsDir, "sess-1.json")
-	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	regPath := withDeletableSession(t)
 	m := modelWithTwoLoops()
 
 	m, _ = updateModel(t, m, runeKey('x'))
@@ -8315,12 +8329,7 @@ func TestUpdate_XKey_SinglePress_DeletesNothing(t *testing.T) {
 // TestUpdate_XKey_ConfirmExpires_DeletesNothing: a second "x" arriving after
 // the window starts a fresh confirm rather than deleting.
 func TestUpdate_XKey_ConfirmExpires_DeletesNothing(t *testing.T) {
-	withHiddenFile(t)
-	sessionsDir := withSessionsDir(t)
-	regPath := filepath.Join(sessionsDir, "sess-1.json")
-	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	regPath := withDeletableSession(t)
 	m := modelWithTwoLoops()
 
 	m, _ = updateModel(t, m, runeKey('x'))
@@ -8341,12 +8350,7 @@ func TestUpdate_XKey_ConfirmExpires_DeletesNothing(t *testing.T) {
 // TestUpdate_XKey_InterveningKeyCancelsConfirm: any other key cancels a pending
 // delete, so "x" then something else then "x" cannot delete on that second x.
 func TestUpdate_XKey_InterveningKeyCancelsConfirm(t *testing.T) {
-	withHiddenFile(t)
-	sessionsDir := withSessionsDir(t)
-	regPath := filepath.Join(sessionsDir, "sess-1.json")
-	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	regPath := withDeletableSession(t)
 	m := modelWithTwoLoops()
 
 	m, _ = updateModel(t, m, runeKey('x'))
@@ -8365,13 +8369,8 @@ func TestUpdate_XKey_InterveningKeyCancelsConfirm(t *testing.T) {
 // registry .json AND persists the hide, while the conversation jsonl is left
 // untouched.
 func TestUpdate_XKey_DeletesRegistryEntryAndHides(t *testing.T) {
-	withHiddenFile(t)
-	sessionsDir := withSessionsDir(t)
-	// A registry entry for sess-1 (what "x" must remove)...
-	regPath := filepath.Join(sessionsDir, "sess-1.json")
-	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// regPath is the registry entry for sess-1 -- what "x" must remove...
+	regPath := withDeletableSession(t)
 	// ...and a stand-in conversation jsonl "x" must NOT touch.
 	jsonlPath := filepath.Join(t.TempDir(), "sess-1.jsonl")
 	if err := os.WriteFile(jsonlPath, []byte("conversation history\n"), 0o644); err != nil {
