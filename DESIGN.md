@@ -10,6 +10,11 @@
 > design specifically (session identity, capability tiers, per-backend
 > verification notes), see
 > [`docs/adr-vendor-independent-actuation.md`](./docs/adr-vendor-independent-actuation.md).
+> For why `LoopState`'s values are really two vocabularies with different
+> producers — inferred (`running`/`idle`/`gate`/`stalled`) vs asserted
+> (`done`/`drift`/`failed`/`killed`/`paused`, structurally reachable only for a
+> contract-bound loop) — and for the staged plan that corrects §3's precedence,
+> see [`docs/adr-loop-state-model.md`](./docs/adr-loop-state-model.md).
 
 ---
 
@@ -108,8 +113,9 @@ claude             — OBSERVATION: globs ~/.claude/projects, classifies
                      governor, enriches from the registry. → domain, engine,
                      events, gate, registry.
 control            — ACTUATION: locate/resume/approve/interrupt/spawn across
-                     pluggable terminal backends (orca/cmux/tmux). → domain,
-                     sessions.
+                     pluggable terminal backends (orca/cmux/tmux), plus a
+                     host-send adapter for terminal emulators that are not
+                     multiplexers (iTerm2, Tier 1h). → domain, sessions.
 tui                — composition root: the Bubble Tea Model. Polls claude's
                      DiscoverLoops, renders the fleet, dispatches control's
                      actuations on a keypress, judges via oracle, persists
@@ -191,6 +197,19 @@ kill  >  gate  >  gone  >  verdict  >  governor  >  tail
   gone → dropped from the fleet (ended cleanly); `StateDone`/`StateDrift` +
   gone → left alone (a settled judgment, not an incident); anything else +
   gone → `StateStalled`/`StallGone` (a mid-work death IS an incident).
+
+  **Correction (2026-07-19) — `StateDrift` does not belong in that exemption,
+  and this describes today's behavior, not the intended one.** `done` is
+  terminal (`LoopState.Terminal()`); `drift` is not. `drift` means the oracle
+  rejected the claim and the loop should be re-driven — which a dead process
+  cannot be, so exempting it leaves a loop whose process exited displaying
+  `✗ DRIFT` indefinitely (observed live 2026-07-19). The governing rule is
+  **final beats non-final; among non-final, observed beats inferred** — so a
+  dead non-final loop reads `gone`, keeping the drift verdict as annotation
+  rather than as its state. `StateDone`'s exemption is unaffected. The fix is
+  stage 1 of [`docs/adr-loop-state-model.md`](./docs/adr-loop-state-model.md)
+  (§1.1, §2.2), landing separately; this bullet is corrected here in advance so
+  the spec does not keep asserting the exemption as designed behavior.
 - **verdict** — a same-cycle oracle verdict promotes `StateDone`/`StateDrift`
   (see §2 step 3). An earlier-cycle verdict is still shown (the ORACLE
   row/column) but does not override the current State.
@@ -218,16 +237,40 @@ through capability tiers, falling through automatically — see
 `docs/adr-vendor-independent-actuation.md` for the full design and live
 verification notes; summarized here:
 
-1. **Tier 1a — registry tty (tmux only).** A live tty recorded at
+1. **Tier 1a — registry tty (tmux/cmux).** A live tty recorded at
    `SessionStart` (via `fleetops hooks install`), re-validated against a
    live `ps` at actuation time — session-unique, so two loops sharing a
-   directory are never ambiguous to each other.
-2. **Tier 1b — cwd-based match (orca/cmux/tmux).** `control.Controller`'s
+   directory are never ambiguous to each other. The binding is validated
+   once, backend-independently, then **every** available backend
+   implementing `control.TTYLocator` is probed and the first hit wins (no
+   ambiguity guard needed — tty is session-unique). Today that is tmux and
+   cmux; orca's CLI exposes no per-terminal tty, so it participates in 1b
+   only.
+2. **Tier 1h — host-terminal send (iTerm2).** The host terminal writes into
+   the session in place, keyed by the registry entry's `host_app` +
+   `window_id` (`control.SendAdapter`), reusing Tier 1a's already-computed
+   pid↔tty binding. Ordered **between 1a and 1b deliberately**: after 1a so a
+   multiplexer running *inside* an iTerm2 window is still addressed by its
+   precise pane rather than by the enclosing window, and before 1b because 1h
+   is session-exact where cwd is many-to-one. It is also resolved **above the
+   "is any multiplexer available?" gate**, so an iTerm2-hosted loop gets
+   `p`/`k`/`a` on a machine with no orca/tmux/cmux installed at all — meaning
+   `backendAvailable=false` denotes "no multiplexer **and** no host send". An
+   unknown or empty `host_app` resolves nothing and falls through to 1b, which
+   keeps this tier a pure superset for existing multiplexer users. Uniquely
+   among the tiers, 1h re-verifies its target binding a second time inside the
+   actuation itself (the host reports the session's own tty in the same
+   `osascript` round trip), so a resolved 1h actuator can still honestly refuse
+   at send time.
+3. **Tier 1b — cwd-based match (orca/cmux/tmux).** `control.Controller`'s
    `Locate`/`LocateClaude` — the latter refuses (rather than guess) when
    more than one `claude` surface shares a directory, the same
    wrong-terminal hazard the TUI's own keypress-time ambiguity guard exists
-   to catch.
-3. **Tier 2 — headless re-drive (every backend, every host).**
+   to catch. Probed across every available backend, and because cwd is
+   many-to-one this tier **counts** matches rather than stopping at the
+   first: two or more distinct backends matching the same directory is
+   cross-backend ambiguity and refuses outright.
+4. **Tier 2 — headless re-drive (every backend, every host).**
    `claude --resume <id> -p "<prompt>"` continues the same session as a
    background turn — no terminal surface needed at all. This is what makes
    a loop whose terminal died resumable, and the only path available with
@@ -235,8 +278,15 @@ verification notes; summarized here:
 
 **Ports** (the pluggable seams): `control.Controller` is the actuation
 port — `Name`/`Available`/`Locate`/`LocateClaude`/typed actions/`Spawn` —
-implemented once per backend (orca, cmux, tmux), resolved in that
-preference order by `control.Resolve()`. `oracle`'s judge call is a second,
+implemented once per backend (orca, cmux, tmux). `control.Resolve()` picks
+one by install preference order, but its remit is **creation/capability**
+(spawn, terminal-open, capability checks) — not actuation: the tiers above
+probe all available backends and select by who can actually reach the
+surface, so a loop hosted in a non-preferred backend is still reachable.
+`control.SendAdapter` (Tier 1h) is a second, narrower actuation port for
+hosts that are terminal emulators rather than pty-owning multiplexers — it
+deliberately implements no `Locate`/`LocateClaude`/`Spawn` and does not join
+the backend list. `oracle`'s judge call is a third,
 narrower port (swap the model/prompt without touching the pipeline that
 calls it). Both are Go functions/interfaces today, not the full
 `Protocol`-per-concern seam set `VISION.md` §2 sketches (`Agent`/`Oracle`/

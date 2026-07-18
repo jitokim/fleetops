@@ -264,7 +264,11 @@ shells out to `git`), but know what you're installing before you opt into
 that backend.
 
 `internal/control.Resolve()` picks the first available backend in that order
-(orca → cmux → tmux).
+(orca → cmux → tmux) — but only for *creating* things (spawning a loop,
+opening a terminal). Typed actions don't use it: they probe every available
+backend and pick whoever can actually reach your session, so a loop living in
+a tmux pane is still reachable on a machine where orca happens to be
+installed and preferred.
 
 ### Capability tiers (session identity, not just backend)
 
@@ -274,12 +278,24 @@ matters less than what fleetops actually *knows* about it. Every typed
 action (resume/approve/stop/kill/inject) now resolves in tiers, falling
 through automatically:
 
-1. **Tier 1a — registry tty (tmux only).** If the session registry has a
+1. **Tier 1a — registry tty (tmux/cmux).** If the session registry has a
    live tty for the loop (written at `SessionStart`, re-validated against a
-   live `ps` at actuation time), fleetops dispatches straight to that tmux
-   pane by tty — session-unique, so two loops sharing a project directory
-   are no longer ambiguous to each other.
-2. **Tier 1b — cwd-based match (orca/cmux/tmux).** The existing
+   live `ps` at actuation time), fleetops dispatches straight to that pane by
+   tty — session-unique, so two loops sharing a project directory are no
+   longer ambiguous to each other. Every backend that can address a surface by
+   tty is probed, not just the preferred one; today that's tmux and cmux
+   (orca's CLI doesn't expose a per-terminal tty, so orca loops land in 1b).
+2. **Tier 1h — host-terminal send (iTerm2).** If the loop isn't in a
+   multiplexer but *is* hosted in a terminal fleetops can script, the host
+   writes into the session in place — for iTerm2, via its AppleScript `write`
+   over `osascript`. This is what gives `p` (interrupt), `k` (kill) and `a`
+   (approve) a path on iTerm2, where they previously had none: they're
+   Tier-1-only verbs with no headless equivalent. It needs **no multiplexer at
+   all** — a plain macOS + iTerm2 machine with no orca/tmux/cmux still gets
+   these keys. Ordered after 1a on purpose, so a tmux/orca/cmux session running
+   *inside* an iTerm2 window is still addressed by its exact pane rather than
+   by whatever pane the window happens to be showing.
+3. **Tier 1b — cwd-based match (orca/cmux/tmux).** The existing
    `Locate`/`LocateClaude` chain, unchanged — still guarded against
    ambiguity when more than one loop shares a directory. For an **idle or
    stalled** loop that guard is no longer a dead end: `i` (inject) lets you
@@ -287,8 +303,10 @@ through automatically:
    re-drive (exact session id — it cannot hit a sibling). A **running**
    (mid-turn) loop still refuses, because a concurrent headless turn against
    a live interactive session is unverified territory — attach (`↵`) and act
-   there instead.
-3. **Tier 2 — headless re-drive (every backend, every host).**
+   there instead. Because a directory can be matched by more than one backend
+   at once, this tier refuses on cross-backend ambiguity too, not just within
+   a single backend.
+4. **Tier 2 — headless re-drive (every backend, every host).**
    `claude --resume <id> -p "<prompt>"` continues the SAME session as a
    fresh background turn, appending to the SAME transcript the cockpit
    already tails. No terminal surface needed at all — this is what makes a
