@@ -90,7 +90,8 @@ look at the UI, or for screenshotting it without leaking real paths/goals.
 | `k` | kill — press twice within 3s to confirm (sends `/exit`) |
 | `n` | spawn a new loop: wizard for the goal/contract (plus an optional display name for the FLEET list), then a "where" step that shows the target directory (default: the dir fleetops was launched from) and lets you change it — `[w]` new worktree, `[d]` this dir, `[c]` type a path, `[s]` the selected loop's dir |
 | `o` | open the session log in `less` |
-| `d` | dismiss: hide the selected loop from the list until restart (doesn't touch the session) |
+| `d` | hide: tombstone the selected loop into `~/.fleetops/hidden.json` — stays hidden across restarts (doesn't touch the session or its registry entry) |
+| `x` | delete — press twice within 3s to confirm: hides the loop (same as `d`) and removes its `~/.fleetops/sessions/` registry entry (conversation history untouched) |
 | `q` | quit |
 
 ## How it works

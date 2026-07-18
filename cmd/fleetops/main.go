@@ -77,6 +77,8 @@ TUI keymap:
   k           kill (press twice within 3s to confirm)
   n           spawn a new loop (contract wizard)
   o           view the selected loop's raw log (pager)
+  d           hide the selected loop (persists across restart)
+  x           hide + remove registry entry (press twice within 3s to confirm)
   q           quit
 `
 }
