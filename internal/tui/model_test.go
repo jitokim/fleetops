@@ -4012,17 +4012,29 @@ func TestWrapTailText_CapsAtMaxLinesWithMarker(t *testing.T) {
 }
 
 func TestWrapTailText_FullWidthLastLineMarkerStaysWithinWidth(t *testing.T) {
-	// each word is exactly the width; the marker must displace a rune rather
-	// than overflow the column.
-	got := wrapTailText("aaaaa bbbbb ccccc ddddd", 5, 2)
+	// each word is exactly the width; the marker must displace enough of the
+	// text to land exactly on the column, rather than overflow it.
+	//
+	// Asserted in DISPLAY width, not rune count, and with no expected
+	// literal. "…" (U+2026) is East Asian Ambiguous, so go-runewidth — which
+	// both trunc() and lipgloss measure with — resolves it to 2 columns under
+	// an East Asian locale and 1 column otherwise, auto-detected from the
+	// environment. A rune-count assertion therefore encodes the ambiguous-
+	// width POLICY rather than wrapTailText's own logic, and flips with $LANG:
+	// this test wanted "bbbb…" (5 runes) but gets "bbb…" (4 runes, still 5
+	// columns) under ko_KR.UTF-8. See issue #44 — pinning that policy
+	// deliberately is tracked separately; the invariant below is the one
+	// wrapTailText actually owns, and it holds under either resolution.
+	const width = 5
+	got := wrapTailText("aaaaa bbbbb ccccc ddddd", width, 2)
 	if len(got) != 2 {
 		t.Fatalf("got %d lines %q, want 2", len(got), got)
 	}
-	if got[1] != "bbbb…" {
-		t.Errorf("last line = %q, want %q (last rune dropped for the marker)", got[1], "bbbb…")
+	if !strings.HasSuffix(got[1], "…") {
+		t.Errorf("last shown line %q lacks the truncation marker", got[1])
 	}
-	if n := len([]rune(got[1])); n != 5 {
-		t.Errorf("last line = %d runes, want exactly width 5 (no overflow)", n)
+	if w := runewidth.StringWidth(got[1]); w != width {
+		t.Errorf("last line %q = %d columns, want exactly width %d (marker displaces, never overflows)", got[1], w, width)
 	}
 }
 
