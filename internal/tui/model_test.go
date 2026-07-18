@@ -4015,16 +4015,13 @@ func TestWrapTailText_FullWidthLastLineMarkerStaysWithinWidth(t *testing.T) {
 	// each word is exactly the width; the marker must displace enough of the
 	// text to land exactly on the column, rather than overflow it.
 	//
-	// Asserted in DISPLAY width, not rune count, and with no expected
-	// literal. "…" (U+2026) is East Asian Ambiguous, so go-runewidth — which
-	// both trunc() and lipgloss measure with — resolves it to 2 columns under
-	// an East Asian locale and 1 column otherwise, auto-detected from the
-	// environment. A rune-count assertion therefore encodes the ambiguous-
-	// width POLICY rather than wrapTailText's own logic, and flips with $LANG:
-	// this test wanted "bbbb…" (5 runes) but gets "bbb…" (4 runes, still 5
-	// columns) under ko_KR.UTF-8. See issue #44 — pinning that policy
-	// deliberately is tracked separately; the invariant below is the one
-	// wrapTailText actually owns, and it holds under either resolution.
+	// Asserted in DISPLAY width, not rune count, and measured with the SAME
+	// condition trunc() truncates with (narrowAmbiguous, #44). "…" is East
+	// Asian Ambiguous: a rune-count assertion would encode the ambiguous-width
+	// policy rather than wrapTailText's own logic, and measuring with
+	// go-runewidth's locale-inheriting DefaultCondition would report 6 columns
+	// for a line trunc deliberately cut to 5 under ko/ja/zh. The invariant
+	// below is the one wrapTailText actually owns.
 	const width = 5
 	got := wrapTailText("aaaaa bbbbb ccccc ddddd", width, 2)
 	if len(got) != 2 {
@@ -4033,7 +4030,7 @@ func TestWrapTailText_FullWidthLastLineMarkerStaysWithinWidth(t *testing.T) {
 	if !strings.HasSuffix(got[1], "…") {
 		t.Errorf("last shown line %q lacks the truncation marker", got[1])
 	}
-	if w := runewidth.StringWidth(got[1]); w != width {
+	if w := narrowAmbiguous.StringWidth(got[1]); w != width {
 		t.Errorf("last line %q = %d columns, want exactly width %d (marker displaces, never overflows)", got[1], w, width)
 	}
 }
@@ -5916,6 +5913,38 @@ func TestTrunc_CJKDisplayWidth(t *testing.T) {
 	mixed := trunc("fix字字mix字字字123456", 12)
 	if w := runewidth.StringWidth(mixed); w > 12 {
 		t.Errorf("mixed trunc width = %d, want <= 12 (%q)", w, mixed)
+	}
+}
+
+// Regression (#44): trunc must not inherit the process locale. go-runewidth's
+// DefaultCondition auto-detects it and widens East Asian Ambiguous glyphs
+// ("…", "●", "◆", box-drawing) to 2 columns under ko/ja/zh, while lipgloss and
+// iTerm2 both draw them as 1 — so an inherited condition made trunc reserve a
+// column nothing else used, cutting text one column early for exactly the
+// users whose transcripts most need the room. trunc pins its own condition
+// (narrowAmbiguous); this asserts that pin holds by moving the global out from
+// under it, which is what a ko_KR.UTF-8 machine does at init.
+func TestTrunc_IgnoresAmbientLocaleCondition(t *testing.T) {
+	const width = 5
+	// each input is exactly `width` columns once truncated, and contains an
+	// Ambiguous glyph either in the text or via trunc's own "…" marker.
+	inputs := []string{"aaaaa bbbbb", "●●●●●●●●", "abcdefgh"}
+
+	saved := runewidth.DefaultCondition.EastAsianWidth
+	t.Cleanup(func() { runewidth.DefaultCondition.EastAsianWidth = saved })
+
+	runewidth.DefaultCondition.EastAsianWidth = false
+	narrow := make([]string, len(inputs))
+	for i, in := range inputs {
+		narrow[i] = trunc(in, width)
+	}
+
+	runewidth.DefaultCondition.EastAsianWidth = true // simulate a ko/ja/zh locale
+	for i, in := range inputs {
+		if got := trunc(in, width); got != narrow[i] {
+			t.Errorf("trunc(%q, %d) = %q under an East Asian ambient locale, want %q (identical) — the pin leaked",
+				in, width, got, narrow[i])
+		}
 	}
 }
 
