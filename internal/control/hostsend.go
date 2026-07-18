@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -119,7 +120,32 @@ var iterm2SendFn = func(argv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), actuationTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).Output()
-	return string(out), err
+	return string(out), withCommandStderr(err)
+}
+
+// withCommandStderr folds a failed command's stderr into its error.
+//
+// exec.ExitError stringifies to bare "exit status 1" while carrying the only
+// text that says WHY in an ignored field. On this path that text is the whole
+// diagnosis: a denied Automation grant reports
+// "Not authorized to send Apple events to iTerm2. (-1743)" on stderr, and
+// dropping it left the operator with "exit status 1" and no way to learn they
+// need to re-grant in System Settings → Privacy → Automation. (.Output()
+// populates Stderr precisely so this is possible; design §5.3's honest-failure
+// claim depends on it.)
+//
+// Non-ExitError failures (LookPath, a context deadline) already carry their own
+// text and pass through untouched.
+func withCommandStderr(err error) error {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return err
+	}
+	stderr := strings.TrimSpace(string(exitErr.Stderr))
+	if stderr == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, stderr)
 }
 
 // The verdicts the osascript returns on stdout. osascript exits 0 whether it

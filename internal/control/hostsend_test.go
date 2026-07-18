@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -486,5 +487,40 @@ func TestBoundSendAdapter_PropagatesErrorAndReportsTier(t *testing.T) {
 	}
 	if act.Tier() != actuationTierHostSend {
 		t.Errorf("Tier() = %q, want %q", act.Tier(), actuationTierHostSend)
+	}
+}
+
+// TestWithCommandStderr_IncludesStderr: design §5.3 claims a denied Automation
+// grant reaches the operator as an honest diagnosis. That is only true if the
+// -1743 text — which osascript writes to STDERR, and which .Output() stashes in
+// an ignored field — makes it into the error. Bare "exit status 1" tells the
+// operator nothing and hides the one action that fixes it.
+func TestWithCommandStderr_IncludesStderr(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "echo 'Not authorized to send Apple events to iTerm2. (-1743)' >&2; exit 1")
+	_, execErr := cmd.Output()
+	if execErr == nil {
+		t.Fatal("expected the probe command to fail")
+	}
+
+	err := withCommandStderr(execErr)
+
+	if !strings.Contains(err.Error(), "-1743") {
+		t.Errorf("error = %q, want it to carry the stderr diagnosis", err)
+	}
+	if !errors.Is(err, execErr) {
+		t.Error("the original exec error must stay unwrappable")
+	}
+}
+
+// TestWithCommandStderr_PassesThroughNonExitErrors: a nil error, or a failure
+// that already carries its own text (LookPath, a context deadline), must be
+// returned untouched rather than dressed up.
+func TestWithCommandStderr_PassesThroughNonExitErrors(t *testing.T) {
+	if got := withCommandStderr(nil); got != nil {
+		t.Errorf("withCommandStderr(nil) = %v, want nil", got)
+	}
+	plain := errors.New("exec: \"osascript\": executable file not found in $PATH")
+	if got := withCommandStderr(plain); got != plain {
+		t.Errorf("withCommandStderr(%v) = %v, want it unchanged", plain, got)
 	}
 }
