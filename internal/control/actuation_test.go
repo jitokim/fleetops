@@ -87,6 +87,15 @@ func TestResolveActuationTarget_PIDBindingConfirmed_TriesTierOneA(t *testing.T) 
 		t.Fatalf("WriteSession: %v", err)
 	}
 
+	// Inject one available backend: ResolveActuationTarget's anyBackendAvailable()
+	// gate now short-circuits (backendAvailable=false) BEFORE the pid↔tty binding
+	// probe when nothing could act on the result, so a hermetic test must supply a
+	// backend rather than rely on whichever real multiplexer happens to be
+	// installed. orca has no TTYLocator and matches no claude surface, so the call
+	// still falls through to the cwd chain — but the binding probe must have been
+	// consulted with the right pid first.
+	withBackends(t, &fakeResolveCtl{t: t, name: "orca", available: true})
+
 	origPidTTY := pidTTYFn
 	defer func() { pidTTYFn = origPidTTY }()
 	var gotPID int
@@ -96,9 +105,6 @@ func TestResolveActuationTarget_PIDBindingConfirmed_TriesTierOneA(t *testing.T) 
 		return "ttys012" // matches the registry entry — binding confirmed
 	}
 
-	// No real tmux pane exists at this tty in the test environment, so this
-	// still falls through to the cwd chain — but the binding probe must
-	// have been consulted with the right pid first.
 	ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
 
 	if !called {
@@ -118,6 +124,11 @@ func TestResolveActuationTarget_TTYNormalizedBeforeComparison(t *testing.T) {
 	if err := sessions.WriteSession(dir, "sess-1", sessions.SessionEntry{PID: 42, TTY: "/dev/ttys012"}); err != nil {
 		t.Fatalf("WriteSession: %v", err)
 	}
+
+	// An available backend must exist for the binding probe to be reached at all
+	// (the anyBackendAvailable() gate now precedes it) — inject one rather than
+	// depend on an installed multiplexer.
+	withBackends(t, &fakeResolveCtl{t: t, name: "orca", available: true})
 
 	origPidTTY := pidTTYFn
 	defer func() { pidTTYFn = origPidTTY }()
