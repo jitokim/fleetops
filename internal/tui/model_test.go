@@ -1668,8 +1668,8 @@ func TestKillCmd_AlreadyKilled_ReturnsFriendlyMessage(t *testing.T) {
 
 func TestKillCmd_SuccessMessage_DoesNotClaimImmediateStateChange(t *testing.T) {
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return &fakeController{name: "tmux"}, control.Target{Backend: "tmux", ID: "%1"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "tmux"}, true, true
 		},
 		nil,
 	)
@@ -1686,8 +1686,8 @@ func TestKillCmd_SuccessMessage_DoesNotClaimImmediateStateChange(t *testing.T) {
 
 func TestKillCmd_Success_RecordsKillActuationEvent(t *testing.T) {
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return &fakeController{name: "tmux"}, control.Target{Backend: "tmux", ID: "%1"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "tmux"}, true, true
 		},
 		nil,
 	)
@@ -2174,10 +2174,10 @@ func TestComposeDriftPrompt_HintIsTrimmed(t *testing.T) {
 
 func TestDriftRedriveCmd_ComposesHintIntoSentPrompt(t *testing.T) {
 	var gotPrompt string
-	fakeCtrl := &fakeController{name: "tmux"}
+	fakeCtrl := &fakeActuator{backend: "tmux"}
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return fakeCtrl, true, true
 		},
 		nil,
 	)
@@ -2198,10 +2198,10 @@ func TestDriftRedriveCmd_ComposesHintIntoSentPrompt(t *testing.T) {
 }
 
 func TestDriftRedriveCmd_EmptyHint_SendsPromptUnchanged(t *testing.T) {
-	fakeCtrl := &fakeController{name: "tmux"}
+	fakeCtrl := &fakeActuator{backend: "tmux"}
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return fakeCtrl, true, true
 		},
 		nil,
 	)
@@ -2419,9 +2419,9 @@ func TestUpdate_IKey_StalledAmbiguous_FullRoundTrip_RoutesToExactSessionIDHeadle
 	var tier1Called bool
 	var redriveSessionID, redrivePrompt string
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			tier1Called = true
-			return nil, control.Target{}, true, false // backend resolves but can't disambiguate — the orca/cwd-chain outcome
+			return nil, true, false // backend resolves but can't disambiguate — the orca/cwd-chain outcome
 		},
 		func(sessionID, prompt string) error {
 			redriveSessionID, redrivePrompt = sessionID, prompt
@@ -2473,11 +2473,11 @@ func TestUpdate_IKey_StalledAmbiguous_FullRoundTrip_RoutesToExactSessionIDHeadle
 // disambiguate, never as a shortcut around a resolvable target.
 func TestUpdate_IKey_ResolvableInPlace_FullRoundTrip_UsesTierOneNotHeadless(t *testing.T) {
 	m := modelWithOneLoop() // single loop — not ambiguous, so the eligibility gate is never even consulted
-	ctrl := &fakeController{name: "orca"}
+	ctrl := &fakeActuator{backend: "orca"}
 	var redriveCalled bool
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return ctrl, control.Target{Backend: "orca", ID: "term_1"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return ctrl, true, true
 		},
 		func(sessionID, prompt string) error { redriveCalled = true; return nil },
 	)
@@ -2523,8 +2523,8 @@ func TestUpdate_InjectSubmit_TargetWentRunningWhileTyping_Refuses(t *testing.T) 
 	m := modelWithTwoLoopsSharingDir() // cursor 0 = sess-1, StateStalled (eligible at keypress)
 	var redriveCalled bool
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false
 		},
 		func(sessionID, prompt string) error {
 			redriveCalled = true
@@ -2567,8 +2567,8 @@ func TestUpdate_InjectSubmit_TargetWentRunningWhileTyping_Refuses(t *testing.T) 
 func TestUpdate_InjectSubmit_AmbiguousEligible_InterimStatusSaysHeadless(t *testing.T) {
 	m := modelWithTwoLoopsSharingDir()
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false
 		},
 		func(sessionID, prompt string) error { return nil },
 	)
@@ -2610,8 +2610,8 @@ func TestUpdate_IKey_OrcaThreeSessionsOneWorktree_IdleSelected_RoutesHeadlessly(
 	m := modelWithThreeOrcaLoopsSharingWorktree() // cursor 0 = orca-sess-1, StateIdle
 	var redriveSessionID string
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false // orca resolves as a backend, but the 3-way cwd match can't disambiguate (LocateClaude's own >1 refusal)
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false // orca resolves as a backend, but the 3-way cwd match can't disambiguate (LocateClaude's own >1 refusal)
 		},
 		func(sessionID, prompt string) error { redriveSessionID = sessionID; return nil },
 	)
@@ -2749,7 +2749,7 @@ func TestSendPromptCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
 // test that reaches a real tier dispatch (success or failure) now also
 // triggers logActuationEvent's events.Append call, which must never touch
 // the real ~/.fleetops/history during `go test`.
-func withFakeActuationSeams(t *testing.T, resolve func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool), redrive func(sessionID, prompt string) error) {
+func withFakeActuationSeams(t *testing.T, resolve func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool), redrive func(sessionID, prompt string) error) {
 	t.Helper()
 	origResolve, origRedrive, origHistoryDir := resolveActuationTargetFn, redriveFn, historyDirFn
 	t.Cleanup(func() { resolveActuationTargetFn, redriveFn, historyDirFn = origResolve, origRedrive, origHistoryDir })
@@ -2767,9 +2767,9 @@ func TestSendPromptCmd_StallGone_SkipsTierOne_GoesStraightToTierTwo(t *testing.T
 	tier1Called := false
 	var gotSessionID, gotPrompt string
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			tier1Called = true
-			return nil, control.Target{}, true, true // would succeed if tried — must NOT be tried
+			return nil, true, true // would succeed if tried — must NOT be tried
 		},
 		func(sessionID, prompt string) error {
 			gotSessionID, gotPrompt = sessionID, prompt
@@ -2800,10 +2800,10 @@ func TestSendPromptCmd_StallGone_SkipsTierOne_GoesStraightToTierTwo(t *testing.T
 
 func TestSendPromptCmd_TierOneFound_UsesTierOneNotRedrive(t *testing.T) {
 	redriveCalled := false
-	fakeCtrl := &fakeController{name: "tmux"}
+	fakeCtrl := &fakeActuator{backend: "tmux"}
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return fakeCtrl, true, true
 		},
 		func(sessionID, prompt string) error {
 			redriveCalled = true
@@ -2832,8 +2832,8 @@ func TestSendPromptCmd_TierOneFound_UsesTierOneNotRedrive(t *testing.T) {
 func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 	redriveCalled := false
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false // backend resolved, but no surface located
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false // backend resolved, but no surface located
 		},
 		func(sessionID, prompt string) error {
 			redriveCalled = true
@@ -2853,6 +2853,121 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 	}
 }
 
+// TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive is the
+// capability-regression guard for the iTerm2 Tier 1h slice.
+//
+// Tier 1h resolves OPTIMISTICALLY (the registry says the loop lives in an
+// iTerm2 session) and only discovers a closed tab / moved tty at SEND time.
+// Before 1h existed, such a loop resolved nothing and the prompt landed via
+// Tier 2. Reporting the 1h failure as terminal would therefore have made "r"/
+// "i" strictly WORSE for exactly the sessions this tier was added to serve.
+//
+// Safe precisely because a 1h failure never half-delivers (see
+// control.IsHostSendTier), so the redrive cannot double-send.
+func TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive(t *testing.T) {
+	for _, sendErr := range []error{
+		control.ErrSendNoSession,    // the tab was closed
+		control.ErrSendTTYMismatch,  // the session moved / tab recycled
+		control.ErrNoSendSurface,    // refused before exec
+		errors.New("exit status 1"), // osascript itself failed
+	} {
+		t.Run(sendErr.Error(), func(t *testing.T) {
+			redriveCalled := false
+			act := &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: sendErr}
+			withFakeActuationSeams(t,
+				func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+					return act, true, true
+				},
+				func(sessionID, prompt string) error { redriveCalled = true; return nil },
+			)
+			l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
+
+			msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+			if !act.resumeCalled {
+				t.Fatal("Tier 1h was never attempted")
+			}
+			if !redriveCalled {
+				t.Fatal("a failed Tier 1h send did not fall through to Tier 2 — capability regression")
+			}
+			rm, ok := msg.(resumeResultMsg)
+			if !ok || !rm.ok {
+				t.Fatalf("got %+v, want a successful (degraded) resumeResultMsg", msg)
+			}
+		})
+	}
+}
+
+// TestSendPromptCmd_TierOneHTimeout_DoesNotRedrive is the double-delivery
+// guard, and the one carve-out in the Tier 1h degrade.
+//
+// Every other 1h failure happens before osascript can write, so a redrive
+// provably cannot duplicate anything. A DEADLINE kill is different in kind: the
+// script was running and we stopped it, so the write may already have landed.
+// Re-driving would then deliver the same prompt twice — a duplicate injection
+// or re-send, with a transcript that reads as if the human pressed the key
+// twice.
+//
+// The repo's rule is that fleetops never claims more than it knows, so this
+// must resolve to neither "sent" nor a plain failure that quietly triggers a
+// retry: the operator is told the outcome is UNKNOWN and decides.
+func TestSendPromptCmd_TierOneHTimeout_DoesNotRedrive(t *testing.T) {
+	redriveCalled := false
+	timedOut := fmt.Errorf("%w (signal: killed)", control.ErrSendDeliveryUnknown)
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: timedOut}, true, true
+		},
+		func(sessionID, prompt string) error { redriveCalled = true; return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
+
+	msg := sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	if redriveCalled {
+		t.Fatal("a timed-out Tier 1h send fell through to Tier 2 — risks delivering the same prompt twice")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok {
+		t.Fatalf("got %T, want resumeResultMsg", msg)
+	}
+	if rm.ok {
+		t.Error("a timeout must not be reported as a success — nothing confirmed the write landed")
+	}
+	if !strings.Contains(rm.text, "UNKNOWN") {
+		t.Errorf("text = %q, want it to say the delivery outcome is unknown", rm.text)
+	}
+	if !strings.Contains(rm.text, "Attach") {
+		t.Errorf("text = %q, want it to tell the operator to go look before retrying", rm.text)
+	}
+}
+
+// TestSendPromptCmd_TierOneMultiplexerSendFails_IsTerminal is the other half of
+// the classification: a MULTIPLEXER send that fails must NOT be retried on
+// Tier 2. `tmux send-keys` offers no fail-closed guarantee, so a redrive after
+// it could deliver the same prompt twice.
+func TestSendPromptCmd_TierOneMultiplexerSendFails_IsTerminal(t *testing.T) {
+	redriveCalled := false
+	act := &fakeActuator{backend: "tmux", resumeErr: errors.New("send-keys: no such pane")}
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return act, true, true
+		},
+		func(sessionID, prompt string) error { redriveCalled = true; return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
+
+	msg := sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	if redriveCalled {
+		t.Error("a failed multiplexer send fell through to Tier 2 — risks a double delivery")
+	}
+	rm, ok := msg.(resumeResultMsg)
+	if !ok || rm.ok {
+		t.Fatalf("got %+v, want a failed resumeResultMsg", msg)
+	}
+}
+
 // TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy pins Bug 2's
 // Option B honesty fix: a non-StallGone loop that downgrades from Tier 1 to
 // Tier 2 (couldn't disambiguate the on-screen session — the common case with
@@ -2862,8 +2977,8 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 // terminal window that may not visibly update.
 func TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy(t *testing.T) {
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false // backend resolved, but no surface located
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false // backend resolved, but no surface located
 		},
 		func(sessionID, prompt string) error { return nil },
 	)
@@ -2901,9 +3016,9 @@ func TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy(t *testing.T
 // unambiguously" wording (which would be misleading here).
 func TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText(t *testing.T) {
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			t.Fatal("resolveActuationTargetFn must not be called for a StallGone loop")
-			return nil, control.Target{}, false, false
+			return nil, false, false
 		},
 		func(sessionID, prompt string) error { return nil },
 	)
@@ -2925,8 +3040,8 @@ func TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText(t *testing.T)
 
 func TestSendPromptCmd_TierTwoRedriveFails_ReportsError(t *testing.T) {
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, false, false
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, false, false
 		},
 		func(sessionID, prompt string) error {
 			return errTestJudgeFailed
@@ -2968,10 +3083,10 @@ func TestSendPromptCmd_TTYPlausibleButBindingFails_FallsToTierTwoNotMisrouted(t 
 	// at a Tier 1 target.
 	redriveCalled := false
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			// simulates: tty binding failed, AND the cwd chain's LocateClaude
 			// refused internally because >1 loop matched that directory.
-			return nil, control.Target{}, true, false
+			return nil, true, false
 		},
 		func(sessionID, prompt string) error {
 			redriveCalled = true
@@ -2998,8 +3113,8 @@ func TestApproveCmd_TierOneFailsAmbiguously_RefusesWithoutMisrouting(t *testing.
 	// approve/interrupt/kill have no Tier 2 — when Tier 1 fails to find an
 	// unambiguous surface, they must refuse outright, never guess.
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false // ambiguous cwd match, refused internally by LocateClaude
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false // ambiguous cwd match, refused internally by LocateClaude
 		},
 		nil,
 	)
@@ -3019,6 +3134,121 @@ func TestApproveCmd_TierOneFailsAmbiguously_RefusesWithoutMisrouting(t *testing.
 	}
 }
 
+// TestKPA_TierOneHTimeout_LeadsWithUncertaintyNotFailure covers the three verbs
+// that have NO Tier 2. r/i can degrade to a headless redrive on an unknown
+// delivery; k/p/a cannot, so they have to say the honest thing themselves.
+//
+// "kill X failed: <err>" was the bug: the prefix asserts a definite outcome
+// while the error body says the outcome is unknown, and an operator scanning
+// the status line reads the prefix. For `k` that reads as "press it again" —
+// which reintroduces by hand exactly the double-send control.ErrSendDeliveryUnknown
+// exists to prevent, just moved from automatic to manual.
+func TestKPA_TierOneHTimeout_LeadsWithUncertaintyNotFailure(t *testing.T) {
+	timedOut := fmt.Errorf("%w (signal: killed)", control.ErrSendDeliveryUnknown)
+
+	cases := map[string]struct {
+		loop    domain.Loop
+		run     func(domain.Loop) tea.Msg
+		text    func(tea.Msg) (string, bool)
+		warnKey string
+		// dispatched reports whether act actually recorded the call this
+		// verb is supposed to make, so a regression that never reaches the
+		// adapter (but still happens to render matching text) is caught —
+		// see the gap this case closes below.
+		dispatched func(act *fakeActuator) bool
+	}{
+		"approve": {
+			loop:       domain.Loop{SessionID: "sess-1", Project: "myproject", GateTS: 123},
+			run:        func(l domain.Loop) tea.Msg { return approveCmd(l)() },
+			text:       func(m tea.Msg) (string, bool) { r, ok := m.(approveResultMsg); return r.text, ok && r.ok },
+			warnKey:    "pressing a again",
+			dispatched: func(act *fakeActuator) bool { return act.approveCalled },
+		},
+		"kill": {
+			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject"},
+			run:     func(l domain.Loop) tea.Msg { return killCmd(l)() },
+			text:    func(m tea.Msg) (string, bool) { r, ok := m.(killResultMsg); return r.text, ok && r.ok },
+			warnKey: "pressing k again",
+			// kill rides Resume with the literal "/exit" (see hostsend_test.go's
+			// TestBoundSendAdapter_VerbMapping) — it is not a distinct method.
+			dispatched: func(act *fakeActuator) bool { return act.resumeCalled && act.lastResumePrompt == "/exit" },
+		},
+		"interrupt": {
+			loop:       domain.Loop{SessionID: "sess-1", Project: "myproject"},
+			run:        func(l domain.Loop) tea.Msg { return interruptCmd(l)() },
+			text:       func(m tea.Msg) (string, bool) { r, ok := m.(interruptResultMsg); return r.text, ok && r.ok },
+			warnKey:    "pressing p again",
+			dispatched: func(act *fakeActuator) bool { return act.interruptCalled },
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			act := &fakeActuator{
+				backend:      "iterm2",
+				tier:         "tier1h",
+				resumeErr:    timedOut,
+				approveErr:   timedOut,
+				interruptErr: timedOut,
+			}
+			withFakeActuationSeams(t,
+				func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+					return act, true, true
+				},
+				nil,
+			)
+
+			text, okFlag := tc.text(tc.run(tc.loop))
+
+			if okFlag {
+				t.Error("an unknown delivery must not be reported as a success")
+			}
+			if !strings.Contains(text, "delivery UNKNOWN") {
+				t.Errorf("text = %q, want it to LEAD with the uncertainty", text)
+			}
+			if strings.Contains(text, "failed") {
+				t.Errorf("text = %q, must not assert a definite failure it cannot know", text)
+			}
+			if !strings.Contains(text, tc.warnKey) {
+				t.Errorf("text = %q, want it to warn against %q", text, tc.warnKey)
+			}
+			// The decisive assertion this case closes: the uncertainty text
+			// above is derived from the error a fake RETURNS, so a dispatch
+			// bug that never calls the adapter method at all — while some
+			// other path still produces matching text — would pass every
+			// assertion above it. Only checking the recorded call catches
+			// that class of regression.
+			if !tc.dispatched(act) {
+				t.Errorf("%s never reached the adapter — the verb must actually dispatch to the send adapter, not just render matching text", name)
+			}
+		})
+	}
+}
+
+// TestKPA_OrdinaryTierOneFailure_StillSaysFailed: the carve-out is for unknown
+// delivery ONLY. Every other failure provably delivered nothing, and softening
+// those into hedged language would be the opposite overclaim — under-reporting
+// a definite failure the operator needs to act on.
+func TestKPA_OrdinaryTierOneFailure_StillSaysFailed(t *testing.T) {
+	boom := control.ErrSendTTYMismatch
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: boom, approveErr: boom, interruptErr: boom}, true, true
+		},
+		nil,
+	)
+
+	km, ok := killCmd(domain.Loop{SessionID: "sess-1", Project: "myproject"})().(killResultMsg)
+	if !ok || km.ok {
+		t.Fatalf("got %+v, want a failed killResultMsg", km)
+	}
+	if !strings.Contains(km.text, "failed") {
+		t.Errorf("text = %q, want a definite failure for a definite refusal", km.text)
+	}
+	if strings.Contains(km.text, "UNKNOWN") {
+		t.Errorf("text = %q, must not hedge a failure we actually know about", km.text)
+	}
+}
+
 func TestUpdate_AKey_TTYPlausibleSkipsGuard_ButAsyncResultStillRefusesOnAmbiguity(t *testing.T) {
 	// full round trip through the tui: two loops share a directory, so
 	// refuseIfAmbiguous WOULD normally refuse at keypress time — but the
@@ -3034,8 +3264,8 @@ func TestUpdate_AKey_TTYPlausibleSkipsGuard_ButAsyncResultStillRefusesOnAmbiguit
 		t.Fatalf("WriteSession: %v", err)
 	}
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, true, false
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, true, false
 		},
 		nil,
 	)
@@ -3065,8 +3295,8 @@ func TestUpdate_AKey_TTYPlausibleSkipsGuard_ButAsyncResultStillRefusesOnAmbiguit
 func TestUpdate_RKey_SecondPressWhileActuating_RefusesWithoutSecondRedrive(t *testing.T) {
 	redriveCalls := 0
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return nil, control.Target{}, false, false // Tier 1 never resolves — every dispatch would reach Tier 2
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return nil, false, false // Tier 1 never resolves — every dispatch would reach Tier 2
 		},
 		func(sessionID, prompt string) error {
 			redriveCalls++
@@ -3199,6 +3429,48 @@ func TestUpdate_RKey_AfterActuatingCleared_CanDispatchAgain(t *testing.T) {
 // configurable via locateTarget/locateOK/focusErr — every OTHER existing
 // test leaves these at their zero values (false/empty/nil), which
 // reproduces the exact same stub behavior these methods always had.
+// fakeActuator stands in for a resolved control.Actuator — what
+// resolveActuationTargetFn hands back once resolution has bound a target. It
+// replaces fakeController in the ACTUATION tests specifically: Actuator's
+// methods are target-free (the binding happened during resolution), so a type
+// cannot implement both Resume(Target, string) and Resume(string). fakeController
+// stays for the ATTACH tests, which genuinely still exercise Locate/Focus on a
+// control.Controller.
+//
+// tier defaults to control's "tier1" label so the many existing multiplexer
+// tests keep asserting that tier without restating it. Tests that exercise the
+// iTerm2 Tier 1h dispatch set it to "tier1h" — the label is what
+// logActuationEvent records, and telling an in-place host write apart from a
+// multiplexer send after the fact is the entire reason Actuator.Tier() exists.
+type fakeActuator struct {
+	backend string
+	tier    string
+
+	resumeCalled     bool
+	resumeErr        error
+	lastResumePrompt string // captures what Resume was actually sent, for asserting hint composition
+
+	approveCalled   bool
+	approveErr      error
+	interruptCalled bool
+	interruptErr    error
+}
+
+func (f *fakeActuator) Backend() string { return f.backend }
+func (f *fakeActuator) Tier() string {
+	if f.tier == "" {
+		return "tier1"
+	}
+	return f.tier
+}
+func (f *fakeActuator) Resume(prompt string) error {
+	f.resumeCalled = true
+	f.lastResumePrompt = prompt
+	return f.resumeErr
+}
+func (f *fakeActuator) Approve() error   { f.approveCalled = true; return f.approveErr }
+func (f *fakeActuator) Interrupt() error { f.interruptCalled = true; return f.interruptErr }
+
 type fakeController struct {
 	name             string
 	resumeCalled     bool
@@ -6335,10 +6607,10 @@ func TestJudgeCmd_RecordsOracleHistoryEvent(t *testing.T) {
 }
 
 func TestSendPromptCmd_TierOneSuccess_RecordsActuationEvent(t *testing.T) {
-	fakeCtrl := &fakeController{name: "tmux"}
+	fakeCtrl := &fakeActuator{backend: "tmux"}
 	withFakeActuationSeams(t,
-		func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
-			return fakeCtrl, control.Target{Backend: "tmux", ID: "%3"}, true, true
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return fakeCtrl, true, true
 		},
 		nil,
 	)
@@ -6360,6 +6632,67 @@ func TestSendPromptCmd_TierOneSuccess_RecordsActuationEvent(t *testing.T) {
 	}
 	if !strings.Contains(ev.Detail, "resume") || !strings.Contains(ev.Detail, "tier1") || !strings.Contains(ev.Detail, "ok") {
 		t.Errorf("Detail = %q, want it to mention the action, tier, and outcome", ev.Detail)
+	}
+}
+
+// TestSendPromptCmd_TierOneHSuccess_RecordsTierOneHLabel is the reason
+// Actuator.Tier() exists at all. The actuation event log is the ONLY post-hoc
+// way to tell an in-place iTerm2 write from a multiplexer send when debugging a
+// misrouted keystroke; if 1h logged "tier1" the two mechanisms would be
+// indistinguishable in the record and the field would be decoration.
+func TestSendPromptCmd_TierOneHSuccess_RecordsTierOneHLabel(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateStalled}
+
+	sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	if !strings.Contains(evs[0].Detail, "tier1h") {
+		t.Errorf("Detail = %q, want the tier1h label", evs[0].Detail)
+	}
+}
+
+// TestSendPromptCmd_TierOneHFailureThenTierTwo_RecordsBoth: the degraded path
+// must leave BOTH facts in the log — the 1h attempt and why it failed, then the
+// Tier 2 redrive that actually delivered. Logging only the outcome would erase
+// the evidence that the host send is misbehaving, which is exactly the signal
+// design §5.3 names as the SLI to watch after rollout.
+func TestSendPromptCmd_TierOneHFailureThenTierTwo_RecordsBoth(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: control.ErrSendTTYMismatch}, true, true
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateStalled}
+
+	sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 2 {
+		t.Fatalf("got %d events, want 2 (the tier1h failure AND the tier2 success): %#v", len(evs), evs)
+	}
+	if !strings.Contains(evs[0].Detail, "tier1h") || !strings.Contains(evs[0].Detail, "failed") {
+		t.Errorf("first event Detail = %q, want the tier1h failure", evs[0].Detail)
+	}
+	if !strings.Contains(evs[1].Detail, "tier2") || !strings.Contains(evs[1].Detail, "ok") {
+		t.Errorf("second event Detail = %q, want the tier2 success", evs[1].Detail)
 	}
 }
 
@@ -7597,9 +7930,9 @@ func TestKillCmd_DrivenLoop_ClearsDrivenInsteadOfTierOneExit(t *testing.T) {
 	registryDirFn = func() string { return registryDir }
 	historyDirFn = func() string { return historyDir }
 	resolveCalled := false
-	resolveActuationTargetFn = func(sessionsDir, sessionID, projectDir string) (control.Controller, control.Target, bool, bool) {
+	resolveActuationTargetFn = func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 		resolveCalled = true
-		return nil, control.Target{}, false, false
+		return nil, false, false
 	}
 	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
 		t.Fatalf("Bind: %v", err)

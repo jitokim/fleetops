@@ -6,13 +6,28 @@ import (
 	"github.com/jitokim/fleetops/internal/sessions"
 )
 
+// boundOf unwraps a resolved Actuator back to the (Controller, Target) pair it
+// closed over, so these tests can keep asserting WHICH backend and WHICH
+// surface resolution picked — the binding moved behind Actuator, but what the
+// resolver decides is unchanged and still worth pinning. Fails the test if the
+// actuator isn't a multiplexer binding (a Tier 1h host send would be, and is
+// asserted on separately).
+func boundOf(t *testing.T, act Actuator) boundController {
+	t.Helper()
+	b, ok := act.(boundController)
+	if !ok {
+		t.Fatalf("actuator = %T, want boundController", act)
+	}
+	return b
+}
+
 func TestResolveActuationTarget_NoRegistryEntry_FallsThroughToCwdChain(t *testing.T) {
 	// no sessions dir / no entry at all — must fall to Tier 1b (Resolve +
 	// LocateClaude). Whether a real backend happens to be installed on the
 	// machine running this test varies (this dev box has one), so only
 	// found=false is deterministic here: no real claude surface lives at
 	// this bogus projectDir either way.
-	_, _, _, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-nonexistent-project-dir")
+	_, _, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-nonexistent-project-dir")
 	if found {
 		t.Error("expected found=false — no real claude surface at this projectDir")
 	}
@@ -49,7 +64,7 @@ func TestResolveActuationTarget_EntryPresentTTYSetButPIDDead_SkipsTierOneA(t *te
 	defer func() { pidTTYFn = origPidTTY }()
 	pidTTYFn = func(pid int) string { return "" } // simulate a dead pid (no controlling tty at all) — never trust a stale registry record
 
-	_, _, _, found := ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
+	_, _, found := ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
 	if found {
 		t.Error("expected found=false — a dead pid must skip the tty path, and no real surface matches the bogus cwd fallback either")
 	}
@@ -75,7 +90,7 @@ func TestResolveActuationTarget_PIDAliveButTTYMismatch_SkipsTierOneA(t *testing.
 	// controls a DIFFERENT tty than the one the registry recorded.
 	pidTTYFn = func(pid int) string { return "ttys099" }
 
-	_, _, _, found := ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
+	_, _, found := ResolveActuationTarget(dir, "sess-1", "-x-nonexistent-project-dir")
 	if found {
 		t.Error("expected found=false — the pid is alive but bound to a different tty, must not take Tier 1a")
 	}
@@ -148,7 +163,7 @@ func TestResolveActuationTarget_TTYNormalizedBeforeComparison(t *testing.T) {
 func TestResolveActuationTarget_InvalidSessionID_TreatedAsNoEntry(t *testing.T) {
 	// sessions.ReadSession errors on a malformed/invalid session id — must
 	// degrade to the cwd chain, not panic or propagate the error.
-	_, _, _, found := ResolveActuationTarget(t.TempDir(), "../escape", "-x-nonexistent-project-dir")
+	_, _, found := ResolveActuationTarget(t.TempDir(), "../escape", "-x-nonexistent-project-dir")
 	if found {
 		t.Error("expected found=false")
 	}
@@ -342,7 +357,7 @@ func TestResolveActuationTarget_TierOneB_ExactlyOneBackendLocatesClaude(t *testi
 	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateClaudeOK: true}
 	withBackends(t, orca, tmux)
 
-	ctrl, target, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+	act, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
 
 	if !found {
 		t.Fatal("expected found=true — exactly one backend (tmux) LocatesClaude")
@@ -350,10 +365,13 @@ func TestResolveActuationTarget_TierOneB_ExactlyOneBackendLocatesClaude(t *testi
 	if !backendAvailable {
 		t.Error("expected backendAvailable=true")
 	}
-	if ctrl.Name() != "tmux" {
-		t.Errorf("resolved %q, want tmux", ctrl.Name())
+	if act.Backend() != "tmux" {
+		t.Errorf("resolved %q, want tmux", act.Backend())
 	}
-	if target.Backend != "tmux" {
+	if act.Tier() != actuationTierMultiplexer {
+		t.Errorf("tier = %q, want %q — a multiplexer send is Tier 1", act.Tier(), actuationTierMultiplexer)
+	}
+	if target := boundOf(t, act).target; target.Backend != "tmux" {
 		t.Errorf("target.Backend = %q, want tmux", target.Backend)
 	}
 }
@@ -365,7 +383,7 @@ func TestResolveActuationTarget_TierOneB_CrossBackendAmbiguity_Refuses(t *testin
 	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true, locateClaudeOK: true}
 	withBackends(t, orca, tmux)
 
-	ctrl, _, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+	act, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
 
 	if found {
 		t.Error("expected found=false — two distinct backends match the same cwd (ambiguous)")
@@ -373,8 +391,8 @@ func TestResolveActuationTarget_TierOneB_CrossBackendAmbiguity_Refuses(t *testin
 	if !backendAvailable {
 		t.Error("expected backendAvailable=true — backends ARE available, they just disagree")
 	}
-	if ctrl != nil {
-		t.Error("expected ctrl=nil on ambiguity refusal — nothing must be actuated")
+	if act != nil {
+		t.Error("expected actuator=nil on ambiguity refusal — nothing must be actuated")
 	}
 }
 
@@ -383,7 +401,7 @@ func TestResolveActuationTarget_AllAvailableNoneLocate_NotFoundButBackendAvailab
 	tmux := &fakeResolveCtl{t: t, name: "tmux", available: true}
 	withBackends(t, orca, tmux)
 
-	_, _, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+	_, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
 
 	if found {
 		t.Error("expected found=false")
@@ -398,7 +416,7 @@ func TestResolveActuationTarget_NoBackendAvailable_BackendUnavailable(t *testing
 	tmux := &fakeResolveCtl{t: t, name: "tmux", available: false}
 	withBackends(t, orca, tmux)
 
-	_, _, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
+	_, backendAvailable, found := ResolveActuationTarget(t.TempDir(), "sess-1", "-x-proj")
 
 	if found {
 		t.Error("expected found=false")
@@ -425,7 +443,7 @@ func TestResolveActuationTarget_TierOneA_MultiBackend_ResolvesViaTmuxTTY(t *test
 	tmux := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "tmux", available: true}, locateByTTYOK: true}
 	withBackends(t, orca, cmux, tmux)
 
-	ctrl, target, backendAvailable, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
+	act, backendAvailable, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
 
 	if !found {
 		t.Fatal("expected found=true — tmux's LocateByTTY hits")
@@ -433,10 +451,10 @@ func TestResolveActuationTarget_TierOneA_MultiBackend_ResolvesViaTmuxTTY(t *test
 	if !backendAvailable {
 		t.Error("expected backendAvailable=true")
 	}
-	if ctrl.Name() != "tmux" {
-		t.Errorf("resolved %q, want tmux", ctrl.Name())
+	if act.Backend() != "tmux" {
+		t.Errorf("resolved %q, want tmux", act.Backend())
 	}
-	if target.ID != "tmux:tty" {
+	if target := boundOf(t, act).target; target.ID != "tmux:tty" {
 		t.Errorf("target.ID = %q, want tmux:tty (resolved via Tier 1a LocateByTTY)", target.ID)
 	}
 }
@@ -456,15 +474,15 @@ func TestResolveActuationTarget_BindingInvalid_SkipsTierOneA_FallsToTierOneB(t *
 	orca := &fakeResolveTTYCtl{fakeResolveCtl: &fakeResolveCtl{t: t, name: "orca", available: true, locateClaudeOK: true}, locateByTTYOK: true}
 	withBackends(t, orca)
 
-	ctrl, target, _, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
+	act, _, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
 
 	if !found {
 		t.Fatal("expected found=true via Tier 1b")
 	}
-	if ctrl.Name() != "orca" {
-		t.Errorf("resolved %q, want orca", ctrl.Name())
+	if act.Backend() != "orca" {
+		t.Errorf("resolved %q, want orca", act.Backend())
 	}
-	if target.ID != "orca:claude" {
+	if target := boundOf(t, act).target; target.ID != "orca:claude" {
 		t.Errorf("target.ID = %q, want orca:claude — Tier 1a must have been skipped (binding invalid)", target.ID)
 	}
 }

@@ -172,9 +172,37 @@ session from the registry entry rather than one global `Resolve()`:
   their own headless-bootstrap ownership — folds naturally into VISION.md's
   LoopEngine rather than needing separate design work now.
 
-Rejected: AppleScript/Accessibility-API keystroke simulation (requires a
-focused window + an Accessibility grant, fragile, and wrong shape for
-background fleet actuation across many terminals at once).
+**Rejected: Accessibility-API keystroke simulation** (`System Events`'
+`keystroke`/`key code`, or the equivalent CGEvent posting). It synthesizes
+*system-wide* key events, so it requires an Accessibility grant
+(`kTCCServiceAccessibility`) **and** delivers to whatever window currently
+holds key focus — meaning the target must be frontmost. Fragile, and the wrong
+shape for background fleet actuation across many terminals at once.
+
+**Clarified (amendment, 2026-07-18) — this rejection is about *keystroke
+simulation*, not about AppleScript as a transport.** An earlier revision wrote
+"AppleScript/Accessibility-API keystroke simulation," which can be misread as
+rejecting AppleScript generically. It does not, and in fact never did in
+practice: `internal/control/focus.go`'s shipped iTerm2 attach path already
+drives AppleScript via `osascript`, and the ADR was simply never updated to say
+so. The material distinction is:
+
+|  | Accessibility keystroke simulation (**rejected**) | App-level scripting command (**permitted, curated**) |
+|---|---|---|
+| example | `tell application "System Events" to keystroke "x"` | `tell application "iTerm2" … write <session> text …` |
+| TCC grant | Accessibility (system-wide input synthesis) | Automation, per target app |
+| needs focus? | **yes** — goes to the focused window | **no** — takes an explicit session specifier |
+| targeting | implicit (whatever has focus) | explicit, session-unique, and **verifiable** (iTerm2's `session` exposes a read-only `tty`) |
+| fit for background fleet actuation | wrong shape | correct shape |
+
+Verified live 2026-07-18: enumerating iTerm2 sessions and reading their
+`id`/`tty` over `osascript` raised no Accessibility prompt and did not bring
+iTerm2 to the front. Delivery to a background, non-frontmost window was
+separately measured and passed (see §4's iTerm2 ledger entry).
+
+An app-level scripting command therefore does not fall under this rejection. It
+remains subject to the same curated-list discipline as every other backend:
+added when a real user asks, never on spec.
 
 ## 3. Migration (phased, non-breaking)
 
@@ -247,6 +275,89 @@ among available backends). The Tier 1b fan-out cost is intentional: it is
 what makes the cross-backend ambiguity refusal possible, so it must not be
 "optimized" back to a single first-hit probe.
 
+**iTerm2 Tier 1h (amendment, 2026-07-18).**
+
+*Confirmed live — mechanism:* iTerm2's shipped `.sdef` declares `write` taking
+a **session specifier** with `text`/`newline`/`contents of file` parameters;
+`class session` exposes read-only `id` (guid) and **`tty`**; read-only
+enumeration of sessions over `osascript` works, exits 0, returns
+`<GUID> tty=/dev/ttysNNN`, requires only the already-granted Automation
+permission, and does **not** raise the app; `osascript` argv preserves
+arbitrary bytes including quotes, backslashes, unicode, embedded newlines and
+raw control characters (`\x1b`, `\x03`) byte-identical.
+
+*Measured live 2026-07-18* (throwaway iTerm2 window; no Claude session driven,
+so zero API cost). Method and full evidence: `.notes/design-iterm2-tier1.md`
+§8b. Six experiments run, six PASS:
+
+| id | question | verdict |
+|---|---|---|
+| **E1** | does `write` reach a **background, non-frontmost** window? | ✅ PASS — `frontmost` read `false` before and after; text landed; iTerm2 never came forward |
+| **E2** | does `newline yes` emit CR or LF? | ✅ PASS — **CR (`0x0d`)**, the same byte a physical Enter sends |
+| **E4** | does a raw ESC survive `write` to the pty? | ✅ PASS — `od` read `033`; the `p`/interrupt verb is viable |
+| **E6** (mechanism half only) | does an EMPTY payload still emit CR? | ✅ PASS — `write … text "" newline yes` → `\r`; a bare submit is a real Enter, not a no-op |
+| **E8** | does `tty of session` need normalization beyond stripping `/dev/`? | ✅ PASS — iTerm2 reports `/dev/ttysNNN`, the registry stores the bare `ttysNNN`; `"/dev/" + entry.TTY` is the correct join |
+| **E11** | does `osascript` consume the `--` end-of-options marker? | ✅ PASS — marker consumed, `item N of argv` indices do not shift, and a payload beginning with `-e` arrives as **data** rather than being eaten as a flag |
+
+*Measurement trap, recorded so it is not re-fallen-into:* the first E2 reading
+was `\n` and would have been reported as "LF, may not submit" — **wrong.** That
+was an artifact of the tty line discipline (`icrnl` rewrites incoming CR to NL
+before the shell sees it), so a canonical-mode capture cannot distinguish the
+two. **Any re-verification of E2/E4/E6 must use `stty raw`**; a `cat -v` or
+plain `od` check silently reports the post-translation byte.
+
+*NOT run — do not read this ledger as more verification than was done:*
+
+- **E6's TUI half** — that Claude Code's **gate** prompt accepts a bare CR as
+  "accept the default." Only the byte was measured. This is the one
+  verb-correctness gap left, and **`a` must not be described as verified.**
+  The residual risk is no longer iTerm2-specific, though: the multiplexer
+  backends submit gates the same way, so `a` now rests on the same assumption
+  every other backend already rests on.
+- **E3** multi-line payload — one paste or N submits (affects `i` quality, not
+  correctness).
+- **E5** `write` to a session hosting a tmux client — the empirical
+  justification for the tty-mismatch guard and the 1a-before-1h ordering. Both
+  are implemented and unit-tested; what is unverified is the *hazard*, not the
+  defense.
+- **E7** `osascript`'s exit behavior under a **denied** Automation grant. The
+  code now folds `exec.ExitError.Stderr` into the error specifically so the
+  -1743 text reaches the operator, but the expectation that osascript exits
+  non-zero and writes that text to stderr is still **inferred from Apple's
+  documentation, not observed.**
+- **E9** Apple Event payload size limits. **E10** concurrency/interleaving of
+  two rapid `write`s.
+
+*Recorded risk — deprecated vendor surface:* iTerm2 documents its AppleScript
+support as **Deprecated** in favor of the Python API. `write` is present and
+functional in shipped 3.x and removal would break a large installed base of
+user scripts, so near-term removal is judged unlikely — but this is a
+deprecated vendor surface, the same species of dependency §1 blames for both
+cmux P0s. It is accepted knowingly, and it is bounded to one adapter behind one
+interface.
+
+*What "bounded" actually means, stated per verb rather than as a blanket* (an
+earlier draft of this amendment claimed "if `write` disappears, iTerm2 users
+degrade to today's Tier 2/0 — a return to the status quo," which was **false as
+written**):
+
+- **`r`/`i` — genuinely degrade.** A failed host send falls through to Tier 2's
+  headless redrive, so the prompt still lands. This is a real runtime fallback,
+  not a hope. (It was *not* true when this amendment was first drafted: the
+  dispatch returned the 1h failure as terminal and never reached Tier 2. That
+  was a capability regression and has since been fixed.) The **one** exception
+  is a `write` that times out: delivery is then unknown, so it is deliberately
+  NOT retried, and the operator is told the outcome is unknown rather than
+  sold a success or a silent duplicate.
+- **`k`/`p`/`a` — do NOT degrade. There is no Tier 2 for them.** If `write`
+  disappears these become dead keys on iTerm2, falling back only to Tier 0's
+  manual hint ("attach and do it yourself"). Relative to the pre-amendment
+  world that is the status quo ante — those verbs had no iTerm2 path at all —
+  but it is **not** a graceful runtime degrade, and a fleet that has come to
+  rely on them would experience it as a capability loss. That asymmetry is the
+  honest shape of this dependency and is exactly why the tier is scoped to one
+  adapter.
+
 ## 5. Alternatives considered and rejected
 
 - **Add a 4th (IntelliJ) vendor integration.** Rejected: IntelliJ's terminal
@@ -277,6 +388,58 @@ what makes the cross-backend ambiguity refusal possible, so it must not be
   actual user demand rather than building speculatively (simplicity-first).
   Alacritty/Ghostty/Windows Terminal/Terminal.app either have no comparable
   API or only ad-hoc AppleScript-level text injection, not worth chasing.
+
+  **Partially triggered (amendment, 2026-07-18) — iTerm2 only.** The demand
+  gate fired: fleetops's primary user moved to iTerm2, where `p` (interrupt),
+  `k` (kill), and `a` (approve) have **no actuation path at all** — all three
+  are Tier-1-only with no headless Tier-2 equivalent, and no multiplexer can
+  reach an iTerm2 session. See `.notes/design-iterm2-tier1.md`.
+
+  **kitty, WezTerm, Ghostty, Alacritty, Windows Terminal and Terminal.app
+  remain deferred/rejected exactly as before.** This is one host, not the
+  opening of a plugin framework — the short-curated-list principle in this
+  ADR's preamble is unchanged and is the reason the iTerm2 work is scoped as a
+  single adapter rather than a generalized emulator abstraction.
+
+  **Mechanism, revised from the entry above:** iTerm2's **AppleScript `write`
+  command over `osascript`**, *not* its Python API. The Python API would
+  require the user to enable it in preferences, plus a Python 3 runtime and the
+  `iterm2` package, plus either shipping a Python script alongside a static Go
+  binary or reimplementing iTerm2's websocket/protobuf protocol in Go. The
+  AppleScript path needs none of that: `osascript` ships with macOS, and
+  `focus.go`'s attach already established both the dependency and the TCC
+  Automation grant. See §2.2's amended rejection note for why this is not the
+  rejected keystroke-simulation approach.
+
+  **Shape:** a new **Tier 1h** — a `host_app`-keyed `SendAdapter`, sibling to
+  the existing `FocusAdapter`, dispatched from the session registry. iTerm2
+  does **not** become a `Controller` and does **not** join the `backends`
+  slice: it is a terminal emulator, not a pty-owning multiplexer, and it has no
+  `Locate`/`LocateClaude`/`Spawn` worth implementing (rebuilding cwd-based
+  surface enumeration for it would recreate exactly the discovery layer §2.1
+  deletes). Ordering is **1a → 1h → 1b**: multiplexers keep first say, so a
+  tmux/orca/cmux session running *inside* an iTerm2 window is still addressed
+  by its precise pane rather than by the enclosing iTerm2 session.
+
+  **Tier 1h requires no multiplexer.** It is resolved *before* the
+  "is any backend available?" gate, so a machine with no orca/tmux/cmux
+  installed still gets `p`/`k`/`a` on an iTerm2-hosted loop — which is the
+  configuration this tier exists to serve, and an earlier implementation
+  revision wrongly excluded. The gate's `backendAvailable=false` (and its
+  "no orca/tmux/cmux" operator message) now means "no multiplexer **and** no
+  host send," never merely the former.
+
+  **Safety carried over unchanged:** the session GUID stays whitelist-gated
+  (`itermGUIDPattern`) with no exec on failure; the recorded pid↔tty binding is
+  re-validated against live `ps` exactly as Tier 1a requires (§3 step 2); and
+  — new, with no multiplexer analogue — the GUID→tty binding is **verified
+  inside the same `osascript` round trip** using iTerm2's read-only `session
+  tty` property, refusing on mismatch. Arbitrary prompt text is passed
+  **exclusively as `osascript` argv**, never interpolated into script source
+  (verified: quotes, backslashes, `$(…)`, newlines, unicode and raw control
+  bytes round-trip byte-identical). This is a hard requirement, not a
+  preference — a prior review found a Critical AppleScript-injection defect on
+  this exact surface.
 
 ## 6. Prior art
 

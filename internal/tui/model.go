@@ -42,7 +42,8 @@ import (
 //
 // resolveActuationTargetFn/redriveFn/sessionsDirFn are
 // control.ResolveActuationTarget/control.Redrive/sessions.SessionsDir by
-// default — the ADR Phase 2 tier policy (tty → cwd → headless redrive) —
+// default — the ADR Phase 2 tier policy (tty → host send → cwd → headless
+// redrive) —
 // overridable so sendPromptCmd/approveCmd/interruptCmd/killCmd's tier state
 // machine (and ttyPathPlausible's keypress-time check) can be verified
 // without exec or touching the real ~/.fleetops/sessions.
@@ -1436,11 +1437,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // exec calls belong in a tea.Cmd, never in Update.
 //
 // Tier policy (docs/adr-vendor-independent-actuation.md §2.2/§3 step 2):
-//  1. Tier 1 — tty (session-unique) then cwd (ambiguity-guarded) chain, via
-//     resolveActuationTargetFn — skipped entirely for a StallGone loop (see
-//     below).
+//  1. Tier 1 — tty (session-unique) → host send (1h, session-exact) → cwd
+//     (ambiguity-guarded) chain, via resolveActuationTargetFn — skipped
+//     entirely for a StallGone loop (see below).
 //  2. Tier 2 — vendor-independent headless re-drive (redriveFn), reached
-//     when Tier 1 didn't resolve a surface, OR when l.Stall is StallGone.
+//     when Tier 1 didn't resolve a surface, when a resolved Tier 1h host
+//     send REFUSED (see the dispatch below — EXCEPT on a timeout, whose
+//     delivery is unknown and so must not be retried), OR when l.Stall is
+//     StallGone.
 //     StallGone no longer refuses: the claude process behind the ON-SCREEN
 //     terminal is gone, but `claude --resume <id> -p <prompt>` restarts the
 //     SAME conversation headlessly — that IS the restart the old manual
@@ -1483,14 +1487,45 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		}
 
 		if l.Stall != domain.StallGone {
-			ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+			act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 			if backendAvailable && found {
-				if err := ctrl.Resume(target, prompt); err != nil {
-					logActuationEvent(l, action, "tier1", false, err.Error())
+				err := act.Resume(prompt)
+				if err == nil {
+					logActuationEvent(l, action, act.Tier(), true, "")
+					return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
+				}
+				logActuationEvent(l, action, act.Tier(), false, err.Error())
+				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
+				// resolves optimistically — the registry says the loop lives in
+				// an iTerm2 session, and only the send itself can discover the
+				// tab was closed, moved, or now hosts a different tty. Before
+				// Tier 1h existed such a loop fell to Tier 2 and the prompt
+				// landed; reporting the failure as terminal here would be a
+				// capability REGRESSION for exactly the sessions the tier was
+				// meant to help. Safe because 1h does not half-deliver on any
+				// failure that reaches the fall-through below
+				// (control.IsHostSendTier documents why), so the redrive cannot
+				// double-send. The one failure that CAN have delivered is
+				// carved out immediately after.
+				//
+				// Only r/i degrade: they have a Tier 2 (a headless redrive of
+				// the same session). k/p/a have none, so their call sites keep
+				// reporting a 1h failure as terminal rather than inventing a
+				// fallback that does not exist.
+				if !control.IsHostSendTier(act) {
 					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
 				}
-				logActuationEvent(l, action, "tier1", true, "")
-				return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, ctrl.Name(), note)}
+				// ...with ONE exception: a deadline kill (see
+				// control.ErrSendDeliveryUnknown) is the single 1h failure that
+				// may have already delivered, because it interrupted a script
+				// that was running rather than one that never started. Falling
+				// through would risk re-sending the same prompt into a session
+				// that already got it. Stop here and say the honest thing —
+				// the outcome is UNKNOWN, so the human, not the runtime, makes
+				// the call about retrying.
+				if errors.Is(err, control.ErrSendDeliveryUnknown) {
+					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("%s %s: delivery UNKNOWN — the host send timed out and may or may not have landed. Attach (↵) and check before retrying; NOT re-driven, to avoid sending it twice", action, l.Project)}
+				}
 			}
 		}
 
@@ -1506,7 +1541,9 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			// Bug 2 (Option B honesty fix, refined by
 			// feat/inject-headless-exact-fallback): this branch is a
 			// DOWNGRADE, not StallGone's normal Tier-2 path — Tier 1 either
-			// found no backend, or (most commonly, with N>1 sessions
+			// found no backend, or a resolved Tier 1h
+			// host send refused (the iTerm2 tab was closed, or its tty
+			// moved), or (most commonly, with N>1 sessions
 			// sharing a cwd on a backend with no per-session tty dispatch,
 			// e.g. cmux/orca — see docs/adr-vendor-independent-actuation.md
 			// §4 and ResolveActuationTarget's doc) couldn't disambiguate
@@ -1747,18 +1784,22 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		if l.State == domain.StateKilled {
 			return approveResultMsg{false, "this loop was killed — nothing to approve"}
 		}
-		// Tier 1 only (tty → cwd) — approving a gate has no headless Tier-2
+		// Tier 1 only (tty → host send → cwd) — approving a gate has no headless Tier-2
 		// equivalent (there's no "press Enter" over `claude --resume -p`;
 		// that starts a brand new turn, not an in-place keypress).
-		ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
 			return approveResultMsg{false, "no orca/tmux/cmux — approve manually: attach and press Enter"}
 		}
 		if !found {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
 		}
-		if err := ctrl.Approve(target); err != nil {
-			logActuationEvent(l, "approve", "tier1", false, err.Error())
+		if err := act.Approve(); err != nil {
+			logActuationEvent(l, "approve", act.Tier(), false, err.Error())
+			// Unknown delivery is not a failure — see unknownDeliveryText.
+			if errors.Is(err, control.ErrSendDeliveryUnknown) {
+				return approveResultMsg{false, unknownDeliveryText("approve", l.Project, "the Enter", "a")}
+			}
 			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
 		}
 		// Compare-and-swap delete: only remove the marker THIS decision was
@@ -1766,8 +1807,8 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// NEW marker that landed between this loop's scan snapshot and this
 		// approve call (see gate.DeleteMarkerIfTS).
 		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
-		logActuationEvent(l, "approve", "tier1", true, "")
-		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, ctrl.Name())}
+		logActuationEvent(l, "approve", act.Tier(), true, "")
+		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, act.Backend())}
 	}
 }
 
@@ -2342,18 +2383,25 @@ func killCmd(l domain.Loop) tea.Cmd {
 			logActuationEvent(l, "kill", "engine", true, "")
 			return killResultMsg{true, fmt.Sprintf("killed %s — Driven cleared, state updates on next scan", l.Project)}
 		}
-		// Tier 1 only (tty → cwd) — killing has no headless Tier-2
+		// Tier 1 only (tty → host send → cwd) — killing has no headless Tier-2
 		// equivalent (there's no live conversation left to type "/exit"
 		// into via a fresh --resume -p turn).
-		ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
 			return killResultMsg{false, "no orca/tmux/cmux — kill manually: type /exit in " + l.Project}
 		}
 		if !found {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
 		}
-		if err := ctrl.Resume(target, "/exit"); err != nil {
-			logActuationEvent(l, "kill", "tier1", false, err.Error())
+		if err := act.Resume("/exit"); err != nil {
+			logActuationEvent(l, "kill", act.Tier(), false, err.Error())
+			// Unknown delivery is not a failure — see unknownDeliveryText.
+			// This is the site that motivated the distinction: "kill failed"
+			// reads as "press k again," and a second "/exit" into a session
+			// that already got one is the double-send this guards.
+			if errors.Is(err, control.ErrSendDeliveryUnknown) {
+				return killResultMsg{false, unknownDeliveryText("kill", l.Project, `the "/exit"`, "k")}
+			}
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
 		}
 		// fix/killed-state: the event is written HERE, immediately once
@@ -2365,7 +2413,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// status line deliberately does NOT optimistically set local model
 		// state itself (that would be a fake, unverified state the next
 		// scan could immediately contradict).
-		logActuationEvent(l, "kill", "tier1", true, "")
+		logActuationEvent(l, "kill", act.Tier(), true, "")
 		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
 	}
 }
@@ -2381,21 +2429,25 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		if l.State == domain.StateKilled {
 			return interruptResultMsg{false, "this loop was killed — nothing to stop"}
 		}
-		// Tier 1 only (tty → cwd) — interrupting has no headless Tier-2
+		// Tier 1 only (tty → host send → cwd) — interrupting has no headless Tier-2
 		// equivalent (there's no in-flight turn to interrupt via a fresh
 		// --resume -p call; that would start a brand new turn instead).
-		ctrl, target, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
+		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
 			return interruptResultMsg{false, "no orca/tmux/cmux — stop manually: press Esc in " + l.Project}
 		}
 		if !found {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
 		}
-		if err := ctrl.Interrupt(target); err != nil {
-			logActuationEvent(l, "interrupt", "tier1", false, err.Error())
+		if err := act.Interrupt(); err != nil {
+			logActuationEvent(l, "interrupt", act.Tier(), false, err.Error())
+			// Unknown delivery is not a failure — see unknownDeliveryText.
+			if errors.Is(err, control.ErrSendDeliveryUnknown) {
+				return interruptResultMsg{false, unknownDeliveryText("stop", l.Project, "the Esc", "p")}
+			}
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
 		}
-		logActuationEvent(l, "interrupt", "tier1", true, "")
+		logActuationEvent(l, "interrupt", act.Tier(), true, "")
 		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
 	}
 }
@@ -2986,11 +3038,36 @@ func emitTransitionsCmd(transitions []transitionEvent) tea.Cmd {
 	}
 }
 
+// unknownDeliveryText is the operator line for a Tier 1h send whose delivery is
+// UNKNOWN (control.ErrSendDeliveryUnknown — osascript was killed at the
+// actuationTimeout deadline, so the write may or may not have reached the pty).
+//
+// It exists because k/p/a have no Tier 2 and so must format this themselves,
+// and because the three lines must not drift apart — they are the same claim
+// about the same uncertainty.
+//
+// The wording is load-bearing, not decoration. These call sites used to render
+// it as "kill X failed: <err>", which asserts a definite outcome in the prefix
+// while the error body says the outcome is unknown. An operator scanning the
+// status line reads the prefix, and for `k` "failed" is an invitation to press
+// it again — reintroducing by hand exactly the double-send that
+// ErrSendDeliveryUnknown exists to prevent. So the uncertainty leads, and the
+// line ends by naming the key NOT to press until they have looked.
+//
+// verb is the display verb ("kill"), what is the payload in the operator's own
+// vocabulary ("the \"/exit\""), and key is the keypress to warn off ("k").
+func unknownDeliveryText(verb, project, what, key string) string {
+	return fmt.Sprintf("%s %s: delivery UNKNOWN — %s may or may not have landed (the host send timed out). Attach (↵) and check before pressing %s again", verb, project, what, key)
+}
+
 // logActuationEvent best-effort records an actor=human actuation event —
 // action is what the human triggered ("resume"/"inject"/"approve"/
 // "interrupt"/"kill" — "spawn" is logged separately, see
 // registry.BindPending's doc, since no session_id exists yet at spawn
-// time), tier is which actuation path was actually used ("tier1"/"tier2").
+// time), tier is which actuation path was actually used: "tier1" (multiplexer)
+// or "tier1h" (in-place host send), both reported by the Actuator itself, plus
+// "tier2" for the headless re-drive and "terminal"/"engine" for the take-over
+// and engine-kill paths that bypass actuation entirely.
 // from_state/to_state are both l.State: an actuation attempt is a record of
 // WHAT A HUMAN DID, not itself a state transition (the next scan is what
 // would reclassify the loop, and that gets its own scan-triggered event if

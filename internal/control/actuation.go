@@ -7,6 +7,10 @@
 // (or a stale) registry entry. That fallback now probes every available
 // backend (not just Resolve()'s single pick) and refuses on cross-backend
 // ambiguity — see ResolveActuationTarget's Tier 1b doc.
+//
+// Between those two sits Tier 1h, an in-place write by the HOST terminal
+// itself (see hostsend.go), which needs no multiplexer at all — so this file's
+// "is a backend available?" gate deliberately sits below it rather than above.
 package control
 
 import (
@@ -77,6 +81,14 @@ var pidTTYFn = func(pid int) string {
 //     (e.g. a tmux pane on a machine where orca is also installed and
 //     preferred) still be found by Tier 1a instead of silently falling to
 //     Tier 1b/2.
+//   - Tier 1h — the HOST terminal writes to the session in place, keyed by the
+//     registry entry's host_app + window_id (see SendAdapter). Reuses Tier 1a's
+//     already-computed binding validation, so it costs no extra `ps`. Ordered
+//     between 1a and 1b on purpose — see the inline comment at the dispatch
+//     site for the wrong-pane safety argument. Unlike every other tier, 1h
+//     verifies its target binding a SECOND time inside the actuation itself
+//     (the host reports the session's own tty in the same round trip), which is
+//     why a resolved 1h actuator can still honestly refuse at send time.
 //   - Tier 1b — the cwd-based LocateClaude probe, now run across EVERY
 //     available backend (not just Resolve()'s single pick). Because cwd is
 //     many-to-one this CANNOT stop at the first hit: it must count matches and
@@ -85,13 +97,20 @@ var pidTTYFn = func(pid int) string {
 //     LocateClaude's own single-backend ">1 match" refusal. Exactly one
 //     matching backend → use it; zero → not found.
 //
-// backendAvailable=false means NO backend is available AT ALL (caller's
-// message: "no orca/tmux/cmux"). backendAvailable=true with found=false means
+// backendAvailable=false means NO multiplexer backend is available AT ALL and
+// Tier 1h did not resolve either (caller's message: "no orca/tmux/cmux").
+// Tier 1h is deliberately checked BEFORE that gate — it needs no multiplexer,
+// so a host-send-capable session on a multiplexer-less machine reports
+// backendAvailable=true and the caller's "no orca/tmux/cmux" hint is correctly
+// never shown. backendAvailable=true with found=false means
 // backends were available but none could locate/disambiguate a claude surface
 // — including the cross-backend ambiguity refusal above (caller's message:
-// "no unambiguous claude surface"). Callers only use ctrl/target when
-// found=true.
-func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Controller, target Target, backendAvailable, found bool) {
+// "no unambiguous claude surface"). Callers only use act when found=true.
+//
+// It returns a target-BOUND Actuator rather than the (Controller, Target) pair
+// it used to: see Actuator's doc for why that pair was one level too wide, and
+// why narrowing it is what lets a non-multiplexer host participate at all.
+func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actuator, backendAvailable, found bool) {
 	// Availability is probed ONCE, up front, and both tiers iterate the result.
 	// Available() is a live subprocess (LookPath + a bounded liveness probe per
 	// backend), so re-asking per tier cost up to 3 spawns per backend on every
@@ -100,18 +119,64 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 	// tier-dependent split (visible to Tier 1a, gone by Tier 1b) that nothing
 	// relied on.
 	avail := availableBackends()
-	if len(avail) == 0 {
-		return nil, Target{}, false, false
-	}
 
-	// Tier 1a — session-unique tty. Validate the registry binding once, then
-	// probe every available TTYLocator backend; first hit wins (no ambiguity).
+	// Tiers 1a and 1h share ONE registry read and ONE pid↔tty binding probe:
+	// both require the same guarantee (this pid controls this tty right now),
+	// and re-probing would cost a second `ps` on every actuation keypress.
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
+		// Tier 1a — session-unique tty. Probe every available TTYLocator
+		// backend; first hit wins (no ambiguity guard needed).
 		for _, c := range avail {
 			if t, ok := tierOneA(c, entry.TTY); ok {
-				return c, t, true, true
+				return boundController{ctrl: c, target: t}, true, true
 			}
 		}
+		// Tier 1h — the host terminal writes to the session in place, keyed by
+		// the registry's host_app + window_id.
+		//
+		// AFTER 1a, deliberately, and this is a SAFETY property rather than a
+		// preference. The dangerous case is a multiplexer running INSIDE an
+		// iTerm2 window: if the hook recorded HostApp "iTerm.app" for such a
+		// session, writing to the iTerm2 session would deliver keystrokes to
+		// whichever pane is currently active in that window. Letting 1a win
+		// first means a multiplexer that can address the precise pane always
+		// does. (The adapter's own tty guard then refuses the residual case;
+		// defense in depth is the house style here.)
+		//
+		// BEFORE 1b, deliberately. 1h is session-EXACT — the window id comes
+		// from that very session's own $ITERM_SESSION_ID — whereas 1b is
+		// cwd-based and many-to-one. A strictly more precise tier must never be
+		// shadowed by a guessing one.
+		//
+		// No ambiguity guard, for the same reason Tier 1a has none: the
+		// identifier is session-unique by construction. Ambiguity is a cwd
+		// disease.
+		//
+		// An unknown or empty host_app resolves nothing and falls straight
+		// through to 1b, which is what keeps this a pure superset for existing
+		// orca/cmux/tmux users.
+		if adapter, ok := ResolveSendAdapter(entry.HostApp); ok {
+			return boundSendAdapter{adapter: adapter, entry: entry}, true, true
+		}
+	}
+
+	// The "no backend at all" gate sits BELOW 1a/1h, not above them. Tier 1h
+	// needs no multiplexer — the host terminal writes to its own session — so
+	// gating it on availableBackends() made the tier unreachable for a fresh
+	// macOS + iTerm2 user with no orca/tmux/cmux installed, i.e. precisely the
+	// person it was added for.
+	//
+	// Widening the gate cannot disturb any existing user: the ONLY sessions
+	// whose outcome changes are those whose recorded host_app has a registered
+	// SendAdapter AND whose pid↔tty binding validates, and before this feature
+	// existed that set was empty by construction. Everything else still reaches
+	// the identical `return nil, false, false` and the identical
+	// "no orca/tmux/cmux" message.
+	//
+	// Tier 1a's loop above is a no-op when avail is empty, so ordering costs
+	// nothing here.
+	if len(avail) == 0 {
+		return nil, false, false
 	}
 
 	// Tier 1b — cwd is many-to-one, so probe ALL available backends and count
@@ -127,15 +192,17 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 		}
 	}
 	if matches == 1 {
-		return matchedCtrl, matchedTarget, true, true
+		return boundController{ctrl: matchedCtrl, target: matchedTarget}, true, true
 	}
-	return nil, Target{}, true, false
+	return nil, true, false
 }
 
 // availableBackends returns the backends usable right now, in the shared
-// install-preference order. Empty means NO backend is available at all — the
-// single "is actuation possible?" gate behind ResolveActuationTarget's
-// backendAvailable=false contract. Returning the slice (rather than a bare
+// install-preference order. Empty means no MULTIPLEXER backend is available.
+// That is one input to ResolveActuationTarget's backendAvailable=false
+// contract, not the whole of it: Tier 1h resolves ahead of the emptiness gate
+// and reports backendAvailable=true with no multiplexer installed at all.
+// Returning the slice (rather than a bare
 // bool) is what lets both tiers reuse one round of Available() probes instead
 // of re-execing per tier; preserving the order keeps each tier's iteration —
 // and so Tier 1b's ambiguity counting — identical to probing `backends`
