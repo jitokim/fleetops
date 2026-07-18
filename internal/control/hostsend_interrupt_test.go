@@ -11,7 +11,7 @@ import (
 // TestITerm2InterruptArgv_Shape: no payload argument at all — the Esc is a
 // constant in the script, so the only argument is the expected tty.
 func TestITerm2InterruptArgv_Shape(t *testing.T) {
-	argv := iterm2InterruptArgv("ABC-123", "ttys006")
+	argv := iterm2InterruptArgv(testGUID(t, "ABC-123"), "ttys006")
 
 	if len(argv) != 5 {
 		t.Fatalf("argv = %v, want 5 elements [osascript -e <script> -- <tty>]", argv)
@@ -33,7 +33,7 @@ func TestITerm2InterruptArgv_Shape(t *testing.T) {
 //   - `newline no` — a trailing CR here would SUBMIT whatever is sitting in the
 //     prompt instead of aborting the turn, i.e. the opposite of an interrupt.
 func TestITerm2InterruptScript_SendsRawEscWithoutNewline(t *testing.T) {
-	script := iterm2InterruptArgv("ABC-123", "ttys006")[2]
+	script := iterm2InterruptArgv(testGUID(t, "ABC-123"), "ttys006")[2]
 
 	if !strings.Contains(script, "write aSession text (character id 27) newline no") {
 		t.Errorf("interrupt script does not send a raw Esc without a newline:\n%s", script)
@@ -51,7 +51,7 @@ func TestITerm2InterruptScript_SendsRawEscWithoutNewline(t *testing.T) {
 // shortcut around the wrong-pane protection. It shares the text path's skeleton
 // precisely so this cannot drift.
 func TestITerm2InterruptScript_KeepsTheTTYGuard(t *testing.T) {
-	script := iterm2InterruptArgv("ABC-123", "ttys006")[2]
+	script := iterm2InterruptArgv(testGUID(t, "ABC-123"), "ttys006")[2]
 
 	if !strings.Contains(script, "tty of aSession is not (item 1 of argv)") {
 		t.Errorf("interrupt script dropped the tty binding guard:\n%s", script)
@@ -78,8 +78,8 @@ func TestITerm2InterruptScript_KeepsTheTTYGuard(t *testing.T) {
 // identical, so a future fix to the guard cannot land on one path and miss the
 // other.
 func TestITerm2InterruptScript_DiffersFromTextPathOnlyInTheWriteStatement(t *testing.T) {
-	interruptScript := iterm2InterruptArgv("ABC-123", "ttys006")[2]
-	textScript := iterm2SendTextArgv("ABC-123", "ttys006", "whatever")[2]
+	interruptScript := iterm2InterruptArgv(testGUID(t, "ABC-123"), "ttys006")[2]
+	textScript := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "whatever")[2]
 
 	normalized := strings.Replace(interruptScript, iterm2EscStmt, iterm2WriteTextStmt, 1)
 	if normalized != textScript {
@@ -208,7 +208,7 @@ func TestITerm2Interrupt_ExecsBuiltArgv(t *testing.T) {
 		t.Fatalf("Interrupt = %v, want nil", err)
 	}
 
-	want := iterm2InterruptArgv("C3C73A44-B7A5-4798-8730-4F68B2A6A15E", "ttys006")
+	want := iterm2InterruptArgv(testGUID(t, "C3C73A44-B7A5-4798-8730-4F68B2A6A15E"), "ttys006")
 	if !equalArgv(*captured, want) {
 		t.Errorf("execed argv = %v,\nwant %v", *captured, want)
 	}

@@ -33,7 +33,7 @@ func (a iterm2SendAdapter) Interrupt(entry sessions.SessionEntry) error {
 // There is no payload argument: the Esc is a class-A CONSTANT baked into the
 // fixed script (see iterm2EscStmt), not data. item 1 of argv is still the
 // expected tty, so the binding guard is identical to the text path's.
-func iterm2InterruptArgv(guid, tty string) []string {
+func iterm2InterruptArgv(guid sessionGUID, tty string) []string {
 	return iterm2SendArgvPrefix(guid, iterm2EscStmt, tty)
 }
 

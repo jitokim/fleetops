@@ -167,6 +167,39 @@ const (
 	iterm2SendTTYMismatch = "ttymismatch"
 )
 
+// sessionGUID is a session id that HAS BEEN CHECKED against itermGUIDPattern.
+//
+// It exists because the GUID is the one untrusted value this file interpolates
+// into AppleScript source, and on a surface with a prior Critical injection
+// finding "the caller is supposed to validate first" is not a control — it is a
+// convention, and conventions are what the next refactor deletes. A plain
+// `guid string` parameter meant iterm2SendScript / iterm2SendArgvPrefix /
+// iterm2SendTextArgv would each happily bake an arbitrary caller-supplied
+// string into script text; the type makes that unrepresentable, because
+// newSessionGUID is the only way to obtain a value of it and newSessionGUID
+// cannot return one that failed the pattern.
+//
+// The zero value carries "" — the one other inhabitant, and injection-inert by
+// construction. So the type's invariant reads: every sessionGUID is either
+// empty or pattern-clean, and neither can close a string literal.
+type sessionGUID struct{ checked string }
+
+// newSessionGUID extracts the GUID from an untrusted registry WindowID and
+// validates it. ok=false means REFUSE — never sanitize, never interpolate.
+// Deriving and checking in the same place is the point: it is not possible to
+// hold a sessionGUID whose value was not the value that passed the whitelist.
+func newSessionGUID(windowID string) (sessionGUID, bool) {
+	guid := iterm2SessionGUID(windowID)
+	if !itermGUIDPattern.MatchString(guid) {
+		return sessionGUID{}, false
+	}
+	return sessionGUID{checked: guid}, true
+}
+
+// String returns the checked GUID — the ONLY way to read one, and the only
+// value iterm2SendScript is allowed to interpolate.
+func (g sessionGUID) String() string { return g.checked }
+
 // itermTTYPattern is the WHITELIST the registry-recorded tty must match before
 // it may be used to address a session: bare device names only ("ttys006"), as
 // normalizeTTY produces.
@@ -212,10 +245,10 @@ func (a iterm2SendAdapter) SendText(entry sessions.SessionEntry, text string) er
 // ErrNoSendSurface, and an empty TTY returns ErrSendNoRecordedTTY (a different
 // fact, see there). Refusing beats sanitizing — the worst case is that Tier 1h
 // declines and the loop degrades to an already-shipped tier.
-func iterm2SendTarget(entry sessions.SessionEntry) (guid, tty string, err error) {
-	guid = iterm2SessionGUID(entry.WindowID)
-	if !itermGUIDPattern.MatchString(guid) {
-		return "", "", ErrNoSendSurface
+func iterm2SendTarget(entry sessions.SessionEntry) (guid sessionGUID, tty string, err error) {
+	guid, ok := newSessionGUID(entry.WindowID)
+	if !ok {
+		return sessionGUID{}, "", ErrNoSendSurface
 	}
 	tty = normalizeTTY(entry.TTY)
 	// An EMPTY recorded tty is its own case, checked before the whitelist,
@@ -226,10 +259,10 @@ func iterm2SendTarget(entry sessions.SessionEntry) (guid, tty string, err error)
 	// eventually reach the operator as a tty MISMATCH, blaming a moved tab for
 	// a record that never had one, forever.
 	if tty == "" {
-		return "", "", ErrSendNoRecordedTTY
+		return sessionGUID{}, "", ErrSendNoRecordedTTY
 	}
 	if !itermTTYPattern.MatchString(tty) {
-		return "", "", ErrNoSendSurface
+		return sessionGUID{}, "", ErrNoSendSurface
 	}
 	return guid, tty, nil
 }
@@ -273,7 +306,7 @@ func iterm2SendVerdict(argv []string) error {
 // item 1 of argv is the expected tty, item 2 is the payload. Both are DATA and
 // both travel in argument slots. Go's os/exec calls execve directly — there is
 // no shell, so there is no second quoting layer to get wrong either.
-func iterm2SendTextArgv(guid, tty, text string) []string {
+func iterm2SendTextArgv(guid sessionGUID, tty, text string) []string {
 	return append(iterm2SendArgvPrefix(guid, iterm2WriteTextStmt, tty), text)
 }
 
@@ -287,7 +320,7 @@ const iterm2WriteTextStmt = "write aSession text (item 2 of argv) newline yes"
 // iterm2SendArgvPrefix assembles everything but the trailing payload:
 // the fixed script (parameterized ONLY by class-A values — see below) plus the
 // "--" end-of-options marker and the expected tty as the first argument.
-func iterm2SendArgvPrefix(guid, writeStmt, tty string) []string {
+func iterm2SendArgvPrefix(guid sessionGUID, writeStmt, tty string) []string {
 	return []string{"osascript", "-e", iterm2SendScript(guid, writeStmt), "--", "/dev/" + tty}
 }
 
@@ -303,8 +336,9 @@ func iterm2SendArgvPrefix(guid, writeStmt, tty string) []string {
 //
 // Every value here is therefore classified as exactly one of:
 //
-//   - class A, script-shaped — may be interpolated. That is ONLY: guid (gated
-//     on itermGUIDPattern by iterm2SendTarget before this is ever called),
+//   - class A, script-shaped — may be interpolated. That is ONLY: guid (a
+//     sessionGUID, i.e. a value that CANNOT EXIST unless it passed
+//     itermGUIDPattern — the check is in the type, not in a caller's manners),
 //     writeStmt (a compile-time constant from this package's own source, never
 //     derived from input), and the verdict literals.
 //   - class B, data-shaped — argv ONLY. That is the expected tty and the
@@ -325,13 +359,13 @@ func iterm2SendArgvPrefix(guid, writeStmt, tty string) []string {
 // It walks windows → tabs → sessions read-only. It never mutates the
 // collection it iterates (closing a session mid-iteration invalidates the
 // index), and it returns from inside the loop on the first GUID match.
-func iterm2SendScript(guid, writeStmt string) string {
+func iterm2SendScript(guid sessionGUID, writeStmt string) string {
 	return "on run argv\n" +
 		"\ttell application \"iTerm2\"\n" +
 		"\t\trepeat with aWindow in windows\n" +
 		"\t\t\trepeat with aTab in tabs of aWindow\n" +
 		"\t\t\t\trepeat with aSession in sessions of aTab\n" +
-		"\t\t\t\t\tif id of aSession is \"" + guid + "\" then\n" +
+		"\t\t\t\t\tif id of aSession is \"" + guid.String() + "\" then\n" +
 		// The binding check, INSIDE the same round trip: iTerm2's session
 		// exposes a read-only tty, so the GUID→tty binding is verified against
 		// the registry's recorded tty before a single byte is written. This has

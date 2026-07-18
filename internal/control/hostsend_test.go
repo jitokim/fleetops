@@ -9,6 +9,19 @@ import (
 	"github.com/jitokim/fleetops/internal/sessions"
 )
 
+// testGUID builds a CHECKED sessionGUID for tests that call the argv/script
+// builders directly. Going through the real constructor is deliberate: it is
+// the same door production code uses, so a test cannot accidentally demonstrate
+// a shape production could never produce.
+func testGUID(t *testing.T, raw string) sessionGUID {
+	t.Helper()
+	guid, ok := newSessionGUID(raw)
+	if !ok {
+		t.Fatalf("newSessionGUID(%q) refused a value this test needs", raw)
+	}
+	return guid
+}
+
 // withFakeITerm2Send swaps the injectable exec seam for a spy and restores it.
 // Mirrors withFakeITerm2Focus — no real iTerm2, no osascript, no macOS.
 func withFakeITerm2Send(t *testing.T, fn func(argv []string) (string, error)) *[]string {
@@ -101,7 +114,7 @@ var hostilePayloads = map[string]string{
 func TestITerm2SendTextArgv_PayloadOnlyInArgvNeverInScript(t *testing.T) {
 	for name, payload := range hostilePayloads {
 		t.Run(name, func(t *testing.T) {
-			argv := iterm2SendTextArgv("ABC-123", "ttys006", payload)
+			argv := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", payload)
 
 			if len(argv) != 6 {
 				t.Fatalf("argv = %v, want 6 elements [osascript -e <script> -- <tty> <text>]", argv)
@@ -125,7 +138,7 @@ func TestITerm2SendTextArgv_PayloadOnlyInArgvNeverInScript(t *testing.T) {
 			// TestITerm2SendScript_ByteIdenticalAcrossPayloads; this assertion
 			// is the one that names the offending payload when it fails.
 			script := argv[2]
-			baseline := iterm2SendTextArgv("ABC-123", "ttys006", "\x00unlikely-baseline\x00")[2]
+			baseline := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "\x00unlikely-baseline\x00")[2]
 			if payload != "" && strings.Contains(script, payload) && !strings.Contains(baseline, payload) {
 				t.Errorf("payload %q leaked into the AppleScript source — this is the injection defect:\n%s", payload, script)
 			}
@@ -139,10 +152,10 @@ func TestITerm2SendTextArgv_PayloadOnlyInArgvNeverInScript(t *testing.T) {
 // produce different script text, a value crossed from a parameter slot into a
 // syntax slot.
 func TestITerm2SendScript_ByteIdenticalAcrossPayloads(t *testing.T) {
-	baseline := iterm2SendTextArgv("ABC-123", "ttys006", "benign")[2]
+	baseline := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "benign")[2]
 	for name, payload := range hostilePayloads {
 		t.Run(name, func(t *testing.T) {
-			if got := iterm2SendTextArgv("ABC-123", "ttys006", payload)[2]; got != baseline {
+			if got := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", payload)[2]; got != baseline {
 				t.Errorf("script varied with the payload %q — interpolation has been reintroduced:\ngot:  %s\nwant: %s", payload, got, baseline)
 			}
 		})
@@ -153,7 +166,7 @@ func TestITerm2SendScript_ByteIdenticalAcrossPayloads(t *testing.T) {
 // data too, and it likewise travels in an argument slot. The script compares
 // against `item 1 of argv`, never against a baked-in literal.
 func TestITerm2SendScript_TTYIsArgvNotInterpolated(t *testing.T) {
-	script := iterm2SendTextArgv("ABC-123", "ttys006", "x")[2]
+	script := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "x")[2]
 
 	if !strings.Contains(script, "tty of aSession is not (item 1 of argv)") {
 		t.Errorf("script does not compare tty against argv:\n%s", script)
@@ -266,6 +279,49 @@ func TestITerm2SendText_NoRecordedTTY_RefusesWithItsOwnReason(t *testing.T) {
 	}
 }
 
+// TestNewSessionGUID_RefusesHostileWindowIDs: the constructor is the ONLY door
+// to a sessionGUID, and it is the door the whitelist stands in. Every value
+// that could close the AppleScript string literal must be refused here — after
+// this point the type system, not a caller's discipline, is what keeps the
+// script source fixed.
+func TestNewSessionGUID_RefusesHostileWindowIDs(t *testing.T) {
+	hostile := map[string]string{
+		"do shell script":   `w0t0p0:X" & (do shell script "touch /tmp/pwned") & "`,
+		"bare quote":        `w0t0p0:X"`,
+		"backslash":         `w0t0p0:X\\`,
+		"newline":           "w0t0p0:X\nactivate",
+		"space":             "w0t0p0:X Y",
+		"empty":             "",
+		"empty after colon": "w0t0p0:",
+	}
+	for name, windowID := range hostile {
+		t.Run(name, func(t *testing.T) {
+			guid, ok := newSessionGUID(windowID)
+			if ok {
+				t.Fatalf("newSessionGUID(%q) accepted a hostile value as %q", windowID, guid)
+			}
+			if guid.String() != "" {
+				t.Errorf("a refused sessionGUID carries %q, want the inert zero value", guid)
+			}
+		})
+	}
+}
+
+// TestSessionGUID_ZeroValueIsInjectionInert: the zero value is the one
+// sessionGUID obtainable without the constructor, so it has to be harmless on
+// its own. Baked into the script it produces a GUID nothing can match — a
+// guaranteed miss, never a syntax break.
+func TestSessionGUID_ZeroValueIsInjectionInert(t *testing.T) {
+	script := iterm2SendScript(sessionGUID{}, iterm2WriteTextStmt)
+
+	if strings.Count(script, `"`) != strings.Count(iterm2SendScript(testGUID(t, "ABC-123"), iterm2WriteTextStmt), `"`) {
+		t.Error("the zero value changed the script's quote structure")
+	}
+	if !strings.Contains(script, `is "" then`) {
+		t.Errorf("script did not interpolate the zero value as an empty literal:\n%s", script)
+	}
+}
+
 // TestITerm2SendTarget_AcceptsRealValues guards against whitelists so strict
 // they reject what iTerm2 and the registry actually emit (which would silently
 // disable Tier 1h altogether).
@@ -277,7 +333,7 @@ func TestITerm2SendTarget_AcceptsRealValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("iterm2SendTarget on a real entry = %v, want nil", err)
 	}
-	if guid != "C3C73A44-B7A5-4798-8730-4F68B2A6A15E" {
+	if guid.String() != "C3C73A44-B7A5-4798-8730-4F68B2A6A15E" {
 		t.Errorf("guid = %q, want the extracted GUID", guid)
 	}
 	if tty != "ttys006" {
@@ -395,7 +451,7 @@ func TestITerm2SendText_ExecsBuiltArgv(t *testing.T) {
 		t.Fatalf("SendText = %v, want nil", err)
 	}
 
-	want := iterm2SendTextArgv("C3C73A44-B7A5-4798-8730-4F68B2A6A15E", "ttys006", "do the thing")
+	want := iterm2SendTextArgv(testGUID(t, "C3C73A44-B7A5-4798-8730-4F68B2A6A15E"), "ttys006", "do the thing")
 	if !equalArgv(*captured, want) {
 		t.Errorf("execed argv = %v,\nwant %v", *captured, want)
 	}
@@ -406,7 +462,7 @@ func TestITerm2SendText_ExecsBuiltArgv(t *testing.T) {
 // fleet actuation. A stray select/activate would yank iTerm2 forward on every
 // keypress — the exact behaviour the ADR rejected keystroke simulation for.
 func TestITerm2SendScript_NeverRaisesTheWindow(t *testing.T) {
-	script := iterm2SendTextArgv("ABC-123", "ttys006", "x")[2]
+	script := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "x")[2]
 
 	for _, forbidden := range []string{"activate", "select "} {
 		if strings.Contains(script, forbidden) {
@@ -419,7 +475,7 @@ func TestITerm2SendScript_NeverRaisesTheWindow(t *testing.T) {
 // which of the three outcomes happened. A script that can only fall off the end
 // makes every send indistinguishable from a success.
 func TestITerm2SendScript_ReportsAllThreeVerdicts(t *testing.T) {
-	script := iterm2SendTextArgv("ABC-123", "ttys006", "x")[2]
+	script := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "x")[2]
 
 	for _, verdict := range []string{iterm2SendHit, iterm2SendMiss, iterm2SendTTYMismatch} {
 		if !strings.Contains(script, `return "`+verdict+`"`) {
@@ -442,7 +498,7 @@ func TestITerm2SendScript_ReportsAllThreeVerdicts(t *testing.T) {
 // TestITerm2SendScript_ReadOnlyTraversal: the traversal must not mutate the
 // collections it iterates (closing a session mid-loop invalidates the index).
 func TestITerm2SendScript_ReadOnlyTraversal(t *testing.T) {
-	script := iterm2SendTextArgv("ABC-123", "ttys006", "x")[2]
+	script := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "x")[2]
 
 	for _, mutator := range []string{"close ", "delete ", "create ", "set id of", "set tty of"} {
 		if strings.Contains(script, mutator) {
