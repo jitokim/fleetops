@@ -226,6 +226,10 @@ func TestITerm2SendText_UntrustedTTY_RefusesNoExec(t *testing.T) {
 		"path traversal":   "../../dev/ttys006",
 		"slash":            "dev/ttys006",
 		"applescript frag": `x" & (do shell script "id") & "`,
+		// AppleScript's `is` is case-insensitive, so an uppercase variant would
+		// otherwise satisfy the binding guard against the real lowercase device.
+		"uppercase":  "TTYS006",
+		"mixed case": "TtyS006",
 	}
 	for name, tty := range hostile {
 		t.Run(name, func(t *testing.T) {

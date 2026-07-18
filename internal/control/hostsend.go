@@ -204,6 +204,16 @@ func (g sessionGUID) String() string { return g.checked }
 // it may be used to address a session: bare device names only ("ttys006"), as
 // normalizeTTY produces.
 //
+// LOWERCASE only, and that is a correctness constraint rather than tidiness.
+// The script compares `tty of aSession` against this value with AppleScript's
+// `is`, which is case-INSENSITIVE by default — so a pattern admitting [A-Za-z]
+// would let a recorded "TTYS006" satisfy the binding guard against a real
+// "ttys006". Restricting the pattern is the smaller of the two available fixes
+// (the other being `considering case` in the script) and it cannot cause a
+// false REFUSAL: macOS device names are lowercase, so nothing legitimate is
+// excluded. With only one case admissible, a case-insensitive comparison and a
+// case-sensitive one agree on every value that can reach it.
+//
 // The tty is passed to osascript as ARGV, not interpolated (see
 // iterm2SendScript), so this whitelist is defense in depth rather than the
 // primary control — but it is not decoration. TTY reaches us from the same
@@ -211,7 +221,7 @@ func (g sessionGUID) String() string { return g.checked }
 // the same treatment on principle: a value that cannot be a device name cannot
 // address a real session either, and refusing early beats sending a
 // nonsense comparison to the host.
-var itermTTYPattern = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+var itermTTYPattern = regexp.MustCompile(`^[a-z0-9]+$`)
 
 // iterm2SendAdapter writes to the iTerm2 session identified by the entry's
 // WindowID ($ITERM_SESSION_ID), after verifying that session's own tty still
