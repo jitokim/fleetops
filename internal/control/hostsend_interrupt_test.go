@@ -110,10 +110,7 @@ func TestITerm2Interrupt_UntrustedIdentifiers_RefusesNoExec(t *testing.T) {
 	}
 	for name, entry := range cases {
 		t.Run(name, func(t *testing.T) {
-			captured := withFakeITerm2Send(t, func([]string) (string, error) {
-				t.Fatal("iterm2SendFn must NEVER be called for untrusted identifiers")
-				return "", nil
-			})
+			captured := expectNoExec(t, "for untrusted identifiers")
 
 			err := iterm2SendAdapter{}.Interrupt(entry)
 
@@ -132,10 +129,7 @@ func TestITerm2Interrupt_UntrustedIdentifiers_RefusesNoExec(t *testing.T) {
 // distinct refusal the text path does — re-asserted here because a separate
 // entry point is exactly where such a gap would hide.
 func TestITerm2Interrupt_NoRecordedTTY_RefusesWithItsOwnReason(t *testing.T) {
-	captured := withFakeITerm2Send(t, func([]string) (string, error) {
-		t.Fatal("iterm2SendFn must NEVER be called without a recorded tty")
-		return "", nil
-	})
+	captured := expectNoExec(t, "without a recorded tty")
 
 	entry := sendEntry()
 	entry.TTY = ""

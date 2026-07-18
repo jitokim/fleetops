@@ -37,6 +37,20 @@ func withFakeITerm2Send(t *testing.T, fn func(argv []string) (string, error)) *[
 	return &captured
 }
 
+// expectNoExec installs a send seam that fails the test the moment it is
+// reached, and returns the same capture pointer withFakeITerm2Send does so the
+// caller can still assert zero exec afterwards. The zero-exec property is the
+// point of every refusal test on this surface: a value that reaches osascript
+// at all has already left the whitelist's protection. why names the refusal
+// being pinned, so a firing spy says which guard leaked.
+func expectNoExec(t *testing.T, why string) *[]string {
+	t.Helper()
+	return withFakeITerm2Send(t, func(argv []string) (string, error) {
+		t.Fatalf("iterm2SendFn must NEVER be called %s — execed %v", why, argv)
+		return "", nil
+	})
+}
+
 // sendEntry is a registry entry whose GUID and tty both pass their whitelists —
 // the baseline these tests vary one field at a time from.
 func sendEntry() sessions.SessionEntry {
@@ -194,10 +208,7 @@ func TestITerm2SendText_UntrustedWindowID_RefusesNoExec(t *testing.T) {
 	}
 	for name, windowID := range hostile {
 		t.Run(name, func(t *testing.T) {
-			captured := withFakeITerm2Send(t, func([]string) (string, error) {
-				t.Fatal("iterm2SendFn must NEVER be called for an untrusted WindowID")
-				return "", nil
-			})
+			captured := expectNoExec(t, "for an untrusted WindowID")
 
 			entry := sendEntry()
 			entry.WindowID = windowID
@@ -234,10 +245,7 @@ func TestITerm2SendText_UntrustedTTY_RefusesNoExec(t *testing.T) {
 	}
 	for name, tty := range hostile {
 		t.Run(name, func(t *testing.T) {
-			captured := withFakeITerm2Send(t, func([]string) (string, error) {
-				t.Fatal("iterm2SendFn must NEVER be called for an untrusted tty")
-				return "", nil
-			})
+			captured := expectNoExec(t, "for an untrusted tty")
 
 			entry := sendEntry()
 			entry.TTY = tty
@@ -262,10 +270,7 @@ func TestITerm2SendText_UntrustedTTY_RefusesNoExec(t *testing.T) {
 func TestITerm2SendText_NoRecordedTTY_RefusesWithItsOwnReason(t *testing.T) {
 	for name, tty := range map[string]string{"empty": "", "only dev prefix": "/dev/"} {
 		t.Run(name, func(t *testing.T) {
-			captured := withFakeITerm2Send(t, func([]string) (string, error) {
-				t.Fatal("iterm2SendFn must NEVER be called without a recorded tty")
-				return "", nil
-			})
+			captured := expectNoExec(t, "without a recorded tty")
 
 			entry := sendEntry()
 			entry.TTY = tty

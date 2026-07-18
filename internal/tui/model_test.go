@@ -3430,10 +3430,8 @@ type fakeActuator struct {
 	resumeErr        error
 	lastResumePrompt string // captures what Resume was actually sent, for asserting hint composition
 
-	approveCalled   bool
-	approveErr      error
-	interruptCalled bool
-	interruptErr    error
+	approveErr   error
+	interruptErr error
 }
 
 func (f *fakeActuator) Backend() string { return f.backend }
@@ -3448,8 +3446,8 @@ func (f *fakeActuator) Resume(prompt string) error {
 	f.lastResumePrompt = prompt
 	return f.resumeErr
 }
-func (f *fakeActuator) Approve() error   { f.approveCalled = true; return f.approveErr }
-func (f *fakeActuator) Interrupt() error { f.interruptCalled = true; return f.interruptErr }
+func (f *fakeActuator) Approve() error   { return f.approveErr }
+func (f *fakeActuator) Interrupt() error { return f.interruptErr }
 
 type fakeController struct {
 	name             string

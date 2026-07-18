@@ -142,8 +142,7 @@ func TestTierOneH_BindingInvalid_SkipsHostSend(t *testing.T) {
 		"moved to another tty": "ttys999", // pid recycled onto a different tty
 	} {
 		t.Run(name, func(t *testing.T) {
-			f := &fakeSendAdapter{}
-			withFakeSendAdapter(t, f)
+			withFakeSendAdapter(t, &fakeSendAdapter{})
 			dir := writeTier1hSession(t, tier1hEntry(), pidTTY)
 
 			orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateClaudeOK: true}
@@ -165,8 +164,7 @@ func TestTierOneH_BindingInvalid_SkipsHostSend(t *testing.T) {
 // compare the host's against, and the shared binding gate already requires one.
 // A headless/piped session (no controlling terminal) must fall through.
 func TestTierOneH_EmptyTTY_SkipsHostSend(t *testing.T) {
-	f := &fakeSendAdapter{}
-	withFakeSendAdapter(t, f)
+	withFakeSendAdapter(t, &fakeSendAdapter{})
 
 	entry := tier1hEntry()
 	entry.TTY = ""
