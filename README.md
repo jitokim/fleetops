@@ -17,7 +17,7 @@
 
 _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_
 
-> **Status: experimental / 0.2.0-alpha.** This is a young, actively-changing
+> **Status: experimental / 0.3.0-alpha.** This is a young, actively-changing
 > project — expect rough edges, and read the "Known rough edges" and
 > "Limitations" sections below before trusting it with anything you can't
 > afford to have go wrong (it does send real keystrokes and can kill real
@@ -40,8 +40,9 @@ to find out.
   Oracle below).
 - **Acts in one key** — attach, resume, approve a gate, stop a turn, kill, or
   spawn a brand new loop — across whichever terminal multiplexer hosts the
-  session (orca, tmux, cmux). On a bare terminal with no multiplexer, it still
-  degrades to a copy-pasteable manual command instead of doing nothing.
+  session (orca, tmux, cmux), plus **iTerm2 directly, with no multiplexer at
+  all**. Anywhere else, it still degrades to a copy-pasteable manual command
+  instead of doing nothing.
 
 ## Install
 
@@ -252,6 +253,7 @@ with unverified liveness detection. Only **macOS** gets the full matrix below.
 | **orca** | ✅ | ✅ | Verified live against the real CLI; preferred when available. |
 | **tmux** | ✅ | ✅ | Verified against tmux's documented command contract. |
 | **cmux** | ✅ (locate/send/focus/approve/interrupt) | ❌ | Verified against real **cmux 0.64.15**: `tree --json` shape, and `send`/`send-key`/`focus-panel` subcommands — including **cross-workspace addressing**: each actuation now passes `--window <ref>` so a surface outside the caller's own workspace is reachable (verified live; without it a cross-workspace target failed). Its tree carries no cwd, so surface→dir matching cross-references the OS by tty (`ps`+`lsof`). Spawn is still unsupported (no verified create-surface command). |
+| **iTerm2** (no multiplexer needed) | ✅ | ❌ | The terminal emulator itself, not a multiplexer — reached through iTerm2's AppleScript `write` over `osascript`, keyed by the session GUID the hooks record. Measured live: delivery works to a **background, non-frontmost** window without raising it, `newline yes` emits a real CR, and a raw ESC survives. Before writing, the script re-reads the session's own `tty` and **refuses** if it disagrees with the registry — so a loop inside tmux-inside-iTerm2 is never typed into at the wrong layer. Caveats: `a` (approve) is unverified against a real **gate** prompt — only the byte is measured; and iTerm2 marks AppleScript deprecated in favour of its Python API, so if `write` ever disappears `r`/`i` fall back to the headless re-drive while `k`/`p`/`a` have no fallback and go dead. |
 | **bare terminal** (none of the above) | manual hint only | manual hint only | Observation still works fully; actions print a copy-pasteable command (`claude --resume <id>`, `cd <dir>`, etc.) instead of silently failing. |
 
 The cmux backend requires a separately-installed CLI
