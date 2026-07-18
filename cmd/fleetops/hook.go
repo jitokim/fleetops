@@ -89,6 +89,7 @@ func sessionStartHook() {
 		return
 	}
 	pid, tty := sessions.ResolveClaudeTTY(os.Getppid())
+	hostApp, windowID := resolveHostWindow()
 	_ = sessions.WriteSession(sessions.SessionsDir(), payload.SessionID, sessions.SessionEntry{
 		PID:            pid,
 		TTY:            tty,
@@ -96,7 +97,53 @@ func sessionStartHook() {
 		TranscriptPath: payload.TranscriptPath,
 		Source:         payload.Source,
 		StartedAt:      time.Now(),
+		HostApp:        hostApp,
+		WindowID:       windowID,
 	})
+}
+
+// Host terminal markers this hook recognizes: the $TERM_PROGRAM value each one
+// exports, paired below with the env var carrying ITS OWN window id.
+const (
+	itermTermProgram = "iTerm.app"
+	tmuxTermProgram  = "tmux"
+)
+
+// resolveHostWindow reads the host terminal's identity that the SessionStart
+// hook inherited from the user's shell (Claude Code runs hooks as children of
+// the `claude` process, which inherited these from the host terminal).
+//
+// The two fields are ONE fact and must be resolved together: HostApp comes from
+// $TERM_PROGRAM, and WindowID from whichever env var THAT host uses. Reading
+// them independently ("first non-empty of $ITERM_SESSION_ID/$TMUX_PANE") breaks
+// on the common nested case — claude in tmux inside iTerm2, where tmux sets
+// $TERM_PROGRAM=tmux while the outer iTerm2's $ITERM_SESSION_ID is still
+// inherited — and records HostApp=tmux with an iTerm2 window id: a single
+// record describing two different terminals, which would hand a foreign window
+// id to any multiplexer adapter that later trusts it.
+//
+// An unrecognized host keeps its $TERM_PROGRAM but yields no window id: no
+// window id at all beats a mismatched pair, while the host name itself stays a
+// true, useful fact. Every value is best-effort and optional — empties mean no focus adapter
+// and attach degrades to the manual hint, and the hook always exits 0
+// regardless. Pulled out as its own helper so the env→field mapping is directly
+// testable. SocketPath is intentionally left unpopulated (out of scope for this
+// slice — see SessionEntry's field doc).
+func resolveHostWindow() (hostApp, windowID string) {
+	switch host := os.Getenv("TERM_PROGRAM"); host {
+	case itermTermProgram:
+		return host, os.Getenv("ITERM_SESSION_ID")
+	case tmuxTermProgram:
+		return host, os.Getenv("TMUX_PANE")
+	default:
+		// Unrecognized host (Apple_Terminal, Ghostty, WezTerm, …): keep the
+		// real $TERM_PROGRAM — it is a true fact worth recording for
+		// diagnostics and for showing a human where the loop lives — but
+		// record NO window id, because we don't know which env var this host
+		// publishes it in, and a foreign id is worse than none. No adapter
+		// resolves for an unrecognized host, so attach degrades either way.
+		return host, ""
+	}
 }
 
 // sessionEndHook reads the SessionEnd hook's JSON from stdin and removes the

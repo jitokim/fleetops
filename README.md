@@ -6,6 +6,13 @@
 
 <p align="center">A fleet cockpit for Claude Code loops, in your terminal.</p>
 
+<p align="center">
+  <a href="https://github.com/jitokim/fleetops/releases"><img src="https://img.shields.io/github/v/release/jitokim/fleetops?include_prereleases&amp;label=release&amp;color=blue" alt="Latest release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license" /></a>
+  <a href="go.mod"><img src="https://img.shields.io/badge/go-1.25-00ADD8?logo=go&amp;logoColor=white" alt="Go 1.25" /></a>
+  <a href="https://x.com/fleetopsdev"><img src="https://img.shields.io/badge/follow-%40fleetopsdev-000000?logo=x&amp;logoColor=white" alt="Follow @fleetopsdev on X" /></a>
+</p>
+
 ![fleetops cockpit](screenshot.png)
 
 _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_

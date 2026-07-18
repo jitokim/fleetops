@@ -172,14 +172,62 @@ type TTYLocator interface {
 	LocateByTTY(tty string) (Target, bool)
 }
 
+// backends is the ordered, install-preference backend list every resolver in
+// this package shares — orca preferred (the user's own environment), cmux then
+// tmux as fallbacks. Extracted to a single package var (rather than a literal
+// re-spelled inside each resolver) so Resolve/ResolveForLocate/
+// ResolveActuationTarget all iterate the SAME list, and so tests can inject
+// fake Controllers in one place instead of needing real orca/cmux/tmux
+// binaries on the machine running them.
+var backends = []Controller{orcaController{}, cmuxController{}, tmuxController{}}
+
 // Resolve returns the first available controller: orca preferred (the
 // user's own environment), cmux then tmux as fallbacks; ok is false if
 // none of the three backends is available.
+//
+// This is the CREATION/CAPABILITY resolver — "give me some backend that can
+// spawn / open a terminal / answer a capability question," where install order
+// is the right tiebreak (spawnCmd, checkWorktreeEligibilityCmd, takeOverCmd).
+// It deliberately does NOT consult Locate: for ATTACH (which backend actually
+// hosts an EXISTING surface) use ResolveForLocate; for typed/destructive
+// actuation use ResolveActuationTarget.
 func Resolve() (Controller, bool) {
-	for _, c := range []Controller{orcaController{}, cmuxController{}, tmuxController{}} {
+	for _, c := range backends {
 		if c.Available() {
 			return c, true
 		}
 	}
 	return nil, false
+}
+
+// ResolveForLocate is the ATTACH resolver: it returns the first AVAILABLE
+// backend that can actually Locate a surface for projectDir, together with the
+// Target it located — not merely the first backend that happens to be
+// installed. This closes the "orca is always Available on the captain's
+// machine, so Resolve() always picks it even when the loop physically lives in
+// a tmux/cmux surface orca can't Locate" hazard: attach must follow the
+// surface, not the install order.
+//
+// It iterates backends in the same install-preference order, gating each on
+// Available() BEFORE any Locate call (an unavailable backend is never probed),
+// and STOPS AT THE FIRST HIT. On multiple matches (two backends both Locate a
+// surface for the same projectDir) the first by order wins — permissive by
+// design, mirroring Locate's own "a bare shell tab is a fine attach target"
+// contract; attach NEVER refuses on ambiguity the way the typed/destructive
+// path does. ok is false when no backend is available OR none can Locate.
+//
+// Locate-based, NEVER LocateClaude: attach is the attach-preservation path (a
+// bare shell sharing the directory is a valid jump target), and the stricter
+// claude-only refusal belongs only to typed/destructive actuation
+// (ResolveActuationTarget).
+func ResolveForLocate(projectDir string) (Controller, Target, bool) {
+	for _, c := range backends {
+		if !c.Available() {
+			continue
+		}
+		if t, ok := c.Locate(projectDir); ok {
+			return c, t, true
+		}
+	}
+	return nil, Target{}, false
 }

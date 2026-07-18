@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,6 +35,14 @@ import (
 // save-then-restore pattern as always.
 func TestMain(m *testing.M) {
 	historyDirFn = func() string { return filepath.Join(os.TempDir(), "fleetops-tui-tests-unused-history") }
+	// Same hermeticity net for the persisted hide-set: New() loads it, and
+	// many tests call New() with no reason to care about a real captain's
+	// ~/.fleetops/hidden.json. Point it at a per-run temp file (missing at
+	// start → fail-open empty); hide/delete tests that need real persistence
+	// override hiddenFileFn themselves (save-then-restore).
+	hiddenFileFn = func() string {
+		return filepath.Join(os.TempDir(), "fleetops-tui-tests-unused-hidden.json")
+	}
 	os.Exit(m.Run())
 }
 
@@ -980,10 +989,10 @@ func TestRenderHeaderBlock_HintGridPresentAtThreshold(t *testing.T) {
 
 // TestHeaderHintKeys_GroupedByFunction pins fix/exit-gate-ux item 7's
 // reordering: column-major fill groups send actions (r/i/a), lifecycle
-// (n/k/p), nav (↵/o//), and session housekeeping (q/d) into adjacent
+// (n/k/p), nav (↵/o//), and session housekeeping (q/d/x) into adjacent
 // cells — see headerHintKeys' doc for the grouping rationale.
 func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
-	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q", "d"}
+	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q", "d", "x"}
 	if len(headerHintKeys) != len(want) {
 		t.Fatalf("got %d keys, want %d", len(headerHintKeys), len(want))
 	}
@@ -1000,7 +1009,7 @@ func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
 // have dropped anything.
 func TestRenderHeaderHintGrid_AllKeysPresent_NothingRegressed(t *testing.T) {
 	out := renderHeaderHintGrid(4, 4*headerHintColWidth)
-	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q", "d"} {
+	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q", "d", "x"} {
 		if !strings.Contains(out, "<"+k+">") {
 			t.Errorf("expected hint grid to contain key %q, got:\n%s", k, out)
 		}
@@ -1596,7 +1605,7 @@ func TestUpdate_SecondKWithinWindow_TriggersKill(t *testing.T) {
 func TestUpdate_SecondKAfterWindowExpires_RestartsConfirmCycle(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('k'))
-	m.pendingKillAt = time.Now().Add(-killConfirmWindow - time.Second) // simulate the window having expired
+	m.pendingKillAt = time.Now().Add(-destructiveConfirmWindow - time.Second) // simulate the window having expired
 
 	m, cmd := updateModel(t, m, runeKey('k'))
 
@@ -3244,9 +3253,28 @@ func withFakeControlResolve(t *testing.T, ctrl control.Controller, ok bool) {
 	controlResolveFn = func() (control.Controller, bool) { return ctrl, ok }
 }
 
+// withFakeControlResolveForLocate fakes attachCmd's ATTACH-resolver seam. It
+// DELEGATES to ctrl.Locate (never LocateClaude) exactly as the real
+// control.ResolveForLocate does, so the attach-preservation pin
+// (TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude) still observes the
+// Locate-not-LocateClaude invariant through the fake controller after the seam
+// split.
+func withFakeControlResolveForLocate(t *testing.T, ctrl control.Controller, ok bool) {
+	t.Helper()
+	orig := controlResolveForLocateFn
+	t.Cleanup(func() { controlResolveForLocateFn = orig })
+	controlResolveForLocateFn = func(projectDir string) (control.Controller, control.Target, bool) {
+		if !ok || ctrl == nil {
+			return nil, control.Target{}, false
+		}
+		target, located := ctrl.Locate(projectDir)
+		return ctrl, target, located
+	}
+}
+
 func TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude(t *testing.T) {
 	fakeCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%1"}, locateOK: true}
-	withFakeControlResolve(t, fakeCtrl, true)
+	withFakeControlResolveForLocate(t, fakeCtrl, true)
 	l := domain.Loop{Project: "myproject", SessionID: "s1", ProjectDir: "-x-myproject", State: domain.StateRunning}
 
 	msg := attachCmd(l)()
@@ -3267,7 +3295,7 @@ func TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude(t *testing.T) {
 }
 
 func TestAttachCmd_NoBackendAvailable_ManualHintFallback(t *testing.T) {
-	withFakeControlResolve(t, nil, false)
+	withFakeControlResolveForLocate(t, nil, false)
 	l := domain.Loop{Project: "myproject", SessionID: "s1", Cwd: "/home/user/myproject", State: domain.StateRunning}
 
 	msg := attachCmd(l)()
@@ -3278,6 +3306,269 @@ func TestAttachCmd_NoBackendAvailable_ManualHintFallback(t *testing.T) {
 	}
 	if !strings.Contains(am.text, "cd /home/user/myproject") {
 		t.Errorf("text = %q, want the manual attach hint", am.text)
+	}
+}
+
+// TestAttachCmd_CaptainTopology_FocusesLocatedTmuxSurface pins the fix's
+// user-visible payoff at the attach level: on the captain's machine orca is
+// always available, but the loop lives in a tmux surface. ResolveForLocate
+// hands attachCmd the tmux Target directly, and attachCmd Focuses THAT (no
+// second Locate), reporting the tmux backend — orca never gets to win by
+// install order.
+func TestAttachCmd_CaptainTopology_FocusesLocatedTmuxSurface(t *testing.T) {
+	tmuxCtrl := &fakeController{name: "tmux", focusErr: nil}
+	tmuxTarget := control.Target{Backend: "tmux", ID: "%3"}
+	orig := controlResolveForLocateFn
+	t.Cleanup(func() { controlResolveForLocateFn = orig })
+	controlResolveForLocateFn = func(projectDir string) (control.Controller, control.Target, bool) {
+		return tmuxCtrl, tmuxTarget, true // as if orca couldn't Locate, tmux did
+	}
+	l := domain.Loop{Project: "api", ProjectDir: "-x-api", Cwd: "/home/user/api", State: domain.StateRunning}
+
+	msg := attachCmd(l)()
+
+	if !tmuxCtrl.focusCalled {
+		t.Error("expected Focus to be called on the located tmux surface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok {
+		t.Fatalf("got %+v, want a successful attachResultMsg", msg)
+	}
+	if !strings.Contains(am.text, "via tmux") {
+		t.Errorf("text = %q, want it to report the tmux backend (locate-based, not orca by install order)", am.text)
+	}
+}
+
+// ── attachCmd step 1: host_app FocusAdapter ────────────────────────────────
+
+// fakeFocusAdapter is a control.FocusAdapter test double that records whether
+// Raise was called and with which entry, and returns a configurable error.
+type fakeFocusAdapter struct {
+	raiseCalled bool
+	raiseEntry  sessions.SessionEntry
+	raiseErr    error
+}
+
+func (f *fakeFocusAdapter) Raise(entry sessions.SessionEntry) error {
+	f.raiseCalled = true
+	f.raiseEntry = entry
+	return f.raiseErr
+}
+
+// withFakeAttachEntry makes attachCmd see a fixed SessionEntry for any session.
+func withFakeAttachEntry(t *testing.T, entry sessions.SessionEntry) {
+	t.Helper()
+	orig := sessionEntryFn
+	t.Cleanup(func() { sessionEntryFn = orig })
+	sessionEntryFn = func(string) sessions.SessionEntry { return entry }
+}
+
+// withFakeFocusAdapter makes attachCmd's step-1 resolver return adapter for
+// hostApp (and nothing for any other host_app).
+func withFakeFocusAdapter(t *testing.T, hostApp string, adapter control.FocusAdapter) {
+	t.Helper()
+	orig := resolveFocusAdapterFn
+	t.Cleanup(func() { resolveFocusAdapterFn = orig })
+	resolveFocusAdapterFn = func(h string) (control.FocusAdapter, bool) {
+		if h == hostApp {
+			return adapter, true
+		}
+		return nil, false
+	}
+}
+
+// TestAttachCmd_ITerm2Entry_RaisesViaFocusAdapter is step (a): a loop whose
+// registry entry carries an iTerm2 host_app + a window_id is raised through the
+// FocusAdapter — step 1 wins, the multiplexer path is never consulted.
+func TestAttachCmd_ITerm2Entry_RaisesViaFocusAdapter(t *testing.T) {
+	adapter := &fakeFocusAdapter{}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	// If step 2 were reached it would panic the test by being unexpectedly hit:
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%1"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !adapter.raiseCalled {
+		t.Fatal("expected FocusAdapter.Raise to be called for an iTerm2 entry")
+	}
+	if adapter.raiseEntry.WindowID != "w0t1p0:GUID" {
+		t.Errorf("Raise got WindowID %q, want the recorded one", adapter.raiseEntry.WindowID)
+	}
+	if muxCtrl.focusCalled {
+		t.Error("step 2 (multiplexer Focus) must NOT run once step 1 raised the window")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via iTerm.app") {
+		t.Fatalf("got %+v, want a successful attach reporting the iTerm.app host", msg)
+	}
+}
+
+// TestAttachCmd_NoAdapterButMultiplexerLocatable_UsesResolveForLocate is step
+// (b): an entry with no recognized host_app (legacy/multiplexer loop) falls
+// through to today's ResolveForLocate+Focus path, unchanged.
+func TestAttachCmd_NoAdapterButMultiplexerLocatable_UsesResolveForLocate(t *testing.T) {
+	// Zero entry (no host_app) — the shape of a pre-schema-extension record.
+	withFakeAttachEntry(t, sessions.SessionEntry{})
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%3"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !muxCtrl.locateCalled || !muxCtrl.focusCalled {
+		t.Error("expected the multiplexer ResolveForLocate+Focus path to run for a no-adapter loop")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux", msg)
+	}
+}
+
+// TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer confirms an adapter
+// that reports ErrNoFocusSurface (window gone) degrades to step 2 rather than
+// hard-failing.
+func TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%7"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !adapter.raiseCalled {
+		t.Error("expected Raise to be attempted")
+	}
+	if !muxCtrl.focusCalled {
+		t.Error("expected degrade to the multiplexer Focus path on ErrNoFocusSurface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux after degrade", msg)
+	}
+}
+
+// TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter pins that the
+// TUI does NOT second-guess an adapter's preconditions. "Needs a window_id" is
+// iTerm2's rule, enforced inside its Raise (ErrNoFocusSurface); duplicating it
+// here would silently skip any future adapter that keys on something else. The
+// degrade path is identical either way, so the only observable difference — and
+// the thing this test locks down — is that Raise gets asked.
+func TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"}) // no WindowID
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%9"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !adapter.raiseCalled {
+		t.Error("the adapter must be consulted even with an empty WindowID — that precondition belongs to the adapter")
+	}
+	if !muxCtrl.focusCalled {
+		t.Error("expected degrade to the multiplexer path after ErrNoFocusSurface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux after degrade", msg)
+	}
+}
+
+// TestAttachCmd_ITerm2RaiseError_DegradesToMultiplexer: a genuine Raise error
+// (NOT ErrNoFocusSurface) must still degrade to step 2. osascript exits
+// non-zero when macOS Automation permission has not been granted — a normal
+// first-run state — and hard-failing there would strand the human on an error
+// while a working tmux surface sat one step away.
+func TestAttachCmd_ITerm2RaiseError_DegradesToMultiplexer(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: errors.New("not authorized to send Apple events")}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !muxCtrl.focusCalled {
+		t.Error("a Raise error must degrade to the multiplexer path, not hard-fail")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux after degrading past the Raise error", msg)
+	}
+}
+
+// TestAttachCmd_RaiseErrorAndNoMultiplexer_ReportsWithManualHint: when every
+// step comes up empty the human finally hears about the Raise error — but the
+// message must still carry the manual hint, because attach never leaves someone
+// with an error and no way forward.
+func TestAttachCmd_RaiseErrorAndNoMultiplexer_ReportsWithManualHint(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: errors.New("not authorized to send Apple events")}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	withFakeControlResolveForLocate(t, nil, false) // no multiplexer either
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", Cwd: "/w/api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a non-ok attach result", msg)
+	}
+	if !strings.Contains(am.text, manualAttachHint("/w/api")) {
+		t.Errorf("text = %q, want it to end with the manual hint", am.text)
+	}
+	if !strings.Contains(am.text, "not authorized") {
+		t.Errorf("text = %q, want the underlying Raise error reported once nothing else worked", am.text)
+	}
+}
+
+// TestAttachCmd_NoFocusSurfaceAndNoMultiplexer_HintOnly: the DESIGNED degrade
+// (ErrNoFocusSurface) is not an error the human can act on, so it must not be
+// pasted into the status line — just the hint.
+func TestAttachCmd_NoFocusSurfaceAndNoMultiplexer_HintOnly(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"})
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	withFakeControlResolveForLocate(t, nil, false)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", Cwd: "/w/api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a non-ok attach result", msg)
+	}
+	if !strings.Contains(am.text, manualAttachHint("/w/api")) {
+		t.Errorf("text = %q, want the manual hint", am.text)
+	}
+	if strings.Contains(am.text, "no focus surface") {
+		t.Errorf("text = %q, must not leak the internal degrade sentinel to the human", am.text)
+	}
+}
+
+// TestAttachCmd_MultiplexerFocusFails_StillHints: step 2 failing for real also
+// lands on step 3 rather than a bare error.
+func TestAttachCmd_MultiplexerFocusFails_StillHints(t *testing.T) {
+	withFakeAttachEntry(t, sessions.SessionEntry{})
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true, focusErr: errors.New("pane vanished")}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", Cwd: "/w/api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a non-ok attach result", msg)
+	}
+	if !strings.Contains(am.text, manualAttachHint("/w/api")) {
+		t.Errorf("text = %q, want the manual hint even when Focus itself failed", am.text)
 	}
 }
 
@@ -7772,13 +8063,13 @@ func TestUpdate_DemoMode_MutatingKeyRefused_NavigationStillWorks(t *testing.T) {
 }
 
 func TestIsDemoBlockedKey(t *testing.T) {
-	blocked := []string{"r", "a", "i", "enter", "o", "n", "k", "p"}
+	blocked := []string{"r", "a", "i", "enter", "o", "n", "k", "p", "d", "x"}
 	for _, key := range blocked {
 		if !isDemoBlockedKey(key) {
 			t.Errorf("isDemoBlockedKey(%q) = false, want true", key)
 		}
 	}
-	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c", "d"}
+	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c"}
 	for _, key := range allowed {
 		if isDemoBlockedKey(key) {
 			t.Errorf("isDemoBlockedKey(%q) = true, want false", key)
@@ -7786,28 +8077,143 @@ func TestIsDemoBlockedKey(t *testing.T) {
 	}
 }
 
-// ── "d" dismiss: hide a loop from the fleet list (view-state only) ───────
+// ── "d" hidden / "x" delete: persisted hide-set (survives restart) ───────
 
-func TestUpdate_DKey_DismissesSelectedLoop(t *testing.T) {
+// withHiddenFile points hiddenFileFn at a fresh temp file for one test,
+// restoring the original on cleanup — mirrors withSessionsDir. The file does
+// not exist yet (fail-open empty until the first hide writes it).
+func withHiddenFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hidden.json")
+	orig := hiddenFileFn
+	t.Cleanup(func() { hiddenFileFn = orig })
+	hiddenFileFn = func() string { return path }
+	return path
+}
+
+// withDeletableSession is the shared fixture for the "x" (delete) tests: a
+// temp hide-file, a temp sessions dir, and a registry entry for sess-1 — the
+// thing "x" must remove on a confirmed press and must NOT touch otherwise. It
+// returns that entry's path so a test can assert on its presence.
+//
+// The record goes through sessions.WriteSession rather than a hand-written
+// JSON literal so the on-disk shape and the <id>.json filename convention stay
+// owned by the package that defines them; a literal here would keep passing
+// while silently ceasing to represent a real record.
+func withDeletableSession(t *testing.T) string {
+	t.Helper()
+	withHiddenFile(t)
+	sessionsDir := withSessionsDir(t)
+	if err := sessions.WriteSession(sessionsDir, "sess-1", sessions.SessionEntry{PID: 1, TTY: "ttys001"}); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(sessionsDir, "sess-1.json")
+}
+
+// withUnwritableHiddenFile points hiddenFileFn at a path that can never be
+// written (its "directory" is actually a regular file), so hidden.Add always
+// errors — the only way to exercise hideSession's persistence-failure branch.
+func withUnwritableHiddenFile(t *testing.T) {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("i am a file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := hiddenFileFn
+	t.Cleanup(func() { hiddenFileFn = orig })
+	hiddenFileFn = func() string { return filepath.Join(blocker, "hidden.json") }
+}
+
+// TestUpdate_DKey_PersistFails_StillHidesInMemory pins hideSession's fail-open
+// branch: persistence is best-effort, but the human's intent is not. A loop
+// they hid must disappear from the list for THIS session even when the
+// tombstone can't be written — and they must be told it won't survive a
+// restart, rather than silently believing it will.
+func TestUpdate_DKey_PersistFails_StillHidesInMemory(t *testing.T) {
+	withUnwritableHiddenFile(t)
 	m := modelWithTwoLoops()
 
-	m, cmd := updateModel(t, m, runeKey('d'))
+	m, _ = updateModel(t, m, runeKey('d'))
 
-	if cmd != nil {
-		t.Error("expected no tea.Cmd — dismiss is pure view-state")
+	if !m.hidden["sess-1"] {
+		t.Error("sess-1 not hidden in memory after a persist failure — the hide must still take effect")
 	}
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops = %+v, want sess-1 pruned from the list regardless of the persist failure", m.loops)
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr to surface the persistence failure", m.statusKind)
+	}
+	if !strings.Contains(m.status, "persisting the hide failed") {
+		t.Errorf("status = %q, want it to say the hide was not persisted", m.status)
+	}
+}
+
+// TestUpdate_XKey_PersistFails_ReportsHideFailure: delete routes through the
+// same hideSession, so a persist failure there is reported too — with the
+// registry removal (which DID succeed) still called out.
+func TestUpdate_XKey_PersistFails_ReportsHideFailure(t *testing.T) {
+	withUnwritableHiddenFile(t)
+	withSessionsDir(t)
+	m := modelWithTwoLoops()
+
+	m = confirmDelete(t, m)
+
+	if !m.hidden["sess-1"] {
+		t.Error("sess-1 not hidden in memory after a persist failure")
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
+	}
+	if !strings.Contains(m.status, "persisting the hide failed") {
+		t.Errorf("status = %q, want the hide-persistence failure reported", m.status)
+	}
+}
+
+func TestUpdate_DKey_HidesSelectedLoop(t *testing.T) {
+	withHiddenFile(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('d'))
+
 	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
 		t.Fatalf("loops = %+v, want only sess-2 left", m.loops)
 	}
-	if !m.dismissed["sess-1"] {
-		t.Error("expected sess-1 recorded in the dismissed set")
+	if !m.hidden["sess-1"] {
+		t.Error("expected sess-1 recorded in the hidden set")
 	}
-	if !strings.Contains(m.status, "dismissed myproject") {
-		t.Errorf("status = %q, want a dismissed-myproject message", m.status)
+	if !strings.Contains(m.status, "hidden myproject") {
+		t.Errorf("status = %q, want a hidden-myproject message", m.status)
+	}
+}
+
+// TestUpdate_DKey_HidePersistsAcrossRestart is the headline requirement: a
+// hide written by "d" must still filter the loop after fleetops restarts,
+// which we model by building a FRESH Model (New reloads hidden.Load from the
+// same file) and feeding it a scan that re-derives sess-1.
+func TestUpdate_DKey_HidePersistsAcrossRestart(t *testing.T) {
+	withHiddenFile(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('d')) // hide sess-1, persisted to disk
+
+	// "restart": a brand-new Model loads the persisted hide-set from disk.
+	restarted := modelWithTwoLoops()
+	if !restarted.hidden["sess-1"] {
+		t.Fatalf("restarted model's hidden set = %+v, want sess-1 loaded from disk", restarted.hidden)
+	}
+	rescan := loopsMsg{
+		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	restarted, _ = updateModel(t, restarted, rescan)
+	if len(restarted.loops) != 1 || restarted.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops after restart+rescan = %+v, want sess-1 still hidden", restarted.loops)
 	}
 }
 
 func TestUpdate_DKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
+	withHiddenFile(t)
 	m := New()
 
 	m, cmd := updateModel(t, m, runeKey('d'))
@@ -7815,12 +8221,16 @@ func TestUpdate_DKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
 	if cmd != nil {
 		t.Error("expected no tea.Cmd for an empty fleet")
 	}
-	if !strings.Contains(m.status, "select a loop to dismiss") {
+	if !strings.Contains(m.status, "select a loop to hide") {
 		t.Errorf("status = %q, want the select-a-loop refusal", m.status)
+	}
+	if len(m.hidden) != 0 {
+		t.Errorf("hidden = %+v, want empty — a no-selection refusal must not change state", m.hidden)
 	}
 }
 
 func TestUpdate_DKey_LastRow_ClampsCursor(t *testing.T) {
+	withHiddenFile(t)
 	m := modelWithTwoLoops()
 	m.cursor = 1
 
@@ -7834,9 +8244,10 @@ func TestUpdate_DKey_LastRow_ClampsCursor(t *testing.T) {
 	}
 }
 
-func TestUpdate_LoopsMsg_DoesNotResurrectDismissed(t *testing.T) {
+func TestUpdate_LoopsMsg_DoesNotResurrectHidden(t *testing.T) {
+	withHiddenFile(t)
 	m := modelWithTwoLoops()
-	m, _ = updateModel(t, m, runeKey('d')) // dismiss sess-1
+	m, _ = updateModel(t, m, runeKey('d')) // hide sess-1
 
 	rescan := loopsMsg{
 		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
@@ -7849,11 +8260,192 @@ func TestUpdate_LoopsMsg_DoesNotResurrectDismissed(t *testing.T) {
 	}
 }
 
-func TestWithoutDismissed_EmptySet_ReturnsInputUnchanged(t *testing.T) {
+func TestWithoutHidden_EmptySet_ReturnsInputUnchanged(t *testing.T) {
 	m := modelWithTwoLoops()
-	loops := m.withoutDismissed(m.loops)
+	m.hidden = nil
+	loops := m.withoutHidden(m.loops)
 	if len(loops) != 2 {
-		t.Fatalf("got %d loops, want 2 — an empty dismissed set must filter nothing", len(loops))
+		t.Fatalf("got %d loops, want 2 — an empty hidden set must filter nothing", len(loops))
+	}
+}
+
+// TestNew_CorruptHiddenFile_FailsOpen: a garbage hidden.json must load as an
+// empty set (show every loop), never crash — the fail-open invariant.
+func TestNew_CorruptHiddenFile_FailsOpen(t *testing.T) {
+	path := withHiddenFile(t)
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := modelWithTwoLoops() // New() → hidden.Load on the corrupt file
+
+	if len(m.hidden) != 0 {
+		t.Fatalf("hidden = %+v, want empty (fail-open on corrupt file)", m.hidden)
+	}
+	rescan := loopsMsg{
+		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	m, _ = updateModel(t, m, rescan)
+	if len(m.loops) != 2 {
+		t.Fatalf("loops = %+v, want both shown (corrupt tombstone must not hide anything)", m.loops)
+	}
+}
+
+// confirmDelete presses "x" twice — delete is gated behind the same two-press
+// confirm as kill, so a single press only arms it.
+func confirmDelete(t *testing.T, m Model) Model {
+	t.Helper()
+	m, _ = updateModel(t, m, runeKey('x'))
+	m, _ = updateModel(t, m, runeKey('x'))
+	return m
+}
+
+// TestUpdate_XKey_SinglePress_DeletesNothing is the guard pin. Delete removes
+// the registry registration and writes a permanent tombstone, and NOTHING in
+// the TUI can unhide a loop — so a single stray "x" was unrecoverable short of
+// hand-editing hidden.json, while the strictly-more-reversible "k" already
+// required two presses.
+func TestUpdate_XKey_SinglePress_DeletesNothing(t *testing.T) {
+	regPath := withDeletableSession(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); err != nil {
+		t.Errorf("registry entry removed on the FIRST x (err=%v), want it untouched", err)
+	}
+	if m.hidden["sess-1"] {
+		t.Error("sess-1 was tombstoned on the first x, want the press to only arm the confirm")
+	}
+	if len(m.loops) != 2 {
+		t.Errorf("loops = %d, want both still listed after one x", len(m.loops))
+	}
+	if !strings.Contains(m.status, "press x again") {
+		t.Errorf("status = %q, want a confirm prompt", m.status)
+	}
+}
+
+// TestUpdate_XKey_ConfirmExpires_DeletesNothing: a second "x" arriving after
+// the window starts a fresh confirm rather than deleting.
+func TestUpdate_XKey_ConfirmExpires_DeletesNothing(t *testing.T) {
+	regPath := withDeletableSession(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+	m.pendingDeleteAt = time.Now().Add(-destructiveConfirmWindow - time.Second) // window elapsed
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); err != nil {
+		t.Errorf("registry entry removed after an EXPIRED confirm (err=%v), want it untouched", err)
+	}
+	if m.hidden["sess-1"] {
+		t.Error("sess-1 tombstoned after an expired confirm")
+	}
+	if !strings.Contains(m.status, "press x again") {
+		t.Errorf("status = %q, want a fresh confirm prompt", m.status)
+	}
+}
+
+// TestUpdate_XKey_InterveningKeyCancelsConfirm: any other key cancels a pending
+// delete, so "x" then something else then "x" cannot delete on that second x.
+func TestUpdate_XKey_InterveningKeyCancelsConfirm(t *testing.T) {
+	regPath := withDeletableSession(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown}) // cursor move cancels
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); err != nil {
+		t.Errorf("registry entry removed despite an intervening keypress (err=%v)", err)
+	}
+	if m.pendingDeleteSession == "" {
+		t.Error("expected the second x to re-arm a fresh confirm")
+	}
+}
+
+// TestUpdate_XKey_DeletesRegistryEntryAndHides: "x" twice removes the session
+// registry .json AND persists the hide, while the conversation jsonl is left
+// untouched.
+func TestUpdate_XKey_DeletesRegistryEntryAndHides(t *testing.T) {
+	// regPath is the registry entry for sess-1 -- what "x" must remove...
+	regPath := withDeletableSession(t)
+	// ...and a stand-in conversation jsonl "x" must NOT touch.
+	jsonlPath := filepath.Join(t.TempDir(), "sess-1.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte("conversation history\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := modelWithTwoLoops()
+
+	m = confirmDelete(t, m)
+
+	if _, err := os.Stat(regPath); !os.IsNotExist(err) {
+		t.Errorf("registry entry still present (err=%v), want removed", err)
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Errorf("conversation jsonl was disturbed (err=%v), want preserved", err)
+	}
+	if !m.hidden["sess-1"] {
+		t.Error("expected sess-1 in the hidden set after delete")
+	}
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops = %+v, want only sess-2 left", m.loops)
+	}
+	if !strings.Contains(m.status, "deleted myproject") || !strings.Contains(m.status, "registry entry removed") {
+		t.Errorf("status = %q, want a deleted/registry-removed message", m.status)
+	}
+}
+
+// TestUpdate_XKey_MissingRegistryEntry_StillHides: DeleteSession treats a
+// missing entry as a no-op (nil error), so "x" on a loop with no registry
+// record still hides it — no error status.
+func TestUpdate_XKey_MissingRegistryEntry_StillHides(t *testing.T) {
+	withHiddenFile(t)
+	withSessionsDir(t) // empty — sess-1 has no registry entry
+	m := modelWithTwoLoops()
+
+	m = confirmDelete(t, m)
+
+	if !m.hidden["sess-1"] {
+		t.Error("expected sess-1 hidden even with no registry entry to delete")
+	}
+	if m.statusKind == statusErr {
+		t.Errorf("statusKind = %v, want not statusErr (missing registry entry is a no-op)", m.statusKind)
+	}
+}
+
+func TestUpdate_XKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
+	withHiddenFile(t)
+	m := New()
+
+	m, cmd := updateModel(t, m, runeKey('x'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an empty fleet")
+	}
+	if !strings.Contains(m.status, "select a loop to delete") {
+		t.Errorf("status = %q, want the select-a-loop-to-delete refusal", m.status)
+	}
+	if len(m.hidden) != 0 {
+		t.Errorf("hidden = %+v, want empty — a no-selection refusal must not change state", m.hidden)
+	}
+}
+
+// TestUpdate_DXKeys_DemoBlocked: in demo mode both keys are refused before
+// touching disk (no persisted tombstone keyed by a synthetic session id).
+func TestUpdate_DXKeys_DemoBlocked(t *testing.T) {
+	withHiddenFile(t)
+	for _, key := range []rune{'d', 'x'} {
+		m := NewDemo()
+		before := len(m.loops)
+		m, _ = updateModel(t, m, runeKey(key))
+		if len(m.loops) != before {
+			t.Errorf("key %q: loops changed in demo mode, want refused", string(key))
+		}
+		if !strings.Contains(m.status, "demo mode is read-only") {
+			t.Errorf("key %q: status = %q, want the demo read-only refusal", string(key), m.status)
+		}
 	}
 }
 

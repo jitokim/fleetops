@@ -58,6 +58,113 @@ func TestSessionStartHook_WritesEntry(t *testing.T) {
 	}
 }
 
+// TestSessionStartHook_PopulatesHostWindowFromEnv confirms the hook records
+// $TERM_PROGRAM as HostApp and that host's OWN window id as WindowID.
+func TestSessionStartHook_PopulatesHostWindowFromEnv(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("ITERM_SESSION_ID", "w0t1p0:ABC-123")
+	t.Setenv("TMUX_PANE", "%9") // ignored: the host is iTerm2, so its id wins
+
+	withStdin(t, `{"session_id":"host-win","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "host-win")
+	if err != nil {
+		t.Fatalf("expected an entry: %v", err)
+	}
+	if entry.HostApp != "iTerm.app" {
+		t.Errorf("HostApp = %q, want iTerm.app", entry.HostApp)
+	}
+	if entry.WindowID != "w0t1p0:ABC-123" {
+		t.Errorf("WindowID = %q, want the iTerm2 host's own marker ($ITERM_SESSION_ID)", entry.WindowID)
+	}
+	if entry.SocketPath != "" {
+		t.Errorf("SocketPath = %q, want empty (out of scope for this slice)", entry.SocketPath)
+	}
+}
+
+// TestResolveHostWindow_NestedTmuxInITerm2_NoForeignWindowID is the
+// mismatched-pair pin and the common nested case: claude runs in tmux inside
+// iTerm2, so tmux sets $TERM_PROGRAM=tmux while the OUTER iTerm2's
+// $ITERM_SESSION_ID is still inherited in the environment. Resolving the two
+// fields independently records HostApp=tmux with an iTerm2 window id — one
+// record describing two different terminals. WindowID must come from the
+// resolved host, never from whichever marker happens to be set.
+func TestResolveHostWindow_NestedTmuxInITerm2_NoForeignWindowID(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "tmux")
+	t.Setenv("ITERM_SESSION_ID", "w0t1p0:OUTER-ITERM-GUID") // leaked from the outer iTerm2
+	t.Setenv("TMUX_PANE", "%9")
+
+	hostApp, windowID := resolveHostWindow()
+
+	if hostApp != "tmux" {
+		t.Errorf("HostApp = %q, want tmux", hostApp)
+	}
+	if strings.Contains(windowID, "ITERM") {
+		t.Fatalf("WindowID = %q — a tmux-hosted session must never carry the outer iTerm2 window id", windowID)
+	}
+	if windowID != "%9" {
+		t.Errorf("WindowID = %q, want tmux's own $TMUX_PANE", windowID)
+	}
+}
+
+// TestResolveHostWindow_UnknownHost_KeepsHostDropsWindowID: an unrecognized
+// $TERM_PROGRAM is still a true fact worth recording, but we don't know which
+// env var carries ITS window id — so the host name is kept and the window id is
+// dropped rather than borrowing another terminal's id.
+func TestResolveHostWindow_UnknownHost_KeepsHostDropsWindowID(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "Apple_Terminal")
+	t.Setenv("ITERM_SESSION_ID", "w0t1p0:NOT-OURS")
+	t.Setenv("TMUX_PANE", "%9")
+
+	hostApp, windowID := resolveHostWindow()
+	if hostApp != "Apple_Terminal" {
+		t.Errorf("hostApp = %q, want the real $TERM_PROGRAM %q to be preserved", hostApp, "Apple_Terminal")
+	}
+	if windowID != "" {
+		t.Errorf("windowID = %q, want empty — an unrecognized host must not borrow another terminal's id", windowID)
+	}
+}
+
+// TestResolveHostWindow_HostWithoutItsOwnMarker_EmptyWindowID: iTerm2 without
+// $ITERM_SESSION_ID must NOT fall back to $TMUX_PANE.
+func TestResolveHostWindow_HostWithoutItsOwnMarker_EmptyWindowID(t *testing.T) {
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("ITERM_SESSION_ID", "")
+	t.Setenv("TMUX_PANE", "%9")
+
+	hostApp, windowID := resolveHostWindow()
+
+	if hostApp != "iTerm.app" {
+		t.Errorf("HostApp = %q, want iTerm.app", hostApp)
+	}
+	if windowID != "" {
+		t.Errorf("WindowID = %q, want empty — $TMUX_PANE is not iTerm2's window id", windowID)
+	}
+}
+
+// TestSessionStartHook_HostWindowEnvAbsent_StillWritesEntry confirms the hook
+// still succeeds (exits 0, writes the entry) when NO host/window env is set —
+// HostApp/WindowID simply stay empty and attach later degrades to the hint.
+func TestSessionStartHook_HostWindowEnvAbsent_StillWritesEntry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// Force-clear inherited terminal env (the test runner itself may be under
+	// iTerm2/tmux) so "absent" is actually absent.
+	t.Setenv("TERM_PROGRAM", "")
+	t.Setenv("ITERM_SESSION_ID", "")
+	t.Setenv("TMUX_PANE", "")
+
+	withStdin(t, `{"session_id":"no-host","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "no-host")
+	if err != nil {
+		t.Fatalf("expected an entry even with no host env: %v", err)
+	}
+	if entry.HostApp != "" || entry.WindowID != "" {
+		t.Errorf("want empty host/window with no env, got HostApp=%q WindowID=%q", entry.HostApp, entry.WindowID)
+	}
+}
+
 func TestSessionStartHook_MissingSessionID_NoWrite(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
