@@ -389,6 +389,13 @@ type Model struct {
 	pendingKillSession string // non-empty while awaiting the confirming second "k"
 	pendingKillAt      time.Time
 
+	// Same two-press confirm as kill, for "x" (delete). Delete removes the
+	// session-registry registration and writes a permanent tombstone, and there
+	// is no unhide path anywhere in the TUI — a stray keypress is unrecoverable
+	// without hand-editing hidden.json, so it gets the same guard kill has.
+	pendingDeleteSession string
+	pendingDeleteAt      time.Time
+
 	judging map[string]bool // sessionID -> a judgeCmd is in flight for it (in-flight guard, see triggerJudgments)
 
 	// actuating guards against a double-press of r/i firing two concurrent
@@ -652,8 +659,9 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 	return loops, detailCache, oracleCounts
 }
 
-// killConfirmWindow: the second "k" must land within this long of the first
-// to actually kill — otherwise it starts a fresh confirm cycle instead.
+// killConfirmWindow: the confirming second press must land within this long of
+// the first to actually run — otherwise it starts a fresh confirm cycle
+// instead. Shared by the two destructive keys, "k" (kill) and "x" (delete).
 const killConfirmWindow = 3 * time.Second
 
 // Init dispatches the first scan (loopsMsg) and arms the refresh ticker —
@@ -777,6 +785,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		key := msg.String()
 		if key != "k" {
 			m.pendingKillSession = "" // any key other than a repeat "k" cancels a pending kill-confirm
+		}
+		if key != "x" {
+			m.pendingDeleteSession = "" // ditto for a pending delete-confirm
 		}
 
 		if m.mode == modePrompting {
@@ -1308,6 +1319,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status, m.statusKind = "select a loop to delete", statusNeutral
 				return m, nil
 			}
+			// Two-press confirm, identical to "k". Delete drops the registry
+			// registration and writes a permanent tombstone with no unhide
+			// affordance anywhere in the TUI, so a single stray "x" is
+			// unrecoverable short of hand-editing hidden.json — strictly less
+			// reversible than the kill this guard was built for.
+			now := time.Now()
+			if m.pendingDeleteSession != sel.SessionID || now.Sub(m.pendingDeleteAt) > killConfirmWindow {
+				m.pendingDeleteSession = sel.SessionID
+				m.pendingDeleteAt = now
+				m.status, m.statusKind = fmt.Sprintf("press x again within 3s to delete %s", sel.Project), statusWarn
+				return m, nil
+			}
+			m.pendingDeleteSession = ""
 			delErr := sessions.DeleteSession(sessionsDirFn(), sel.SessionID)
 			hideErr := m.hideSession(sel.SessionID)
 			switch {

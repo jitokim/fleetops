@@ -8213,7 +8213,95 @@ func TestNew_CorruptHiddenFile_FailsOpen(t *testing.T) {
 	}
 }
 
-// TestUpdate_XKey_DeletesRegistryEntryAndHides: "x" removes the session
+// confirmDelete presses "x" twice — delete is gated behind the same two-press
+// confirm as kill, so a single press only arms it.
+func confirmDelete(t *testing.T, m Model) Model {
+	t.Helper()
+	m, _ = updateModel(t, m, runeKey('x'))
+	m, _ = updateModel(t, m, runeKey('x'))
+	return m
+}
+
+// TestUpdate_XKey_SinglePress_DeletesNothing is the guard pin. Delete removes
+// the registry registration and writes a permanent tombstone, and NOTHING in
+// the TUI can unhide a loop — so a single stray "x" was unrecoverable short of
+// hand-editing hidden.json, while the strictly-more-reversible "k" already
+// required two presses.
+func TestUpdate_XKey_SinglePress_DeletesNothing(t *testing.T) {
+	withHiddenFile(t)
+	sessionsDir := withSessionsDir(t)
+	regPath := filepath.Join(sessionsDir, "sess-1.json")
+	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); err != nil {
+		t.Errorf("registry entry removed on the FIRST x (err=%v), want it untouched", err)
+	}
+	if m.hidden["sess-1"] {
+		t.Error("sess-1 was tombstoned on the first x, want the press to only arm the confirm")
+	}
+	if len(m.loops) != 2 {
+		t.Errorf("loops = %d, want both still listed after one x", len(m.loops))
+	}
+	if !strings.Contains(m.status, "press x again") {
+		t.Errorf("status = %q, want a confirm prompt", m.status)
+	}
+}
+
+// TestUpdate_XKey_ConfirmExpires_DeletesNothing: a second "x" arriving after
+// the window starts a fresh confirm rather than deleting.
+func TestUpdate_XKey_ConfirmExpires_DeletesNothing(t *testing.T) {
+	withHiddenFile(t)
+	sessionsDir := withSessionsDir(t)
+	regPath := filepath.Join(sessionsDir, "sess-1.json")
+	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+	m.pendingDeleteAt = time.Now().Add(-killConfirmWindow - time.Second) // window elapsed
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); err != nil {
+		t.Errorf("registry entry removed after an EXPIRED confirm (err=%v), want it untouched", err)
+	}
+	if m.hidden["sess-1"] {
+		t.Error("sess-1 tombstoned after an expired confirm")
+	}
+	if !strings.Contains(m.status, "press x again") {
+		t.Errorf("status = %q, want a fresh confirm prompt", m.status)
+	}
+}
+
+// TestUpdate_XKey_InterveningKeyCancelsConfirm: any other key cancels a pending
+// delete, so "x" then something else then "x" cannot delete on that second x.
+func TestUpdate_XKey_InterveningKeyCancelsConfirm(t *testing.T) {
+	withHiddenFile(t)
+	sessionsDir := withSessionsDir(t)
+	regPath := filepath.Join(sessionsDir, "sess-1.json")
+	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyDown}) // cursor move cancels
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); err != nil {
+		t.Errorf("registry entry removed despite an intervening keypress (err=%v)", err)
+	}
+	if m.pendingDeleteSession == "" {
+		t.Error("expected the second x to re-arm a fresh confirm")
+	}
+}
+
+// TestUpdate_XKey_DeletesRegistryEntryAndHides: "x" twice removes the session
 // registry .json AND persists the hide, while the conversation jsonl is left
 // untouched.
 func TestUpdate_XKey_DeletesRegistryEntryAndHides(t *testing.T) {
@@ -8231,7 +8319,7 @@ func TestUpdate_XKey_DeletesRegistryEntryAndHides(t *testing.T) {
 	}
 	m := modelWithTwoLoops()
 
-	m, _ = updateModel(t, m, runeKey('x'))
+	m = confirmDelete(t, m)
 
 	if _, err := os.Stat(regPath); !os.IsNotExist(err) {
 		t.Errorf("registry entry still present (err=%v), want removed", err)
@@ -8258,7 +8346,7 @@ func TestUpdate_XKey_MissingRegistryEntry_StillHides(t *testing.T) {
 	withSessionsDir(t) // empty — sess-1 has no registry entry
 	m := modelWithTwoLoops()
 
-	m, _ = updateModel(t, m, runeKey('x'))
+	m = confirmDelete(t, m)
 
 	if !m.hidden["sess-1"] {
 		t.Error("expected sess-1 hidden even with no registry entry to delete")
