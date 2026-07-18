@@ -3452,6 +3452,34 @@ func TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer(t *testing.T) {
 	}
 }
 
+// TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter pins that the
+// TUI does NOT second-guess an adapter's preconditions. "Needs a window_id" is
+// iTerm2's rule, enforced inside its Raise (ErrNoFocusSurface); duplicating it
+// here would silently skip any future adapter that keys on something else. The
+// degrade path is identical either way, so the only observable difference — and
+// the thing this test locks down — is that Raise gets asked.
+func TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"}, nil) // no WindowID
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%9"}, locateOK: true}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	if !adapter.raiseCalled {
+		t.Error("the adapter must be consulted even with an empty WindowID — that precondition belongs to the adapter")
+	}
+	if !muxCtrl.focusCalled {
+		t.Error("expected degrade to the multiplexer path after ErrNoFocusSurface")
+	}
+	am, ok := msg.(attachResultMsg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux after degrade", msg)
+	}
+}
+
 // TestAttachCmd_ITerm2RaiseError_ReportsFailure confirms a genuine Raise
 // failure (not ErrNoFocusSurface) is surfaced as a failed attach, not silently
 // swallowed into step 2.

@@ -1572,9 +1572,13 @@ func manualResumeHint(sessionID string) string {
 // Resolution order (design §4 "Attach resolution order"), a pure superset of
 // the pre-FocusAdapter behavior:
 //
-//  1. The loop's recorded host_app has a FocusAdapter AND a window_id is
-//     present → Raise that host's own window directly (iTerm2 today). A
-//     genuine Raise failure is reported; ErrNoFocusSurface degrades to step 2.
+//  1. The loop's recorded host_app has a FocusAdapter → ask it to Raise that
+//     host's own window directly (iTerm2 today). What each adapter needs in
+//     order to raise anything is the ADAPTER's business: iTerm2 requires a
+//     window_id and answers ErrNoFocusSurface without one, so this layer does
+//     not re-check that precondition (a copy here would silently skip a future
+//     adapter that keys on something else entirely). Any Raise error degrades
+//     to step 2 — see the error handling below for why none of them is fatal.
 //  2. else ResolveForLocate(projectDir) → Focus — today's multiplexer path,
 //     UNCHANGED. This is the orca/cmux/tmux adapter family: a loop hosted in a
 //     multiplexer that didn't record a recognized host_app/window_id still
@@ -1593,7 +1597,7 @@ func attachCmd(l domain.Loop) tea.Cmd {
 		// FocusAdapter can raise it. A missing/legacy record yields a zero entry
 		// (empty host_app) that simply falls through to step 2.
 		entry, _ := sessionEntryFn(l.SessionID)
-		if adapter, ok := resolveFocusAdapterFn(entry.HostApp); ok && entry.WindowID != "" {
+		if adapter, ok := resolveFocusAdapterFn(entry.HostApp); ok {
 			switch err := adapter.Raise(entry); {
 			case err == nil:
 				return attachResultMsg{true, fmt.Sprintf("attached %s via %s", l.Project, entry.HostApp)}
