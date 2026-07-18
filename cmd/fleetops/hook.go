@@ -122,8 +122,9 @@ const (
 // record describing two different terminals, which would hand a foreign window
 // id to any multiplexer adapter that later trusts it.
 //
-// An unrecognized host yields ("", ""): no window id at all beats a mismatched
-// pair. Every value is best-effort and optional — empties mean no focus adapter
+// An unrecognized host keeps its $TERM_PROGRAM but yields no window id: no
+// window id at all beats a mismatched pair, while the host name itself stays a
+// true, useful fact. Every value is best-effort and optional — empties mean no focus adapter
 // and attach degrades to the manual hint, and the hook always exits 0
 // regardless. Pulled out as its own helper so the env→field mapping is directly
 // testable. SocketPath is intentionally left unpopulated (out of scope for this
@@ -135,7 +136,13 @@ func resolveHostWindow() (hostApp, windowID string) {
 	case tmuxTermProgram:
 		return host, os.Getenv("TMUX_PANE")
 	default:
-		return "", ""
+		// Unrecognized host (Apple_Terminal, Ghostty, WezTerm, …): keep the
+		// real $TERM_PROGRAM — it is a true fact worth recording for
+		// diagnostics and for showing a human where the loop lives — but
+		// record NO window id, because we don't know which env var this host
+		// publishes it in, and a foreign id is worse than none. No adapter
+		// resolves for an unrecognized host, so attach degrades either way.
+		return host, ""
 	}
 }
 

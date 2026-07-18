@@ -108,16 +108,21 @@ func TestResolveHostWindow_NestedTmuxInITerm2_NoForeignWindowID(t *testing.T) {
 	}
 }
 
-// TestResolveHostWindow_UnknownHost_ReturnsEmptyPair: an unrecognized
-// $TERM_PROGRAM has no window var we know how to read, so it yields no pair at
-// all rather than borrowing another terminal's id.
-func TestResolveHostWindow_UnknownHost_ReturnsEmptyPair(t *testing.T) {
+// TestResolveHostWindow_UnknownHost_KeepsHostDropsWindowID: an unrecognized
+// $TERM_PROGRAM is still a true fact worth recording, but we don't know which
+// env var carries ITS window id — so the host name is kept and the window id is
+// dropped rather than borrowing another terminal's id.
+func TestResolveHostWindow_UnknownHost_KeepsHostDropsWindowID(t *testing.T) {
 	t.Setenv("TERM_PROGRAM", "Apple_Terminal")
 	t.Setenv("ITERM_SESSION_ID", "w0t1p0:NOT-OURS")
 	t.Setenv("TMUX_PANE", "%9")
 
-	if hostApp, windowID := resolveHostWindow(); hostApp != "" || windowID != "" {
-		t.Errorf("resolveHostWindow() = (%q,%q), want an empty pair for an unrecognized host", hostApp, windowID)
+	hostApp, windowID := resolveHostWindow()
+	if hostApp != "Apple_Terminal" {
+		t.Errorf("hostApp = %q, want the real $TERM_PROGRAM %q to be preserved", hostApp, "Apple_Terminal")
+	}
+	if windowID != "" {
+		t.Errorf("windowID = %q, want empty — an unrecognized host must not borrow another terminal's id", windowID)
 	}
 }
 
