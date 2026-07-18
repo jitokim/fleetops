@@ -142,8 +142,8 @@ func TestITerm2Interrupt_Verdicts(t *testing.T) {
 		"hit":               {iterm2SendHit + "\n", nil},
 		"miss":              {iterm2SendMiss, ErrSendNoSession},
 		"tty mismatch":      {iterm2SendTTYMismatch, ErrSendTTYMismatch},
-		"empty":             {"", ErrSendNoSession},
-		"unexpected string": {"huh", ErrSendNoSession},
+		"empty":             {"", ErrSendUnrecognizedVerdict},
+		"unexpected string": {"huh", ErrSendUnrecognizedVerdict},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -62,6 +62,17 @@ var ErrSendNoSession = errors.New("control: the host has no session with this id
 // which of the two happened. Its message is what the TUI surfaces verbatim.
 var ErrSendTTYMismatch = errors.New("control: session found but its tty no longer matches this loop — attach (↵) and act manually")
 
+// ErrSendUnrecognizedVerdict reports that the host ran the script, exited 0,
+// and returned something this package does not recognize — not "ok", not
+// "miss", not "ttymismatch". It fails closed exactly like a miss, but it is a
+// DIFFERENT fact and gets its own message: folding it into ErrSendNoSession
+// told the operator "the tab was closed", which is a claim nothing here
+// supports and which sends them looking at the wrong thing. What it actually
+// indicates is a broken script/host contract (an iTerm2 version whose
+// AppleScript dialect changed, an osascript that printed a warning on stdout),
+// and that is worth diagnosing rather than mistaking for a closed tab.
+var ErrSendUnrecognizedVerdict = errors.New("control: the host returned an unrecognized verdict — the send did NOT happen; iTerm2/osascript may have changed")
+
 // hostAppSendAdapters maps a $TERM_PROGRAM marker to its SendAdapter, mirroring
 // hostAppFocusAdapters exactly. Multiplexers deliberately do NOT appear here —
 // they are addressed by Tier 1a/1b through Controller, and adding one here
@@ -181,6 +192,11 @@ func iterm2SendTarget(entry sessions.SessionEntry) (guid, tty string, err error)
 // silence, whitespace, a garbled string — is treated as a failure, never as
 // success. This is the false-success guard the repo's attach P0 exists to
 // enforce, and it must fail closed on outputs nobody anticipated.
+//
+// Failing closed is not a licence to invent a diagnosis, though: unrecognized
+// output gets ErrSendUnrecognizedVerdict rather than being reported as a
+// closed tab. Every verdict maps to the error that states what was actually
+// observed.
 func iterm2SendVerdict(argv []string) error {
 	out, err := iterm2SendFn(argv)
 	if err != nil {
@@ -194,8 +210,12 @@ func iterm2SendVerdict(argv []string) error {
 		return nil
 	case iterm2SendTTYMismatch:
 		return ErrSendTTYMismatch
-	default:
+	case iterm2SendMiss:
 		return ErrSendNoSession
+	default:
+		// Anything else fails closed too — but as its own fact, not as a
+		// fabricated "the tab was closed."
+		return ErrSendUnrecognizedVerdict
 	}
 }
 

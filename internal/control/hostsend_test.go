@@ -263,18 +263,20 @@ func TestITerm2SendText_Verdicts(t *testing.T) {
 		stdout  string
 		wantErr error
 	}{
-		"hit":                 {iterm2SendHit, nil},
-		"hit with newline":    {iterm2SendHit + "\n", nil},
-		"hit padded":          {"  " + iterm2SendHit + "  \n", nil},
-		"miss":                {iterm2SendMiss, ErrSendNoSession},
-		"miss with newline":   {iterm2SendMiss + "\n", ErrSendNoSession},
-		"tty mismatch":        {iterm2SendTTYMismatch, ErrSendTTYMismatch},
-		"mismatch padded":     {" " + iterm2SendTTYMismatch + "\n", ErrSendTTYMismatch},
-		"empty":               {"", ErrSendNoSession},
-		"whitespace only":     {"   \n", ErrSendNoSession},
-		"unexpected string":   {"something else entirely", ErrSendNoSession},
-		"partial hit prefix":  {"okay", ErrSendNoSession},
-		"hit inside sentence": {"it is ok now", ErrSendNoSession},
+		"hit":               {iterm2SendHit, nil},
+		"hit with newline":  {iterm2SendHit + "\n", nil},
+		"hit padded":        {"  " + iterm2SendHit + "  \n", nil},
+		"miss":              {iterm2SendMiss, ErrSendNoSession},
+		"miss with newline": {iterm2SendMiss + "\n", ErrSendNoSession},
+		"tty mismatch":      {iterm2SendTTYMismatch, ErrSendTTYMismatch},
+		"mismatch padded":   {" " + iterm2SendTTYMismatch + "\n", ErrSendTTYMismatch},
+		// Unrecognized output fails closed like a miss, but is NOT a miss:
+		// claiming "the tab was closed" here would be a fabricated diagnosis.
+		"empty":               {"", ErrSendUnrecognizedVerdict},
+		"whitespace only":     {"   \n", ErrSendUnrecognizedVerdict},
+		"unexpected string":   {"something else entirely", ErrSendUnrecognizedVerdict},
+		"partial hit prefix":  {"okay", ErrSendUnrecognizedVerdict},
+		"hit inside sentence": {"it is ok now", ErrSendUnrecognizedVerdict},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -327,6 +329,25 @@ func TestSendErrors_AreDistinct(t *testing.T) {
 	// actually say what happened and what to do about it.
 	if !strings.Contains(ErrSendTTYMismatch.Error(), "tty") || !strings.Contains(ErrSendTTYMismatch.Error(), "attach") {
 		t.Errorf("ErrSendTTYMismatch message %q must name the tty problem and the manual next step", ErrSendTTYMismatch)
+	}
+}
+
+// TestErrSendUnrecognizedVerdict_DoesNotClaimTheTabWasClosed: failing closed on
+// an output nobody anticipated is required; DIAGNOSING it as a closed tab is
+// not. ErrSendNoSession's message asserts the session was closed, which is a
+// claim an unrecognized verdict does not support — and it points the operator
+// at the wrong thing when the real cause is a changed iTerm2/osascript
+// contract.
+func TestErrSendUnrecognizedVerdict_DoesNotClaimTheTabWasClosed(t *testing.T) {
+	if errors.Is(ErrSendUnrecognizedVerdict, ErrSendNoSession) || errors.Is(ErrSendNoSession, ErrSendUnrecognizedVerdict) {
+		t.Error("ErrSendUnrecognizedVerdict and ErrSendNoSession must be distinguishable")
+	}
+	if strings.Contains(ErrSendUnrecognizedVerdict.Error(), "closed") {
+		t.Errorf("message %q claims the session was closed — nothing observed supports that", ErrSendUnrecognizedVerdict)
+	}
+	// It must still be unmistakably a FAILURE: the send did not happen.
+	if !strings.Contains(ErrSendUnrecognizedVerdict.Error(), "NOT") {
+		t.Errorf("message %q must state that the send did not happen", ErrSendUnrecognizedVerdict)
 	}
 }
 
