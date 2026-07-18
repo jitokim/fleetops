@@ -3339,7 +3339,7 @@ func TestAttachCmd_CaptainTopology_FocusesLocatedTmuxSurface(t *testing.T) {
 	}
 }
 
-// ── attachCmd step 1: host_app FocusAdapter (design §4) ────────────────────
+// ── attachCmd step 1: host_app FocusAdapter ────────────────────────────────
 
 // fakeFocusAdapter is a control.FocusAdapter test double that records whether
 // Raise was called and with which entry, and returns a configurable error.

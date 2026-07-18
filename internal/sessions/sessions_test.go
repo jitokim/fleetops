@@ -56,7 +56,9 @@ func TestWriteReadSession_HostFields_RoundTrip(t *testing.T) {
 }
 
 // TestReadSession_BackCompat_LegacyTtyOnlyRecordLoads is the key back-compat
-// guarantee (design §2): a record written by the OLD binary — no host_app /
+// guarantee — every ~/.fleetops/sessions record on an upgrading machine predates
+// the schema extension, so a strict read would break attach for every existing
+// loop until each one restarted: a record written by the OLD binary — no host_app /
 // window_id / socket_path keys at all — must still load with the extended
 // struct, leaving the new fields at their zero value rather than erroring.
 func TestReadSession_BackCompat_LegacyTtyOnlyRecordLoads(t *testing.T) {

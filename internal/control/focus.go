@@ -41,7 +41,9 @@ var ErrNoFocusSurface = errors.New("control: no focus surface for this session")
 const iterm2HostApp = "iTerm.app"
 
 // hostAppFocusAdapters maps a $TERM_PROGRAM marker to its (non-multiplexer)
-// FocusAdapter. Keyed by host_app, as design §4 specifies. Only genuinely new,
+// FocusAdapter. Keyed by host_app because that is the one thing the SessionStart
+// hook can observe about where a loop lives ($TERM_PROGRAM), so a lookup here
+// needs no probing and no guessing. Only genuinely new,
 // window-id-addressable hosts belong here; multiplexers deliberately do not
 // (see FocusAdapter's own doc for why that keeps attach a pure superset).
 var hostAppFocusAdapters = map[string]FocusAdapter{
@@ -84,8 +86,9 @@ const (
 )
 
 // iterm2FocusAdapter raises the iTerm2 window/tab/session identified by the
-// entry's WindowID ($ITERM_SESSION_ID). Focus-only, no Controller surface —
-// the first non-multiplexer FocusAdapter (design §4).
+// entry's WindowID ($ITERM_SESSION_ID). Focus-only, no Controller surface: it
+// is the first non-multiplexer FocusAdapter, and raising a window is the ONLY
+// capability it has — it cannot send keys, so it never belongs on Controller.
 type iterm2FocusAdapter struct{}
 
 // itermGUIDPattern is the WHITELIST every session GUID must match before it may

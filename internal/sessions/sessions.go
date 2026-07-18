@@ -106,7 +106,8 @@ func WriteSession(dir, sessionID string, entry SessionEntry) error {
 // half-written record that would then fail-load. On any error before the
 // rename the temp is removed, so no ".tmp" litter survives a failure. Adopted
 // (over the previous bare os.WriteFile) now that the record carries more fields
-// and a resume can rewrite it in rapid succession (design §2 atomicity note).
+// and a resume can rewrite it in rapid succession — a torn record would cost
+// the loop its host_app/window_id and silently degrade attach.
 func atomicWrite(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".session-*.tmp")
 	if err != nil {

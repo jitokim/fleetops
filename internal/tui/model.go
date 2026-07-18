@@ -83,7 +83,7 @@ var (
 	// target (see TestAttachCmd_ObservedLoop_UsesLocateNotLocateClaude).
 	controlResolveForLocateFn = control.ResolveForLocate
 	// resolveFocusAdapterFn is control.ResolveFocusAdapter by default —
-	// attachCmd's STEP 1 seam (design §4). Given a loop's recorded host_app it
+	// attachCmd's STEP 1 seam. Given a loop's recorded host_app it
 	// returns the FocusAdapter that can Raise the loop's own window (iTerm2
 	// today), or (nil,false) to degrade to step 2. Overridable so attach's
 	// host_app routing is unit-testable with a fake adapter, without a real
@@ -1593,8 +1593,8 @@ func manualResumeHint(sessionID string) string {
 // loop state (not just stalled) — "jump to it" is useful for a running loop
 // too. Runs off the event loop, same non-blocking pattern as resumeCmd.
 //
-// Resolution order (design §4 "Attach resolution order"), a pure superset of
-// the pre-FocusAdapter behavior:
+// Resolution order — a pure superset of the pre-FocusAdapter behavior, so no
+// loop that attached before can stop attaching now:
 //
 //  1. The loop's recorded host_app has a FocusAdapter → ask it to Raise that
 //     host's own window directly (iTerm2 today). What each adapter needs in
