@@ -270,11 +270,15 @@ const drivenDormantStale = 15 * time.Minute
 //     SAME StateStalled/StallGone treatment as any other presumed-dead
 //     loop (never dropped either way, once Driven: dropping would let a
 //     truly stuck engine loop silently vanish instead of surfacing it).
-//   - StateDone / StateDrift (the oracle already rendered a verdict this
-//     cycle — see enrichFromRegistry) → left alone, dropped or demoted by
-//     neither rule: that's the terminal record of a judgment, not an
-//     incident, regardless of whether the terminal later closed.
-//   - anything else (StateStalled, or StateRunning past the live count —
+//   - StateDone (the oracle converged this loop this cycle — see
+//     enrichFromRegistry) → left alone, dropped or demoted by neither
+//     rule: that's the FINAL record of a judgment, not an incident, and
+//     the process exiting afterwards is the expected epilogue.
+//     StateDrift is NOT in this arm (it used to be): drift is non-final,
+//     it asks for a re-drive, and a dead process can't be re-driven in
+//     place — so it takes the reclassification below. See the switch's
+//     own comment and design-loop-state-model.md §4.
+//   - anything else (StateDrift, StateStalled, or StateRunning past the live count —
 //     e.g. a process that just died mid-turn) → kept, reclassified
 //     StateStalled/StallGone: a mid-work death IS an incident. Applies to
 //     Driven loops exactly the same as observed ones — the dormancy
@@ -342,7 +346,7 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 		// by coincidence of arithmetic. Treat it as zero evidence instead:
 		// every loop sharing this ProjectDir goes through the SAME
 		// "presumed dead" scrutiny below (kill-check, idle-drop,
-		// done/drift exemption, else Gone) that an under-backed group
+		// done exemption, else Gone) that an under-backed group
 		// already gets — never silently exempted.
 		if collidedProjectDir[pd] {
 			k = 0
@@ -367,8 +371,27 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 					continue
 				}
 				drop[i] = true
-			case domain.StateDone, domain.StateDrift:
-				// oracle-judged and settled; leave as-is.
+			case domain.StateDone:
+				// Settled: the oracle converged this loop, and its
+				// process exiting afterwards is the EXPECTED epilogue,
+				// not new information — so the observed death adds
+				// nothing and DONE stands.
+				//
+				// StateDrift deliberately does NOT share this arm any
+				// more (design-loop-state-model.md §4, defect #1). The
+				// precedence rule is "final beats non-final; among
+				// non-final, observed beats inferred" — and drift is
+				// NOT final (LoopState.Terminal() is false for it). It
+				// means "the oracle rejected the agent's claim, re-drive
+				// this loop", which is a statement about a loop that is
+				// still supposed to be workable. A dead process cannot
+				// be re-driven in place, so the OS fact outranks that
+				// interpretation and drift falls through to `default`
+				// below → StateStalled/StallGone. The rejected verdict
+				// itself is not lost: enrichFromRegistry already copied
+				// it onto Loop.Last, which is what the ORACLE column
+				// renders, so the screen reads "gone" with the drift
+				// verdict still beside it.
 			default:
 				loops[i].State = domain.StateStalled
 				loops[i].Stall = domain.StallGone
