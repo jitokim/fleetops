@@ -3134,6 +3134,101 @@ func TestApproveCmd_TierOneFailsAmbiguously_RefusesWithoutMisrouting(t *testing.
 	}
 }
 
+// TestKPA_TierOneHTimeout_LeadsWithUncertaintyNotFailure covers the three verbs
+// that have NO Tier 2. r/i can degrade to a headless redrive on an unknown
+// delivery; k/p/a cannot, so they have to say the honest thing themselves.
+//
+// "kill X failed: <err>" was the bug: the prefix asserts a definite outcome
+// while the error body says the outcome is unknown, and an operator scanning
+// the status line reads the prefix. For `k` that reads as "press it again" —
+// which reintroduces by hand exactly the double-send control.ErrSendDeliveryUnknown
+// exists to prevent, just moved from automatic to manual.
+func TestKPA_TierOneHTimeout_LeadsWithUncertaintyNotFailure(t *testing.T) {
+	timedOut := fmt.Errorf("%w (signal: killed)", control.ErrSendDeliveryUnknown)
+
+	cases := map[string]struct {
+		loop    domain.Loop
+		run     func(domain.Loop) tea.Msg
+		text    func(tea.Msg) (string, bool)
+		warnKey string
+	}{
+		"approve": {
+			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject", GateTS: 123},
+			run:     func(l domain.Loop) tea.Msg { return approveCmd(l)() },
+			text:    func(m tea.Msg) (string, bool) { r, ok := m.(approveResultMsg); return r.text, ok && r.ok },
+			warnKey: "pressing a again",
+		},
+		"kill": {
+			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject"},
+			run:     func(l domain.Loop) tea.Msg { return killCmd(l)() },
+			text:    func(m tea.Msg) (string, bool) { r, ok := m.(killResultMsg); return r.text, ok && r.ok },
+			warnKey: "pressing k again",
+		},
+		"interrupt": {
+			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject"},
+			run:     func(l domain.Loop) tea.Msg { return interruptCmd(l)() },
+			text:    func(m tea.Msg) (string, bool) { r, ok := m.(interruptResultMsg); return r.text, ok && r.ok },
+			warnKey: "pressing p again",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			withFakeActuationSeams(t,
+				func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+					return &fakeActuator{
+						backend:      "iterm2",
+						tier:         "tier1h",
+						resumeErr:    timedOut,
+						approveErr:   timedOut,
+						interruptErr: timedOut,
+					}, true, true
+				},
+				nil,
+			)
+
+			text, okFlag := tc.text(tc.run(tc.loop))
+
+			if okFlag {
+				t.Error("an unknown delivery must not be reported as a success")
+			}
+			if !strings.Contains(text, "delivery UNKNOWN") {
+				t.Errorf("text = %q, want it to LEAD with the uncertainty", text)
+			}
+			if strings.Contains(text, "failed") {
+				t.Errorf("text = %q, must not assert a definite failure it cannot know", text)
+			}
+			if !strings.Contains(text, tc.warnKey) {
+				t.Errorf("text = %q, want it to warn against %q", text, tc.warnKey)
+			}
+		})
+	}
+}
+
+// TestKPA_OrdinaryTierOneFailure_StillSaysFailed: the carve-out is for unknown
+// delivery ONLY. Every other failure provably delivered nothing, and softening
+// those into hedged language would be the opposite overclaim — under-reporting
+// a definite failure the operator needs to act on.
+func TestKPA_OrdinaryTierOneFailure_StillSaysFailed(t *testing.T) {
+	boom := control.ErrSendTTYMismatch
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: boom, approveErr: boom, interruptErr: boom}, true, true
+		},
+		nil,
+	)
+
+	km, ok := killCmd(domain.Loop{SessionID: "sess-1", Project: "myproject"})().(killResultMsg)
+	if !ok || km.ok {
+		t.Fatalf("got %+v, want a failed killResultMsg", km)
+	}
+	if !strings.Contains(km.text, "failed") {
+		t.Errorf("text = %q, want a definite failure for a definite refusal", km.text)
+	}
+	if strings.Contains(km.text, "UNKNOWN") {
+		t.Errorf("text = %q, must not hedge a failure we actually know about", km.text)
+	}
+}
+
 func TestUpdate_AKey_TTYPlausibleSkipsGuard_ButAsyncResultStillRefusesOnAmbiguity(t *testing.T) {
 	// full round trip through the tui: two loops share a directory, so
 	// refuseIfAmbiguous WOULD normally refuse at keypress time — but the

@@ -1793,6 +1793,10 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		}
 		if err := act.Approve(); err != nil {
 			logActuationEvent(l, "approve", act.Tier(), false, err.Error())
+			// Unknown delivery is not a failure — see unknownDeliveryText.
+			if errors.Is(err, control.ErrSendDeliveryUnknown) {
+				return approveResultMsg{false, unknownDeliveryText("approve", l.Project, "the Enter", "a")}
+			}
 			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
 		}
 		// Compare-and-swap delete: only remove the marker THIS decision was
@@ -2388,6 +2392,13 @@ func killCmd(l domain.Loop) tea.Cmd {
 		}
 		if err := act.Resume("/exit"); err != nil {
 			logActuationEvent(l, "kill", act.Tier(), false, err.Error())
+			// Unknown delivery is not a failure — see unknownDeliveryText.
+			// This is the site that motivated the distinction: "kill failed"
+			// reads as "press k again," and a second "/exit" into a session
+			// that already got one is the double-send this guards.
+			if errors.Is(err, control.ErrSendDeliveryUnknown) {
+				return killResultMsg{false, unknownDeliveryText("kill", l.Project, `the "/exit"`, "k")}
+			}
 			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
 		}
 		// fix/killed-state: the event is written HERE, immediately once
@@ -2427,6 +2438,10 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		}
 		if err := act.Interrupt(); err != nil {
 			logActuationEvent(l, "interrupt", act.Tier(), false, err.Error())
+			// Unknown delivery is not a failure — see unknownDeliveryText.
+			if errors.Is(err, control.ErrSendDeliveryUnknown) {
+				return interruptResultMsg{false, unknownDeliveryText("stop", l.Project, "the Esc", "p")}
+			}
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
 		}
 		logActuationEvent(l, "interrupt", act.Tier(), true, "")
@@ -3031,6 +3046,28 @@ func emitTransitionsCmd(transitions []transitionEvent) tea.Cmd {
 // it happens). Only called at a point where a tier was actually dispatched
 // — the early "no backend"/"ambiguous" refusal branches never reach a tier,
 // so callers simply don't call this for those (nothing was "taken" to log).
+// unknownDeliveryText is the operator line for a Tier 1h send whose delivery is
+// UNKNOWN (control.ErrSendDeliveryUnknown — osascript was killed at the
+// actuationTimeout deadline, so the write may or may not have reached the pty).
+//
+// It exists because k/p/a have no Tier 2 and so must format this themselves,
+// and because the three lines must not drift apart — they are the same claim
+// about the same uncertainty.
+//
+// The wording is load-bearing, not decoration. These call sites used to render
+// it as "kill X failed: <err>", which asserts a definite outcome in the prefix
+// while the error body says the outcome is unknown. An operator scanning the
+// status line reads the prefix, and for `k` "failed" is an invitation to press
+// it again — reintroducing by hand exactly the double-send that
+// ErrSendDeliveryUnknown exists to prevent. So the uncertainty leads, and the
+// line ends by naming the key NOT to press until they have looked.
+//
+// verb is the display verb ("kill"), what is the payload in the operator's own
+// vocabulary ("the \"/exit\""), and key is the keypress to warn off ("k").
+func unknownDeliveryText(verb, project, what, key string) string {
+	return fmt.Sprintf("%s %s: delivery UNKNOWN — %s may or may not have landed (the host send timed out). Attach (↵) and check before pressing %s again", verb, project, what, key)
+}
+
 func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText string) {
 	detail := action + " " + tier
 	if ok {
