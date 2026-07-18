@@ -3207,14 +3207,60 @@ func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 	if n <= 1 {
 		return "", false
 	}
-	// Bug 2 (Option B, honesty fix): this refusal is reached specifically
-	// because l had no usable session-registry tty (ttyPathPlausible was
-	// false — see its own doc) AND the cwd-based Tier 1b fallback can't
-	// disambiguate N sessions sharing one directory. Tell the human the
-	// actual fix (install the hooks so this session gets a tty entry, which
-	// makes Tier 1a session-unique — see docs/adr-vendor-independent-actuation.md
-	// §2.1), not just the manual-attach workaround.
-	return fmt.Sprintf("ambiguous: %d loops share %s's directory, none has a session-registry tty — attach (↵) or run `fleetops hooks install` so injects can target by session", n, l.Project), true
+	// The refusal itself is honest — fail-closed beats killing the wrong
+	// loop. The REMEDY has to be too, which means consulting l rather than
+	// emitting a constant; see ambiguityRemedy.
+	return fmt.Sprintf("ambiguous: %d loops share %s's directory, none has a session-registry tty — %s", n, l.Project, ambiguityRemedy(l)), true
+}
+
+// ambiguityRemedy picks what to actually advise for the loop that hit the
+// cwd-ambiguity refusal (issue #49, part 2).
+//
+// This used to be a compile-time constant — "attach (↵) or run `fleetops
+// hooks install` so injects can target by session" — emitted identically
+// for a live loop and a dead one, and for a session fleetops spawned as
+// well as one a human started elsewhere. Both halves were wrong for the
+// reported case (a fleetops-spawned loop, dead 40 minutes, oracle-drifted):
+// attaching cannot help a process that is gone, and `hooks install` cannot
+// retroactively register an ALREADY-RUNNING session, because registration
+// happens at SessionStart. The operator was told to do two things that
+// could not change the outcome.
+//
+// The branches, in precedence order, each on a fact the caller already
+// handed us:
+//
+//   - process gone (Stall == StallGone) — nothing to reach at all, so
+//     neither remedy applies. What DOES work is the headless path: "r"/"i"
+//     re-drive via `claude --resume <exact session id> -p`, which needs no
+//     surface and no live process, and "x" retires the row.
+//   - fleetops-spawned (BoundAt non-zero ⇔ a registry.Record exists ⇔ this
+//     loop came through the "n" wizard's spawn → WritePending → BindPending
+//     path, which is the only way a Record is ever created). Installing
+//     hooks cannot fix THIS session; only a fresh session registers. Attach
+//     is genuinely available, so offer it and say what actually restores
+//     session-exact targeting.
+//   - otherwise: an observed session with no registry entry, alive. The
+//     original advice is correct here and is kept verbatim.
+//
+// Deliberately NOT consulted: whether the hooks are in fact installed.
+// Nothing in the TUI knows that today, and guessing would just move the
+// dishonesty. The owned branch sidesteps it by not advising hooks at all.
+//
+// Note on the first branch: every current caller pre-filters StallGone
+// before reaching refuseIfAmbiguous (and the one that did not — "r" on a
+// StateDrift loop — stops producing dead loops now that drift no longer
+// survives the liveness pass). It is kept because this is a helper shared
+// by seven call sites each carrying its own hand-written pre-filter, and
+// the invariant belongs in the one place that authors the sentence rather
+// than in seven places that must remember to.
+func ambiguityRemedy(l domain.Loop) string {
+	if l.Stall == domain.StallGone {
+		return "and this one's process is already gone, so neither reaches it — r/i re-drive it headlessly, or x to remove it"
+	}
+	if !l.BoundAt.IsZero() {
+		return "attach (↵) to act manually; `fleetops hooks install` can't help — registration happens at session start, so only a fresh loop gets session-exact targeting"
+	}
+	return "attach (↵) or run `fleetops hooks install` so injects can target by session"
 }
 
 // sameProjectDirCount counts how many loops in the current fleet (not just

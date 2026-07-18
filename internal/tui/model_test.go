@@ -1859,6 +1859,89 @@ func TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable(t *testing.T) {
 	}
 }
 
+// ── issue #49 part 2: the ambiguity refusal's remedy must be applicable ──
+
+// The reported case: a fleetops-spawned loop, dead 40 minutes,
+// oracle-drifted. It was told to attach and to install hooks. Neither can
+// reach a process that is gone.
+func TestAmbiguityRemedy_ProcessGone_AdvisesNeitherAttachNorHooks(t *testing.T) {
+	l := domain.Loop{Project: "fleetops", Stall: domain.StallGone, BoundAt: time.Now()}
+
+	got := ambiguityRemedy(l)
+
+	if strings.Contains(got, "hooks install") {
+		t.Errorf("remedy = %q, must not advise `fleetops hooks install` for a dead process", got)
+	}
+	if !strings.Contains(got, "gone") {
+		t.Errorf("remedy = %q, want it to say the process is gone", got)
+	}
+	if !strings.Contains(got, "r/i") {
+		t.Errorf("remedy = %q, want it to point at the headless re-drive, which needs no surface and no live process", got)
+	}
+}
+
+// A fleetops-spawned (registry-bound) loop that is still ALIVE: attach is
+// genuinely available, but `hooks install` still cannot help, because
+// registration happens at SessionStart and this session is already running.
+func TestAmbiguityRemedy_SpawnedAndAlive_AdvisesAttachNotHooks(t *testing.T) {
+	l := domain.Loop{Project: "fleetops", BoundAt: time.Now()}
+
+	got := ambiguityRemedy(l)
+
+	if strings.Contains(got, "run `fleetops hooks install` so injects") {
+		t.Errorf("remedy = %q, must not advise installing hooks as the fix for an already-running session", got)
+	}
+	if !strings.Contains(got, "attach (↵)") {
+		t.Errorf("remedy = %q, want attach offered — the process is alive", got)
+	}
+	if !strings.Contains(got, "session start") {
+		t.Errorf("remedy = %q, want it to explain why hooks can't retroactively register this session", got)
+	}
+}
+
+// The unchanged case, so the branching can't be satisfied by deleting the
+// original advice: an observed session (no registry record) that is alive.
+// Installing hooks genuinely is what gets its successors targeted by
+// session.
+func TestAmbiguityRemedy_ObservedAndAlive_KeepsOriginalAdvice(t *testing.T) {
+	l := domain.Loop{Project: "fleetops"} // zero BoundAt — never bound, never spawned by us
+
+	got := ambiguityRemedy(l)
+
+	if !strings.Contains(got, "attach (↵)") || !strings.Contains(got, "fleetops hooks install") {
+		t.Errorf("remedy = %q, want the original two-part advice, which is correct for this case", got)
+	}
+}
+
+// Wiring: the branch actually reaches the status line the human reads, not
+// just the helper. Same fixture as
+// TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable, with the selected
+// loop marked as fleetops-spawned.
+func TestUpdate_RKey_AmbiguousSpawnedLoop_DoesNotAdviseHooksInstall(t *testing.T) {
+	m := modelWithTwoLoopsSharingDir()
+	m.loops[0].BoundAt = time.Now()
+
+	m, _ = updateModel(t, m, runeKey('r'))
+
+	if !strings.Contains(m.status, "session-registry tty") {
+		t.Fatalf("status = %q, want the ambiguity refusal (fixture no longer triggers it?)", m.status)
+	}
+	if strings.Contains(m.status, "run `fleetops hooks install` so injects") {
+		t.Errorf("status = %q, want no hooks-install advice for a loop fleetops spawned itself", m.status)
+	}
+}
+
+// Precedence: liveness outranks origin. A dead spawned loop gets the dead
+// branch, not the spawned one.
+func TestAmbiguityRemedy_GoneOutranksSpawned(t *testing.T) {
+	gone := ambiguityRemedy(domain.Loop{Project: "fleetops", Stall: domain.StallGone, BoundAt: time.Now()})
+	alive := ambiguityRemedy(domain.Loop{Project: "fleetops", BoundAt: time.Now()})
+
+	if gone == alive {
+		t.Errorf("a gone loop and a live one got the same remedy %q — liveness must be consulted first", gone)
+	}
+}
+
 func TestUpdate_RKey_SingleLoopInDir_Proceeds(t *testing.T) {
 	// the counterpart case: exactly one loop shares this directory, so the
 	// guard must NOT refuse.
