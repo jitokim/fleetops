@@ -1102,6 +1102,73 @@ func TestApplyLiveness_StateDoneAndProcessGone_StaysDone(t *testing.T) {
 	}
 }
 
+// The third final state, and the one that was actually broken. Unlike
+// StateKilled, StateFailed genuinely IS an input to applyLiveness:
+// applyGovernor sets it inside enrichFromRegistry, which DiscoverLoops runs
+// one pass earlier. So before this arm existed, a governor-stopped loop
+// whose process then exited was demoted FAILED → STALLED/gone, losing the
+// governor's conclusion while keeping its note. A pre-existing violation of
+// the ladder's rung 1, surfaced (not caused) by Stage 1.
+func TestApplyLiveness_StateFailedAndProcessGone_StaysFailed(t *testing.T) {
+	now := time.Now()
+	loops := []domain.Loop{
+		{SessionID: "failed-one", ProjectDir: "-x-myproject", Cwd: "/x/myproject",
+			State: domain.StateFailed, Note: "stopped: no improvement", LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, t.TempDir(), time.Now(), ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State != domain.StateFailed {
+		t.Errorf("State = %v, want StateFailed — the governor stopped this deliberately; the process exiting afterwards doesn't make that judgment less true", out[0].State)
+	}
+	if out[0].Stall != domain.StallNone {
+		t.Errorf("Stall = %v, want StallNone (untouched)", out[0].Stall)
+	}
+}
+
+// The rule the three arms share, asserted as the rule rather than three
+// times as instances: every LoopState.Terminal() state survives an observed
+// death intact, and every non-terminal one is demoted. This is what keeps
+// the code's Terminal() guard and domain's Terminal() definition from
+// drifting apart — add a terminal state and this test covers it for free.
+func TestApplyLiveness_ProcessGone_TerminalStatesSurviveNonTerminalDemoted(t *testing.T) {
+	// Every LoopState except StateIdle, which is excluded on purpose: it
+	// has its own older rule (a cleanly-finished loop is DROPPED, not
+	// demoted — see TestApplyLiveness_ZeroLiveProcesses_* and the Driven
+	// dormancy exception), so it is neither a survivor nor a demotion and
+	// would not fit this assertion's shape.
+	all := []domain.LoopState{
+		domain.StateRunning, domain.StateGate, domain.StateStalled,
+		domain.StateDrift, domain.StateDone, domain.StateFailed,
+		domain.StatePaused, domain.StateKilled,
+	}
+	for _, st := range all {
+		t.Run(string(st), func(t *testing.T) {
+			loops := []domain.Loop{
+				{SessionID: "s1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: st, LastActivity: time.Now()},
+			}
+
+			out := applyLiveness(loops, map[string]int{}, true, t.TempDir(), time.Now(), ActiveWindow)
+
+			if len(out) != 1 {
+				t.Fatalf("got %d loops, want 1", len(out))
+			}
+			if st.Terminal() {
+				if out[0].State != st {
+					t.Errorf("State = %v, want unchanged %v — final beats non-final", out[0].State, st)
+				}
+				return
+			}
+			if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+				t.Errorf("State = %v Stall = %v, want StateStalled/StallGone — among non-final states, observed beats inferred", out[0].State, out[0].Stall)
+			}
+		})
+	}
+}
+
 // Same guard for the human's own final word. Note the fixture goes through
 // the PRODUCTION route: StateKilled is never an INPUT to applyLiveness
 // (nothing upstream produces it — classifyLoop and enrichFromRegistry
