@@ -3666,13 +3666,24 @@ type fakeController struct {
 	locateOK           bool
 	focusCalled        bool
 	focusErr           error
+
+	// Spawn recording — added for the backend-agnostic worktree spawn tests,
+	// which must assert WHICH directory the loop was actually started in (the
+	// fresh worktree, never the repo the human was trying to keep clean).
+	spawnCalled bool
+	spawnCwd    string
+	spawnPrompt string
+	spawnErr    error
 }
 
 func (f *fakeController) Name() string                   { return f.name }
 func (f *fakeController) Available() bool                { return true }
 func (f *fakeController) Approve(control.Target) error   { return nil }
 func (f *fakeController) Interrupt(control.Target) error { return nil }
-func (f *fakeController) Spawn(string, string) error     { return nil }
+func (f *fakeController) Spawn(cwd, prompt string) error {
+	f.spawnCalled, f.spawnCwd, f.spawnPrompt = true, cwd, prompt
+	return f.spawnErr
+}
 func (f *fakeController) Locate(string) (control.Target, bool) {
 	f.locateCalled = true
 	return f.locateTarget, f.locateOK

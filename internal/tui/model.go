@@ -32,6 +32,7 @@ import (
 	"github.com/jitokim/fleetops/internal/oracle"
 	"github.com/jitokim/fleetops/internal/registry"
 	"github.com/jitokim/fleetops/internal/sessions"
+	"github.com/jitokim/fleetops/internal/worktree"
 	runewidth "github.com/mattn/go-runewidth"
 )
 
@@ -74,6 +75,14 @@ var (
 	// control.Resolve does real exec/Available probes, so tests can't rely on
 	// a real orca/tmux/cmux backend being installed.
 	controlResolveFn = control.Resolve
+	// worktreeCreateFn is worktree.Create by default — spawnCmd's
+	// BACKEND-AGNOSTIC worktree seam. Overridable so the worktree spawn branch
+	// (and every way it can fail: not a repo, no origin remote, a colliding
+	// path) is unit-testable without creating real git checkouts on the
+	// machine running the suite. internal/worktree's own tests cover it
+	// against a REAL git and a real temp repo; this seam is about testing what
+	// the TUI does with each outcome.
+	worktreeCreateFn = worktree.Create
 	// controlResolveForLocateFn is control.ResolveForLocate by default —
 	// attachCmd's ATTACH resolver seam. Split from controlResolveFn on purpose:
 	// attach must follow whichever backend can actually Locate the loop's
@@ -2058,19 +2067,27 @@ func (m Model) submitSpawnWizardEngineDrive() (tea.Model, tea.Cmd) {
 	return m, bootstrapEngineCmd(m.spawnCwd, spec)
 }
 
-// checkWorktreeEligibilityCmd resolves the current backend and reports
-// whether it implements control.WorktreeSpawner — run off the event loop
-// (control.Resolve/Available do real exec calls) and fired at "n" keypress
-// time, well before the wizard reaches wizardWhere (see
-// worktreeEligibilityMsg).
+// checkWorktreeEligibilityCmd reports whether the wizard should offer [w]
+// (worktree-isolated spawn) — run off the event loop (control.Resolve/
+// Available do real exec calls) and fired at "n" keypress time, well before
+// the wizard reaches wizardWhere (see worktreeEligibilityMsg).
+//
+// Eligibility is now simply "a backend resolved at all", NOT "the backend
+// implements control.WorktreeSpawner". Since fleetops creates worktrees itself
+// with plain git (spawnIntoGitWorktree), every backend that can spawn can
+// spawn into a worktree — the old WorktreeSpawner test would hide the new
+// capability from exactly the tmux/iTerm2 users it was added for.
+//
+// It deliberately does NOT probe whether the target dir is a git repo. That
+// dir can still change later in the wizard ([c]/[s]), so an answer computed
+// here could be stale by the time it is used, and a non-repo target already
+// fails at spawn time with worktree.ErrNotARepo — a specific, honest message
+// naming the directory. Refusing to offer the choice would be the less
+// informative of the two.
 func checkWorktreeEligibilityCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctrl, ok := control.Resolve()
-		if !ok {
-			return worktreeEligibilityMsg(false)
-		}
-		_, supports := ctrl.(control.WorktreeSpawner)
-		return worktreeEligibilityMsg(supports)
+		_, ok := controlResolveFn()
+		return worktreeEligibilityMsg(ok)
 	}
 }
 
@@ -2085,15 +2102,20 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // the composed contract block (buildSpawnPrompt), not the bare goal — the
 // registry still stores goal/doneWhen/oracle/challenger as separate fields.
 //
-// useWorktree requests the worktree-isolated branch (Part 1 of the
-// worktree-spawn slice): when the resolved controller implements
-// control.WorktreeSpawner, cwd is treated as the REPO to branch a fresh
-// worktree from (SpawnWorktree also sends the contract prompt itself, as
-// part of orca's one-shot --agent launch — no separate Resume/send step,
-// verified live). If useWorktree is false, or the backend doesn't implement
-// WorktreeSpawner at all (tmux/cmux — a structural fallback, not a
-// preference), this falls through to the ordinary current-dir Spawn path
-// unchanged.
+// useWorktree requests the worktree-isolated branch, which now has TWO
+// implementations and cwd is the REPO to branch from in both:
+//
+//   - The resolved controller implements control.WorktreeSpawner (orca):
+//     its own one-shot `worktree create --agent` launch, which also sends the
+//     contract prompt itself — no separate Resume/send step, verified live.
+//     Unchanged.
+//   - Any other backend (tmux, iTerm2, …): fleetops creates the worktree
+//     ITSELF with plain git and then spawns into it — see
+//     spawnIntoGitWorktree. This is what stopped worktree isolation from being
+//     an orca-only capability; git worktrees are a git feature, not a vendor's.
+//
+// If useWorktree is false this falls through to the ordinary current-dir Spawn
+// path, unchanged.
 //
 // SHARED-WORKSPACE CAVEAT (verified live, see SpawnWorktree's doc): for a
 // path-registered ("folder") repo, Orca doesn't isolate at all — the
@@ -2103,7 +2125,12 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // failure.
 func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 	return func() tea.Msg {
-		ctrl, ok := control.Resolve()
+		// controlResolveFn, not control.Resolve directly — the same
+		// CREATION/CAPABILITY seam takeOverCmd already uses. Resolve does real
+		// exec/Available probes, so without it none of the spawn branches
+		// (worktree or plain) can be tested on a machine with no backend
+		// installed.
+		ctrl, ok := controlResolveFn()
 		if !ok {
 			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
 		}
@@ -2139,6 +2166,10 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 			return spawnResultMsg{true, fmt.Sprintf("spawned loop in new worktree %s via %s%s", name, ctrl.Name(), bindNote)}
 		}
 
+		if useWorktree {
+			return spawnIntoGitWorktree(ctrl, cwd, spec, prompt)
+		}
+
 		if err := ctrl.Spawn(cwd, prompt); err != nil {
 			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
 		}
@@ -2149,6 +2180,45 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		}
 		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
 	}
+}
+
+// spawnIntoGitWorktree is spawnCmd's BACKEND-AGNOSTIC worktree branch: it
+// creates a real git worktree itself (internal/worktree — plain `git worktree
+// add`, branched from an explicit origin/<default-branch>) and then runs the
+// ordinary Controller.Spawn INTO that fresh directory.
+//
+// This is what makes worktree isolation available on every backend rather than
+// only on orca. It is reached only when the resolved controller does NOT
+// implement control.WorktreeSpawner — orca still takes its own one-shot
+// `worktree create --agent` path above, unchanged. Keeping orca's route intact
+// is deliberate: its worktrees are Orca-managed and show up in Orca's own UI,
+// which is a real advantage for an orca user, and demoting that path is a
+// separate decision nobody has made.
+//
+// Failure is REPORTED, never silently downgraded to a plain current-dir spawn.
+// The human explicitly asked for isolation; quietly spawning into the repo they
+// were trying to keep clean is the kind of "success" this project treats as a
+// defect. The status line names the branch AND the base it was cut from, since
+// the explicit base is the whole guarantee and a guarantee nobody can see is
+// one nobody can trust.
+func spawnIntoGitWorktree(ctrl control.Controller, cwd string, spec registry.BindSpec, prompt string) tea.Msg {
+	wt, err := worktreeCreateFn(cwd)
+	if err != nil {
+		return spawnResultMsg{false, fmt.Sprintf("worktree spawn failed: %v", err)}
+	}
+	if err := ctrl.Spawn(wt.Path, prompt); err != nil {
+		// The checkout exists but nothing is running in it. Say exactly that,
+		// and name the path — it is the human's to reuse or remove, and a
+		// message that omitted it would leave an orphan directory they never
+		// heard about.
+		return spawnResultMsg{false, fmt.Sprintf("created worktree %s but spawn failed: %v (the checkout is at %s)", wt.Branch, err, wt.Path)}
+	}
+	if err := registry.WritePending(registry.PendingDir(), wt.Path, spec); err != nil {
+		// best-effort, same posture as the plain-spawn path: the loop really
+		// did start, it just won't get ORACLE/N-I tracking.
+		return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s) via %s (goal not recorded: %v)", wt.Branch, wt.Base, ctrl.Name(), err)}
+	}
+	return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s) via %s", wt.Branch, wt.Base, ctrl.Name())}
 }
 
 // ── LoopEngine: headless bootstrap ───────────────────────────────────────
