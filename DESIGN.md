@@ -10,6 +10,11 @@
 > design specifically (session identity, capability tiers, per-backend
 > verification notes), see
 > [`docs/adr-vendor-independent-actuation.md`](./docs/adr-vendor-independent-actuation.md).
+> For why `LoopState`'s values are really two vocabularies with different
+> producers — inferred (`running`/`idle`/`gate`/`stalled`) vs asserted
+> (`done`/`drift`/`failed`/`killed`/`paused`, structurally reachable only for a
+> contract-bound loop) — and for the staged plan that corrects §3's precedence,
+> see [`docs/adr-loop-state-model.md`](./docs/adr-loop-state-model.md).
 
 ---
 
@@ -191,6 +196,19 @@ kill  >  gate  >  gone  >  verdict  >  governor  >  tail
   gone → dropped from the fleet (ended cleanly); `StateDone`/`StateDrift` +
   gone → left alone (a settled judgment, not an incident); anything else +
   gone → `StateStalled`/`StallGone` (a mid-work death IS an incident).
+
+  **Correction (2026-07-19) — `StateDrift` does not belong in that exemption,
+  and this describes today's behavior, not the intended one.** `done` is
+  terminal (`LoopState.Terminal()`); `drift` is not. `drift` means the oracle
+  rejected the claim and the loop should be re-driven — which a dead process
+  cannot be, so exempting it leaves a loop whose process exited displaying
+  `✗ DRIFT` indefinitely (observed live 2026-07-19). The governing rule is
+  **final beats non-final; among non-final, observed beats inferred** — so a
+  dead non-final loop reads `gone`, keeping the drift verdict as annotation
+  rather than as its state. `StateDone`'s exemption is unaffected. The fix is
+  stage 1 of [`docs/adr-loop-state-model.md`](./docs/adr-loop-state-model.md)
+  (§1.1, §2.2), landing separately; this bullet is corrected here in advance so
+  the spec does not keep asserting the exemption as designed behavior.
 - **verdict** — a same-cycle oracle verdict promotes `StateDone`/`StateDrift`
   (see §2 step 3). An earlier-cycle verdict is still shown (the ORACLE
   row/column) but does not override the current State.

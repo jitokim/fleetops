@@ -171,6 +171,44 @@ session from the registry entry rather than one global `Resolve()`:
   fleetops-spawned engine-owned loops get guaranteed control for free via
   their own headless-bootstrap ownership — folds naturally into VISION.md's
   LoopEngine rather than needing separate design work now.
+  **(Superseded — see the 2026-07-19 amendment immediately below.)**
+
+**Superseded (amendment, 2026-07-19) — "guaranteed control for free" and "no
+separate design work now" were both wrong.** Recorded rather than deleted
+because the reasoning that produced them is the reasoning this repo keeps
+failing at: it treats "fleetops created it" as a fact the actuation path can
+still consult later. It cannot, because nothing durable records it.
+
+- **"For free" was never bought.** The ownership fast paths that skip terminal
+  resolution and the ambiguity guard (`killCmd`'s `if l.Driven` arm and the `k`
+  handler's) are gated on **one** flag, `domain.Loop.Driven`, copied in from
+  `registry.Record.Driven`. That flag is **opt-in at the `n` wizard**
+  (`registry.BindSpec.Driven` defaults false, so `[m]` yields a fleetops-spawned,
+  contract-bound loop with `Driven == false`) and is **cleared by both take-over
+  and kill** (`registry.MarkDriven(..., false)`). An ordinary human take-over of a
+  loop fleetops itself spawned therefore drops it back onto the cwd-guessing
+  path and, on a directory shared by several sessions, into the ambiguity
+  refusal — for a surface fleetops opened. `Driven` is doing three jobs at once
+  (origin ∧ engine authority ∧ ¬taken-over), and only the middle one warrants
+  being cleared.
+- **"For free" also over-reads this tier.** Tier 2 is a *re-drive* path; `k`/`p`/
+  `a` have no Tier 2 equivalent at all — a point §4's iTerm2 ledger already makes
+  independently. Headless-bootstrap ownership cannot confer "guaranteed control"
+  over verbs this tier does not serve.
+- **The design work was owed and has now been done.** See
+  [`docs/adr-loop-state-model.md`](./adr-loop-state-model.md), which was derived
+  from a live incident on `544c27c`: a fleetops-spawned loop hit its ceiling, its
+  oracle rejected it 11×, its process exited, the cockpit still read `✗ DRIFT`,
+  and `k` refused with a cwd-ambiguity message advising `fleetops hooks install`
+  — a remedy that can neither retroactively register a running session nor help a
+  dead one. That ADR's §1.2 is this bullet's root cause; its §2.4 (spawn-time
+  surface binding, "Tier 1s") is the tier this bullet assumed already existed
+  implicitly, deliberately placed **between 1a and 1b** rather than at the top,
+  for exactly this ADR's §3 step 2 reason: provenance is not a substitute for
+  re-proving the binding against live `ps` at actuation time.
+
+Nothing about Tier 2 itself is withdrawn — the mechanism verified in §4 stands
+unchanged. What is withdrawn is the claim that ownership needed no design.
 
 **Rejected: Accessibility-API keystroke simulation** (`System Events`'
 `keystroke`/`key code`, or the equivalent CGEvent posting). It synthesizes
