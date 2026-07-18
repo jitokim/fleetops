@@ -217,28 +217,66 @@ func TestTierOneH_UnknownHostApp_ByteIdenticalToToday(t *testing.T) {
 	}
 }
 
-// TestTierOneH_NoBackendAvailable_StillUnavailable: the availableBackends()
-// short-circuit precedes every tier, so a host-send-capable session on a
-// machine with NO multiplexer installed still reports backendAvailable=false.
-//
-// This is a real, deliberate limitation rather than an oversight: Tier 1h does
-// not need a multiplexer, so an iTerm2-hosted loop on a multiplexer-less
-// machine could in principle be actuated. Wiring 1h ahead of that gate would
-// change the meaning of backendAvailable for every existing caller and their
-// "no orca/tmux/cmux" messages, which is outside this slice. Pinned so the
-// behaviour is a recorded decision, not an accident.
-func TestTierOneH_NoBackendAvailable_StillUnavailable(t *testing.T) {
+// TestTierOneH_NoBackendAvailable_StillResolvesHostSend is the tier's whole
+// target audience: a fresh macOS user running claude in iTerm2 with NO
+// multiplexer installed. Tier 1h needs no orca/tmux/cmux — the host terminal
+// writes to its own session — so the availability gate must sit BELOW it, not
+// above.
+func TestTierOneH_NoBackendAvailable_StillResolvesHostSend(t *testing.T) {
 	withFakeSendAdapter(t, &fakeSendAdapter{})
 	dir := writeTier1hSession(t, tier1hEntry(), "ttys012")
 	withBackends(t, &fakeResolveCtl{t: t, name: "orca", available: false})
 
 	act, backendAvailable, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
 
+	if !found || !backendAvailable {
+		t.Fatalf("found=%v backendAvailable=%v, want both true — 1h needs no multiplexer", found, backendAvailable)
+	}
+	if act.Tier() != actuationTierHostSend {
+		t.Errorf("tier = %q, want %q", act.Tier(), actuationTierHostSend)
+	}
+	// backendAvailable=true is what suppresses the caller's "no orca/tmux/cmux"
+	// hint — showing it while 1h is actively handling the keypress would be a
+	// lie to the operator.
+}
+
+// TestTierOneH_NoBackendAvailable_WithoutHostSend_StillUnavailable is the other
+// half: hoisting 1h above the gate must not widen backendAvailable for anyone
+// else. A session with no send-capable host_app on a multiplexer-less machine
+// reports exactly what it always did.
+func TestTierOneH_NoBackendAvailable_WithoutHostSend_StillUnavailable(t *testing.T) {
+	for _, hostApp := range []string{"", "Apple_Terminal", "vscode"} {
+		t.Run("host_app="+hostApp, func(t *testing.T) {
+			withFakeSendAdapter(t, &fakeSendAdapter{})
+			entry := tier1hEntry()
+			entry.HostApp = hostApp
+			dir := writeTier1hSession(t, entry, "ttys012")
+			withBackends(t, &fakeResolveCtl{t: t, name: "orca", available: false})
+
+			act, backendAvailable, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
+
+			if backendAvailable || found {
+				t.Errorf("backendAvailable=%v found=%v, want both false", backendAvailable, found)
+			}
+			if act != nil {
+				t.Errorf("actuator = %v, want nil", act)
+			}
+		})
+	}
+}
+
+// TestTierOneH_NoBackendAvailable_BindingInvalid_StillUnavailable: a stale
+// registry entry must not become an actuation surface just because no
+// multiplexer is installed. The shared pid↔tty binding gate still applies.
+func TestTierOneH_NoBackendAvailable_BindingInvalid_StillUnavailable(t *testing.T) {
+	withFakeSendAdapter(t, &fakeSendAdapter{})
+	dir := writeTier1hSession(t, tier1hEntry(), "ttys999") // pid controls a DIFFERENT tty
+	withBackends(t, &fakeResolveCtl{t: t, name: "orca", available: false})
+
+	_, backendAvailable, found := ResolveActuationTarget(dir, "sess-1", "-x-proj")
+
 	if backendAvailable || found {
 		t.Errorf("backendAvailable=%v found=%v, want both false", backendAvailable, found)
-	}
-	if act != nil {
-		t.Errorf("actuator = %v, want nil", act)
 	}
 }
 

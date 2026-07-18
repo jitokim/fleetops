@@ -93,8 +93,12 @@ var pidTTYFn = func(pid int) string {
 //     LocateClaude's own single-backend ">1 match" refusal. Exactly one
 //     matching backend → use it; zero → not found.
 //
-// backendAvailable=false means NO backend is available AT ALL (caller's
-// message: "no orca/tmux/cmux"). backendAvailable=true with found=false means
+// backendAvailable=false means NO multiplexer backend is available AT ALL and
+// Tier 1h did not resolve either (caller's message: "no orca/tmux/cmux").
+// Tier 1h is deliberately checked BEFORE that gate — it needs no multiplexer,
+// so a host-send-capable session on a multiplexer-less machine reports
+// backendAvailable=true and the caller's "no orca/tmux/cmux" hint is correctly
+// never shown. backendAvailable=true with found=false means
 // backends were available but none could locate/disambiguate a claude surface
 // — including the cross-backend ambiguity refusal above (caller's message:
 // "no unambiguous claude surface"). Callers only use act when found=true.
@@ -111,9 +115,6 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 	// tier-dependent split (visible to Tier 1a, gone by Tier 1b) that nothing
 	// relied on.
 	avail := availableBackends()
-	if len(avail) == 0 {
-		return nil, false, false
-	}
 
 	// Tiers 1a and 1h share ONE registry read and ONE pid↔tty binding probe:
 	// both require the same guarantee (this pid controls this tty right now),
@@ -153,6 +154,25 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 		if adapter, ok := ResolveSendAdapter(entry.HostApp); ok {
 			return boundSendAdapter{adapter: adapter, entry: entry}, true, true
 		}
+	}
+
+	// The "no backend at all" gate sits BELOW 1a/1h, not above them. Tier 1h
+	// needs no multiplexer — the host terminal writes to its own session — so
+	// gating it on availableBackends() made the tier unreachable for a fresh
+	// macOS + iTerm2 user with no orca/tmux/cmux installed, i.e. precisely the
+	// person it was added for.
+	//
+	// Widening the gate cannot disturb any existing user: the ONLY sessions
+	// whose outcome changes are those whose recorded host_app has a registered
+	// SendAdapter AND whose pid↔tty binding validates, and before this feature
+	// existed that set was empty by construction. Everything else still reaches
+	// the identical `return nil, false, false` and the identical
+	// "no orca/tmux/cmux" message.
+	//
+	// Tier 1a's loop above is a no-op when avail is empty, so ordering costs
+	// nothing here.
+	if len(avail) == 0 {
+		return nil, false, false
 	}
 
 	// Tier 1b — cwd is many-to-one, so probe ALL available backends and count
