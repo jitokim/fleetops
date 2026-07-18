@@ -3278,9 +3278,11 @@ func TestUpdate_RKey_AfterActuatingCleared_CanDispatchAgain(t *testing.T) {
 // stays for the ATTACH tests, which genuinely still exercise Locate/Focus on a
 // control.Controller.
 //
-// tier defaults to control's "tier1" label so existing tests keep asserting the
-// multiplexer tier without restating it; the iTerm2 Tier 1h tests set it
-// explicitly.
+// tier defaults to control's "tier1" label so the many existing multiplexer
+// tests keep asserting that tier without restating it. Tests that exercise the
+// iTerm2 Tier 1h dispatch set it to "tier1h" — the label is what
+// logActuationEvent records, and telling an in-place host write apart from a
+// multiplexer send after the fact is the entire reason Actuator.Tier() exists.
 type fakeActuator struct {
 	backend string
 	tier    string
@@ -6471,6 +6473,67 @@ func TestSendPromptCmd_TierOneSuccess_RecordsActuationEvent(t *testing.T) {
 	}
 	if !strings.Contains(ev.Detail, "resume") || !strings.Contains(ev.Detail, "tier1") || !strings.Contains(ev.Detail, "ok") {
 		t.Errorf("Detail = %q, want it to mention the action, tier, and outcome", ev.Detail)
+	}
+}
+
+// TestSendPromptCmd_TierOneHSuccess_RecordsTierOneHLabel is the reason
+// Actuator.Tier() exists at all. The actuation event log is the ONLY post-hoc
+// way to tell an in-place iTerm2 write from a multiplexer send when debugging a
+// misrouted keystroke; if 1h logged "tier1" the two mechanisms would be
+// indistinguishable in the record and the field would be decoration.
+func TestSendPromptCmd_TierOneHSuccess_RecordsTierOneHLabel(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h"}, true, true
+		},
+		nil,
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateStalled}
+
+	sendPromptCmd(l, "do the thing", "inject", "injected into", "")()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1: %#v", len(evs), evs)
+	}
+	if !strings.Contains(evs[0].Detail, "tier1h") {
+		t.Errorf("Detail = %q, want the tier1h label", evs[0].Detail)
+	}
+}
+
+// TestSendPromptCmd_TierOneHFailureThenTierTwo_RecordsBoth: the degraded path
+// must leave BOTH facts in the log — the 1h attempt and why it failed, then the
+// Tier 2 redrive that actually delivered. Logging only the outcome would erase
+// the evidence that the host send is misbehaving, which is exactly the signal
+// design §5.3 names as the SLI to watch after rollout.
+func TestSendPromptCmd_TierOneHFailureThenTierTwo_RecordsBoth(t *testing.T) {
+	withFakeActuationSeams(t,
+		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: control.ErrSendTTYMismatch}, true, true
+		},
+		func(sessionID, prompt string) error { return nil },
+	)
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateStalled}
+
+	sendPromptCmd(l, "do the thing", "resume", "resumed", "")()
+
+	got, err := events.ReadAll(historyDirFn())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 2 {
+		t.Fatalf("got %d events, want 2 (the tier1h failure AND the tier2 success): %#v", len(evs), evs)
+	}
+	if !strings.Contains(evs[0].Detail, "tier1h") || !strings.Contains(evs[0].Detail, "failed") {
+		t.Errorf("first event Detail = %q, want the tier1h failure", evs[0].Detail)
+	}
+	if !strings.Contains(evs[1].Detail, "tier2") || !strings.Contains(evs[1].Detail, "ok") {
+		t.Errorf("second event Detail = %q, want the tier2 success", evs[1].Detail)
 	}
 }
 
