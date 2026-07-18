@@ -39,11 +39,14 @@ func stubWorktreeCreate(t *testing.T, result worktree.Result, err error) *string
 	return &gotRepoDir
 }
 
-func stubControlResolve(t *testing.T, ctrl control.Controller, ok bool) {
+// stubSpawner pins spawnCmd's resolver seam. It takes a control.Spawner (not a
+// Controller) because spawn now resolves over the wider seam — which is what
+// lets a host terminal with no multiplexer spawn at all.
+func stubSpawner(t *testing.T, spawner control.Spawner, ok bool) {
 	t.Helper()
-	original := controlResolveFn
-	t.Cleanup(func() { controlResolveFn = original })
-	controlResolveFn = func() (control.Controller, bool) { return ctrl, ok }
+	original := resolveSpawnerFn
+	t.Cleanup(func() { resolveSpawnerFn = original })
+	resolveSpawnerFn = func() (control.Spawner, bool) { return spawner, ok }
 }
 
 // fakeWorktreeSpawnerController is a controller that ALSO implements
@@ -89,7 +92,7 @@ func okResult(path string) worktree.Result {
 func TestSpawnCmd_Worktree_NonOrcaBackend_SpawnsIntoTheNewWorktree(t *testing.T) {
 	isolateFleetopsHome(t)
 	ctrl := &fakeController{name: "tmux"}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	wtPath := filepath.Join(t.TempDir(), "repo-wt-20260719-011612")
 	gotRepoDir := stubWorktreeCreate(t, okResult(wtPath), nil)
 
@@ -113,7 +116,7 @@ func TestSpawnCmd_Worktree_NonOrcaBackend_SpawnsIntoTheNewWorktree(t *testing.T)
 // able to SEE which base the branch was cut from.
 func TestSpawnCmd_Worktree_StatusNamesBranchAndBase(t *testing.T) {
 	isolateFleetopsHome(t)
-	stubControlResolve(t, &fakeController{name: "tmux"}, true)
+	stubSpawner(t, &fakeController{name: "tmux"}, true)
 	stubWorktreeCreate(t, okResult(filepath.Join(t.TempDir(), "repo-wt-20260719-011612")), nil)
 
 	result := runSpawn(t, "/repo", true)
@@ -130,7 +133,7 @@ func TestSpawnCmd_Worktree_StatusNamesBranchAndBase(t *testing.T) {
 // on it. Keyed by the repo, the loop would never bind.
 func TestSpawnCmd_Worktree_PendingRecordIsKeyedByWorktreePath(t *testing.T) {
 	home := isolateFleetopsHome(t)
-	stubControlResolve(t, &fakeController{name: "tmux"}, true)
+	stubSpawner(t, &fakeController{name: "tmux"}, true)
 	wtPath := filepath.Join(t.TempDir(), "repo-wt-20260719-011612")
 	stubWorktreeCreate(t, okResult(wtPath), nil)
 
@@ -172,7 +175,7 @@ func TestSpawnCmd_Worktree_OrcaStillUsesItsOwnSpawnWorktree(t *testing.T) {
 		fakeController: &fakeController{name: "orca"},
 		worktreePath:   "/repo-orca-wt",
 	}
-	stubControlResolve(t, orca, true)
+	stubSpawner(t, orca, true)
 	gotRepoDir := stubWorktreeCreate(t, okResult("/should-not-be-used"), nil)
 
 	if result := runSpawn(t, "/repo", true); !result.ok {
@@ -192,7 +195,7 @@ func TestSpawnCmd_Worktree_OrcaStillUsesItsOwnSpawnWorktree(t *testing.T) {
 func TestSpawnCmd_NoWorktree_UsesCwdDirectlyAndCreatesNoWorktree(t *testing.T) {
 	isolateFleetopsHome(t)
 	ctrl := &fakeController{name: "tmux"}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	gotRepoDir := stubWorktreeCreate(t, okResult("/should-not-be-used"), nil)
 
 	if result := runSpawn(t, "/repo", false); !result.ok {
@@ -214,7 +217,7 @@ func TestSpawnCmd_NoWorktree_UsesCwdDirectlyAndCreatesNoWorktree(t *testing.T) {
 func TestSpawnCmd_Worktree_NotARepo_FailsAndNeverSpawns(t *testing.T) {
 	isolateFleetopsHome(t)
 	ctrl := &fakeController{name: "tmux"}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	stubWorktreeCreate(t, worktree.Result{}, worktree.ErrNotARepo)
 
 	result := runSpawn(t, "/not-a-repo", true)
@@ -233,7 +236,7 @@ func TestSpawnCmd_Worktree_NotARepo_FailsAndNeverSpawns(t *testing.T) {
 func TestSpawnCmd_Worktree_NoOriginRemote_Fails(t *testing.T) {
 	isolateFleetopsHome(t)
 	ctrl := &fakeController{name: "tmux"}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	stubWorktreeCreate(t, worktree.Result{}, worktree.ErrNoRemote)
 
 	result := runSpawn(t, "/repo", true)
@@ -249,7 +252,7 @@ func TestSpawnCmd_Worktree_NoOriginRemote_Fails(t *testing.T) {
 func TestSpawnCmd_Worktree_PathCollision_Fails(t *testing.T) {
 	isolateFleetopsHome(t)
 	ctrl := &fakeController{name: "tmux"}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	stubWorktreeCreate(t, worktree.Result{}, worktree.ErrPathExists)
 
 	if result := runSpawn(t, "/repo", true); result.ok {
@@ -266,7 +269,7 @@ func TestSpawnCmd_Worktree_PathCollision_Fails(t *testing.T) {
 func TestSpawnCmd_Worktree_FailureNeverFallsBackToTheRepoDir(t *testing.T) {
 	isolateFleetopsHome(t)
 	ctrl := &fakeController{name: "tmux"}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	stubWorktreeCreate(t, worktree.Result{}, worktree.ErrNoRemote)
 
 	runSpawn(t, "/repo", true)
@@ -282,7 +285,7 @@ func TestSpawnCmd_Worktree_SpawnFailsAfterCreate_NamesTheOrphanCheckout(t *testi
 	isolateFleetopsHome(t)
 	wtPath := filepath.Join(t.TempDir(), "repo-wt-20260719-011612")
 	ctrl := &fakeController{name: "tmux", spawnErr: errors.New("tmux: no server running")}
-	stubControlResolve(t, ctrl, true)
+	stubSpawner(t, ctrl, true)
 	stubWorktreeCreate(t, okResult(wtPath), nil)
 
 	result := runSpawn(t, "/repo", true)
@@ -300,7 +303,7 @@ func TestSpawnCmd_Worktree_SpawnFailsAfterCreate_NamesTheOrphanCheckout(t *testi
 
 func TestSpawnCmd_Worktree_NoBackend_FailsBeforeCreatingAnything(t *testing.T) {
 	isolateFleetopsHome(t)
-	stubControlResolve(t, nil, false)
+	stubSpawner(t, nil, false)
 	gotRepoDir := stubWorktreeCreate(t, okResult("/x"), nil)
 
 	result := runSpawn(t, "/repo", true)
@@ -313,13 +316,124 @@ func TestSpawnCmd_Worktree_NoBackend_FailsBeforeCreatingAnything(t *testing.T) {
 	}
 }
 
+// ── iTerm2-only machine (no multiplexer) ─────────────────────────────────
+
+// hostOnlySpawner implements ONLY control.Spawner — no Locate, no Focus, no
+// pane addressing. It stands in for the iTerm2 host spawner, and the point of
+// using it here is structural: if spawnCmd ever required a full Controller
+// again, these tests stop compiling.
+type hostOnlySpawner struct {
+	spawnCalled bool
+	spawnCwd    string
+	spawnErr    error
+}
+
+func (hostOnlySpawner) Name() string    { return "iterm2" }
+func (hostOnlySpawner) Available() bool { return true }
+func (h *hostOnlySpawner) Spawn(cwd, prompt string) error {
+	h.spawnCalled, h.spawnCwd = true, cwd
+	return h.spawnErr
+}
+
+// The headline of stage 3: pressing "n" on a machine with no multiplexer now
+// starts a loop instead of refusing.
+func TestSpawnCmd_HostOnlySpawner_SpawnsWithNoMultiplexer(t *testing.T) {
+	isolateFleetopsHome(t)
+	host := &hostOnlySpawner{}
+	stubSpawner(t, host, true)
+
+	result := runSpawn(t, "/repo", false)
+
+	if !result.ok {
+		t.Fatalf("spawn failed on an iTerm2-only machine: %s", result.text)
+	}
+	if !host.spawnCalled || host.spawnCwd != "/repo" {
+		t.Fatalf("host spawner was not used correctly (called=%v cwd=%q)", host.spawnCalled, host.spawnCwd)
+	}
+	if !strings.Contains(result.text, "iterm2") {
+		t.Fatalf("status %q does not name the backend that spawned it", result.text)
+	}
+}
+
+// Worktree isolation must work on the host spawner too — a Spawner that is not
+// a WorktreeSpawner takes fleetops's own git path.
+func TestSpawnCmd_HostOnlySpawner_StillGetsAGitWorktree(t *testing.T) {
+	isolateFleetopsHome(t)
+	host := &hostOnlySpawner{}
+	stubSpawner(t, host, true)
+	wtPath := filepath.Join(t.TempDir(), "repo-wt-20260719-011612")
+	stubWorktreeCreate(t, okResult(wtPath), nil)
+
+	result := runSpawn(t, "/repo", true)
+
+	if !result.ok {
+		t.Fatalf("worktree spawn failed on an iTerm2-only machine: %s", result.text)
+	}
+	if host.spawnCwd != wtPath {
+		t.Fatalf("spawned in %q, want the new worktree %q", host.spawnCwd, wtPath)
+	}
+}
+
+// With nothing at all available the message must mention iTerm2 too, or an
+// iTerm2 user reads "no orca/tmux/cmux" and concludes fleetops cannot help
+// them when in fact their host is supported.
+func TestSpawnCmd_NoSpawnerAtAll_MessageMentionsITerm2(t *testing.T) {
+	isolateFleetopsHome(t)
+	stubSpawner(t, nil, false)
+
+	result := runSpawn(t, "/repo", false)
+
+	if result.ok {
+		t.Fatal("spawn reported success with no spawner available")
+	}
+	if !strings.Contains(result.text, "iTerm2") {
+		t.Fatalf("status %q does not mention iTerm2 among the supported hosts", result.text)
+	}
+}
+
+// The stale-base caveat has to reach the human — it is appended to a SUCCESS
+// line, so it is the only thing standing between them and a silently stale
+// branch.
+func TestSpawnCmd_Worktree_StaleBaseIsSurfacedOnSuccess(t *testing.T) {
+	isolateFleetopsHome(t)
+	stubSpawner(t, &fakeController{name: "tmux"}, true)
+	stale := okResult(filepath.Join(t.TempDir(), "repo-wt-20260719-011612"))
+	stale.StaleBase = true
+	stale.StaleReason = "could not read from remote repository"
+	stubWorktreeCreate(t, stale, nil)
+
+	result := runSpawn(t, "/repo", true)
+
+	if !result.ok {
+		t.Fatalf("a stale base must not fail the spawn: %s", result.text)
+	}
+	if !strings.Contains(result.text, "STALE") {
+		t.Fatalf("status %q does not warn that the base may be stale", result.text)
+	}
+	if !strings.Contains(result.text, "could not read from remote repository") {
+		t.Fatalf("status %q does not carry the fetch failure reason", result.text)
+	}
+}
+
+func TestSpawnCmd_Worktree_FreshBaseAddsNoWarning(t *testing.T) {
+	isolateFleetopsHome(t)
+	stubSpawner(t, &fakeController{name: "tmux"}, true)
+	stubWorktreeCreate(t, okResult(filepath.Join(t.TempDir(), "repo-wt-20260719-011612")), nil)
+
+	result := runSpawn(t, "/repo", true)
+
+	if strings.Contains(result.text, "STALE") {
+		t.Fatalf("status %q warns about staleness after a clean fetch", result.text)
+	}
+}
+
 // ── eligibility ──────────────────────────────────────────────────────────
 
 // [w] must now be offered on ANY backend that can spawn — gating it on
 // control.WorktreeSpawner would hide the new capability from exactly the
 // tmux/iTerm2 users it was added for.
 func TestCheckWorktreeEligibility_OfferedOnNonWorktreeSpawnerBackend(t *testing.T) {
-	stubControlResolve(t, &fakeController{name: "tmux"}, true)
+	stubSpawner(t, &fakeController{name: "tmux"}, true)
 
 	msg := checkWorktreeEligibilityCmd()()
 	if eligible, ok := msg.(worktreeEligibilityMsg); !ok || !bool(eligible) {
@@ -328,7 +442,7 @@ func TestCheckWorktreeEligibility_OfferedOnNonWorktreeSpawnerBackend(t *testing.
 }
 
 func TestCheckWorktreeEligibility_NotOfferedWithNoBackend(t *testing.T) {
-	stubControlResolve(t, nil, false)
+	stubSpawner(t, nil, false)
 
 	msg := checkWorktreeEligibilityCmd()()
 	if eligible, ok := msg.(worktreeEligibilityMsg); !ok || bool(eligible) {

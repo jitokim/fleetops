@@ -75,6 +75,16 @@ var (
 	// control.Resolve does real exec/Available probes, so tests can't rely on
 	// a real orca/tmux/cmux backend being installed.
 	controlResolveFn = control.Resolve
+	// resolveSpawnerFn is control.ResolveSpawner by default — spawnCmd's own
+	// resolver seam, deliberately WIDER than controlResolveFn. Spawning is the
+	// one operation a plain host terminal can do without being a multiplexer,
+	// so it resolves over control.Spawner (every multiplexer first, then the
+	// iTerm2 host spawner) rather than over Controller. Split from
+	// controlResolveFn rather than replacing it: takeOverCmd genuinely needs a
+	// Controller (it type-asserts TerminalOpener), and widening its resolver
+	// would have changed attach/take-over behaviour, which this is not
+	// allowed to touch.
+	resolveSpawnerFn = control.ResolveSpawner
 	// worktreeCreateFn is worktree.Create by default — spawnCmd's
 	// BACKEND-AGNOSTIC worktree seam. Overridable so the worktree spawn branch
 	// (and every way it can fail: not a repo, no origin remote, a colliding
@@ -2086,7 +2096,7 @@ func (m Model) submitSpawnWizardEngineDrive() (tea.Model, tea.Cmd) {
 // informative of the two.
 func checkWorktreeEligibilityCmd() tea.Cmd {
 	return func() tea.Msg {
-		_, ok := controlResolveFn()
+		_, ok := resolveSpawnerFn()
 		return worktreeEligibilityMsg(ok)
 	}
 }
@@ -2125,14 +2135,16 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // failure.
 func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 	return func() tea.Msg {
-		// controlResolveFn, not control.Resolve directly — the same
-		// CREATION/CAPABILITY seam takeOverCmd already uses. Resolve does real
-		// exec/Available probes, so without it none of the spawn branches
-		// (worktree or plain) can be tested on a machine with no backend
-		// installed.
-		ctrl, ok := controlResolveFn()
+		// resolveSpawnerFn, not controlResolveFn: spawn is the one operation
+		// a host terminal can perform without being a multiplexer, so it
+		// resolves over the wider Spawner seam (multiplexers first, then
+		// iTerm2). Everything else in this file still resolves over
+		// Controller. It is also a seam because Resolve does real
+		// exec/Available probes, so without it no spawn branch could be
+		// tested on a machine with no backend installed.
+		ctrl, ok := resolveSpawnerFn()
 		if !ok {
-			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
+			return spawnResultMsg{false, "no orca/tmux/cmux/iTerm2 — spawn manually: cd " + cwd + " && claude"}
 		}
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 
@@ -2201,7 +2213,7 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 // defect. The status line names the branch AND the base it was cut from, since
 // the explicit base is the whole guarantee and a guarantee nobody can see is
 // one nobody can trust.
-func spawnIntoGitWorktree(ctrl control.Controller, cwd string, spec registry.BindSpec, prompt string) tea.Msg {
+func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt string) tea.Msg {
 	wt, err := worktreeCreateFn(cwd)
 	if err != nil {
 		return spawnResultMsg{false, fmt.Sprintf("worktree spawn failed: %v", err)}
