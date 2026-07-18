@@ -31,23 +31,20 @@ func TestResolveFocusAdapter_EmptyHostApp_Degrades(t *testing.T) {
 }
 
 // TestITerm2FocusArgv_BuildsSelectScriptForGUID pins the pure osascript
-// builder: given a $ITERM_SESSION_ID it emits `osascript -e <script>` whose
-// script matches on the session GUID (the part after the colon) and selects
-// the enclosing window/tab/session.
+// builder: given a session GUID it emits `osascript -e <script>` whose script
+// matches on that GUID and selects the enclosing window/tab/session. The
+// builder takes an already-extracted GUID — extraction itself is pinned by
+// TestITerm2SessionGUID, and that Raise extracts before building is pinned by
+// TestITerm2Raise_WithWindowID_ExecsBuiltScript.
 func TestITerm2FocusArgv_BuildsSelectScriptForGUID(t *testing.T) {
-	argv := iterm2FocusArgv("w0t1p0:ABC-123-GUID")
+	argv := iterm2FocusArgv("ABC-123-GUID")
 
 	if len(argv) != 3 || argv[0] != "osascript" || argv[1] != "-e" {
 		t.Fatalf("argv = %v, want [osascript -e <script>]", argv)
 	}
 	script := argv[2]
-	// Matches on the GUID, not the whole window id (the colon-prefixed
-	// w/t/p coordinates are NOT the scriptable session id).
 	if !strings.Contains(script, `id of aSession is "ABC-123-GUID"`) {
 		t.Errorf("script does not match on the session GUID:\n%s", script)
-	}
-	if strings.Contains(script, "w0t1p0") {
-		t.Errorf("script leaked the w/t/p prefix into the id match:\n%s", script)
 	}
 	for _, want := range []string{`tell application "iTerm2"`, "activate", "select aWindow", "select aTab", "select aSession"} {
 		if !strings.Contains(script, want) {
@@ -62,7 +59,7 @@ func TestITerm2FocusArgv_BuildsSelectScriptForGUID(t *testing.T) {
 // activate-first script yanks the app forward and returns success for a session
 // that no longer exists.
 func TestITerm2FocusArgv_ReportsHitAndMiss(t *testing.T) {
-	script := iterm2FocusArgv("w0t1p0:ABC-123")[2]
+	script := iterm2FocusArgv("ABC-123")[2]
 
 	if !strings.Contains(script, `return "`+iterm2FocusHit+`"`) {
 		t.Errorf("script never reports a hit:\n%s", script)
@@ -174,7 +171,9 @@ func TestITerm2Raise_WithWindowID_ExecsBuiltScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Raise = %v, want nil", err)
 	}
-	if want := iterm2FocusArgv("w0t0p0:GUID-9"); !equalArgv(*captured, want) {
+	// Built from the EXTRACTED GUID, not the raw window id — this is what pins
+	// that Raise derives the GUID once and hands that same value to the builder.
+	if want := iterm2FocusArgv("GUID-9"); !equalArgv(*captured, want) {
 		t.Errorf("execed argv = %v, want %v", *captured, want)
 	}
 }

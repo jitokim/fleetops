@@ -101,19 +101,20 @@ type iterm2FocusAdapter struct{}
 // to write that file or set that env var controls this string: it is untrusted.
 var itermGUIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 
-// Raise selects the iTerm2 session named by entry.WindowID. Two degrade paths,
-// both ErrNoFocusSurface with NO exec so attach falls through to its next step:
-// an empty WindowID (nothing to raise), and a GUID that fails
-// itermGUIDPattern — we never build a script out of an untrusted id, and never
-// exec one. Refusing beats sanitizing: the worst case is a degraded attach.
+// Raise selects the iTerm2 session named by entry.WindowID. It derives the GUID
+// ONCE and both validates and interpolates that same value — deriving it
+// separately at each site would let the whitelist and the script drift apart,
+// so that the string actually reaching osascript is not the one that was
+// checked. Anything failing itermGUIDPattern degrades to ErrNoFocusSurface with
+// NO exec, so attach falls through to its next step; an empty WindowID
+// ("nothing to raise") lands here too, since the pattern requires at least one
+// character. Refusing beats sanitizing: the worst case is a degraded attach.
 func (iterm2FocusAdapter) Raise(entry sessions.SessionEntry) error {
-	if entry.WindowID == "" {
+	guid := iterm2SessionGUID(entry.WindowID)
+	if !itermGUIDPattern.MatchString(guid) {
 		return ErrNoFocusSurface
 	}
-	if !itermGUIDPattern.MatchString(iterm2SessionGUID(entry.WindowID)) {
-		return ErrNoFocusSurface
-	}
-	out, err := iterm2FocusFn(iterm2FocusArgv(entry.WindowID))
+	out, err := iterm2FocusFn(iterm2FocusArgv(guid))
 	if err != nil {
 		return err
 	}
@@ -127,12 +128,13 @@ func (iterm2FocusAdapter) Raise(entry sessions.SessionEntry) error {
 }
 
 // iterm2FocusArgv builds the osascript argv that reveals the iTerm2 session
-// whose AppleScript `id` matches windowID's session GUID — pulled out as a pure
-// function so the exact script is directly unit-testable (same pattern as
-// redriveArgv/orcaResumeCmd). $ITERM_SESSION_ID is shaped "w<W>t<T>p<P>:<GUID>";
-// the session's scriptable `id` is that trailing GUID, so we match on it and
-// select the enclosing window + tab + session, then activate iTerm2 to bring it
-// forward.
+// whose AppleScript `id` is guid — pulled out as a pure function so the exact
+// script is directly unit-testable (same pattern as redriveArgv/orcaResumeCmd).
+// It takes the ALREADY-EXTRACTED, already-validated GUID rather than a raw
+// $ITERM_SESSION_ID (shaped "w<W>t<T>p<P>:<GUID>") so exactly one derivation
+// feeds both Raise's whitelist check and this interpolation. It matches on the
+// GUID and selects the enclosing window + tab + session, then activates iTerm2
+// to bring it forward.
 //
 // The script REPORTS its outcome on stdout ("ok" / "miss") and `activate` lives
 // INSIDE the match branch. Both matter: osascript exits 0 whether or not the
@@ -143,9 +145,8 @@ func (iterm2FocusAdapter) Raise(entry sessions.SessionEntry) error {
 // miss from yanking iTerm2 forward for no reason.
 //
 // Interpolating guid is safe only because Raise gates it on itermGUIDPattern
-// first; do not call this with an unvalidated window id.
-func iterm2FocusArgv(windowID string) []string {
-	guid := iterm2SessionGUID(windowID)
+// first; do not call this with an unvalidated GUID.
+func iterm2FocusArgv(guid string) []string {
 	script := "tell application \"iTerm2\"\n" +
 		"\trepeat with aWindow in windows\n" +
 		"\t\trepeat with aTab in tabs of aWindow\n" +
