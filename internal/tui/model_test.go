@@ -34,6 +34,14 @@ import (
 // save-then-restore pattern as always.
 func TestMain(m *testing.M) {
 	historyDirFn = func() string { return filepath.Join(os.TempDir(), "fleetops-tui-tests-unused-history") }
+	// Same hermeticity net for the persisted hide-set: New() loads it, and
+	// many tests call New() with no reason to care about a real captain's
+	// ~/.fleetops/hidden.json. Point it at a per-run temp file (missing at
+	// start → fail-open empty); hide/delete tests that need real persistence
+	// override hiddenFileFn themselves (save-then-restore).
+	hiddenFileFn = func() string {
+		return filepath.Join(os.TempDir(), "fleetops-tui-tests-unused-hidden.json")
+	}
 	os.Exit(m.Run())
 }
 
@@ -980,10 +988,10 @@ func TestRenderHeaderBlock_HintGridPresentAtThreshold(t *testing.T) {
 
 // TestHeaderHintKeys_GroupedByFunction pins fix/exit-gate-ux item 7's
 // reordering: column-major fill groups send actions (r/i/a), lifecycle
-// (n/k/p), nav (↵/o//), and session housekeeping (q/d) into adjacent
+// (n/k/p), nav (↵/o//), and session housekeeping (q/d/x) into adjacent
 // cells — see headerHintKeys' doc for the grouping rationale.
 func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
-	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q", "d"}
+	want := []string{"r", "i", "a", "n", "k", "p", "↵", "o", "/", "q", "d", "x"}
 	if len(headerHintKeys) != len(want) {
 		t.Fatalf("got %d keys, want %d", len(headerHintKeys), len(want))
 	}
@@ -1000,7 +1008,7 @@ func TestHeaderHintKeys_GroupedByFunction(t *testing.T) {
 // have dropped anything.
 func TestRenderHeaderHintGrid_AllKeysPresent_NothingRegressed(t *testing.T) {
 	out := renderHeaderHintGrid(4, 4*headerHintColWidth)
-	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q", "d"} {
+	for _, k := range []string{"r", "a", "i", "↵", "p", "k", "n", "o", "/", "q", "d", "x"} {
 		if !strings.Contains(out, "<"+k+">") {
 			t.Errorf("expected hint grid to contain key %q, got:\n%s", k, out)
 		}
@@ -7821,13 +7829,13 @@ func TestUpdate_DemoMode_MutatingKeyRefused_NavigationStillWorks(t *testing.T) {
 }
 
 func TestIsDemoBlockedKey(t *testing.T) {
-	blocked := []string{"r", "a", "i", "enter", "o", "n", "k", "p"}
+	blocked := []string{"r", "a", "i", "enter", "o", "n", "k", "p", "d", "x"}
 	for _, key := range blocked {
 		if !isDemoBlockedKey(key) {
 			t.Errorf("isDemoBlockedKey(%q) = false, want true", key)
 		}
 	}
-	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c", "d"}
+	allowed := []string{"up", "down", "j", "g", "G", "/", "esc", "q", "ctrl+c"}
 	for _, key := range allowed {
 		if isDemoBlockedKey(key) {
 			t.Errorf("isDemoBlockedKey(%q) = true, want false", key)
@@ -7835,28 +7843,64 @@ func TestIsDemoBlockedKey(t *testing.T) {
 	}
 }
 
-// ── "d" dismiss: hide a loop from the fleet list (view-state only) ───────
+// ── "d" hidden / "x" delete: persisted hide-set (survives restart) ───────
 
-func TestUpdate_DKey_DismissesSelectedLoop(t *testing.T) {
+// withHiddenFile points hiddenFileFn at a fresh temp file for one test,
+// restoring the original on cleanup — mirrors withSessionsDir. The file does
+// not exist yet (fail-open empty until the first hide writes it).
+func withHiddenFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hidden.json")
+	orig := hiddenFileFn
+	t.Cleanup(func() { hiddenFileFn = orig })
+	hiddenFileFn = func() string { return path }
+	return path
+}
+
+func TestUpdate_DKey_HidesSelectedLoop(t *testing.T) {
+	withHiddenFile(t)
 	m := modelWithTwoLoops()
 
-	m, cmd := updateModel(t, m, runeKey('d'))
+	m, _ = updateModel(t, m, runeKey('d'))
 
-	if cmd != nil {
-		t.Error("expected no tea.Cmd — dismiss is pure view-state")
-	}
 	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
 		t.Fatalf("loops = %+v, want only sess-2 left", m.loops)
 	}
-	if !m.dismissed["sess-1"] {
-		t.Error("expected sess-1 recorded in the dismissed set")
+	if !m.hidden["sess-1"] {
+		t.Error("expected sess-1 recorded in the hidden set")
 	}
-	if !strings.Contains(m.status, "dismissed myproject") {
-		t.Errorf("status = %q, want a dismissed-myproject message", m.status)
+	if !strings.Contains(m.status, "hidden myproject") {
+		t.Errorf("status = %q, want a hidden-myproject message", m.status)
+	}
+}
+
+// TestUpdate_DKey_HidePersistsAcrossRestart is the headline requirement: a
+// hide written by "d" must still filter the loop after fleetops restarts,
+// which we model by building a FRESH Model (New reloads hidden.Load from the
+// same file) and feeding it a scan that re-derives sess-1.
+func TestUpdate_DKey_HidePersistsAcrossRestart(t *testing.T) {
+	withHiddenFile(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('d')) // hide sess-1, persisted to disk
+
+	// "restart": a brand-new Model loads the persisted hide-set from disk.
+	restarted := modelWithTwoLoops()
+	if !restarted.hidden["sess-1"] {
+		t.Fatalf("restarted model's hidden set = %+v, want sess-1 loaded from disk", restarted.hidden)
+	}
+	rescan := loopsMsg{
+		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	restarted, _ = updateModel(t, restarted, rescan)
+	if len(restarted.loops) != 1 || restarted.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops after restart+rescan = %+v, want sess-1 still hidden", restarted.loops)
 	}
 }
 
 func TestUpdate_DKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
+	withHiddenFile(t)
 	m := New()
 
 	m, cmd := updateModel(t, m, runeKey('d'))
@@ -7864,12 +7908,16 @@ func TestUpdate_DKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
 	if cmd != nil {
 		t.Error("expected no tea.Cmd for an empty fleet")
 	}
-	if !strings.Contains(m.status, "select a loop to dismiss") {
+	if !strings.Contains(m.status, "select a loop to hide") {
 		t.Errorf("status = %q, want the select-a-loop refusal", m.status)
+	}
+	if len(m.hidden) != 0 {
+		t.Errorf("hidden = %+v, want empty — a no-selection refusal must not change state", m.hidden)
 	}
 }
 
 func TestUpdate_DKey_LastRow_ClampsCursor(t *testing.T) {
+	withHiddenFile(t)
 	m := modelWithTwoLoops()
 	m.cursor = 1
 
@@ -7883,9 +7931,10 @@ func TestUpdate_DKey_LastRow_ClampsCursor(t *testing.T) {
 	}
 }
 
-func TestUpdate_LoopsMsg_DoesNotResurrectDismissed(t *testing.T) {
+func TestUpdate_LoopsMsg_DoesNotResurrectHidden(t *testing.T) {
+	withHiddenFile(t)
 	m := modelWithTwoLoops()
-	m, _ = updateModel(t, m, runeKey('d')) // dismiss sess-1
+	m, _ = updateModel(t, m, runeKey('d')) // hide sess-1
 
 	rescan := loopsMsg{
 		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
@@ -7898,11 +7947,124 @@ func TestUpdate_LoopsMsg_DoesNotResurrectDismissed(t *testing.T) {
 	}
 }
 
-func TestWithoutDismissed_EmptySet_ReturnsInputUnchanged(t *testing.T) {
+func TestWithoutHidden_EmptySet_ReturnsInputUnchanged(t *testing.T) {
 	m := modelWithTwoLoops()
-	loops := m.withoutDismissed(m.loops)
+	m.hidden = nil
+	loops := m.withoutHidden(m.loops)
 	if len(loops) != 2 {
-		t.Fatalf("got %d loops, want 2 — an empty dismissed set must filter nothing", len(loops))
+		t.Fatalf("got %d loops, want 2 — an empty hidden set must filter nothing", len(loops))
+	}
+}
+
+// TestNew_CorruptHiddenFile_FailsOpen: a garbage hidden.json must load as an
+// empty set (show every loop), never crash — the fail-open invariant.
+func TestNew_CorruptHiddenFile_FailsOpen(t *testing.T) {
+	path := withHiddenFile(t)
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := modelWithTwoLoops() // New() → hidden.Load on the corrupt file
+
+	if len(m.hidden) != 0 {
+		t.Fatalf("hidden = %+v, want empty (fail-open on corrupt file)", m.hidden)
+	}
+	rescan := loopsMsg{
+		{Project: "myproject", SessionID: "sess-1", State: domain.StateRunning},
+		{Project: "asre", SessionID: "sess-2", State: domain.StateIdle},
+	}
+	m, _ = updateModel(t, m, rescan)
+	if len(m.loops) != 2 {
+		t.Fatalf("loops = %+v, want both shown (corrupt tombstone must not hide anything)", m.loops)
+	}
+}
+
+// TestUpdate_XKey_DeletesRegistryEntryAndHides: "x" removes the session
+// registry .json AND persists the hide, while the conversation jsonl is left
+// untouched.
+func TestUpdate_XKey_DeletesRegistryEntryAndHides(t *testing.T) {
+	withHiddenFile(t)
+	sessionsDir := withSessionsDir(t)
+	// A registry entry for sess-1 (what "x" must remove)...
+	regPath := filepath.Join(sessionsDir, "sess-1.json")
+	if err := os.WriteFile(regPath, []byte(`{"pid":1,"tty":"ttys001"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// ...and a stand-in conversation jsonl "x" must NOT touch.
+	jsonlPath := filepath.Join(t.TempDir(), "sess-1.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte("conversation history\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if _, err := os.Stat(regPath); !os.IsNotExist(err) {
+		t.Errorf("registry entry still present (err=%v), want removed", err)
+	}
+	if _, err := os.Stat(jsonlPath); err != nil {
+		t.Errorf("conversation jsonl was disturbed (err=%v), want preserved", err)
+	}
+	if !m.hidden["sess-1"] {
+		t.Error("expected sess-1 in the hidden set after delete")
+	}
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops = %+v, want only sess-2 left", m.loops)
+	}
+	if !strings.Contains(m.status, "deleted myproject") || !strings.Contains(m.status, "registry entry removed") {
+		t.Errorf("status = %q, want a deleted/registry-removed message", m.status)
+	}
+}
+
+// TestUpdate_XKey_MissingRegistryEntry_StillHides: DeleteSession treats a
+// missing entry as a no-op (nil error), so "x" on a loop with no registry
+// record still hides it — no error status.
+func TestUpdate_XKey_MissingRegistryEntry_StillHides(t *testing.T) {
+	withHiddenFile(t)
+	withSessionsDir(t) // empty — sess-1 has no registry entry
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('x'))
+
+	if !m.hidden["sess-1"] {
+		t.Error("expected sess-1 hidden even with no registry entry to delete")
+	}
+	if m.statusKind == statusErr {
+		t.Errorf("statusKind = %v, want not statusErr (missing registry entry is a no-op)", m.statusKind)
+	}
+}
+
+func TestUpdate_XKey_EmptyFleet_RefusesWithoutCrashing(t *testing.T) {
+	withHiddenFile(t)
+	m := New()
+
+	m, cmd := updateModel(t, m, runeKey('x'))
+
+	if cmd != nil {
+		t.Error("expected no tea.Cmd for an empty fleet")
+	}
+	if !strings.Contains(m.status, "select a loop to delete") {
+		t.Errorf("status = %q, want the select-a-loop-to-delete refusal", m.status)
+	}
+	if len(m.hidden) != 0 {
+		t.Errorf("hidden = %+v, want empty — a no-selection refusal must not change state", m.hidden)
+	}
+}
+
+// TestUpdate_DXKeys_DemoBlocked: in demo mode both keys are refused before
+// touching disk (no persisted tombstone keyed by a synthetic session id).
+func TestUpdate_DXKeys_DemoBlocked(t *testing.T) {
+	withHiddenFile(t)
+	for _, key := range []rune{'d', 'x'} {
+		m := NewDemo()
+		before := len(m.loops)
+		m, _ = updateModel(t, m, runeKey(key))
+		if len(m.loops) != before {
+			t.Errorf("key %q: loops changed in demo mode, want refused", string(key))
+		}
+		if !strings.Contains(m.status, "demo mode is read-only") {
+			t.Errorf("key %q: status = %q, want the demo read-only refusal", string(key), m.status)
+		}
 	}
 }
 

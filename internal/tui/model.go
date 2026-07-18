@@ -26,6 +26,7 @@ import (
 	"github.com/jitokim/fleetops/internal/engine"
 	"github.com/jitokim/fleetops/internal/events"
 	"github.com/jitokim/fleetops/internal/gate"
+	"github.com/jitokim/fleetops/internal/hidden"
 	"github.com/jitokim/fleetops/internal/notify"
 	"github.com/jitokim/fleetops/internal/oracle"
 	"github.com/jitokim/fleetops/internal/registry"
@@ -60,6 +61,10 @@ var (
 	sessionsDirFn            = sessions.SessionsDir
 	historyDirFn             = events.HistoryDir
 	notifySendFn             = notify.Send
+	// hiddenFileFn is hidden.HiddenFile by default — the persisted hide-set
+	// seam ("d"/"x"). Overridable so the hide/delete keys and startup load can
+	// be verified without touching the real ~/.fleetops/hidden.json.
+	hiddenFileFn = hidden.HiddenFile
 	// controlResolveFn is control.Resolve by default — the CREATION/CAPABILITY
 	// resolver seam. takeOverCmd still uses it (open a fresh terminal via
 	// whichever backend is available); attach does NOT — see
@@ -197,7 +202,11 @@ func (m Model) scanCmd() tea.Cmd {
 // added to the switch below it.
 func isDemoBlockedKey(key string) bool {
 	switch key {
-	case "r", "a", "i", "enter", "o", "n", "k", "p":
+	// d/x now persist a tombstone (and x removes a registry entry), so both
+	// write under ~/.fleetops keyed by a synthetic session id nothing else
+	// would clean up — refused in demo like the other mutating keys, unlike
+	// the old in-memory-only "d" dismiss.
+	case "r", "a", "i", "enter", "o", "n", "k", "p", "d", "x":
 		return true
 	default:
 		return false
@@ -332,13 +341,17 @@ type Model struct {
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
-	// dismissed is the "d" key's hide-set: sessionID -> hidden from the
-	// fleet list. In-memory only (same lifetime trade as notifiedAt) — a
-	// fleetops restart brings every dismissed loop back. The loopsMsg
-	// handler filters each scan's result through this set BEFORE
-	// detectTransitions, so a dismissed loop neither reappears on rescan
-	// nor keeps firing gate/gone notifications from off-screen.
-	dismissed map[string]bool
+	// hidden is the persisted hide-set: sessionID -> hidden from the fleet
+	// list. Both "d" (hide) and "x" (delete) add to it. UNLIKE the in-memory
+	// dismiss it replaced, this is loaded from disk at startup (New →
+	// hidden.Load) and rewritten on every add (hidden.Add), so a hidden loop
+	// stays filtered across a fleetops restart even though loops are
+	// re-derived by scanning ~/.claude on every launch. The loopsMsg handler
+	// filters each scan's result through this set BEFORE detectTransitions,
+	// so a hidden loop neither reappears on rescan nor keeps firing gate/gone
+	// notifications from off-screen. See internal/hidden for the persistence
+	// (atomic, fail-open) and Model.withoutHidden for the filter.
+	hidden map[string]bool
 
 	// injectTarget is the loop a modeInjecting prompt will be sent to,
 	// snapshotted at "i" keypress time — NOT re-resolved from m.selected() at
@@ -451,6 +464,12 @@ func New() Model {
 		status:   "watching ~/.claude/projects",
 		start:    time.Now(),
 		hostname: host,
+		// Load the persisted hide-set up front so the FIRST scan's loopsMsg
+		// already filters (and detectTransitions already skips) every hidden
+		// loop — a restart must not re-surface, or re-notify for, anything the
+		// human hid or deleted last session. Fail-open: a missing/corrupt file
+		// loads as an empty set (see hidden.Load).
+		hidden: hidden.Load(hiddenFileFn()),
 	}
 }
 
@@ -472,6 +491,11 @@ func NewDemo() Model {
 	m.loops = loops
 	m.detailCache = detailCache
 	m.fleetOracleCounts = oracleCounts
+	// Demo is hermetic ("nothing real"): drop whatever New loaded from the
+	// real ~/.fleetops/hidden.json so a captain's actual tombstones can't
+	// filter the synthetic fleet, and so d/x (demo-blocked anyway) have
+	// nothing real to touch.
+	m.hidden = nil
 	return m
 }
 
@@ -629,7 +653,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case loopsMsg:
-		newLoops := m.withoutDismissed([]domain.Loop(msg))
+		newLoops := m.withoutHidden([]domain.Loop(msg))
 		now := time.Now()
 		transitions, autoRedriveCmds := m.detectTransitions(newLoops, now) // must run BEFORE m.loops is overwritten — compares old vs new
 		m.loops = newLoops
@@ -1240,25 +1264,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status, m.statusKind = fmt.Sprintf("stopping %s...", sel.Project), statusNeutral
 			return m, interruptCmd(sel)
 		case "d":
-			// Dismiss: hide the selected loop from the fleet list. Pure
-			// view-state — never touches the session, its process, or disk
-			// (which is also why it isn't demo-blocked), unlike its k/p
-			// neighbors. See Model.dismissed for the rescan/notification
-			// semantics.
+			// Hide: tombstone the selected loop into the PERSISTED hide-set so
+			// it stays filtered across a fleetops restart (a restart otherwise
+			// re-derives it from the ~/.claude scan). Non-destructive — nothing
+			// in ~/.claude and no registry record is removed; the loop is only
+			// filtered. See Model.hidden / hideSession for the semantics.
 			sel, ok := m.selected()
 			if !ok {
-				m.status, m.statusKind = "select a loop to dismiss", statusNeutral
+				m.status, m.statusKind = "select a loop to hide", statusNeutral
 				return m, nil
 			}
-			if m.dismissed == nil {
-				m.dismissed = make(map[string]bool)
+			if err := m.hideSession(sel.SessionID); err != nil {
+				m.status, m.statusKind = fmt.Sprintf("hid %s in view, but persisting the hide failed: %v", sel.Project, err), statusErr
+			} else {
+				m.status, m.statusKind = fmt.Sprintf("hidden %s — stays hidden after restart", sel.Project), statusNeutral
 			}
-			m.dismissed[sel.SessionID] = true
-			m.loops = m.withoutDismissed(m.loops)
-			if m.cursor >= len(m.visibleLoops()) {
-				m.cursor = maxInt(0, len(m.visibleLoops())-1)
+		case "x":
+			// Delete (registry-only, safe): remove the session-registry tty
+			// registration AND tombstone the same session into the persisted
+			// hide-set, so the jsonl-scan-derived loop never reappears. NEVER
+			// deletes the ~/.claude conversation log — history is preserved;
+			// this is registry-entry removal + persistent tombstone only.
+			sel, ok := m.selected()
+			if !ok {
+				m.status, m.statusKind = "select a loop to delete", statusNeutral
+				return m, nil
 			}
-			m.status, m.statusKind = fmt.Sprintf("dismissed %s — hidden until restart", sel.Project), statusNeutral
+			delErr := sessions.DeleteSession(sessionsDirFn(), sel.SessionID)
+			hideErr := m.hideSession(sel.SessionID)
+			switch {
+			case delErr != nil:
+				m.status, m.statusKind = fmt.Sprintf("deleted %s — hidden, but registry removal failed: %v", sel.Project, delErr), statusErr
+			case hideErr != nil:
+				m.status, m.statusKind = fmt.Sprintf("deleted %s — registry entry removed, but persisting the hide failed: %v", sel.Project, hideErr), statusErr
+			default:
+				m.status, m.statusKind = fmt.Sprintf("deleted %s — registry entry removed, hidden", sel.Project), statusNeutral
+			}
 		}
 	case resumeResultMsg:
 		if m.actuating != nil {
@@ -3028,21 +3069,44 @@ func (m *Model) setActuating(sessionID string) {
 	m.actuating[sessionID] = true
 }
 
-// withoutDismissed drops every loop the "d" key has hidden this session —
-// applied both at dismiss-keypress time (prune m.loops in place) and to each
-// scan's fresh result in the loopsMsg handler (so a rescan can't resurrect
-// a dismissed loop). See Model.dismissed.
-func (m Model) withoutDismissed(loops []domain.Loop) []domain.Loop {
-	if len(m.dismissed) == 0 {
+// withoutHidden drops every loop in the persisted hide-set — applied both at
+// hide/delete-keypress time (prune m.loops in place) and to each scan's fresh
+// result in the loopsMsg handler (so a rescan, or a restart, can't resurrect
+// a hidden loop). See Model.hidden.
+func (m Model) withoutHidden(loops []domain.Loop) []domain.Loop {
+	if len(m.hidden) == 0 {
 		return loops
 	}
 	out := make([]domain.Loop, 0, len(loops))
 	for _, l := range loops {
-		if !m.dismissed[l.SessionID] {
+		if !m.hidden[l.SessionID] {
 			out = append(out, l)
 		}
 	}
 	return out
+}
+
+// hideSession tombstones sessionID into the persisted hide-set, then prunes it
+// out of the fleet list and clamps the cursor onto a still-visible row. Shared
+// by the "d" (hide) and "x" (delete) keys — both end in exactly this. Returns
+// the persistence error (nil on success): the in-memory hide + prune happen
+// REGARDLESS, so even a persist failure still hides the loop for this session
+// (it just won't survive a restart) — fail-open toward the human's intent.
+func (m *Model) hideSession(sessionID string) error {
+	set, err := hidden.Add(hiddenFileFn(), sessionID)
+	if err != nil {
+		if m.hidden == nil {
+			m.hidden = make(map[string]bool)
+		}
+		m.hidden[sessionID] = true // persist failed — still hide in memory
+	} else {
+		m.hidden = set // disk is source of truth; adopt what it now holds
+	}
+	m.loops = m.withoutHidden(m.loops)
+	if m.cursor >= len(m.visibleLoops()) {
+		m.cursor = maxInt(0, len(m.visibleLoops())-1)
+	}
+	return err
 }
 
 // visibleLoops is what the table/cursor/actions operate on: all loops, or
@@ -3469,13 +3533,13 @@ func headerGateBadgeLineAbbrev(gated, stalled int) string {
 // coincidence of position: col0 = send-into-the-loop (r/i/a — resume,
 // inject, approve all push some decision/prompt at the loop), col1 =
 // lifecycle (n/k/p — start, kill, stop), col2 = nav/view (↵/o// — attach,
-// view log, filter), col3 = session housekeeping (q quit, d dismiss —
+// view log, filter), col3 = session housekeeping (q quit, d hidden, x delete —
 // appended after the pinned groups so none of them reshuffle).
 var headerHintKeys = []struct{ key, action string }{
 	{"r", "resume"}, {"i", "inject"}, {"a", "approve"},
 	{"n", "new"}, {"k", "kill"}, {"p", "stop"},
 	{"↵", "attach"}, {"o", "log"}, {"/", "filter"},
-	{"q", "quit"}, {"d", "dismiss"},
+	{"q", "quit"}, {"d", "hidden"}, {"x", "delete"},
 }
 
 // headerHintColWidth is one hint grid column's width (the task's "~14
