@@ -344,20 +344,32 @@ before the shell sees it), so a canonical-mode capture cannot distinguish the
 two. **Any re-verification of E2/E4/E6 must use `stty raw`**; a `cat -v` or
 plain `od` check silently reports the post-translation byte.
 
-*NOT run — do not read this ledger as more verification than was done:*
+**Run since (amendment, 2026-07-19) — E5 and E6's TUI half both PASS.** Budget
+was approved for the two experiments this ledger flagged as gating, and both
+were run live against a real Claude Code session in iTerm2:
 
-- **E6's TUI half** — that Claude Code's **gate** prompt accepts a bare CR as
-  "accept the default." Only the byte was measured. This is the one
-  verb-correctness gap left, and **`a` must not be described as verified.**
-  The residual risk is no longer iTerm2-specific, though: the multiplexer
-  backends submit gates the same way, so `a` now rests on the same assumption
-  every other backend already rests on.
+- **E6's TUI half — ✅ PASS. `a` is now verified end-to-end, not inferred.**
+  A `claude --settings` run with `permissions.ask: ["Bash"]` was driven to a
+  real permission prompt (`Do you want to proceed? ❯ 1. Yes / 2. No`), and the
+  exact call the `a` key makes — `write <session> text "" newline yes` — cleared
+  it: the default option was accepted and the command ran. The same session also
+  confirmed the **text** path end-to-end (a prompt written with `newline yes`
+  submitted and produced a turn), which upgrades `r`/`i` from byte-level to
+  behaviour-level verification. The earlier caution that "`a` must not be
+  described as verified" is hereby withdrawn — it may be.
+- **E5 — ✅ PASS, and the hazard is real.** An iTerm2 session hosting a tmux
+  client reported `tty of aSession` = `/dev/ttys001`, while the pane inside that
+  tmux reported `/dev/ttys007`. So a loop running inside tmux inside iTerm2
+  genuinely carries a registry tty that differs from the enclosing iTerm2
+  session's, and an unguarded Tier 1h write would land in the tmux client's
+  shell rather than the claude pane. The tty-mismatch guard is not defensive
+  paranoia; it refuses exactly this case, and the 1a-before-1h ordering is
+  justified as a safety property rather than a preference.
+
+*Still NOT run — do not read this ledger as more verification than was done:*
+
 - **E3** multi-line payload — one paste or N submits (affects `i` quality, not
   correctness).
-- **E5** `write` to a session hosting a tmux client — the empirical
-  justification for the tty-mismatch guard and the 1a-before-1h ordering. Both
-  are implemented and unit-tested; what is unverified is the *hazard*, not the
-  defense.
 - **E7** `osascript`'s exit behavior under a **denied** Automation grant. The
   code now folds `exec.ExitError.Stderr` into the error specifically so the
   -1743 text reaches the operator, but the expectation that osascript exits
