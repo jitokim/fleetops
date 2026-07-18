@@ -5404,11 +5404,30 @@ func trunc(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	if runewidth.StringWidth(s) <= n {
+	if narrowAmbiguous.StringWidth(s) <= n {
 		return s
 	}
-	return runewidth.Truncate(s, n, "…")
+	return narrowAmbiguous.Truncate(s, n, "…")
 }
+
+// narrowAmbiguous measures text the way this cockpit's own layout engine and
+// the terminals it targets actually draw it: East Asian **Ambiguous**
+// characters — "…", "●", "◆", the box-drawing runes — occupy ONE column.
+//
+// Pinned rather than inherited. go-runewidth's DefaultCondition auto-detects
+// from the process locale and widens Ambiguous glyphs to 2 columns under
+// ko/ja/zh, which disagrees with both sides trunc() has to line up with:
+// lipgloss v1.1.0 measures via charmbracelet/x/ansi and always treats them as
+// 1, and iTerm2 draws them as 1 (measured on the maintainer's machine:
+// "Ambiguous Double Width" = false). Inheriting the locale therefore made
+// trunc() — the ONLY runewidth caller in the tree — reserve a column the
+// renderer never used, cutting text one column early on an East Asian locale
+// while every other component stayed at 1. Issue #44.
+//
+// CJK proper is unaffected either way: Hangul/Kana/Han are Wide, not
+// Ambiguous, so they measure 2 under both conditions — which is the whole
+// point of measuring in columns here (see trunc's doc above).
+var narrowAmbiguous = &runewidth.Condition{EastAsianWidth: false}
 
 func maxInt(a, b int) int {
 	if a > b {
