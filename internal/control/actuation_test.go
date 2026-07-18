@@ -162,46 +162,22 @@ func TestResolveActuationTarget_InvalidSessionID_TreatedAsNoEntry(t *testing.T) 
 // against fake Controllers, independent of which real multiplexer binaries
 // (if any) happen to be installed on the test machine.
 
-// fakeControllerNoTTY implements control.Controller only — no TTYLocator —
-// the shape orcaController has today (confirmed live: orca's terminal
-// list/show JSON carries no tty/pid field at all).
-type fakeControllerNoTTY struct{}
+// The fakes these tests run against (fakeResolveCtl / fakeResolveTTYCtl) are
+// defined below with the multi-backend resolution tests — one fake family for
+// the whole package, so a new Controller method is implemented once.
 
-func (fakeControllerNoTTY) Name() string                       { return "fake-no-tty" }
-func (fakeControllerNoTTY) Available() bool                    { return true }
-func (fakeControllerNoTTY) Locate(string) (Target, bool)       { return Target{}, false }
-func (fakeControllerNoTTY) LocateClaude(string) (Target, bool) { return Target{}, false }
-func (fakeControllerNoTTY) Resume(Target, string) error        { return nil }
-func (fakeControllerNoTTY) Focus(Target) error                 { return nil }
-func (fakeControllerNoTTY) Approve(Target) error               { return nil }
-func (fakeControllerNoTTY) Spawn(string, string) error         { return nil }
-func (fakeControllerNoTTY) Interrupt(Target) error             { return nil }
-
-// fakeControllerWithTTY implements Controller AND TTYLocator — the shape
-// cmuxController has (tty is already exposed directly in `tree --json`).
-type fakeControllerWithTTY struct {
-	fakeControllerNoTTY
-	locateByTTYCalled string // last tty passed in
-	target            Target
-	ok                bool
-}
-
-func (f *fakeControllerWithTTY) Name() string { return "fake-with-tty" }
-func (f *fakeControllerWithTTY) LocateByTTY(tty string) (Target, bool) {
-	f.locateByTTYCalled = tty
-	return f.target, f.ok
-}
-
-func TestTierOneA_ResolvedImplementsTTYLocator_Dispatches(t *testing.T) {
-	want := Target{Backend: "fake-with-tty", ID: "surface:1"}
-	f := &fakeControllerWithTTY{target: want, ok: true}
+func TestTierOneA_BackendImplementsTTYLocator_Dispatches(t *testing.T) {
+	f := &fakeResolveTTYCtl{
+		fakeResolveCtl: &fakeResolveCtl{t: t, name: "fake-with-tty", available: true},
+		locateByTTYOK:  true,
+	}
 
 	got, ok := tierOneA(f, "ttys012")
 
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
-	if got != want {
+	if want := (Target{Backend: "fake-with-tty", ID: "fake-with-tty:tty"}); got != want {
 		t.Errorf("got %+v, want %+v", got, want)
 	}
 	if f.locateByTTYCalled != "ttys012" {
@@ -209,13 +185,14 @@ func TestTierOneA_ResolvedImplementsTTYLocator_Dispatches(t *testing.T) {
 	}
 }
 
-func TestTierOneA_ResolvedDoesNotImplementTTYLocator_ReturnsNotFound(t *testing.T) {
-	// orca's real shape today: Controller without TTYLocator. Must degrade
+func TestTierOneA_BackendDoesNotImplementTTYLocator_ReturnsNotFound(t *testing.T) {
+	// orca's real shape today: Controller without TTYLocator (confirmed live —
+	// its terminal list/show JSON carries no tty/pid field at all). Must degrade
 	// gracefully (never panic on the failed type assertion) so
 	// ResolveActuationTarget falls through to Tier 1b.
-	_, ok := tierOneA(fakeControllerNoTTY{}, "ttys012")
+	_, ok := tierOneA(&fakeResolveCtl{t: t, name: "fake-no-tty", available: true}, "ttys012")
 	if ok {
-		t.Error("expected ok=false — resolved backend doesn't implement TTYLocator")
+		t.Error("expected ok=false — backend doesn't implement TTYLocator")
 	}
 }
 
@@ -261,13 +238,15 @@ func (f *fakeResolveCtl) Interrupt(Target) error      { return nil }
 // alone (no TTYLocator).
 type fakeResolveTTYCtl struct {
 	*fakeResolveCtl
-	locateByTTYOK bool
+	locateByTTYOK     bool
+	locateByTTYCalled string // last tty passed in, for the Tier 1a dispatch pin
 }
 
-func (f *fakeResolveTTYCtl) LocateByTTY(string) (Target, bool) {
+func (f *fakeResolveTTYCtl) LocateByTTY(tty string) (Target, bool) {
 	if !f.available {
 		f.t.Errorf("LocateByTTY probed on unavailable backend %q — resolvers must gate on Available() first", f.name)
 	}
+	f.locateByTTYCalled = tty
 	return Target{Backend: f.name, ID: f.name + ":tty"}, f.locateByTTYOK
 }
 
