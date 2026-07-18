@@ -1605,7 +1605,7 @@ func TestUpdate_SecondKWithinWindow_TriggersKill(t *testing.T) {
 func TestUpdate_SecondKAfterWindowExpires_RestartsConfirmCycle(t *testing.T) {
 	m := modelWithOneLoop()
 	m, _ = updateModel(t, m, runeKey('k'))
-	m.pendingKillAt = time.Now().Add(-killConfirmWindow - time.Second) // simulate the window having expired
+	m.pendingKillAt = time.Now().Add(-destructiveConfirmWindow - time.Second) // simulate the window having expired
 
 	m, cmd := updateModel(t, m, runeKey('k'))
 
@@ -3356,11 +3356,11 @@ func (f *fakeFocusAdapter) Raise(entry sessions.SessionEntry) error {
 }
 
 // withFakeAttachEntry makes attachCmd see a fixed SessionEntry for any session.
-func withFakeAttachEntry(t *testing.T, entry sessions.SessionEntry, err error) {
+func withFakeAttachEntry(t *testing.T, entry sessions.SessionEntry) {
 	t.Helper()
 	orig := sessionEntryFn
 	t.Cleanup(func() { sessionEntryFn = orig })
-	sessionEntryFn = func(string) (sessions.SessionEntry, error) { return entry, err }
+	sessionEntryFn = func(string) sessions.SessionEntry { return entry }
 }
 
 // withFakeFocusAdapter makes attachCmd's step-1 resolver return adapter for
@@ -3382,7 +3382,7 @@ func withFakeFocusAdapter(t *testing.T, hostApp string, adapter control.FocusAda
 // FocusAdapter — step 1 wins, the multiplexer path is never consulted.
 func TestAttachCmd_ITerm2Entry_RaisesViaFocusAdapter(t *testing.T) {
 	adapter := &fakeFocusAdapter{}
-	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	// If step 2 were reached it would panic the test by being unexpectedly hit:
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%1"}, locateOK: true}
@@ -3411,7 +3411,7 @@ func TestAttachCmd_ITerm2Entry_RaisesViaFocusAdapter(t *testing.T) {
 // through to today's ResolveForLocate+Focus path, unchanged.
 func TestAttachCmd_NoAdapterButMultiplexerLocatable_UsesResolveForLocate(t *testing.T) {
 	// Zero entry (no host_app) — the shape of a pre-schema-extension record.
-	withFakeAttachEntry(t, sessions.SessionEntry{}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{})
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%3"}, locateOK: true}
 	withFakeControlResolveForLocate(t, muxCtrl, true)
 
@@ -3432,7 +3432,7 @@ func TestAttachCmd_NoAdapterButMultiplexerLocatable_UsesResolveForLocate(t *test
 // hard-failing.
 func TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer(t *testing.T) {
 	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
-	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%7"}, locateOK: true}
 	withFakeControlResolveForLocate(t, muxCtrl, true)
@@ -3460,7 +3460,7 @@ func TestAttachCmd_ITerm2NoFocusSurface_DegradesToMultiplexer(t *testing.T) {
 // the thing this test locks down — is that Raise gets asked.
 func TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter(t *testing.T) {
 	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
-	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"}, nil) // no WindowID
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"}) // no WindowID
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux", ID: "%9"}, locateOK: true}
 	withFakeControlResolveForLocate(t, muxCtrl, true)
@@ -3487,7 +3487,7 @@ func TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter(t *testing.T) 
 // while a working tmux surface sat one step away.
 func TestAttachCmd_ITerm2RaiseError_DegradesToMultiplexer(t *testing.T) {
 	adapter := &fakeFocusAdapter{raiseErr: errors.New("not authorized to send Apple events")}
-	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true}
 	withFakeControlResolveForLocate(t, muxCtrl, true)
@@ -3510,7 +3510,7 @@ func TestAttachCmd_ITerm2RaiseError_DegradesToMultiplexer(t *testing.T) {
 // with an error and no way forward.
 func TestAttachCmd_RaiseErrorAndNoMultiplexer_ReportsWithManualHint(t *testing.T) {
 	adapter := &fakeFocusAdapter{raiseErr: errors.New("not authorized to send Apple events")}
-	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"})
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	withFakeControlResolveForLocate(t, nil, false) // no multiplexer either
 
@@ -3534,7 +3534,7 @@ func TestAttachCmd_RaiseErrorAndNoMultiplexer_ReportsWithManualHint(t *testing.T
 // pasted into the status line — just the hint.
 func TestAttachCmd_NoFocusSurfaceAndNoMultiplexer_HintOnly(t *testing.T) {
 	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
-	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"})
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	withFakeControlResolveForLocate(t, nil, false)
 
@@ -3556,7 +3556,7 @@ func TestAttachCmd_NoFocusSurfaceAndNoMultiplexer_HintOnly(t *testing.T) {
 // TestAttachCmd_MultiplexerFocusFails_StillHints: step 2 failing for real also
 // lands on step 3 rather than a bare error.
 func TestAttachCmd_MultiplexerFocusFails_StillHints(t *testing.T) {
-	withFakeAttachEntry(t, sessions.SessionEntry{}, nil)
+	withFakeAttachEntry(t, sessions.SessionEntry{})
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true, focusErr: errors.New("pane vanished")}
 	withFakeControlResolveForLocate(t, muxCtrl, true)
 
@@ -8324,7 +8324,7 @@ func TestUpdate_XKey_ConfirmExpires_DeletesNothing(t *testing.T) {
 	m := modelWithTwoLoops()
 
 	m, _ = updateModel(t, m, runeKey('x'))
-	m.pendingDeleteAt = time.Now().Add(-killConfirmWindow - time.Second) // window elapsed
+	m.pendingDeleteAt = time.Now().Add(-destructiveConfirmWindow - time.Second) // window elapsed
 	m, _ = updateModel(t, m, runeKey('x'))
 
 	if _, err := os.Stat(regPath); err != nil {

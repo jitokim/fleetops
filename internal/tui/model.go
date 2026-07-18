@@ -92,12 +92,18 @@ var (
 	// sessionEntryFn reads the selected loop's identity record so attachCmd can
 	// resolve its host_app/window_id for step 1. sessions.ReadSession (against
 	// sessionsDirFn) by default; overridable so attach's FocusAdapter routing is
-	// testable without a real ~/.fleetops/sessions file. A miss (no record — a
-	// loop from before the schema extension, or a headless one) yields a zero
-	// SessionEntry: empty HostApp/WindowID, so attach degrades to step 2 exactly
-	// as it did before this seam existed.
-	sessionEntryFn = func(sessionID string) (sessions.SessionEntry, error) {
-		return sessions.ReadSession(sessionsDirFn(), sessionID)
+	// testable without a real ~/.fleetops/sessions file.
+	//
+	// Returns the entry ALONE, no error: a miss (no record — a loop from before
+	// the schema extension, or a headless one) is not exceptional here and its
+	// only handling is the zero SessionEntry, whose empty HostApp/WindowID
+	// already degrades attach to step 2 exactly as it did before this seam
+	// existed. ReadSession returns that zero value on every failure path, so the
+	// error carried no information the caller could act on — and the sole caller
+	// discarded it.
+	sessionEntryFn = func(sessionID string) sessions.SessionEntry {
+		entry, _ := sessions.ReadSession(sessionsDirFn(), sessionID)
+		return entry
 	}
 )
 
@@ -659,10 +665,11 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 	return loops, detailCache, oracleCounts
 }
 
-// killConfirmWindow: the confirming second press must land within this long of
-// the first to actually run — otherwise it starts a fresh confirm cycle
-// instead. Shared by the two destructive keys, "k" (kill) and "x" (delete).
-const killConfirmWindow = 3 * time.Second
+// destructiveConfirmWindow: the confirming second press must land within this
+// long of the first to actually run — otherwise it starts a fresh confirm cycle
+// instead. Shared by the two destructive keys, "k" (kill) and "x" (delete),
+// hence the name: it stopped being kill-specific when "x" adopted the gate.
+const destructiveConfirmWindow = 3 * time.Second
 
 // Init dispatches the first scan (loopsMsg) and arms the refresh ticker —
 // EXCEPT in demo mode, which never scans at all (m.scanCmd() returns nil):
@@ -1254,7 +1261,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			now := time.Now()
-			if m.pendingKillSession == sel.SessionID && now.Sub(m.pendingKillAt) <= killConfirmWindow {
+			if m.pendingKillSession == sel.SessionID && now.Sub(m.pendingKillAt) <= destructiveConfirmWindow {
 				m.pendingKillSession = ""
 				// feat/engine-provenance: a Driven loop's kill never touches
 				// an existing terminal surface at all (killCmd's own Driven
@@ -1325,7 +1332,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// unrecoverable short of hand-editing hidden.json — strictly less
 			// reversible than the kill this guard was built for.
 			now := time.Now()
-			if m.pendingDeleteSession != sel.SessionID || now.Sub(m.pendingDeleteAt) > killConfirmWindow {
+			if m.pendingDeleteSession != sel.SessionID || now.Sub(m.pendingDeleteAt) > destructiveConfirmWindow {
 				m.pendingDeleteSession = sel.SessionID
 				m.pendingDeleteAt = now
 				m.status, m.statusKind = fmt.Sprintf("press x again within 3s to delete %s", sel.Project), statusWarn
@@ -1620,7 +1627,7 @@ func attachCmd(l domain.Loop) tea.Cmd {
 		// Step 1 — the loop's own host window, if the registry knows it and a
 		// FocusAdapter can raise it. A missing/legacy record yields a zero entry
 		// (empty host_app) that simply falls through to step 2.
-		entry, _ := sessionEntryFn(l.SessionID)
+		entry := sessionEntryFn(l.SessionID)
 		var raiseErr error
 		if adapter, ok := resolveFocusAdapterFn(entry.HostApp); ok {
 			if raiseErr = adapter.Raise(entry); raiseErr == nil {
@@ -3195,8 +3202,11 @@ func (m *Model) hideSession(sessionID string) error {
 		m.hidden = set // disk is source of truth; adopt what it now holds
 	}
 	m.loops = m.withoutHidden(m.loops)
-	if m.cursor >= len(m.visibleLoops()) {
-		m.cursor = maxInt(0, len(m.visibleLoops())-1)
+	// One visibleLoops() call, not two: under an active filter it allocates and
+	// repopulates a fresh slice over every loop, and the clamp needs only its
+	// length.
+	if visible := len(m.visibleLoops()); m.cursor >= visible {
+		m.cursor = maxInt(0, visible-1)
 	}
 	return err
 }
