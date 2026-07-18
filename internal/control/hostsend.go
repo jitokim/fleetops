@@ -43,9 +43,11 @@ type SendAdapter interface {
 }
 
 // ErrNoSendSurface reports that an adapter REFUSED before executing anything:
-// the entry carried no usable window id / tty, or one of them failed its
-// whitelist. Like ErrNoFocusSurface this is a fail-closed degrade signal, not a
-// report that the write was attempted and lost.
+// the entry carried no usable window id, or its window id / tty failed its
+// whitelist. An entry with no recorded tty AT ALL is a different fact with a
+// different operator fix and gets ErrSendNoRecordedTTY instead (see there).
+// Like ErrNoFocusSurface this is a fail-closed degrade signal, not a report
+// that the write was attempted and lost.
 var ErrNoSendSurface = errors.New("control: no send surface for this session")
 
 // ErrSendNoSession reports that the host ran the script fine but found no
@@ -400,9 +402,10 @@ func iterm2SendArgvPrefix(guid sessionGUID, writeStmt, tty string) []string {
 //     compiled, or re-parsed. Same structural argument as SQL bind parameters:
 //     the payload travels in a parameter slot, not a syntax slot.
 //
-// The consequence, and what iterm2_send_test.go asserts structurally: the
-// script text is BYTE-IDENTICAL for every payload. If that assertion ever
-// fails, someone has reintroduced interpolation.
+// The consequence, and what TestITerm2SendScript_ByteIdenticalAcrossPayloads
+// (hostsend_test.go) asserts structurally: the script text is BYTE-IDENTICAL
+// for every payload. If that assertion ever fails, someone has reintroduced
+// interpolation.
 //
 // The script neither selects nor activates anything — it must not raise the
 // window. Delivery to a background, non-frontmost iTerm2 window is verified

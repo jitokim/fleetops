@@ -52,15 +52,22 @@ const (
 // host send) rather than through a multiplexer.
 //
 // Exported for exactly ONE caller — the TUI's actuation dispatch — because a
-// Tier 1h failure is DEGRADABLE in a way no other tier's is. Every 1h failure
-// mode refuses BEFORE delivering a keystroke: a whitelist refusal never execs
-// at all, and `miss` / `ttymismatch` / an unrecognized verdict / a non-zero
-// osascript all mean the `write` did not run (the script returns "ok" only on
-// the line after it). So a caller may fall through to another tier without
-// risking a double delivery. A multiplexer `send-keys` offers no such
-// guarantee, which is why this is keyed on the TIER and not on a list of error
-// values: an error nobody anticipated must still degrade here, and must still
-// be terminal there.
+// Tier 1h failure is DEGRADABLE in a way no other tier's is. Nearly every 1h
+// failure mode refuses BEFORE delivering a keystroke: a whitelist refusal never
+// execs at all, and `miss` / `ttymismatch` / an unrecognized verdict / an
+// osascript that failed on its own mean the `write` did not run (the script
+// returns "ok" only on the line after it). So a caller may fall through to
+// another tier without risking a double delivery.
+//
+// The ONE exception is a deadline kill: it interrupts a script that was already
+// running rather than one that never started, so ErrSendDeliveryUnknown may
+// have delivered. Callers must check for it explicitly before degrading (see
+// that sentinel's doc, and the dispatch in the TUI's resume/inject path).
+//
+// That residual case is keyed on an ERROR VALUE, but the degrade PERMISSION
+// stays keyed on the TIER, deliberately: a multiplexer `send-keys` offers no
+// such guarantee at all, so an error nobody anticipated must still degrade here
+// and must still be terminal there.
 func IsHostSendTier(act Actuator) bool {
 	return act != nil && act.Tier() == actuationTierHostSend
 }

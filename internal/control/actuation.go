@@ -7,6 +7,10 @@
 // (or a stale) registry entry. That fallback now probes every available
 // backend (not just Resolve()'s single pick) and refuses on cross-backend
 // ambiguity — see ResolveActuationTarget's Tier 1b doc.
+//
+// Between those two sits Tier 1h, an in-place write by the HOST terminal
+// itself (see hostsend.go), which needs no multiplexer at all — so this file's
+// "is a backend available?" gate deliberately sits below it rather than above.
 package control
 
 import (
@@ -194,9 +198,11 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 }
 
 // availableBackends returns the backends usable right now, in the shared
-// install-preference order. Empty means NO backend is available at all — the
-// single "is actuation possible?" gate behind ResolveActuationTarget's
-// backendAvailable=false contract. Returning the slice (rather than a bare
+// install-preference order. Empty means no MULTIPLEXER backend is available.
+// That is one input to ResolveActuationTarget's backendAvailable=false
+// contract, not the whole of it: Tier 1h resolves ahead of the emptiness gate
+// and reports backendAvailable=true with no multiplexer installed at all.
+// Returning the slice (rather than a bare
 // bool) is what lets both tiers reuse one round of Available() probes instead
 // of re-execing per tier; preserving the order keeps each tier's iteration —
 // and so Tier 1b's ambiguity counting — identical to probing `backends`
