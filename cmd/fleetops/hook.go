@@ -89,6 +89,7 @@ func sessionStartHook() {
 		return
 	}
 	pid, tty := sessions.ResolveClaudeTTY(os.Getppid())
+	hostApp, windowID := resolveHostWindow()
 	_ = sessions.WriteSession(sessions.SessionsDir(), payload.SessionID, sessions.SessionEntry{
 		PID:            pid,
 		TTY:            tty,
@@ -96,7 +97,34 @@ func sessionStartHook() {
 		TranscriptPath: payload.TranscriptPath,
 		Source:         payload.Source,
 		StartedAt:      time.Now(),
+		HostApp:        hostApp,
+		WindowID:       windowID,
 	})
+}
+
+// resolveHostWindow reads the host terminal's identity that the SessionStart
+// hook inherited from the user's shell (Claude Code runs hooks as children of
+// the `claude` process, which inherited these from the host terminal):
+// HostApp from $TERM_PROGRAM, and WindowID from the first non-empty of
+// $ITERM_SESSION_ID / $TMUX_PANE. Every value is best-effort and optional — an
+// unset var yields "" (→ no focus adapter, attach degrades to the manual hint),
+// and the hook always exits 0 regardless. Pulled out as its own helper so the
+// env→field mapping is directly testable. SocketPath is intentionally left
+// unpopulated (out of scope for this slice — see SessionEntry's field doc).
+func resolveHostWindow() (hostApp, windowID string) {
+	return os.Getenv("TERM_PROGRAM"), firstNonEmptyEnv("ITERM_SESSION_ID", "TMUX_PANE")
+}
+
+// firstNonEmptyEnv returns the value of the first environment variable in keys
+// that is set to a non-empty string, or "" if none is — the "first recognized
+// window marker wins" resolution WindowID needs across host terminals.
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // sessionEndHook reads the SessionEnd hook's JSON from stdin and removes the

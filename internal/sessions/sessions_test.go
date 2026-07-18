@@ -34,6 +34,76 @@ func TestWriteReadSession_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestWriteReadSession_HostFields_RoundTrip confirms the additive
+// HostApp/WindowID/SocketPath fields round-trip through Write→Read.
+func TestWriteReadSession_HostFields_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	in := sampleEntry()
+	in.HostApp = "iTerm.app"
+	in.WindowID = "w0t1p0:ABC-123"
+	in.SocketPath = "/home/user/.fleetops/sessions/sess-2.sock"
+
+	if err := WriteSession(dir, "sess-2", in); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	got, err := ReadSession(dir, "sess-2")
+	if err != nil {
+		t.Fatalf("ReadSession: %v", err)
+	}
+	if got != in {
+		t.Errorf("round-trip mismatch:\n got %+v\nwant %+v", got, in)
+	}
+}
+
+// TestReadSession_BackCompat_LegacyTtyOnlyRecordLoads is the key back-compat
+// guarantee (design §2): a record written by the OLD binary — no host_app /
+// window_id / socket_path keys at all — must still load with the extended
+// struct, leaving the new fields at their zero value rather than erroring.
+func TestReadSession_BackCompat_LegacyTtyOnlyRecordLoads(t *testing.T) {
+	dir := t.TempDir()
+	// Exactly the JSON the pre-extension binary wrote: the original six fields,
+	// none of the three new ones.
+	legacy := `{"pid":4242,"tty":"ttys004","cwd":"/home/user/fleetops",` +
+		`"transcript_path":"/home/user/.claude/projects/foo/abc.jsonl",` +
+		`"source":"startup","started_at":"2026-07-16T09:30:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "legacy.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadSession(dir, "legacy")
+	if err != nil {
+		t.Fatalf("ReadSession on a legacy tty-only record = %v, want it to load", err)
+	}
+	if got.TTY != "ttys004" || got.PID != 4242 || got.Cwd != "/home/user/fleetops" {
+		t.Errorf("legacy fields not preserved: %+v", got)
+	}
+	if got.HostApp != "" || got.WindowID != "" || got.SocketPath != "" {
+		t.Errorf("absent new fields must be zero-valued, got HostApp=%q WindowID=%q SocketPath=%q",
+			got.HostApp, got.WindowID, got.SocketPath)
+	}
+}
+
+// TestWriteSession_AtomicWrite_NoTempLitter confirms the temp+rename write
+// leaves ONLY the final record behind — no ".tmp" sibling — so a directory
+// scan (ListSessions) never trips over write scratch files.
+func TestWriteSession_AtomicWrite_NoTempLitter(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteSession(dir, "clean", sampleEntry()); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "clean.json" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("dir contents = %v, want exactly [clean.json] with no .tmp litter", names)
+	}
+}
+
 // TestWriteSession_EmptyTTY confirms a headless session (no controlling tty)
 // round-trips as an empty TTY, not an error.
 func TestWriteSession_EmptyTTY(t *testing.T) {

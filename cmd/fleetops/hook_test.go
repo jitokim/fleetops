@@ -58,6 +58,54 @@ func TestSessionStartHook_WritesEntry(t *testing.T) {
 	}
 }
 
+// TestSessionStartHook_PopulatesHostWindowFromEnv confirms the hook records
+// $TERM_PROGRAM as HostApp and the first window marker ($ITERM_SESSION_ID) as
+// WindowID (design §2 population).
+func TestSessionStartHook_PopulatesHostWindowFromEnv(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TERM_PROGRAM", "iTerm.app")
+	t.Setenv("ITERM_SESSION_ID", "w0t1p0:ABC-123")
+	t.Setenv("TMUX_PANE", "%9") // ITERM_SESSION_ID wins — it comes first
+
+	withStdin(t, `{"session_id":"host-win","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "host-win")
+	if err != nil {
+		t.Fatalf("expected an entry: %v", err)
+	}
+	if entry.HostApp != "iTerm.app" {
+		t.Errorf("HostApp = %q, want iTerm.app", entry.HostApp)
+	}
+	if entry.WindowID != "w0t1p0:ABC-123" {
+		t.Errorf("WindowID = %q, want the first non-empty marker ($ITERM_SESSION_ID)", entry.WindowID)
+	}
+	if entry.SocketPath != "" {
+		t.Errorf("SocketPath = %q, want empty (out of scope for this slice)", entry.SocketPath)
+	}
+}
+
+// TestSessionStartHook_HostWindowEnvAbsent_StillWritesEntry confirms the hook
+// still succeeds (exits 0, writes the entry) when NO host/window env is set —
+// HostApp/WindowID simply stay empty and attach later degrades to the hint.
+func TestSessionStartHook_HostWindowEnvAbsent_StillWritesEntry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// Force-clear inherited terminal env (the test runner itself may be under
+	// iTerm2/tmux) so "absent" is actually absent.
+	t.Setenv("TERM_PROGRAM", "")
+	t.Setenv("ITERM_SESSION_ID", "")
+	t.Setenv("TMUX_PANE", "")
+
+	withStdin(t, `{"session_id":"no-host","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "no-host")
+	if err != nil {
+		t.Fatalf("expected an entry even with no host env: %v", err)
+	}
+	if entry.HostApp != "" || entry.WindowID != "" {
+		t.Errorf("want empty host/window with no env, got HostApp=%q WindowID=%q", entry.HostApp, entry.WindowID)
+	}
+}
+
 func TestSessionStartHook_MissingSessionID_NoWrite(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

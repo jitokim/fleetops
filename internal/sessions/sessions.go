@@ -39,6 +39,13 @@ func SessionsDir() string {
 // error). PID is the resolved `claude` process pid; a later liveness check
 // (Phase 2) re-validates tty↔pid against live ps at actuation time rather
 // than trusting this possibly-stale record, since ttys are OS-recycled.
+//
+// HostApp/WindowID/SocketPath are additive, omitempty extensions (design
+// §2). They are BACK-COMPATIBLE by construction: json.Unmarshal leaves them at
+// their zero value for a record written by an older binary (no field present),
+// and json.Marshal omits an empty one — so a tty-only record still round-trips,
+// and a new binary reading it simply sees empty strings (→ no focus adapter,
+// attach degrades to the manual hint). No migration, no version field.
 type SessionEntry struct {
 	PID            int       `json:"pid"`
 	TTY            string    `json:"tty"`
@@ -46,6 +53,19 @@ type SessionEntry struct {
 	TranscriptPath string    `json:"transcript_path"`
 	Source         string    `json:"source"`
 	StartedAt      time.Time `json:"started_at"`
+	// HostApp is the host terminal application's $TERM_PROGRAM value
+	// ("iTerm.app", "tmux", …), inherited by the SessionStart hook from the
+	// user's shell. It keys the FocusAdapter that raises this session's
+	// window at attach time (internal/control §4); "" ⇒ no adapter ⇒ degrade.
+	HostApp string `json:"host_app,omitempty"`
+	// WindowID identifies the host's window/tab/pane — the first non-empty of
+	// $ITERM_SESSION_ID, $TMUX_PANE, … A FocusAdapter needs it to select the
+	// exact surface; "" ⇒ attach falls through to the cwd-based resolver.
+	WindowID string `json:"window_id,omitempty"`
+	// SocketPath is reserved for the (out-of-scope here) session-agent control
+	// channel at ~/.fleetops/sessions/<id>.sock. Declared now for forward
+	// compatibility only — this slice never populates or reads it.
+	SocketPath string `json:"socket_path,omitempty"`
 }
 
 // validSessionID rejects anything that isn't a plain, single-component
@@ -77,7 +97,36 @@ func WriteSession(dir, sessionID string, entry SessionEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, sessionID+".json"), data, 0o644)
+	return atomicWrite(filepath.Join(dir, sessionID+".json"), data)
+}
+
+// atomicWrite writes data to path via a sibling temp file + rename, mirroring
+// hidden.write (internal/hidden): rename is atomic on the same filesystem —
+// which a sibling temp guarantees — so a crash mid-write can never leave a
+// half-written record that would then fail-load. On any error before the
+// rename the temp is removed, so no ".tmp" litter survives a failure. Adopted
+// (over the previous bare os.WriteFile) now that the record carries more fields
+// and a resume can rewrite it in rapid succession (design §2 atomicity note).
+func atomicWrite(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".session-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // ReadSession loads sessionID's entry. A missing or malformed file is an
