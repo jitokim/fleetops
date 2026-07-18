@@ -3480,11 +3480,13 @@ func TestAttachCmd_AdapterWithoutWindowID_StillDelegatesToAdapter(t *testing.T) 
 	}
 }
 
-// TestAttachCmd_ITerm2RaiseError_ReportsFailure confirms a genuine Raise
-// failure (not ErrNoFocusSurface) is surfaced as a failed attach, not silently
-// swallowed into step 2.
-func TestAttachCmd_ITerm2RaiseError_ReportsFailure(t *testing.T) {
-	adapter := &fakeFocusAdapter{raiseErr: errors.New("osascript boom")}
+// TestAttachCmd_ITerm2RaiseError_DegradesToMultiplexer: a genuine Raise error
+// (NOT ErrNoFocusSurface) must still degrade to step 2. osascript exits
+// non-zero when macOS Automation permission has not been granted — a normal
+// first-run state — and hard-failing there would strand the human on an error
+// while a working tmux surface sat one step away.
+func TestAttachCmd_ITerm2RaiseError_DegradesToMultiplexer(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: errors.New("not authorized to send Apple events")}
 	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
 	withFakeFocusAdapter(t, "iTerm.app", adapter)
 	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true}
@@ -3493,12 +3495,80 @@ func TestAttachCmd_ITerm2RaiseError_ReportsFailure(t *testing.T) {
 	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", State: domain.StateRunning}
 	msg := attachCmd(l)()
 
-	if muxCtrl.focusCalled {
-		t.Error("a real Raise failure must NOT fall through to the multiplexer path")
+	if !muxCtrl.focusCalled {
+		t.Error("a Raise error must degrade to the multiplexer path, not hard-fail")
 	}
 	am, ok := msg.(attachResultMsg)
-	if !ok || am.ok || !strings.Contains(am.text, "failed") {
-		t.Fatalf("got %+v, want a failed attach reporting the Raise error", msg)
+	if !ok || !am.ok || !strings.Contains(am.text, "via tmux") {
+		t.Fatalf("got %+v, want a successful attach via tmux after degrading past the Raise error", msg)
+	}
+}
+
+// TestAttachCmd_RaiseErrorAndNoMultiplexer_ReportsWithManualHint: when every
+// step comes up empty the human finally hears about the Raise error — but the
+// message must still carry the manual hint, because attach never leaves someone
+// with an error and no way forward.
+func TestAttachCmd_RaiseErrorAndNoMultiplexer_ReportsWithManualHint(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: errors.New("not authorized to send Apple events")}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app", WindowID: "w0t1p0:GUID"}, nil)
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	withFakeControlResolveForLocate(t, nil, false) // no multiplexer either
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", Cwd: "/w/api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a non-ok attach result", msg)
+	}
+	if !strings.Contains(am.text, manualAttachHint("/w/api")) {
+		t.Errorf("text = %q, want it to end with the manual hint", am.text)
+	}
+	if !strings.Contains(am.text, "not authorized") {
+		t.Errorf("text = %q, want the underlying Raise error reported once nothing else worked", am.text)
+	}
+}
+
+// TestAttachCmd_NoFocusSurfaceAndNoMultiplexer_HintOnly: the DESIGNED degrade
+// (ErrNoFocusSurface) is not an error the human can act on, so it must not be
+// pasted into the status line — just the hint.
+func TestAttachCmd_NoFocusSurfaceAndNoMultiplexer_HintOnly(t *testing.T) {
+	adapter := &fakeFocusAdapter{raiseErr: control.ErrNoFocusSurface}
+	withFakeAttachEntry(t, sessions.SessionEntry{HostApp: "iTerm.app"}, nil)
+	withFakeFocusAdapter(t, "iTerm.app", adapter)
+	withFakeControlResolveForLocate(t, nil, false)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", Cwd: "/w/api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a non-ok attach result", msg)
+	}
+	if !strings.Contains(am.text, manualAttachHint("/w/api")) {
+		t.Errorf("text = %q, want the manual hint", am.text)
+	}
+	if strings.Contains(am.text, "no focus surface") {
+		t.Errorf("text = %q, must not leak the internal degrade sentinel to the human", am.text)
+	}
+}
+
+// TestAttachCmd_MultiplexerFocusFails_StillHints: step 2 failing for real also
+// lands on step 3 rather than a bare error.
+func TestAttachCmd_MultiplexerFocusFails_StillHints(t *testing.T) {
+	withFakeAttachEntry(t, sessions.SessionEntry{}, nil)
+	muxCtrl := &fakeController{name: "tmux", locateTarget: control.Target{Backend: "tmux"}, locateOK: true, focusErr: errors.New("pane vanished")}
+	withFakeControlResolveForLocate(t, muxCtrl, true)
+
+	l := domain.Loop{Project: "api", SessionID: "s1", ProjectDir: "-x-api", Cwd: "/w/api", State: domain.StateRunning}
+	msg := attachCmd(l)()
+
+	am, ok := msg.(attachResultMsg)
+	if !ok || am.ok {
+		t.Fatalf("got %+v, want a non-ok attach result", msg)
+	}
+	if !strings.Contains(am.text, manualAttachHint("/w/api")) {
+		t.Errorf("text = %q, want the manual hint even when Focus itself failed", am.text)
 	}
 }
 

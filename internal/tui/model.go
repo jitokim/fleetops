@@ -1597,16 +1597,20 @@ func attachCmd(l domain.Loop) tea.Cmd {
 		// FocusAdapter can raise it. A missing/legacy record yields a zero entry
 		// (empty host_app) that simply falls through to step 2.
 		entry, _ := sessionEntryFn(l.SessionID)
+		var raiseErr error
 		if adapter, ok := resolveFocusAdapterFn(entry.HostApp); ok {
-			switch err := adapter.Raise(entry); {
-			case err == nil:
+			if raiseErr = adapter.Raise(entry); raiseErr == nil {
 				return attachResultMsg{true, fmt.Sprintf("attached %s via %s", l.Project, entry.HostApp)}
-			case errors.Is(err, control.ErrNoFocusSurface):
-				// Nothing to raise (e.g. the window is gone) — degrade, don't
-				// fail: fall through to the multiplexer/hint path below.
-			default:
-				return attachResultMsg{false, fmt.Sprintf("attach %s failed: %v", l.Project, err)}
 			}
+			// EVERY Raise error degrades to step 2 — none of them is fatal here.
+			// ErrNoFocusSurface is the expected "nothing to raise", but a real
+			// exec error is just as non-fatal: osascript exits non-zero when
+			// macOS Automation permission has not been granted, which is a
+			// normal first-run state, not a broken loop. Hard-failing there
+			// would strand the human on an error with no way forward even
+			// though a perfectly good tmux surface may be one step away. The
+			// error is remembered so it can be reported IF every later step
+			// also comes up empty.
 		}
 
 		// Step 2 — today's multiplexer path, unchanged. ResolveForLocate picks
@@ -1617,13 +1621,28 @@ func attachCmd(l domain.Loop) tea.Cmd {
 		// fallback (step 3) is identical for both.
 		ctrl, target, ok := controlResolveForLocateFn(l.ProjectDir)
 		if !ok {
-			return attachResultMsg{false, "no orca/tmux/cmux surface — attach manually: " + manualAttachHint(l.Cwd)}
+			return attachResultMsg{false, attachDegradedText(l, raiseErr, "no orca/tmux/cmux surface")}
 		}
 		if err := ctrl.Focus(target); err != nil {
-			return attachResultMsg{false, fmt.Sprintf("attach %s failed: %v", l.Project, err)}
+			return attachResultMsg{false, attachDegradedText(l, raiseErr, fmt.Sprintf("attach %s failed: %v", l.Project, err))}
 		}
 		return attachResultMsg{true, fmt.Sprintf("attached %s via %s", l.Project, ctrl.Name())}
 	}
+}
+
+// attachDegradedText builds the step-3 message for an attach that raised
+// nothing: why the last step failed, the earlier step-1 Raise error when there
+// was a real one worth reporting, and ALWAYS the manual hint. That trailing
+// hint is the contract — attach never hard-fails, it either raises the surface
+// or tells the human exactly where the loop lives, so there is always a way
+// forward. ErrNoFocusSurface is deliberately omitted: "this host had no window
+// to raise" is the designed degrade, not information the human can act on.
+func attachDegradedText(l domain.Loop, raiseErr error, reason string) string {
+	text := reason
+	if raiseErr != nil && !errors.Is(raiseErr, control.ErrNoFocusSurface) {
+		text = fmt.Sprintf("%s (%s raise failed: %v)", reason, l.Project, raiseErr)
+	}
+	return text + " — attach manually: " + manualAttachHint(l.Cwd)
 }
 
 // manualAttachHint is the copy-pasteable fallback for bare terminals (no
