@@ -7994,6 +7994,77 @@ func TestKillCmd_DrivenLoop_EmitsKillEventMostRecentActuationIsKillRecognizes(t 
 	if !strings.HasPrefix(evs[0].Detail, "kill ") {
 		t.Errorf("Detail = %q, want it prefixed \"kill \" (mostRecentActuationIsKill's exact match)", evs[0].Detail)
 	}
+	if evs[0].Outcome != events.OutcomeOK {
+		t.Errorf("Outcome = %q, want %q (issue #50: the derivation reads this, not the prose)", evs[0].Outcome, events.OutcomeOK)
+	}
+}
+
+// ── issue #50: logActuationEvent's structured outcome ────────────────────
+
+func TestActuationOutcome_Classification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"success", nil, events.OutcomeOK},
+		{"plain failure", errors.New("no such pane"), events.OutcomeFailed},
+		{"delivery timeout", control.ErrSendDeliveryUnknown, events.OutcomeUnknown},
+		{"wrapped delivery timeout", fmt.Errorf("tier1h: %w", control.ErrSendDeliveryUnknown), events.OutcomeUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := actuationOutcome(tc.err); got != tc.want {
+				t.Errorf("actuationOutcome(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// The failure path end to end: a kill whose /exit send errored writes an
+// event whose Detail still matches "kill " (unchanged, for the EVENTS
+// panel) but whose Outcome says it did not land — which is what keeps
+// mostRecentActuationIsKill from promoting the loop to StateKilled.
+func TestLogActuationEvent_FailedKill_RecordsFailedOutcome(t *testing.T) {
+	historyDir := t.TempDir()
+	orig := historyDirFn
+	defer func() { historyDirFn = orig }()
+	historyDirFn = func() string { return historyDir }
+
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateIdle}
+	logActuationEvent(l, "kill", "tier1h", errors.New("no such pane"))
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	evs := got["sess-1"]
+	if len(evs) != 1 {
+		t.Fatalf("got %d events, want 1", len(evs))
+	}
+	if evs[0].Outcome != events.OutcomeFailed {
+		t.Errorf("Outcome = %q, want %q", evs[0].Outcome, events.OutcomeFailed)
+	}
+	if !strings.HasPrefix(evs[0].Detail, "kill ") || !strings.Contains(evs[0].Detail, "no such pane") {
+		t.Errorf("Detail = %q, want the unchanged human-readable \"kill <tier> failed: <err>\" shape", evs[0].Detail)
+	}
+}
+
+func TestLogActuationEvent_UnknownDelivery_RecordsUnknownOutcome(t *testing.T) {
+	historyDir := t.TempDir()
+	orig := historyDirFn
+	defer func() { historyDirFn = orig }()
+	historyDirFn = func() string { return historyDir }
+
+	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateIdle}
+	logActuationEvent(l, "kill", "tier1h", fmt.Errorf("send: %w", control.ErrSendDeliveryUnknown))
+
+	got, err := events.ReadAll(historyDir)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got["sess-1"][0].Outcome != events.OutcomeUnknown {
+		t.Errorf("Outcome = %q, want %q — a timed-out send is neither confirmed sent nor confirmed failed", got["sess-1"][0].Outcome, events.OutcomeUnknown)
+	}
 }
 
 func TestKillCmd_DrivenLoop_MarkDrivenErrorSurfacesAsFailure(t *testing.T) {

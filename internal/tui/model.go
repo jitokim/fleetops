@@ -1491,10 +1491,10 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			if backendAvailable && found {
 				err := act.Resume(prompt)
 				if err == nil {
-					logActuationEvent(l, action, act.Tier(), true, "")
+					logActuationEvent(l, action, act.Tier(), nil)
 					return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
 				}
-				logActuationEvent(l, action, act.Tier(), false, err.Error())
+				logActuationEvent(l, action, act.Tier(), err)
 				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
 				// resolves optimistically — the registry says the loop lives in
 				// an iTerm2 session, and only the send itself can discover the
@@ -1533,10 +1533,10 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
 		if err := redriveFn(l.SessionID, prompt); err != nil {
-			logActuationEvent(l, action, "tier2", false, err.Error())
+			logActuationEvent(l, action, "tier2", err)
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
-		logActuationEvent(l, action, "tier2", true, "")
+		logActuationEvent(l, action, "tier2", nil)
 		if l.Stall != domain.StallGone {
 			// Bug 2 (Option B honesty fix, refined by
 			// feat/inject-headless-exact-fallback): this branch is a
@@ -1762,7 +1762,7 @@ func takeOverCmd(l domain.Loop) tea.Cmd {
 		if err := registry.MarkDriven(registryDirFn(), l.SessionID, false); err != nil {
 			return attachResultMsg{false, fmt.Sprintf("take-over %s opened a terminal but could not clear Driven: %v — the engine may still drive it; kill (k) to stop it", l.Project, err)}
 		}
-		logActuationEvent(l, "take-over", "terminal", true, "")
+		logActuationEvent(l, "take-over", "terminal", nil)
 		return attachResultMsg{true, fmt.Sprintf("took over %s via %s — engine stopped driving it", l.Project, ctrl.Name())}
 	}
 }
@@ -1795,7 +1795,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
 		}
 		if err := act.Approve(); err != nil {
-			logActuationEvent(l, "approve", act.Tier(), false, err.Error())
+			logActuationEvent(l, "approve", act.Tier(), err)
 			// Unknown delivery is not a failure — see unknownDeliveryText.
 			if errors.Is(err, control.ErrSendDeliveryUnknown) {
 				return approveResultMsg{false, unknownDeliveryText("approve", l.Project, "the Enter", "a")}
@@ -1807,7 +1807,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// NEW marker that landed between this loop's scan snapshot and this
 		// approve call (see gate.DeleteMarkerIfTS).
 		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
-		logActuationEvent(l, "approve", act.Tier(), true, "")
+		logActuationEvent(l, "approve", act.Tier(), nil)
 		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, act.Backend())}
 	}
 }
@@ -2380,7 +2380,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 			if err := registry.MarkDriven(registryDirFn(), l.SessionID, false); err != nil {
 				return killResultMsg{false, fmt.Sprintf("kill %s failed: could not clear Driven — %v", l.Project, err)}
 			}
-			logActuationEvent(l, "kill", "engine", true, "")
+			logActuationEvent(l, "kill", "engine", nil)
 			return killResultMsg{true, fmt.Sprintf("killed %s — Driven cleared, state updates on next scan", l.Project)}
 		}
 		// Tier 1 only (tty → host send → cwd) — killing has no headless Tier-2
@@ -2394,7 +2394,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
 		}
 		if err := act.Resume("/exit"); err != nil {
-			logActuationEvent(l, "kill", act.Tier(), false, err.Error())
+			logActuationEvent(l, "kill", act.Tier(), err)
 			// Unknown delivery is not a failure — see unknownDeliveryText.
 			// This is the site that motivated the distinction: "kill failed"
 			// reads as "press k again," and a second "/exit" into a session
@@ -2413,7 +2413,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// status line deliberately does NOT optimistically set local model
 		// state itself (that would be a fake, unverified state the next
 		// scan could immediately contradict).
-		logActuationEvent(l, "kill", act.Tier(), true, "")
+		logActuationEvent(l, "kill", act.Tier(), nil)
 		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
 	}
 }
@@ -2440,14 +2440,14 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
 		}
 		if err := act.Interrupt(); err != nil {
-			logActuationEvent(l, "interrupt", act.Tier(), false, err.Error())
+			logActuationEvent(l, "interrupt", act.Tier(), err)
 			// Unknown delivery is not a failure — see unknownDeliveryText.
 			if errors.Is(err, control.ErrSendDeliveryUnknown) {
 				return interruptResultMsg{false, unknownDeliveryText("stop", l.Project, "the Esc", "p")}
 			}
 			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
 		}
-		logActuationEvent(l, "interrupt", act.Tier(), true, "")
+		logActuationEvent(l, "interrupt", act.Tier(), nil)
 		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
 	}
 }
@@ -3074,12 +3074,27 @@ func unknownDeliveryText(verb, project, what, key string) string {
 // it happens). Only called at a point where a tier was actually dispatched
 // — the early "no backend"/"ambiguous" refusal branches never reach a tier,
 // so callers simply don't call this for those (nothing was "taken" to log).
-func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText string) {
+//
+// err is the actuation's result — nil means it was confirmed dispatched.
+// It is classified into the event's STRUCTURED Outcome field (see
+// events.Outcome*), which is what derivations must read; Detail keeps its
+// existing human-readable "<action> <tier> ok|failed: <err>" shape for the
+// EVENTS panel and `fleetops report`, and is no longer load-bearing for any
+// derivation (issue #50: mostRecentActuationIsKill used to match a prefix
+// that a FAILED kill's detail also satisfies).
+//
+// ErrSendDeliveryUnknown (the host send timed out) is classified
+// OutcomeUnknown, not OutcomeFailed — the same distinction killCmd already
+// makes in what it tells the human ("delivery UNKNOWN — it may or may not
+// have landed"). Recording it as "failed" would assert something we did not
+// observe, which is the exact class of over-claim this field exists to stop.
+func logActuationEvent(l domain.Loop, action, tier string, err error) {
+	outcome := actuationOutcome(err)
 	detail := action + " " + tier
-	if ok {
+	if err == nil {
 		detail += " ok"
 	} else {
-		detail += " failed: " + errText
+		detail += " failed: " + err.Error()
 	}
 	_ = events.Append(historyDirFn(), events.Event{
 		TS:        time.Now().UnixNano(),
@@ -3089,7 +3104,21 @@ func logActuationEvent(l domain.Loop, action, tier string, ok bool, errText stri
 		Trigger:   events.TriggerActuation,
 		Detail:    detail,
 		Actor:     events.ActorHuman,
+		Outcome:   outcome,
 	})
+}
+
+// actuationOutcome classifies an actuation's error into an events.Outcome*
+// value — the one place the "a timeout is not a failure" rule is written.
+func actuationOutcome(err error) string {
+	switch {
+	case err == nil:
+		return events.OutcomeOK
+	case errors.Is(err, control.ErrSendDeliveryUnknown):
+		return events.OutcomeUnknown
+	default:
+		return events.OutcomeFailed
+	}
 }
 
 // pagerCmd builds the argv for the "o" key's log pager: -R renders color

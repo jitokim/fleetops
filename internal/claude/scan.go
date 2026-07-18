@@ -412,9 +412,44 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 }
 
 // mostRecentActuationIsKill reports whether sessionID's most recent
-// actor=human actuation event within `within` of now was a kill attempt
-// (logActuationEvent's "kill <tier> ok|failed: ..." detail format — see
-// internal/tui). Deliberately the MOST RECENT one, not "was there ever a
+// actor=human actuation event within `within` of now was a kill that was
+// CONFIRMED DISPATCHED.
+//
+// Issue #50: this used to be strings.HasPrefix(Detail, "kill ") with no
+// success filter, and logActuationEvent writes a failed kill's Detail as
+// "kill <tier> failed: <err>" — which that prefix also matches. So a kill
+// the human was explicitly told had FAILED still promoted the loop to
+// StateKilled once its process was later observed gone (for any reason),
+// after which `k` refused it as already killed. "The human pressed k" is
+// not "the kill landed."
+//
+// The fix is structural, not a longer string match: the outcome now
+// travels in Event.Outcome, and only events.OutcomeOK counts. Two
+// consequences, both deliberate:
+//
+//   - events.OutcomeUnknown (ErrSendDeliveryUnknown — the host send timed
+//     out) does NOT count. It is genuinely neither confirmed-sent nor
+//     confirmed-failed, and StateKilled is an ASSERTION that a human ended
+//     this loop; an unconfirmed send does not license it. Declining to
+//     assert costs only that the loop reads "gone" rather than "killed"
+//     once its process exits, and it keeps `k` available for the human the
+//     TUI just told to "attach and check before pressing k again" — whereas
+//     counting it would make the loop unkillable on the strength of
+//     something we did not observe.
+//   - events written before Outcome existed carry "", so they do not count
+//     either. A kill recorded by an older build stops being replayed as
+//     StateKilled; the loop shows the ordinary gone treatment instead. That
+//     is a bounded, one-time, fail-toward-not-claiming regression (the
+//     window is `within`, 24h by default) and is the correct direction for
+//     a field whose whole purpose is to stop claiming more than we know.
+//
+// Residual, named rather than hidden: WHICH ACTION the event records is
+// still read out of Detail's prefix. That is a weaker dependency (the
+// action word is chosen by logActuationEvent's callers from a fixed set and
+// is always first) and is not what let the bug through, but structuring it
+// too would be the right follow-up.
+//
+// Deliberately the MOST RECENT one, not "was there ever a
 // kill": if a kill was followed by a later successful resume/inject
 // actuation (reviving the session before this fix landed, or via a race),
 // that later actuation — not the stale kill — is what should win. events.Read
@@ -443,7 +478,10 @@ func mostRecentActuationIsKill(historyDir, sessionID string, now time.Time, with
 			lastActuation = ev
 		}
 	}
-	return lastActuation != nil && strings.HasPrefix(lastActuation.Detail, "kill ")
+	if lastActuation == nil {
+		return false
+	}
+	return lastActuation.Outcome == events.OutcomeOK && strings.HasPrefix(lastActuation.Detail, "kill ")
 }
 
 // isHiddenProjectDir reports whether an encoded project dir contains a

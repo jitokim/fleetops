@@ -949,7 +949,7 @@ func TestApplyLiveness_DrivenLoopKilled_WinsOverDormancy(t *testing.T) {
 	now := time.Now()
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "engine-1",
-		Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Trigger: events.TriggerActuation, Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1116,7 +1116,7 @@ func TestApplyLiveness_KilledOnRecordAndProcessGone_StaysKilledNotGone(t *testin
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "killed-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1182,7 +1182,7 @@ func TestApplyLiveness_DriftLoopKilledAndGone_BecomesKilled(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1213,7 +1213,7 @@ func TestApplyLiveness_IdleLoopKilledAndGone_BecomesKilled_NotDropped(t *testing
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "idle-one",
 		FromState: "idle", ToState: "idle", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1239,7 +1239,7 @@ func TestApplyLiveness_KillEventButProcessStillAlive_NotKilled(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1278,7 +1278,7 @@ func TestApplyLiveness_KillEventOutsideActiveWindow_Ignored(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-48 * time.Hour).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -1310,14 +1310,14 @@ func TestApplyLiveness_LaterResumeAfterKill_NotTreatedAsKilled(t *testing.T) {
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Hour).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "kill tier1 ok", Actor: events.ActorHuman,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append kill: %v", err)
 	}
 	if err := events.Append(historyDir, events.Event{
 		TS: now.Add(-time.Minute).UnixNano(), SessionID: "drift-one",
 		FromState: "drift", ToState: "drift", Trigger: events.TriggerActuation,
-		Detail: "resume tier2 ok", Actor: events.ActorHuman,
+		Detail: "resume tier2 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
 	}); err != nil {
 		t.Fatalf("Append resume: %v", err)
 	}
@@ -1340,6 +1340,123 @@ func TestApplyLiveness_LaterResumeAfterKill_NotTreatedAsKilled(t *testing.T) {
 func TestMostRecentActuationIsKill_NoEvents_False(t *testing.T) {
 	if mostRecentActuationIsKill(t.TempDir(), "no-such-session", time.Now(), ActiveWindow) {
 		t.Error("expected false when there's no history at all")
+	}
+}
+
+// ── issue #50: a kill that FAILED is not a kill ──────────────────────────
+
+// The defect itself. logActuationEvent writes a failed kill's Detail as
+// "kill <tier> failed: <err>", which the old HasPrefix(Detail, "kill ")
+// matched — so a kill the human was told had failed still promoted the
+// loop to StateKilled once its process was later observed gone.
+func TestMostRecentActuationIsKill_FailedKill_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1h failed: no such pane", Actor: events.ActorHuman,
+		Outcome: events.OutcomeFailed,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — the user was told the kill FAILED; we must not record it as a kill")
+	}
+}
+
+// The delivery-timeout case, decided explicitly: OutcomeUnknown is neither
+// confirmed-sent nor confirmed-failed, and StateKilled is an assertion that
+// a human ended this loop — an unconfirmed send does not license it.
+func TestMostRecentActuationIsKill_UnknownDeliveryKill_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1h failed: send delivery unknown", Actor: events.ActorHuman,
+		Outcome: events.OutcomeUnknown,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — delivery UNKNOWN must not be asserted as a landed kill")
+	}
+}
+
+// Back-compat, stated as a decision rather than discovered later: a kill
+// event written before Event.Outcome existed carries "", and is treated as
+// "not confirmed" rather than as success.
+func TestMostRecentActuationIsKill_LegacyEventWithoutOutcome_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, // no Outcome — pre-#50 record
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — an event with no structured outcome is not a confirmed kill")
+	}
+}
+
+// The success case, so the filter can't be satisfied by refusing everything.
+func TestMostRecentActuationIsKill_SucceededKill_True(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "kill tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if !mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected true — a confirmed-dispatched kill is a kill")
+	}
+}
+
+// A SUCCEEDED non-kill actuation must not be read as a kill either: the
+// outcome filter narrows, it does not replace, the action check.
+func TestMostRecentActuationIsKill_SucceededResume_False(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.UnixNano(), SessionID: "s1", Trigger: events.TriggerActuation,
+		Detail: "resume tier2 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if mostRecentActuationIsKill(historyDir, "s1", now, ActiveWindow) {
+		t.Error("expected false — a successful resume is not a kill")
+	}
+}
+
+// End to end through the pass that consumes it: a failed kill leaves the
+// gone loop reading STALLED/gone, not KILLED — and therefore still
+// killable, which is the user-visible half of #50.
+func TestApplyLiveness_FailedKillAndProcessGone_NotKilled(t *testing.T) {
+	historyDir := t.TempDir()
+	now := time.Now()
+	if err := events.Append(historyDir, events.Event{
+		TS: now.Add(-time.Minute).UnixNano(), SessionID: "s1",
+		Trigger: events.TriggerActuation, Detail: "kill tier1h failed: no such pane",
+		Actor: events.ActorHuman, Outcome: events.OutcomeFailed,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateRunning, LastActivity: now},
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State == domain.StateKilled {
+		t.Error("State = killed, but the kill demonstrably did not land — fleetops must not assert a human ended this loop")
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone (ordinary process-gone treatment)", out[0].State, out[0].Stall)
 	}
 }
 
