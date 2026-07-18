@@ -8091,6 +8091,66 @@ func withHiddenFile(t *testing.T) string {
 	return path
 }
 
+// withUnwritableHiddenFile points hiddenFileFn at a path that can never be
+// written (its "directory" is actually a regular file), so hidden.Add always
+// errors — the only way to exercise hideSession's persistence-failure branch.
+func withUnwritableHiddenFile(t *testing.T) {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("i am a file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := hiddenFileFn
+	t.Cleanup(func() { hiddenFileFn = orig })
+	hiddenFileFn = func() string { return filepath.Join(blocker, "hidden.json") }
+}
+
+// TestUpdate_DKey_PersistFails_StillHidesInMemory pins hideSession's fail-open
+// branch: persistence is best-effort, but the human's intent is not. A loop
+// they hid must disappear from the list for THIS session even when the
+// tombstone can't be written — and they must be told it won't survive a
+// restart, rather than silently believing it will.
+func TestUpdate_DKey_PersistFails_StillHidesInMemory(t *testing.T) {
+	withUnwritableHiddenFile(t)
+	m := modelWithTwoLoops()
+
+	m, _ = updateModel(t, m, runeKey('d'))
+
+	if !m.hidden["sess-1"] {
+		t.Error("sess-1 not hidden in memory after a persist failure — the hide must still take effect")
+	}
+	if len(m.loops) != 1 || m.loops[0].SessionID != "sess-2" {
+		t.Fatalf("loops = %+v, want sess-1 pruned from the list regardless of the persist failure", m.loops)
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr to surface the persistence failure", m.statusKind)
+	}
+	if !strings.Contains(m.status, "persisting the hide failed") {
+		t.Errorf("status = %q, want it to say the hide was not persisted", m.status)
+	}
+}
+
+// TestUpdate_XKey_PersistFails_ReportsHideFailure: delete routes through the
+// same hideSession, so a persist failure there is reported too — with the
+// registry removal (which DID succeed) still called out.
+func TestUpdate_XKey_PersistFails_ReportsHideFailure(t *testing.T) {
+	withUnwritableHiddenFile(t)
+	withSessionsDir(t)
+	m := modelWithTwoLoops()
+
+	m = confirmDelete(t, m)
+
+	if !m.hidden["sess-1"] {
+		t.Error("sess-1 not hidden in memory after a persist failure")
+	}
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr", m.statusKind)
+	}
+	if !strings.Contains(m.status, "persisting the hide failed") {
+		t.Errorf("status = %q, want the hide-persistence failure reported", m.status)
+	}
+}
+
 func TestUpdate_DKey_HidesSelectedLoop(t *testing.T) {
 	withHiddenFile(t)
 	m := modelWithTwoLoops()
