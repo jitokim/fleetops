@@ -142,7 +142,8 @@ func TestTierOneH_BindingInvalid_SkipsHostSend(t *testing.T) {
 		"moved to another tty": "ttys999", // pid recycled onto a different tty
 	} {
 		t.Run(name, func(t *testing.T) {
-			withFakeSendAdapter(t, &fakeSendAdapter{})
+			f := &fakeSendAdapter{}
+			withFakeSendAdapter(t, f)
 			dir := writeTier1hSession(t, tier1hEntry(), pidTTY)
 
 			orca := &fakeResolveCtl{t: t, name: "orca", available: true, locateClaudeOK: true}
@@ -156,6 +157,12 @@ func TestTierOneH_BindingInvalid_SkipsHostSend(t *testing.T) {
 			if act.Tier() != actuationTierMultiplexer {
 				t.Errorf("tier = %q, want %q — an invalid binding must skip 1h entirely", act.Tier(), actuationTierMultiplexer)
 			}
+			// The decisive assertion: an invalid binding must skip 1h entirely,
+			// not merely lose the tie to 1b — the send adapter must never be
+			// consulted for a stale or moved registry entry.
+			if len(f.sentTexts) != 0 || f.interruptCalled {
+				t.Error("the send adapter was used even though the pid/tty binding was invalid — a stale or moved session must not reach the host adapter")
+			}
 		})
 	}
 }
@@ -164,7 +171,8 @@ func TestTierOneH_BindingInvalid_SkipsHostSend(t *testing.T) {
 // compare the host's against, and the shared binding gate already requires one.
 // A headless/piped session (no controlling terminal) must fall through.
 func TestTierOneH_EmptyTTY_SkipsHostSend(t *testing.T) {
-	withFakeSendAdapter(t, &fakeSendAdapter{})
+	f := &fakeSendAdapter{}
+	withFakeSendAdapter(t, f)
 
 	entry := tier1hEntry()
 	entry.TTY = ""
@@ -180,6 +188,11 @@ func TestTierOneH_EmptyTTY_SkipsHostSend(t *testing.T) {
 	}
 	if act.Tier() != actuationTierMultiplexer {
 		t.Errorf("tier = %q, want %q — no recorded tty means no 1h binding to verify", act.Tier(), actuationTierMultiplexer)
+	}
+	// The decisive assertion: a headless/piped session (no controlling tty)
+	// must skip 1h entirely — the send adapter must never be consulted.
+	if len(f.sentTexts) != 0 || f.interruptCalled {
+		t.Error("the send adapter was used even though the session had no recorded tty — 1h has no binding to verify and must not be consulted")
 	}
 }
 

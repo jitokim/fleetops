@@ -3151,37 +3151,48 @@ func TestKPA_TierOneHTimeout_LeadsWithUncertaintyNotFailure(t *testing.T) {
 		run     func(domain.Loop) tea.Msg
 		text    func(tea.Msg) (string, bool)
 		warnKey string
+		// dispatched reports whether act actually recorded the call this
+		// verb is supposed to make, so a regression that never reaches the
+		// adapter (but still happens to render matching text) is caught —
+		// see the gap this case closes below.
+		dispatched func(act *fakeActuator) bool
 	}{
 		"approve": {
-			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject", GateTS: 123},
-			run:     func(l domain.Loop) tea.Msg { return approveCmd(l)() },
-			text:    func(m tea.Msg) (string, bool) { r, ok := m.(approveResultMsg); return r.text, ok && r.ok },
-			warnKey: "pressing a again",
+			loop:       domain.Loop{SessionID: "sess-1", Project: "myproject", GateTS: 123},
+			run:        func(l domain.Loop) tea.Msg { return approveCmd(l)() },
+			text:       func(m tea.Msg) (string, bool) { r, ok := m.(approveResultMsg); return r.text, ok && r.ok },
+			warnKey:    "pressing a again",
+			dispatched: func(act *fakeActuator) bool { return act.approveCalled },
 		},
 		"kill": {
 			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject"},
 			run:     func(l domain.Loop) tea.Msg { return killCmd(l)() },
 			text:    func(m tea.Msg) (string, bool) { r, ok := m.(killResultMsg); return r.text, ok && r.ok },
 			warnKey: "pressing k again",
+			// kill rides Resume with the literal "/exit" (see hostsend_test.go's
+			// TestBoundSendAdapter_VerbMapping) — it is not a distinct method.
+			dispatched: func(act *fakeActuator) bool { return act.resumeCalled && act.lastResumePrompt == "/exit" },
 		},
 		"interrupt": {
-			loop:    domain.Loop{SessionID: "sess-1", Project: "myproject"},
-			run:     func(l domain.Loop) tea.Msg { return interruptCmd(l)() },
-			text:    func(m tea.Msg) (string, bool) { r, ok := m.(interruptResultMsg); return r.text, ok && r.ok },
-			warnKey: "pressing p again",
+			loop:       domain.Loop{SessionID: "sess-1", Project: "myproject"},
+			run:        func(l domain.Loop) tea.Msg { return interruptCmd(l)() },
+			text:       func(m tea.Msg) (string, bool) { r, ok := m.(interruptResultMsg); return r.text, ok && r.ok },
+			warnKey:    "pressing p again",
+			dispatched: func(act *fakeActuator) bool { return act.interruptCalled },
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			act := &fakeActuator{
+				backend:      "iterm2",
+				tier:         "tier1h",
+				resumeErr:    timedOut,
+				approveErr:   timedOut,
+				interruptErr: timedOut,
+			}
 			withFakeActuationSeams(t,
 				func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
-					return &fakeActuator{
-						backend:      "iterm2",
-						tier:         "tier1h",
-						resumeErr:    timedOut,
-						approveErr:   timedOut,
-						interruptErr: timedOut,
-					}, true, true
+					return act, true, true
 				},
 				nil,
 			)
@@ -3199,6 +3210,15 @@ func TestKPA_TierOneHTimeout_LeadsWithUncertaintyNotFailure(t *testing.T) {
 			}
 			if !strings.Contains(text, tc.warnKey) {
 				t.Errorf("text = %q, want it to warn against %q", text, tc.warnKey)
+			}
+			// The decisive assertion this case closes: the uncertainty text
+			// above is derived from the error a fake RETURNS, so a dispatch
+			// bug that never calls the adapter method at all — while some
+			// other path still produces matching text — would pass every
+			// assertion above it. Only checking the recorded call catches
+			// that class of regression.
+			if !tc.dispatched(act) {
+				t.Errorf("%s never reached the adapter — the verb must actually dispatch to the send adapter, not just render matching text", name)
 			}
 		})
 	}
@@ -3430,8 +3450,10 @@ type fakeActuator struct {
 	resumeErr        error
 	lastResumePrompt string // captures what Resume was actually sent, for asserting hint composition
 
-	approveErr   error
-	interruptErr error
+	approveCalled   bool
+	approveErr      error
+	interruptCalled bool
+	interruptErr    error
 }
 
 func (f *fakeActuator) Backend() string { return f.backend }
@@ -3446,8 +3468,8 @@ func (f *fakeActuator) Resume(prompt string) error {
 	f.lastResumePrompt = prompt
 	return f.resumeErr
 }
-func (f *fakeActuator) Approve() error   { return f.approveErr }
-func (f *fakeActuator) Interrupt() error { return f.interruptErr }
+func (f *fakeActuator) Approve() error   { f.approveCalled = true; return f.approveErr }
+func (f *fakeActuator) Interrupt() error { f.interruptCalled = true; return f.interruptErr }
 
 type fakeController struct {
 	name             string
