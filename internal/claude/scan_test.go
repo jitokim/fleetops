@@ -2253,3 +2253,49 @@ func TestEnrichFromRegistry_NameCopiedOntoLoop(t *testing.T) {
 		t.Errorf("Name = %q, want %q (registry display name must surface onto the loop)", out[0].Name, "bugfix loop")
 	}
 }
+
+// The two passes composed, in DiscoverLoops' own order — the design
+// (design-loop-state-model.md §2.1) warned that enrichFromRegistry
+// overwrites the scanner's inferred State one pass BEFORE applyLiveness
+// runs, and asked whether that destroys the input the drift/gone fix needs.
+// It does not: enrich clobbers the ACTIVITY (idle/running), which the fix
+// never consults — the demotion keys off the verdict-derived StateDrift
+// itself. This reproduces the reported incident end to end: a rejected
+// verdict at the current cycle, no live process, screen must read gone.
+//
+// It also pins the half the fix is careful not to lose: the rejected
+// verdict survives on Loop.Last, which is what the ORACLE column renders,
+// so "gone" is displayed WITH its drift verdict rather than instead of it.
+func TestEnrichThenLiveness_RejectedVerdictAndProcessGone_ShowsGoneKeepingVerdict(t *testing.T) {
+	loopsDir := t.TempDir()
+	if err := registry.Bind(loopsDir, "sess-1", registry.BindSpec{Goal: "ship it", MaxCycles: 99}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := registry.SaveVerdict(loopsDir, "sess-1", domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "not done"}, 16); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+	now := time.Now()
+	historyDir := t.TempDir()
+
+	// the scanner's own inference from the transcript tail
+	loops := []domain.Loop{
+		{SessionID: "sess-1", ProjectDir: "-x-myproject", Cwd: "/x/myproject", State: domain.StateIdle, Cycle: 16, LastActivity: now.Add(-40 * time.Minute)},
+	}
+
+	loops = enrichFromRegistry(loops, loopsDir, historyDir)
+	if loops[0].State != domain.StateDrift {
+		t.Fatalf("after enrich: State = %v, want StateDrift (fixture no longer reproduces the incident)", loops[0].State)
+	}
+
+	out := applyLiveness(loops, map[string]int{}, true, historyDir, now, ActiveWindow)
+
+	if len(out) != 1 {
+		t.Fatalf("got %d loops, want 1", len(out))
+	}
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallGone {
+		t.Errorf("got State=%v Stall=%v, want StateStalled/StallGone — the incident screen must read gone, not ✗ DRIFT", out[0].State, out[0].Stall)
+	}
+	if out[0].Last == nil || out[0].Last.Outcome != domain.OutcomeRejected {
+		t.Errorf("Last = %+v, want the rejected verdict preserved for the ORACLE column — gone must not erase what it was doing", out[0].Last)
+	}
+}
