@@ -42,8 +42,8 @@ func SessionsDir() string {
 // (Phase 2) re-validates tty↔pid against live ps at actuation time rather
 // than trusting this possibly-stale record, since ttys are OS-recycled.
 //
-// HostApp/WindowID/SocketPath are additive, omitempty extensions (design
-// §2). They are BACK-COMPATIBLE by construction: json.Unmarshal leaves them at
+// HostApp/WindowID/SocketPath are additive, omitempty extensions. They are
+// BACK-COMPATIBLE by construction: json.Unmarshal leaves them at
 // their zero value for a record written by an older binary (no field present),
 // and json.Marshal omits an empty one — so a tty-only record still round-trips,
 // and a new binary reading it simply sees empty strings (→ no focus adapter,
@@ -57,12 +57,18 @@ type SessionEntry struct {
 	StartedAt      time.Time `json:"started_at"`
 	// HostApp is the host terminal application's $TERM_PROGRAM value
 	// ("iTerm.app", "tmux", …), inherited by the SessionStart hook from the
-	// user's shell. It keys the FocusAdapter that raises this session's
-	// window at attach time (internal/control §4); "" ⇒ no adapter ⇒ degrade.
+	// user's shell. It keys the FocusAdapter that raises this session's window
+	// at attach time (control.ResolveFocusAdapter); "" ⇒ no adapter ⇒ degrade.
 	HostApp string `json:"host_app,omitempty"`
-	// WindowID identifies the host's window/tab/pane — the first non-empty of
-	// $ITERM_SESSION_ID, $TMUX_PANE, … A FocusAdapter needs it to select the
-	// exact surface; "" ⇒ attach falls through to the cwd-based resolver.
+	// WindowID identifies the host's window/tab/pane, read from whichever env
+	// var the RESOLVED HostApp publishes it in ($ITERM_SESSION_ID for
+	// iTerm.app, $TMUX_PANE for tmux) — never resolved independently of
+	// HostApp, so the pair always describes one and the same terminal. Taking
+	// the first non-empty of the two instead would pair a tmux $TMUX_PANE with
+	// HostApp "iTerm.app" under tmux-inside-iTerm2 and aim the focus adapter at
+	// a foreign surface (see cmd/fleetops.resolveHostWindow). A FocusAdapter
+	// needs it to select the exact surface; "" ⇒ attach falls through to the
+	// cwd-based resolver.
 	WindowID string `json:"window_id,omitempty"`
 	// SocketPath is reserved for the (out-of-scope here) session-agent control
 	// channel at ~/.fleetops/sessions/<id>.sock. Declared now for forward

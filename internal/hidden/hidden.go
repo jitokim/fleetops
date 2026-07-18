@@ -81,8 +81,10 @@ func load(path string) (set map[string]bool, corrupt bool) {
 // Add tombstones sessionID: it re-reads the current set from disk (so a
 // concurrent add elsewhere isn't clobbered), inserts sessionID, and atomically
 // rewrites path. Returns the resulting set so the caller can adopt it as its
-// in-memory copy, keeping memory and disk in lockstep. A no-op sessionID ("")
-// is rejected so an empty tombstone can never be written.
+// in-memory copy, keeping memory and disk in lockstep. An empty sessionID adds
+// no tombstone — the insert is skipped, so "" can never land in the file — but
+// it is not an early return: the rewrite still happens, which is what lets a
+// corrupt file be set aside and replaced even when there is nothing to add.
 // A corrupt file gets preserved alongside as <path>.bad first: fail-open on
 // READ is right (never hide a loop behind an unreadable file), but fail-open
 // then OVERWRITE is data loss — Load returns the empty set for garbage, so a
