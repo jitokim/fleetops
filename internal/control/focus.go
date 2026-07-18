@@ -59,16 +59,29 @@ func ResolveFocusAdapter(hostApp string) (FocusAdapter, bool) {
 	return adapter, ok
 }
 
-// iterm2FocusFn runs the osascript that raises an iTerm2 session. An injectable
-// package var (same seam discipline as pidTTYFn/redriveFn) so the adapter is
-// unit-testable against a fake without a real iTerm2 or osascript on the
-// machine — the whole reason iterm2FocusArgv is pulled out as a pure function
-// too. Bounded by actuationTimeout so a wedged osascript never hangs the caller.
-var iterm2FocusFn = func(argv []string) error {
+// iterm2FocusFn runs the osascript that raises an iTerm2 session and returns
+// its stdout — the script's own verdict (iterm2FocusHit / iterm2FocusMiss),
+// which is the ONLY way to tell a real raise from a no-op: osascript exits 0
+// for both. An injectable package var (same seam discipline as
+// pidTTYFn/redriveFn) so the adapter is unit-testable against a fake without a
+// real iTerm2 or osascript on the machine — the whole reason iterm2FocusArgv is
+// pulled out as a pure function too. Bounded by actuationTimeout so a wedged
+// osascript never hangs the caller.
+var iterm2FocusFn = func(argv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), actuationTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).Output()
+	return string(out), err
 }
+
+// iterm2FocusHit / iterm2FocusMiss are the verdicts the osascript returns on
+// stdout. They exist because exit status cannot carry this: the script exits 0
+// whether or not it found the session, so without an explicit verdict Raise
+// could never fail and attach would report success for a closed tab.
+const (
+	iterm2FocusHit  = "ok"
+	iterm2FocusMiss = "miss"
+)
 
 // iterm2FocusAdapter raises the iTerm2 window/tab/session identified by the
 // entry's WindowID ($ITERM_SESSION_ID). Focus-only, no Controller surface —
@@ -97,7 +110,17 @@ func (iterm2FocusAdapter) Raise(entry sessions.SessionEntry) error {
 	if !itermGUIDPattern.MatchString(iterm2SessionGUID(entry.WindowID)) {
 		return ErrNoFocusSurface
 	}
-	return iterm2FocusFn(iterm2FocusArgv(entry.WindowID))
+	out, err := iterm2FocusFn(iterm2FocusArgv(entry.WindowID))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) != iterm2FocusHit {
+		// The script ran fine but matched nothing (the tab was closed). That is
+		// NOT a success — reporting it as one would make step 1 a one-way door
+		// that swallows the loop and never lets attach try ResolveForLocate.
+		return ErrNoFocusSurface
+	}
+	return nil
 }
 
 // iterm2FocusArgv builds the osascript argv that reveals the iTerm2 session
@@ -106,13 +129,21 @@ func (iterm2FocusAdapter) Raise(entry sessions.SessionEntry) error {
 // redriveArgv/orcaResumeCmd). $ITERM_SESSION_ID is shaped "w<W>t<T>p<P>:<GUID>";
 // the session's scriptable `id` is that trailing GUID, so we match on it and
 // select the enclosing window + tab + session, then activate iTerm2 to bring it
-// forward. Best-effort by design: if nothing matches (the session was closed),
-// the script simply activates iTerm2 and returns — attach never hard-fails on a
-// focus miss.
+// forward.
+//
+// The script REPORTS its outcome on stdout ("ok" / "miss") and `activate` lives
+// INSIDE the match branch. Both matter: osascript exits 0 whether or not the
+// session was found, so an activate-first / fall-off-the-end script is
+// indistinguishable from a real raise — Raise could never return an error, and
+// attach would claim "attached via iTerm.app" for a tab the human closed hours
+// ago, never trying its multiplexer step. Activating only on a hit also stops a
+// miss from yanking iTerm2 forward for no reason.
+//
+// Interpolating guid is safe only because Raise gates it on itermGUIDPattern
+// first; do not call this with an unvalidated window id.
 func iterm2FocusArgv(windowID string) []string {
 	guid := iterm2SessionGUID(windowID)
 	script := "tell application \"iTerm2\"\n" +
-		"\tactivate\n" +
 		"\trepeat with aWindow in windows\n" +
 		"\t\trepeat with aTab in tabs of aWindow\n" +
 		"\t\t\trepeat with aSession in sessions of aTab\n" +
@@ -120,11 +151,13 @@ func iterm2FocusArgv(windowID string) []string {
 		"\t\t\t\t\tselect aWindow\n" +
 		"\t\t\t\t\tselect aTab\n" +
 		"\t\t\t\t\tselect aSession\n" +
-		"\t\t\t\t\treturn\n" +
+		"\t\t\t\t\tactivate\n" +
+		"\t\t\t\t\treturn \"" + iterm2FocusHit + "\"\n" +
 		"\t\t\t\tend if\n" +
 		"\t\t\tend repeat\n" +
 		"\t\tend repeat\n" +
 		"\tend repeat\n" +
+		"\treturn \"" + iterm2FocusMiss + "\"\n" +
 		"end tell"
 	return []string{"osascript", "-e", script}
 }

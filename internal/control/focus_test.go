@@ -56,6 +56,89 @@ func TestITerm2FocusArgv_BuildsSelectScriptForGUID(t *testing.T) {
 	}
 }
 
+// TestITerm2FocusArgv_ReportsHitAndMiss pins the property that makes Raise
+// capable of failing at all: osascript exits 0 either way, so the script must
+// say which happened, and must NOT activate iTerm2 before it knows. An
+// activate-first script yanks the app forward and returns success for a session
+// that no longer exists.
+func TestITerm2FocusArgv_ReportsHitAndMiss(t *testing.T) {
+	script := iterm2FocusArgv("w0t1p0:ABC-123")[2]
+
+	if !strings.Contains(script, `return "`+iterm2FocusHit+`"`) {
+		t.Errorf("script never reports a hit:\n%s", script)
+	}
+	if !strings.Contains(script, `return "`+iterm2FocusMiss+`"`) {
+		t.Errorf("script falls off the end without reporting a miss:\n%s", script)
+	}
+	// activate must come AFTER the match (inside the branch), so a miss never
+	// brings iTerm2 forward.
+	activateAt := strings.Index(script, "activate")
+	matchAt := strings.Index(script, "id of aSession is")
+	if activateAt < matchAt {
+		t.Errorf("activate runs before the id match — a miss would still raise iTerm2:\n%s", script)
+	}
+}
+
+// TestITerm2Raise_ScriptMiss_DegradesNoHardFailure is the false-success pin:
+// the script ran fine (exit 0) but matched no session, which must surface as
+// ErrNoFocusSurface so attach degrades to its multiplexer step instead of
+// reporting "attached via iTerm.app" for a closed tab.
+func TestITerm2Raise_ScriptMiss_DegradesNoHardFailure(t *testing.T) {
+	withFakeITerm2Focus(t, func([]string) (string, error) { return iterm2FocusMiss + "\n", nil })
+
+	err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: "w0t0p0:GONE-1"})
+	if !errors.Is(err, ErrNoFocusSurface) {
+		t.Errorf("Raise on a script miss = %v, want ErrNoFocusSurface", err)
+	}
+}
+
+// TestITerm2Raise_UnexpectedStdout_Degrades: any verdict that is not exactly
+// the hit marker is treated as a miss. Silence (an osascript that printed
+// nothing) must not read as success.
+func TestITerm2Raise_UnexpectedStdout_Degrades(t *testing.T) {
+	for name, stdout := range map[string]string{
+		"empty":      "",
+		"whitespace": "  \n",
+		"garbage":    "something else",
+	} {
+		t.Run(name, func(t *testing.T) {
+			withFakeITerm2Focus(t, func([]string) (string, error) { return stdout, nil })
+
+			err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: "w0t0p0:GUID-2"})
+			if !errors.Is(err, ErrNoFocusSurface) {
+				t.Errorf("Raise with stdout %q = %v, want ErrNoFocusSurface", stdout, err)
+			}
+		})
+	}
+}
+
+// TestITerm2Raise_ExecError_Propagates: a non-zero osascript (e.g. macOS
+// Automation permission denied) is a REAL error, distinct from a miss. The
+// adapter reports it as-is; deciding it is non-fatal is attach's job, not the
+// adapter's.
+func TestITerm2Raise_ExecError_Propagates(t *testing.T) {
+	boom := errors.New("exit status 1: not authorized to send Apple events")
+	withFakeITerm2Focus(t, func([]string) (string, error) { return "", boom })
+
+	err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: "w0t0p0:GUID-3"})
+	if !errors.Is(err, boom) {
+		t.Errorf("Raise = %v, want the exec error %v", err, boom)
+	}
+	if errors.Is(err, ErrNoFocusSurface) {
+		t.Error("an exec failure must not masquerade as ErrNoFocusSurface")
+	}
+}
+
+// TestITerm2Raise_ScriptHit_Succeeds is the one success case.
+func TestITerm2Raise_ScriptHit_Succeeds(t *testing.T) {
+	withFakeITerm2Focus(t, func([]string) (string, error) { return iterm2FocusHit + "\n", nil })
+
+	err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: "w0t0p0:GUID-4"})
+	if err != nil {
+		t.Errorf("Raise on a script hit = %v, want nil", err)
+	}
+}
+
 func TestITerm2SessionGUID(t *testing.T) {
 	cases := map[string]string{
 		"w0t1p0:ABC-123": "ABC-123",   // typical $ITERM_SESSION_ID
@@ -70,12 +153,12 @@ func TestITerm2SessionGUID(t *testing.T) {
 }
 
 // withFakeITerm2Focus swaps the injectable exec seam for a spy and restores it.
-func withFakeITerm2Focus(t *testing.T, fn func(argv []string) error) *[]string {
+func withFakeITerm2Focus(t *testing.T, fn func(argv []string) (string, error)) *[]string {
 	t.Helper()
 	var captured []string
 	orig := iterm2FocusFn
 	t.Cleanup(func() { iterm2FocusFn = orig })
-	iterm2FocusFn = func(argv []string) error {
+	iterm2FocusFn = func(argv []string) (string, error) {
 		captured = argv
 		return fn(argv)
 	}
@@ -85,7 +168,7 @@ func withFakeITerm2Focus(t *testing.T, fn func(argv []string) error) *[]string {
 // TestITerm2Raise_WithWindowID_ExecsBuiltScript confirms Raise dispatches the
 // pure builder's argv to the exec seam (not a real osascript).
 func TestITerm2Raise_WithWindowID_ExecsBuiltScript(t *testing.T) {
-	captured := withFakeITerm2Focus(t, func([]string) error { return nil })
+	captured := withFakeITerm2Focus(t, func([]string) (string, error) { return iterm2FocusHit, nil })
 
 	err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: "w0t0p0:GUID-9"})
 	if err != nil {
@@ -100,9 +183,9 @@ func TestITerm2Raise_WithWindowID_ExecsBuiltScript(t *testing.T) {
 // an empty WindowID must NOT exec anything and must return ErrNoFocusSurface so
 // attach falls through rather than hard-failing.
 func TestITerm2Raise_EmptyWindowID_DegradesNoExec(t *testing.T) {
-	captured := withFakeITerm2Focus(t, func([]string) error {
+	captured := withFakeITerm2Focus(t, func([]string) (string, error) {
 		t.Fatal("iterm2FocusFn must not be called for an empty WindowID")
-		return nil
+		return "", nil
 	})
 
 	err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp})
@@ -134,9 +217,9 @@ func TestITerm2Raise_UntrustedWindowID_DegradesNoExec(t *testing.T) {
 	}
 	for name, windowID := range hostile {
 		t.Run(name, func(t *testing.T) {
-			captured := withFakeITerm2Focus(t, func([]string) error {
+			captured := withFakeITerm2Focus(t, func([]string) (string, error) {
 				t.Fatal("iterm2FocusFn must never be called for an untrusted WindowID")
-				return nil
+				return "", nil
 			})
 
 			err := iterm2FocusAdapter{}.Raise(sessions.SessionEntry{HostApp: iterm2HostApp, WindowID: windowID})
