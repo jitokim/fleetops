@@ -87,7 +87,7 @@ func TestResolveActuationTarget_PIDBindingConfirmed_TriesTierOneA(t *testing.T) 
 		t.Fatalf("WriteSession: %v", err)
 	}
 
-	// Inject one available backend: ResolveActuationTarget's anyBackendAvailable()
+	// Inject one available backend: ResolveActuationTarget's availableBackends()
 	// gate now short-circuits (backendAvailable=false) BEFORE the pid↔tty binding
 	// probe when nothing could act on the result, so a hermetic test must supply a
 	// backend rather than rely on whichever real multiplexer happens to be
@@ -126,7 +126,7 @@ func TestResolveActuationTarget_TTYNormalizedBeforeComparison(t *testing.T) {
 	}
 
 	// An available backend must exist for the binding probe to be reached at all
-	// (the anyBackendAvailable() gate now precedes it) — inject one rather than
+	// (the availableBackends() gate now precedes it) — inject one rather than
 	// depend on an installed multiplexer.
 	withBackends(t, &fakeResolveCtl{t: t, name: "orca", available: true})
 

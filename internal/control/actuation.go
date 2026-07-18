@@ -92,17 +92,22 @@ var pidTTYFn = func(pid int) string {
 // "no unambiguous claude surface"). Callers only use ctrl/target when
 // found=true.
 func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Controller, target Target, backendAvailable, found bool) {
-	if !anyBackendAvailable() {
+	// Availability is probed ONCE, up front, and both tiers iterate the result.
+	// Available() is a live subprocess (LookPath + a bounded liveness probe per
+	// backend), so re-asking per tier cost up to 3 spawns per backend on every
+	// actuation keypress. Snapshotting is also the more honest semantics: a
+	// backend that dies mid-resolution previously produced an arbitrary
+	// tier-dependent split (visible to Tier 1a, gone by Tier 1b) that nothing
+	// relied on.
+	avail := availableBackends()
+	if len(avail) == 0 {
 		return nil, Target{}, false, false
 	}
 
 	// Tier 1a — session-unique tty. Validate the registry binding once, then
 	// probe every available TTYLocator backend; first hit wins (no ambiguity).
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
-		for _, c := range backends {
-			if !c.Available() {
-				continue
-			}
+		for _, c := range avail {
 			if t, ok := tierOneA(c, entry.TTY); ok {
 				return c, t, true, true
 			}
@@ -115,10 +120,7 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 	var matchedCtrl Controller
 	var matchedTarget Target
 	matches := 0
-	for _, c := range backends {
-		if !c.Available() {
-			continue
-		}
+	for _, c := range avail {
 		if t, ok := c.LocateClaude(projectDir); ok {
 			matchedCtrl, matchedTarget = c, t
 			matches++
@@ -130,27 +132,33 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (ctrl Con
 	return nil, Target{}, true, false
 }
 
-// anyBackendAvailable reports whether at least one backend is usable right now
-// — the single "is actuation possible at all" gate for backendAvailable.
-// Deliberately its own tiny helper (not an inlined loop) so the
-// backendAvailable=false contract lives in exactly one place.
-func anyBackendAvailable() bool {
+// availableBackends returns the backends usable right now, in the shared
+// install-preference order. Empty means NO backend is available at all — the
+// single "is actuation possible?" gate behind ResolveActuationTarget's
+// backendAvailable=false contract. Returning the slice (rather than a bare
+// bool) is what lets both tiers reuse one round of Available() probes instead
+// of re-execing per tier; preserving the order keeps each tier's iteration —
+// and so Tier 1b's ambiguity counting — identical to probing `backends`
+// directly.
+func availableBackends() []Controller {
+	avail := make([]Controller, 0, len(backends))
 	for _, c := range backends {
 		if c.Available() {
-			return true
+			avail = append(avail, c)
 		}
 	}
-	return false
+	return avail
 }
 
-// tierOneA type-asserts resolved as a TTYLocator and, if it implements the
-// interface, tries to locate a surface by tty — pulled out as its own pure
-// function (same reasoning as every other type-assert-then-call seam in this
-// package) so "dispatch Tier 1a to whichever resolved backend implements
-// TTYLocator" is directly unit-testable against a fake Controller, without
-// needing a real orca/cmux/tmux binary on the test machine.
-func tierOneA(resolved Controller, tty string) (Target, bool) {
-	locator, ok := resolved.(TTYLocator)
+// tierOneA type-asserts c as a TTYLocator and, if it implements the interface,
+// tries to locate a surface by tty — pulled out as its own pure function (same
+// reasoning as every other type-assert-then-call seam in this package) so
+// "dispatch Tier 1a to a candidate backend that implements TTYLocator" is
+// directly unit-testable against a fake Controller, without needing a real
+// orca/cmux/tmux binary on the test machine. Called once per AVAILABLE backend
+// (not once for a single pre-resolved pick) — Tier 1a probes them all.
+func tierOneA(c Controller, tty string) (Target, bool) {
+	locator, ok := c.(TTYLocator)
 	if !ok {
 		return Target{}, false
 	}
