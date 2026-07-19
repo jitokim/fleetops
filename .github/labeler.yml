@@ -1,0 +1,86 @@
+# Rule-based PR labeling config for actions/labeler (v6).
+#
+# No LLM/AI involved by design (captain directive: zero AI API usage) — every
+# rule below is a path glob or branch-name pattern checked against the diff.
+#
+# The `area/*` labels mirror this repo's actual `internal/*` package
+# boundaries 1:1 (see CONTRIBUTING.md's "Making changes" section on keeping
+# changes focused per package). Add a new `area/*` entry only when a new
+# `internal/<pkg>` directory is actually created — do not pre-create labels
+# for packages that don't exist yet.
+
+# --- area labels: one per real cmd/ and internal/ package ---
+
+area/cmd:
+  - changed-files:
+      - any-glob-to-any-file: 'cmd/**'
+
+area/claude:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/claude/**'
+
+area/control:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/control/**'
+
+area/domain:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/domain/**'
+
+area/engine:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/engine/**'
+
+area/events:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/events/**'
+
+area/fsatomic:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/fsatomic/**'
+
+area/gate:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/gate/**'
+
+area/hidden:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/hidden/**'
+
+area/notify:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/notify/**'
+
+area/oracle:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/oracle/**'
+
+area/registry:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/registry/**'
+
+area/sessions:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/sessions/**'
+
+area/tui:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/tui/**'
+
+# --- cross-cutting labels ---
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file: '**/*.md'
+
+build/ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'Makefile'
+          - '.github/**'
+
+deps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'go.mod'
+          - 'go.sum'

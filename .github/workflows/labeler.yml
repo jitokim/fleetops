@@ -1,0 +1,28 @@
+name: "PR Labeler"
+
+# pull_request_target (not pull_request) so labeling also works on PRs from
+# forks: the `pull_request` event gives forked PRs a read-only token, which
+# would make actions/labeler fail to write labels. pull_request_target runs
+# with the base repo's token/permissions instead.
+#
+# Security tradeoff, made explicit: pull_request_target evaluates using the
+# BASE branch's workflow file and config (.github/labeler.yml), not the PR
+# branch's — so a PR cannot alter its own labeling rules to grant itself
+# something, and PR label changes take effect only after merging to main.
+# This is safe here specifically because this workflow does no
+# actions/checkout of the PR's ref and runs no code from the PR — it only
+# calls actions/labeler, which reads the PR's changed-file list via the
+# GitHub API. Do not add a checkout of the PR head or any script that
+# executes PR content to this workflow without re-reviewing this tradeoff.
+"on":
+  - pull_request_target
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v6
