@@ -25,6 +25,12 @@
 #     failed job. See `.github/scripts/authorize.sh` for why the event
 #     payload's `author_association` is not an acceptable substitute.
 #
+# ACTION PINNING POLICY (applies to every workflow in this repo):
+#   Third-party actions are pinned to a full commit SHA with a trailing
+#   `# vX.Y.Z` comment. A tag is a mutable pointer — whoever can move it can
+#   run their code with this repo's write scopes. The comment is for humans
+#   and for dependabot; the SHA is what actually gets run.
+#
 # Usage notes for maintainers: docs/maintainer-review-command.md
 
 name: PR review dispatch
@@ -74,7 +80,7 @@ jobs:
       - name: Check out workflow scripts
         # Checks out the default branch (the privileged ref this workflow
         # already runs as), NOT the PR head. Only `.github/scripts` is used.
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -168,7 +174,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Check out workflow scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
