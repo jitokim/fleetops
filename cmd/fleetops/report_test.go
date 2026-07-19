@@ -444,3 +444,32 @@ func TestWriteReport_StallKindEncodedTransition_CountedAsRealTransition(t *testi
 		t.Errorf("out = %q, want last state to show the encoded stall kind", buf.String())
 	}
 }
+
+func TestWriteReport_KeepsActorTallyAlongsideOutcome(t *testing.T) {
+	// Fixing #52 must not cost the answer to a different question. Grouping by
+	// outcome is the fix; "who acted" is separate, and the roadmap's actor and
+	// brake model (§2.4) depends on it being askable — it becomes load-bearing
+	// as soon as something other than a human is driving the fleet.
+	dir := t.TempDir()
+	now := time.Now()
+	sess := "sess-actor"
+	evs := []events.Event{
+		{TS: now.Add(-2 * time.Hour).UnixNano(), SessionID: sess, Trigger: events.TriggerActuation, Outcome: events.OutcomeOK, Actor: events.ActorHuman},
+		{TS: now.Add(-1 * time.Hour).UnixNano(), SessionID: sess, Trigger: events.TriggerActuation, Outcome: events.OutcomeFailed, Actor: events.ActorAuto},
+	}
+	for _, e := range evs {
+		if err := events.Append(dir, e); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	var buf bytes.Buffer
+	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
+		t.Fatalf("writeReport: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"landed", "failed", string(events.ActorHuman), string(events.ActorAuto)} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q\n%s", want, out)
+		}
+	}
+}

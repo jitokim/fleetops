@@ -45,7 +45,14 @@ type loopSummary struct {
 	gatesOpened         int
 	gatesAnswered       int
 	actuationsByOutcome map[string]int
-	verdictsByOutcome   map[string]int
+	// actuationsByActor is kept ALONGSIDE the outcome tally rather than
+	// replaced by it. Issue #52 was about outcomes, and grouping by outcome is
+	// the fix — but "who acted" is a separate question that the roadmap's
+	// actor/brake model (§2.4) depends on being able to ask, and it becomes
+	// load-bearing the moment something other than a human is acting. Dropping
+	// it to fix #52 would have quietly removed the answer.
+	actuationsByActor map[string]int
+	verdictsByOutcome map[string]int
 }
 
 // writeReport is runReportCmd's testable core: reads dir's full event
@@ -119,6 +126,7 @@ func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 	s := loopSummary{
 		sessionID:           sessionID,
 		actuationsByOutcome: map[string]int{},
+		actuationsByActor:   map[string]int{},
 		verdictsByOutcome:   map[string]int{},
 	}
 	for _, ev := range evs {
@@ -138,6 +146,7 @@ func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 		switch ev.Trigger {
 		case events.TriggerActuation:
 			s.actuationsByOutcome[actuationOutcomeLabel(ev.Outcome)]++
+			s.actuationsByActor[string(ev.Actor)]++
 		case events.TriggerOracle:
 			if outcome := verdictOutcome(ev.Detail); outcome != "" {
 				s.verdictsByOutcome[outcome]++
@@ -190,12 +199,20 @@ func writeLoopSummary(w io.Writer, s loopSummary) {
 	fmt.Fprintf(w, "  transitions:  %d\n", s.transitions)
 	fmt.Fprintf(w, "  gates:        %d opened, %d answered\n", s.gatesOpened, s.gatesAnswered)
 	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(s.actuationsByOutcome))
+	if len(s.actuationsByActor) > 0 {
+		fmt.Fprintf(w, "  by actor:     %s\n", formatByKey(s.actuationsByActor))
+	}
 	fmt.Fprintf(w, "  verdicts:     %s\n", formatByKey(s.verdictsByOutcome))
 }
 
 func writeFleetTotals(w io.Writer, summaries []loopSummary) {
 	var transitions, gatesOpened, gatesAnswered int
 	actuations := map[string]int{}
+	// Fleet-level actor totals are the more useful half of the actor question,
+	// not a mirror of the per-loop line: what matters about a non-human actor
+	// is how far its decisions reached ACROSS the fleet, since that is the
+	// thing a human cannot notice one loop at a time.
+	byActor := map[string]int{}
 	verdicts := map[string]int{}
 	for _, s := range summaries {
 		transitions += s.transitions
@@ -203,6 +220,9 @@ func writeFleetTotals(w io.Writer, summaries []loopSummary) {
 		gatesAnswered += s.gatesAnswered
 		for k, n := range s.actuationsByOutcome {
 			actuations[k] += n
+		}
+		for k, n := range s.actuationsByActor {
+			byActor[k] += n
 		}
 		for k, n := range s.verdictsByOutcome {
 			verdicts[k] += n
@@ -213,6 +233,9 @@ func writeFleetTotals(w io.Writer, summaries []loopSummary) {
 	fmt.Fprintf(w, "  transitions:  %d\n", transitions)
 	fmt.Fprintf(w, "  gates:        %d opened, %d answered\n", gatesOpened, gatesAnswered)
 	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(actuations))
+	if len(byActor) > 0 {
+		fmt.Fprintf(w, "  by actor:     %s\n", formatByKey(byActor))
+	}
 	fmt.Fprintf(w, "  verdicts:     %s\n", formatByKey(verdicts))
 }
 
