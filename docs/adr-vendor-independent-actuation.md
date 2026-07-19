@@ -460,11 +460,36 @@ users. Spawning is the only capability added.
 
 **Known and accepted:** `create window` **takes focus** — spawning from an
 iTerm2 cockpit moves you to the new window, unlike `tmux new-window -d`.
-iTerm2's dictionary exposes no non-activating creation. A re-`select` of the
-cockpit window afterwards is plausible (the disruption is intra-application,
-and `select` needs no new permission), but attempting to measure it is what
-wedged AppleScript above, so it is **untested and unimplemented** rather than
-assumed either way.
+iTerm2's dictionary exposes no non-activating creation.
+
+The obvious mitigation — re-`select` the cockpit window afterwards, since the
+disruption is intra-application and `select` needs no new permission — was
+**measured 2026-07-19 and does NOT work**:
+
+```
+create window        → front session = <new window>
+select <cockpit window>, delay 1
+                     → front session = <new window>   (unchanged)
+```
+
+`select` on a window does not pull frontmost back from a just-created one. So
+the focus yank is not a thing we chose to leave unfixed for tidiness; it is a
+limit of the surface, recorded as measured-and-rejected rather than untested.
+Anything that WOULD restore focus (activating another application, System
+Events) is on the wrong side of §2.2's Accessibility rejection, so the yank
+stands until iTerm2 offers a non-activating create.
+
+**A second finding, discovered while measuring the above and worth recording
+here because it affects the already-shipped Tier 1h, not just spawn:** iTerm2
+**reassigns session GUIDs across a restart**. A process that survived an iTerm2
+restart-and-restore was observed on the same `/dev/ttys006` under a new session
+id, while its own `$ITERM_SESSION_ID` still carried the old one. Since
+`window_id` is recorded once at `SessionStart`, a restart leaves the registry
+naming a session that no longer exists: Tier 1h misses, `r`/`i` fall to Tier 2
+and `k`/`p`/`a` refuse — silently and permanently for that loop, since
+re-registration only happens at session start. The refusal is fail-closed and
+correct; the *diagnosability* is the defect. The tty, notably, DOES survive the
+restart. Tracked separately.
 
 
 ## 5. Alternatives considered and rejected
