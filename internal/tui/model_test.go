@@ -8565,8 +8565,8 @@ func TestUpdate_EnterKey_ObservedLoop_StillDispatchesAttach(t *testing.T) {
 func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	loops, detailCache, oracleCounts := demoFleet()
 
-	if len(loops) != 6 {
-		t.Fatalf("got %d loops, want 6", len(loops))
+	if len(loops) != 7 {
+		t.Fatalf("got %d loops, want 7", len(loops))
 	}
 	byProject := make(map[string]domain.Loop, len(loops))
 	for _, l := range loops {
@@ -8577,14 +8577,38 @@ func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	if !ok {
 		t.Fatal("expected an auth-harden loop")
 	}
-	if authHarden.State != domain.StateGate || authHarden.GatePrompt != "Allow Bash(git push origin main)?" {
-		t.Errorf("auth-harden = %+v, want StateGate with the git-push permission prompt", authHarden)
+	// Pinned to the exact shape gate.Info.Detail() renders for a permission
+	// gate. If the demo drifts from what the product actually produces, the
+	// demo becomes a claim nothing verifies — and the demo is what a new
+	// reader believes fleetops looks like.
+	if authHarden.State != domain.StateGate || authHarden.GatePrompt != "Bash: git push origin main" {
+		t.Errorf("auth-harden = %+v, want StateGate with the tool-named permission prompt", authHarden)
+	}
+	if len(authHarden.GateOptions) != 0 {
+		t.Errorf("auth-harden.GateOptions = %q, want none — a permission prompt has no structured choices", authHarden.GateOptions)
 	}
 	if authHarden.Goal.MaxCycles != 12 || authHarden.Cycle != 6 || authHarden.TokensSpent != 640000 || authHarden.Goal.BudgetTokens != 2_000_000 {
 		t.Errorf("auth-harden contract/usage fields = %+v, want the spec'd values", authHarden)
 	}
 	if authHarden.Cwd != "/home/user/api" {
 		t.Errorf("auth-harden.Cwd = %q, want /home/user/api", authHarden.Cwd)
+	}
+
+	// The second gate exists to show the OTHER gate kind. A demo with only a
+	// permission gate would never render a choices line, so the feature would
+	// be invisible in the one place people look before installing.
+	migrateDB, ok := byProject["migrate-db"]
+	if !ok {
+		t.Fatal("expected a migrate-db loop — the AskUserQuestion gate")
+	}
+	if migrateDB.State != domain.StateGate {
+		t.Errorf("migrate-db.State = %v, want %v", migrateDB.State, domain.StateGate)
+	}
+	if migrateDB.GatePrompt == "" {
+		t.Error("migrate-db.GatePrompt is empty — a question gate must carry its question")
+	}
+	if len(migrateDB.GateOptions) != 3 {
+		t.Errorf("migrate-db.GateOptions = %q, want three choices", migrateDB.GateOptions)
 	}
 
 	flakyTests, ok := byProject["flaky-tests"]
@@ -8640,8 +8664,8 @@ func TestNewDemo_SeedsFleetCursorOnGateAndSetsDemoFlag(t *testing.T) {
 	if !m.demo {
 		t.Error("expected m.demo = true")
 	}
-	if len(m.loops) != 6 {
-		t.Fatalf("got %d loops, want 6", len(m.loops))
+	if len(m.loops) != 7 {
+		t.Fatalf("got %d loops, want 7", len(m.loops))
 	}
 	if m.cursor != 0 || m.loops[0].Project != "auth-harden" || m.loops[0].State != domain.StateGate {
 		t.Errorf("cursor = %d on %+v, want cursor 0 on the auth-harden GATE (the hero frame)", m.cursor, m.loops[m.cursor])

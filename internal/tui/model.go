@@ -596,13 +596,17 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 	now := time.Now()
 
 	authHarden := domain.Loop{
-		Project:      "auth-harden",
-		SessionID:    "demo-auth-harden",
-		ProjectDir:   "-home-user-api",
-		Cwd:          "/home/user/api",
-		Path:         "/home/user/.claude/projects/-home-user-api/demo-auth-harden.jsonl",
-		State:        domain.StateGate,
-		GatePrompt:   "Allow Bash(git push origin main)?",
+		Project:    "auth-harden",
+		SessionID:  "demo-auth-harden",
+		ProjectDir: "-home-user-api",
+		Cwd:        "/home/user/api",
+		Path:       "/home/user/.claude/projects/-home-user-api/demo-auth-harden.jsonl",
+		State:      domain.StateGate,
+		// Exactly the shape gate.Info.Detail() produces for a permission gate
+		// ("<tool>: <detail>"), not a prettier paraphrase — the demo is what
+		// a new reader believes the product looks like, so a divergence here
+		// is a false claim that no test would catch.
+		GatePrompt:   "Bash: git push origin main",
 		Cycle:        6,
 		Goal:         domain.Goal{Text: "Harden the auth middleware and open a PR", MaxCycles: 12, BudgetTokens: 2_000_000},
 		TokensSpent:  640000,
@@ -654,6 +658,25 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		Cycle:        3,
 		LastActivity: now.Add(-12 * time.Minute),
 	}
+	// The SECOND gate, and deliberately a different KIND. A permission gate
+	// names a tool; an AskUserQuestion gate carries a real question plus the
+	// choices on offer. Two gates at once is also the situation the callout
+	// exists for: with only one, "attach and look" costs about the same, and
+	// the demo would not show why any of this was built.
+	migrateDB := domain.Loop{
+		Project:      "migrate-db",
+		SessionID:    "demo-migrate-db",
+		ProjectDir:   "-home-user-billing",
+		Cwd:          "/home/user/billing",
+		Path:         "/home/user/.claude/projects/-home-user-billing/demo-migrate-db.jsonl",
+		State:        domain.StateGate,
+		GatePrompt:   "The migration will drop the legacy invoices table. How should I proceed?",
+		GateOptions:  []string{"Drop it", "Keep and rename", "Stop and let me look"},
+		Cycle:        2,
+		Goal:         domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
+		TokensSpent:  180000,
+		LastActivity: now.Add(-2 * time.Minute),
+	}
 	refactorCoreReason := "payment handlers moved into internal/payment, existing tests still pass — ledger reconciliation not yet covered"
 	refactorCore := domain.Loop{
 		Project:    "refactor-core",
@@ -676,7 +699,7 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		LastActivity: now.Add(-90 * time.Second),
 	}
 
-	loops = []domain.Loop{authHarden, flakyTests, depUpgrade, docsGen, coverage, refactorCore}
+	loops = []domain.Loop{authHarden, migrateDB, flakyTests, depUpgrade, docsGen, coverage, refactorCore}
 
 	detailCache = map[string]detailCacheEntry{
 		authHarden.SessionID: {events: []events.Event{
