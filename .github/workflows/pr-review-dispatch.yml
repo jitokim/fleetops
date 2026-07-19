@@ -1,0 +1,211 @@
+# Maintainer-triggered PR review dispatch.
+#
+# WHAT THIS IS: the trigger + authorization + dispatch plumbing for a
+# `/review` slash command on pull requests. A maintainer comments `/review`
+# on a PR; this workflow verifies they are actually allowed to, acknowledges
+# the command, and hands off to a review engine.
+#
+# WHAT THIS IS NOT: a review engine. The engine is a deliberately empty
+# extension point (`.github/scripts/review-engine.sh`) that a future PR
+# fills in. If you run this today it will tell you, plainly, that no review
+# engine is configured. It does not and must not emit anything that could be
+# mistaken for review findings.
+#
+# SECURITY MODEL (read before editing):
+#   - `issue_comment` runs in a *privileged* context: the workflow file and
+#     GITHUB_TOKEN come from the default branch, not from the PR. That is
+#     what makes the authorization check meaningful, and it is also why this
+#     workflow never checks out PR head code. Untrusted contributor code must
+#     not execute here. If the future review engine needs the PR diff, it
+#     should fetch it as *data* via the API — never `git checkout` it and
+#     never run anything from it.
+#   - Permissions are denied by default at the top level and granted
+#     per-job, as narrowly as each job can work with.
+#   - Unauthorized invocations fail closed: no dispatch, a 👎 reaction, and a
+#     failed job. See `.github/scripts/authorize.sh` for why the event
+#     payload's `author_association` is not an acceptable substitute.
+#
+# Usage notes for maintainers: docs/maintainer-review-command.md
+
+name: PR review dispatch
+
+on:
+  issue_comment:
+    types: [created]
+  # Manual escape hatch: lets a maintainer dispatch without a comment, and
+  # makes the workflow testable without spraying comments on a real PR.
+  # Actor authorization is re-checked identically for this path.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to dispatch a review for"
+        required: true
+        type: string
+
+# Deny by default; each job opts into exactly what it needs.
+permissions: {}
+
+# One dispatch at a time per PR. Not a queue — a second `/review` while one
+# is in flight simply waits its turn.
+concurrency:
+  group: review-dispatch-${{ github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize dispatch
+    runs-on: ubuntu-latest
+    # Cheap pre-filter, evaluated before a runner is allocated: ignore
+    # comments on plain issues (issue_comment fires for both) and anything
+    # that is not the command. The exact-match check happens in the shell
+    # step below; this expression only has to be conservative, not precise.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/review'))
+    permissions:
+      # Reacting to a PR comment is the issues API — PR comments are issue
+      # comments. Nothing here needs `contents` or `pull-requests: write`.
+      issues: write
+    outputs:
+      authorized: ${{ steps.auth.outputs.authorized }}
+      pr_number: ${{ steps.context.outputs.pr_number }}
+    steps:
+      - name: Check out workflow scripts
+        # Checks out the default branch (the privileged ref this workflow
+        # already runs as), NOT the PR head. Only `.github/scripts` is used.
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve dispatch context
+        id: context
+        env:
+          # Quoting into env, not into the script body: comment bodies are
+          # attacker-controlled text and must never be interpolated into a
+          # shell command line.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_FROM_COMMENT: ${{ github.event.issue.number }}
+          PR_FROM_INPUT: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            pr="$PR_FROM_INPUT"
+          else
+            # Exact match on the first line, whitespace-trimmed: `/review`
+            # and nothing else. A comment that merely mentions the command
+            # in prose must not trigger a dispatch.
+            first_line=$(printf '%s' "$COMMENT_BODY" | head -n 1 | tr -d '\r')
+            trimmed=$(printf '%s' "$first_line" | awk '{$1=$1};1')
+            if [ "$trimmed" != "/review" ]; then
+              echo "Comment is not the /review command; nothing to do." >&2
+              exit 1
+            fi
+            pr="$PR_FROM_COMMENT"
+          fi
+          case "$pr" in
+            ''|*[!0-9]*)
+              echo "Refusing to dispatch: PR number '$pr' is not numeric." >&2
+              exit 1
+              ;;
+          esac
+          echo "pr_number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Acknowledge command
+        # Ack before the permission check so the maintainer sees the command
+        # was received even if authorization then takes a moment. This is a
+        # reaction, not a comment: it is free of notification spam and it
+        # cannot be used by a drive-by commenter to make the bot post text.
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api --silent -X POST \
+            "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content=eyes
+
+      - name: Verify actor permission
+        id: auth
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: .github/scripts/authorize.sh
+
+      - name: Mark unauthorized invocation
+        if: steps.auth.outputs.authorized != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ACTOR: ${{ github.actor }}
+          RESOLVED: ${{ steps.auth.outputs.permission }}
+        run: |
+          set -euo pipefail
+          if [ "${COMMENT_ID:-}" != "" ]; then
+            # A reaction, deliberately not a comment. Replying in the thread
+            # would let anyone with a GitHub account make this repo's bot
+            # post text on demand — cheap for them, noisy for maintainers.
+            gh api --silent -X POST \
+              "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+              -f content=-1
+          fi
+          echo "::error::Unauthorized: @${ACTOR} resolved to '${RESOLVED}';" \
+               "/review requires write, maintain, or admin permission."
+          exit 1
+
+  dispatch:
+    name: Dispatch review
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # Write access is confined to this job, which runs only after the
+      # authorization gate passed.
+      pull-requests: write
+    steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # ---------------------------------------------------------------
+      # THE EXTENSION POINT. Everything above is plumbing; the actual
+      # review lives behind this one script. See its header for the
+      # contract a future implementation must satisfy.
+      # ---------------------------------------------------------------
+      - name: Run review engine
+        id: engine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+        run: .github/scripts/review-engine.sh
+
+      - name: Post terminal status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          ENGINE_OUTCOME: ${{ steps.engine.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ENGINE_CONFIGURED: ${{ steps.engine.outputs.engine_configured }}
+        run: |
+          set -euo pipefail
+          if [ "$ENGINE_OUTCOME" = "success" ] && [ "$ENGINE_CONFIGURED" = "true" ]; then
+            # Reached only once a future PR implements the engine; the engine
+            # is responsible for its own findings output, so this is just a
+            # completion marker.
+            body="Review dispatch completed. [Run log](${RUN_URL})"
+          elif [ "$ENGINE_OUTCOME" = "success" ]; then
+            body="**No review engine is configured.** The \`/review\` command was authorized and dispatched, but this repository has no review engine wired up yet, so **no review was performed and no findings were produced**. See \`.github/scripts/review-engine.sh\`. [Run log](${RUN_URL})"
+          else
+            body="Review dispatch **failed** before producing any result. No findings were produced. [Run log](${RUN_URL})"
+          fi
+          gh api --silent -X POST \
+            "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -f body="$body"
