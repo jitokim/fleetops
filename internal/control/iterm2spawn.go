@@ -130,7 +130,8 @@ type iterm2Session struct {
 //
 // # How this avoids reporting a false success
 //
-// Four checks, none of which trusts an exit status:
+// The checks below, none of which trusts an exit status (numbered for
+// reference from the code, not as a count to keep in sync):
 //
 //  1. The script must RETURN a GUID and a tty, both of which must pass their
 //     whitelists (parseITerm2SpawnResult). osascript exits 0 even when it
@@ -192,7 +193,7 @@ var iterm2ForegroundIsClaudeFn = iterm2ForegroundIsClaude
 // iterm2ForegroundIsClaude closes the last false-success hole in the spawn
 // path, and it is not theoretical.
 //
-// The other three checks all pass for a window that is merely ALIVE: the GUID
+// The checks above it all pass for a window that is merely ALIVE: the GUID
 // and tty are real because iTerm2 minted them, and the Tier 1h send re-finds
 // the session by GUID and matches its tty — a bare login shell satisfies every
 // one of those. The `|| exit 1` guard in the launch line only fires if the
