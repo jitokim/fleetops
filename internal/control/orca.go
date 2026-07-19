@@ -194,7 +194,8 @@ const (
 // the exact `terminal create --worktree path:<cwd> --command <...>
 // --title <...> --json` call
 // Spawn already verified live (see Spawn's own doc), just generalized from
-// the hardcoded "claude" command to an arbitrary one — command is already
+// Spawn's CONFIGURED spawn command (spawnCommandFn — internal/settings,
+// default ["claude"]) to an arbitrary one — command is already
 // the complete shell invocation, so unlike Spawn there is no follow-up
 // wait/re-locate/send step; the envelope-error check is the whole
 // verification this needs (same "not a worktree Orca knows about" failure

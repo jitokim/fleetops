@@ -66,8 +66,8 @@ func LiveClaudeCwds() (map[string]int, bool) {
 // "claude" comparison made that process invisible to this scan — wrong
 // live counts, risking a false gone/drop demotion for its sibling loops.
 // Deliberately NOT loosened to a
-// prefix match: "claude-helper" and similar must stay excluded (see
-// TestParsePsClaudePids_ExcludesClaudeHelper).
+// prefix match: "claude-helper" and similar must stay excluded (pinned by
+// TestMatchesClaudeComm's {"claude-helper", false} case).
 func parsePsClaudePids(out string) []int {
 	var pids []int
 	for _, raw := range strings.Split(out, "\n") {

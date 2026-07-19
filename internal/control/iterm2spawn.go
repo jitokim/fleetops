@@ -325,7 +325,7 @@ func iterm2SpawnArgv(launchLine string) []string {
 // re-parsed. AppleScript reaches `do shell script`, so a value able to close a
 // string literal and append statements would be arbitrary local code
 // execution; a prior review found exactly that Critical defect on this
-// surface. TestITerm2SpawnScript_IsAConstantWithNoInterpolation and the
+// surface. TestITerm2SpawnScript_ContainsNoInterpolationPoints and the
 // byte-identity test enforce that it stays this way.
 //
 // It also never TRAVERSES the windows→tabs→sessions collection that

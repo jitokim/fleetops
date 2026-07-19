@@ -280,8 +280,9 @@ func containsArg(argv []string, arg string) bool {
 }
 
 // feat/engine-provenance: OpenTerminal's argv — generalized from
-// tmuxNewWindowCmd's hardcoded "claude" to an arbitrary command (take-over's
-// "claude --resume <id>"), and unlike tmuxNewWindowCmd, no -P -F pane-id
+// tmuxNewWindowCmd's configured spawn command (spawnCommandFn, default
+// ["claude"]) to an arbitrary command (take-over's "claude --resume <id>"),
+// and unlike tmuxNewWindowCmd, no -P -F pane-id
 // capture (see OpenTerminal's doc — no follow-up send needed).
 func TestTmuxOpenTerminalCmd(t *testing.T) {
 	got := tmuxOpenTerminalCmd("/home/user/myproject", "claude --resume sess-1")

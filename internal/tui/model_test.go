@@ -1332,8 +1332,17 @@ func TestUpdate_Esc_CancelsPromptingMode(t *testing.T) {
 }
 
 func TestUpdate_EscAtEachWizardStep_Cancels(t *testing.T) {
-	// esc must cancel the wizard regardless of which of the 6 steps is
-	// currently active.
+	// esc must cancel the wizard from any of the SIX free-text steps below.
+	// wizardStep has nine values; this table deliberately covers only the
+	// free-text ones, because the other three are driven by single keys and
+	// need their own setup:
+	//   - wizardWhere       → TestUpdate_WizardWhere_Esc_Cancels
+	//   - wizardEngineDrive → TestUpdate_WizardEngineDrive_Esc_Cancels
+	//   - wizardDir         → NOT COVERED by any test today.
+	// So "esc cancels from every wizard step" is not yet fully pinned. If
+	// you add a step, add it here or to a sibling test — and check this
+	// list still matches wizardStep's constants (model.go) rather than
+	// trusting the count in this sentence.
 	steps := []struct {
 		name    string
 		answers []string // typed+entered before esc
@@ -1341,7 +1350,7 @@ func TestUpdate_EscAtEachWizardStep_Cancels(t *testing.T) {
 		{"step1_goal", nil},
 		{"step2_name", []string{"goal"}},
 		{"step3_doneWhen", []string{"goal", ""}},
-		{"step4_oracle", []string{"goal", "", ""}},
+		{"step4_rubric", []string{"goal", "", ""}},
 		{"step5_challenger", []string{"goal", "", "", ""}},
 		{"step6_maxCycles", []string{"goal", "", "", "", ""}},
 	}

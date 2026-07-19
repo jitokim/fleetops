@@ -272,8 +272,10 @@ func tmuxNewWindowCmd(cwd string, spawnArgv []string) []string {
 
 // OpenTerminal implements control.TerminalOpener: opens a new tmux window in
 // cwd running command — LoopEngine's take-over attach. Reuses
-// tmuxNewWindowCmd's exact "-c cwd" shape, generalized from the hardcoded "claude" Spawn always runs
-// to an arbitrary command (take-over's "claude --resume <id>"); command is
+// tmuxNewWindowCmd's exact "-c cwd" shape, generalized from the configured
+// spawn command Spawn runs (spawnCommandFn — internal/settings, default
+// ["claude"]) to an arbitrary command (take-over's "claude --resume <id>");
+// command is
 // already the complete shell invocation, and tmux interprets a single
 // trailing argv element as the shell-command to run in the new window's
 // pane (same convention `tmux new-window "claude --resume <id>"` documents)
