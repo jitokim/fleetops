@@ -50,10 +50,10 @@ jobs:
       # pull_request_target compromise.
       #
       # Actions are pinned by commit SHA, not tag. A tag is mutable: whoever
-      # can move `v4` can run their code here, and this job holds issues:write
+      # can move `v7` can run their code here, and this job holds issues:write
       # and pull-requests:write on the base repo. The version comment records
       # what the SHA was at pin time; update both together.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
