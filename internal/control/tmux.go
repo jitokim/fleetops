@@ -248,8 +248,15 @@ func (tmuxController) Spawn(cwd, goal string) error {
 // ["claude"]) and is appended as SEPARATE argv elements, never joined into a
 // string. tmux runs a multi-argument command directly with execvp instead of
 // handing it to a shell, so there is no word splitting or quoting layer — and
-// the pane's foreground process stays literally "claude", which is what
-// LocateClaude matches `#{pane_current_command}` against (see isClaudeComm).
+// the pane's foreground process stays a claude binary, which is what
+// LocateClaude matches `#{pane_current_command}` against (see isClaudeComm
+// for the actual rule: base name, ".exe" stripped, so an absolute path works).
+//
+// That holds because internal/settings REFUSES a configured argv whose
+// argv[0] is not claude, not because of anything tmux does here — a launcher
+// form like ["mise","exec","--","claude"] would leave the pane reporting
+// "mise" and make every configured loop invisible to Tier 1a/1b. If that
+// enforcement is ever relaxed, this sentence goes with it.
 // Joining the argv into one string would have made every configured loop
 // invisible to actuation, since the pane would report a shell instead.
 //
