@@ -3445,13 +3445,22 @@ func (m Model) refuseIfAmbiguous(l domain.Loop) (msg string, ambiguous bool) {
 // Nothing in the TUI knows that today, and guessing would just move the
 // dishonesty. The owned branch sidesteps it by not advising hooks at all.
 //
-// Note on the first branch: every current caller pre-filters StallGone
-// before reaching refuseIfAmbiguous (and the one that did not — "r" on a
-// StateDrift loop — stops producing dead loops now that drift no longer
-// survives the liveness pass). It is kept because this is a helper shared
-// by seven call sites each carrying its own hand-written pre-filter, and
-// the invariant belongs in the one place that authors the sentence rather
-// than in seven places that must remember to.
+// Note on the first branch (StallGone): it is REACHABLE — do not delete it
+// as defensive-only. "r" reaches refuseIfAmbiguous through the
+// driftRedriveEligible branch BEFORE the StallGone early-return further
+// down, and driftRedriveEligible deliberately admits StallGone loops (a
+// gone loop whose CURRENT cycle was just rejected is drift-redrive
+// eligible; see its doc). So an ambiguous, gone, freshly-rejected loop
+// lands here and gets the "this one's process is already gone" remedy —
+// which is the honest sentence for it, since neither attach nor `hooks
+// install` can reach a dead process.
+//
+// Most other call sites do pre-filter StallGone, but that is a property of
+// each caller, not an invariant this helper may assume: the branch exists
+// precisely so a caller that does not pre-filter still gets a true remedy.
+// If you believe it is dead, prove it from driftRedriveEligible and from
+// every caller's ordering — not from this comment, whose previous version
+// asserted exactly that and was wrong.
 func ambiguityRemedy(l domain.Loop) string {
 	if l.Stall == domain.StallGone {
 		return "and this one's process is already gone, so neither reaches it — r/i re-drive it headlessly, or x to forget it permanently"

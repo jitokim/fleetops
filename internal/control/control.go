@@ -16,9 +16,22 @@ import (
 )
 
 // actuationTimeout bounds a single typed-action exec call (Resume/Approve/
-// Focus/Interrupt) so a wedged multiplexer CLI never hangs the TUI — Spawn
-// already has its own, longer per-step timeouts (see orca.go/tmux.go), so it
-// doesn't use this.
+// Focus/Interrupt) so a wedged multiplexer CLI never hangs the TUI. No
+// backend's Spawn uses it, and Spawn is NOT uniformly bounded by something
+// longer instead — do not read this constant as evidence that spawning is
+// covered elsewhere:
+//
+//   - orca.go's Spawn IS bounded, per step, via exec.CommandContext
+//     (spawnCreateTimeout / spawnWaitTimeout / spawnLocateTimeout /
+//     spawnSendTextTimeout).
+//   - tmux.go's Spawn is UNBOUNDED. It shells out with bare exec.Command and
+//     no context at all, and spawnBootWait is a flat time.Sleep, not a
+//     deadline — so a wedged `tmux new-window` or `send-keys` hangs that
+//     goroutine indefinitely. Adding a timeout there is a behaviour change,
+//     tracked separately; this comment only stops claiming otherwise.
+//
+// Treat a Spawn as unbounded until its own implementation shows a context,
+// rather than assuming the list above stays exhaustive as backends are added.
 const actuationTimeout = 5 * time.Second
 
 // runWithTimeout runs argv[0] with argv[1:] bounded by actuationTimeout —
