@@ -386,8 +386,20 @@ type Model struct {
 	//     CURRENT spawnCwd (independent evidence claude has actually run
 	//     there) — recomputed whenever spawnCwd changes (see
 	//     dirHostsClaudeRepo).
+	//   - spawnCwdIsRepo: is the CURRENT spawnCwd inside a git repository?
+	//     Separate from spawnWorktreeEligible because that one answers "can any
+	//     spawner run at all", which is a property of the machine, while this
+	//     answers "is there a repo here to branch from", which is a property of
+	//     the target directory and therefore changes as the wizard moves it
+	//     ([c] type a path, [s] the selected loop's dir). Recomputed at every
+	//     spawnCwd assignment for that reason. Gating [w] on it is what stops
+	//     the wizard offering an option that can only fail — worktree.Create
+	//     already refuses a non-repo, but by then the human has typed a goal,
+	//     a contract and a rubric, and submitSpawnWizard has closed the wizard,
+	//     so the refusal costs them all of it.
 	spawnWorktreeEligible bool
 	spawnHostsClaudeRepo  bool
+	spawnCwdIsRepo        bool
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
@@ -862,8 +874,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status, m.statusKind = "cancelled", statusNeutral
 					return m, nil
 				case "w":
-					if !m.spawnWorktreeEligible {
-						return m, nil // [w] isn't offered — don't promise an isolation the backend can't deliver
+					if !m.worktreeOffered() {
+						// [w] isn't offered — either no spawner resolved, or
+						// spawnCwd is not a git repo. Refusing the KEY as well
+						// as hiding the label matters: hiding it only stops a
+						// reader, and the person who already knows the
+						// keybinding is exactly the one who would type it
+						// blind and pay for the failure with a whole wizard's
+						// worth of input.
+						return m, nil
 					}
 					return m.submitSpawnWizard(true)
 				case "c":
@@ -875,11 +894,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// ProjectDir and could point anywhere).
 					if sel, ok := m.selected(); ok && sel.CwdVerified && sel.Cwd != "" {
 						m.spawnCwd = sel.Cwd
+						m.spawnCwdIsRepo = worktree.IsRepo(m.spawnCwd)
 						m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(sel.Cwd)
 					}
 					return m, nil // stay on wizardWhere — the label re-renders with the new target
 				case "enter":
-					return m.submitSpawnWizard(m.spawnWorktreeEligible && m.spawnHostsClaudeRepo) // default
+					return m.submitSpawnWizard(m.worktreeOffered() && m.spawnHostsClaudeRepo) // default
 				case "d":
 					return m.submitSpawnWizard(false)
 				}
@@ -1267,6 +1287,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spawnMaxCycles = 0
 			m.spawnWorktreeEligible = false // set once checkWorktreeEligibilityCmd's result arrives
 			m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(cwd)
+			m.spawnCwdIsRepo = worktree.IsRepo(cwd)
 			m.mode = modePrompting
 			m.input = newWizardInput()
 			return m, tea.Batch(textinput.Blink, checkWorktreeEligibilityCmd())
@@ -2017,6 +2038,7 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 				return m, nil // re-prompt: stay on wizardDir
 			}
 			m.spawnCwd = dir
+			m.spawnCwdIsRepo = worktree.IsRepo(dir)
 			m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(dir)
 		}
 		m.spawnStep = m.spawnDirReturn
@@ -5577,6 +5599,23 @@ func wizardStepLabel(step wizardStep) string {
 // always names the target directory — the spawn base must be visible BEFORE
 // the human commits, never discovered from the status line after. [w] is
 // offered only when the backend can actually isolate; [s] only when the
+
+// worktreeOffered reports whether the wizard should show [w] at all.
+//
+// BOTH conditions, and they are different kinds of fact: a spawner must exist
+// (a property of the machine, probed once at "n") AND the target directory
+// must be inside a git repository (a property of spawnCwd, which the wizard
+// can move). Offering [w] without the second is what let a spawn in a non-repo
+// directory get all the way to "worktree: not inside a git repository" — after
+// the human had typed the goal, the contract and the rubric, and after
+// submitSpawnWizard had already closed the wizard and discarded them.
+//
+// An option that can only fail is worse than a missing option: the missing one
+// costs a glance, the failing one costs everything typed before it.
+func (m Model) worktreeOffered() bool {
+	return m.spawnWorktreeEligible && m.spawnCwdIsRepo
+}
+
 // selected loop has a verified-real cwd that differs from the current
 // target (the explicit replacement for the old silent inheritance). The
 // busy-directory nudge appends when the target already hosts >=1 fleet loop
@@ -5584,7 +5623,7 @@ func wizardStepLabel(step wizardStep) string {
 // which only gates the w/enter default).
 func (m Model) whereStepLabel() string {
 	label := "where?"
-	if m.spawnWorktreeEligible {
+	if m.worktreeOffered() {
 		label += " [w] new worktree ·"
 	}
 	label += " [d] this dir · [c] change dir"

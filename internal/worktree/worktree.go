@@ -272,6 +272,23 @@ func repoRoot(dir string) (string, error) {
 	return root, nil
 }
 
+// IsRepo reports whether dir is inside a git repository.
+//
+// Exported so the TUI can decide whether to OFFER a worktree spawn at all,
+// rather than accepting the choice and failing after the fact. Create already
+// refuses a non-repo with ErrNotARepo, but a wizard that lists [w] and then
+// answers "not inside a git repository" has already wasted the human's
+// decision — the option should not have been there.
+//
+// Same probe Create uses, so the two cannot disagree about what counts as a
+// repo. Best-effort by design: any failure (no git binary, missing directory,
+// permissions) reports false, which closes the option rather than offering
+// something that would fail.
+func IsRepo(dir string) bool {
+	_, err := repoRoot(dir)
+	return err == nil
+}
+
 // defaultBase resolves the explicit base ref: "origin/<default-branch>".
 //
 // The default branch is RESOLVED, never hardcoded to "main" — "master" repos
