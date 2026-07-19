@@ -408,6 +408,65 @@ written**):
   honest shape of this dependency and is exactly why the tier is scoped to one
   adapter.
 
+### iTerm2 SPAWN (amendment, 2026-07-19)
+
+The iTerm2 tier grew a **creation** half: pressing `n` on a machine with only
+iTerm2 now opens a fresh window and starts a loop in it, with no multiplexer
+involved. Previously every spawn path went through a `Controller`, and
+`Resolve()` only knows orca/cmux/tmux, so an iTerm2-only user had a cockpit
+that could observe and actuate loops but could not create one.
+
+This uses the **same vendor-deprecated AppleScript surface** §5 already
+accepts for `write`, so it inherits that bet unchanged — no new dependency, no
+new permission, one more command (`create window with default profile`) on a
+grant that attach already established. It is exposed through a narrow
+`Spawner` seam rather than by adding iTerm2 to `backends`: that slice feeds
+`ResolveForLocate` and Tier 1b's cross-backend ambiguity **count**, so an entry
+there would silently change actuation dispatch for existing orca/cmux/tmux
+users. Spawning is the only capability added.
+
+**Confirmed live 2026-07-19:**
+
+- `create window with default profile` returns a session whose `id` and `tty`
+  are immediately readable, which is what makes the new window addressable at
+  all.
+- A window created this way inherits `$TERM_PROGRAM` and `$ITERM_SESSION_ID`
+  from iTerm2, so the ordinary `SessionStart` hook registers the loop with
+  `host_app`, `window_id` and `tty` — the same completeness a hand-started
+  loop gets. Measured directly: a session created by exactly this route was
+  registered with all three, keyed by the real `session_id`, and its entry was
+  removed again on exit.
+- **`create window ... command "<cmd>"` WEDGES iTerm2's AppleScript
+  dispatch.** Using the `command` parameter form left `osascript` unresponsive
+  to *any* subsequent script, including a read-only window count, until the
+  created window was closed. The implementation does not use that form — it
+  creates the window and then `write`s the launch line — and it must not start
+  using it. Recorded because the parameter is documented, looks convenient, and
+  is a trap.
+
+**Inferred, NOT measured — treat as the weak point:**
+
+- **Shell readiness.** The launch line is `write`-ten into a login shell that
+  started microseconds earlier. It works in practice because tty line
+  discipline queues input until the shell reads it, but that mechanism has not
+  been instrumented. It is the one place tmux's approach is structurally safer:
+  `tmux new-window … argv` never types anything.
+- Because a bare shell would satisfy every other check (real GUID, real tty,
+  a Tier 1h send that matches both), spawn additionally asks the OS whether
+  **claude is actually on that tty** (`ps -t <tty> -o comm=`, matched through
+  the same `isClaudeComm` Tier 1a/1b use) before reporting success, and fails
+  closed if the probe cannot answer. That guard exists precisely because the
+  readiness assumption above is inferred.
+
+**Known and accepted:** `create window` **takes focus** — spawning from an
+iTerm2 cockpit moves you to the new window, unlike `tmux new-window -d`.
+iTerm2's dictionary exposes no non-activating creation. A re-`select` of the
+cockpit window afterwards is plausible (the disruption is intra-application,
+and `select` needs no new permission), but attempting to measure it is what
+wedged AppleScript above, so it is **untested and unimplemented** rather than
+assumed either way.
+
+
 ## 5. Alternatives considered and rejected
 
 - **Add a 4th (IntelliJ) vendor integration.** Rejected: IntelliJ's terminal
@@ -429,6 +488,13 @@ written**):
   started in IntelliJ. Correct as the engine's long-term model for
   loops fleetops itself spawns (VISION.md), not a substitute for
   discovery+Tier 0/2 on human-started sessions.
+> **Amended 2026-07-19:** the iTerm2 entry below is no longer merely deferred —
+> it shipped as Tier 1h (in-place actuation) and then grew a spawn half. See
+> §2.2's 2026-07-18 amendment and §4's iTerm2 SPAWN entry. kitty and WezTerm
+> remain deferred on the same terms: added when a real user asks, never on
+> spec. The curated-list discipline is what keeps this from becoming a
+> terminal-emulator plugin framework.
+
 - **A 4th actuation tier via terminal-emulator-native remote-control APIs**
   (kitty's documented RPC protocol, WezTerm's `cli send-text`, iTerm2's
   Python API — all real, externally-callable, no TIOCSTI-style hackery
