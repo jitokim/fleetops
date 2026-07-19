@@ -69,9 +69,18 @@ fleetops                 # launch the fleet cockpit
 fleetops hooks install   # wire up gate detection (see below)
 ```
 
-`hooks install` registers a Claude Code `Notification` hook
-(`fleetops hook notify`) in `~/.claude/settings.json`, backing up the existing
-file first. `hooks uninstall` removes only the entry fleetops added.
+`hooks install` registers four Claude Code hooks in `~/.claude/settings.json`,
+backing up the existing file first: `Notification` and `PermissionRequest`
+(gate detection), plus `SessionStart`/`SessionEnd` (the session-identity
+registry that actuation depends on). `hooks uninstall` removes only the
+entries fleetops added.
+
+All four are **sensors**. `PermissionRequest` is the one that could be more
+than that — Claude Code lets such a hook return a `permissionDecision` and
+grant or deny the permission itself. fleetops writes nothing to stdout and
+always exits 0. A decision made inside a hook leaves no event, no actor and
+nothing to attribute or brake; decisions belong on the actuation path, which
+records them.
 
 **Try it without any real loops:** `fleetops --demo` launches the cockpit
 seeded with a small synthetic fleet instead of scanning `~/.claude/projects` —
@@ -157,6 +166,22 @@ Only markers whose `notification_type` means "blocked on a human"
 `◆ GATE` — the same hook also fires for the 60s "waiting for your input" idle
 nudge, which is not a gate. A marker goes stale (and is deleted) once the
 transcript shows new activity after it fired — the human already answered.
+
+The gate callout says **what is being asked**, so you can judge whether a gate
+deserves the interrupt without attaching to it:
+
+- **Permission prompts** name the tool and its argument — `Bash: git push
+  origin main` rather than "Claude needs your permission". That detail comes
+  from the `PermissionRequest` hook, the only source that has it.
+- **Questions** (`AskUserQuestion`) list the answer choices under the
+  question. The choices are deliberately **not numbered**: fleetops does not
+  inject answers into a gate, so a number would advertise a keystroke that
+  does not exist. You still answer with `a` or by attaching.
+
+Both hooks fire for a single permission gate, and the generic one arrives
+about six seconds after the detailed one (measured). Markers are keyed by
+session, so they are merged on `prompt_id` rather than overwritten — otherwise
+the late generic payload would erase the tool name.
 
 **Oracle.** Loops spawned via `n` are goal-bound: fleetops knows what they're
 trying to achieve, so it can judge them. Once idle, `internal/oracle` asks a
