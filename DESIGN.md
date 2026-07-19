@@ -97,9 +97,20 @@ domain            — the seam: Loop/Goal/Verdict/LoopState/StallKind value
                      objects that cross every other boundary, and the
                      ports the sections below describe. Zero internal deps.
 events, gate,      — low-level, dependency-free infrastructure primitives:
-sessions, notify     the append-only event log, gate marker files, the
-                     session-identity registry, desktop notifications.
-                     Zero internal deps each.
+notify, settings,    the append-only event log, gate marker files, desktop
+fsatomic, worktree   notifications, ~/.fleetops/settings.json (spawn.command
+                     — what `n` actually runs), the temp-file+rename atomic
+                     write the on-disk registries share, and git-worktree
+                     creation with plain `git` (deliberately NOT in control:
+                     making a checkout drives no terminal). Zero internal
+                     deps each.
+sessions           — the session-identity registry: the hook-recorded
+                     session→tty map that lets actuation target one exact
+                     session rather than guessing by cwd. → fsatomic.
+hidden             — the persisted hide-set: `d`/`x` tombstones the TUI
+                     filters every scan through, so a hidden loop stays
+                     hidden across restarts. Never touches ~/.claude and
+                     never removes a registry record. → fsatomic.
 engine             — governor.Check (a pure function, domain.Loop in,
                      Decision out) plus the LoopEngine drive predicate
                      (ShouldDrive/NextWorkPrompt, §0.1) — also pure.
@@ -115,12 +126,14 @@ claude             — OBSERVATION: globs ~/.claude/projects, classifies
 control            — ACTUATION: locate/resume/approve/interrupt/spawn across
                      pluggable terminal backends (orca/cmux/tmux), plus a
                      host-send adapter for terminal emulators that are not
-                     multiplexers (iTerm2, Tier 1h). → domain, sessions.
+                     multiplexers (iTerm2, Tier 1h). → domain, sessions,
+                     settings.
 tui                — composition root: the Bubble Tea Model. Polls claude's
                      DiscoverLoops, renders the fleet, dispatches control's
                      actuations on a keypress, judges via oracle, persists
-                     via registry. → claude, control, domain, events, gate,
-                     notify, oracle, registry, sessions.
+                     via registry. → claude, control, domain, engine, events,
+                     gate, hidden, notify, oracle, registry, sessions,
+                     worktree.
 ```
 
 Two deliberate exceptions to "no duplication across packages," both
