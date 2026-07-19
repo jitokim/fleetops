@@ -36,9 +36,11 @@ func (tmuxController) Locate(projectDir string) (Target, bool) {
 }
 
 // LocateClaude is like Locate, but returns only a pane whose foreground
-// command is literally "claude" — typed/destructive actions must never land
-// on a bare shell pane that merely happens to share the directory (see
-// parseTmuxClaudePanes and selectClaudeTmuxPane).
+// command names claude by isClaudeComm's rule (base name, ".exe" stripped —
+// see its doc in control.go for the exact test and why it is not stricter) —
+// typed/destructive actions must never land on a bare shell pane that merely
+// happens to share the directory (see parseTmuxClaudePanes and
+// selectClaudeTmuxPane).
 func (tmuxController) LocateClaude(projectDir string) (Target, bool) {
 	out, ok := tmuxListPanes()
 	if !ok {
@@ -81,8 +83,9 @@ func tmuxListPanes() (string, bool) {
 }
 
 // LocateByTTY finds the pane whose controlling tty matches tty (as recorded
-// by the session registry, e.g. "ttys012") AND whose foreground command is
-// literally "claude" — the ADR Phase 2 tty-dispatch path (see
+// by the session registry, e.g. "ttys012") AND whose foreground command
+// names claude by isClaudeComm's rule (see its doc in control.go) — the ADR
+// Phase 2 tty-dispatch path (see
 // ResolveActuationTarget). tty is session-unique (unlike cwd), so this
 // deliberately does NOT apply an ambiguity refusal the way
 // selectClaudeTmuxPane does for the cwd path: at most one live pane can
@@ -99,7 +102,7 @@ func (tmuxController) LocateByTTY(tty string) (Target, bool) {
 // tty-matching logic is directly unit-testable against a fixture without a
 // real tmux binary (same pattern as selectClaudeTmuxPane for the cwd path).
 // Matches the pane whose tty normalizes equal to tty AND whose foreground
-// command is literally "claude".
+// command names claude by isClaudeComm's rule (see its doc in control.go).
 func selectTTYPane(lines []tmuxTTYPaneLine, tty string) (Target, bool) {
 	want := normalizeTTY(tty)
 	for _, l := range lines {
@@ -245,8 +248,15 @@ func (tmuxController) Spawn(cwd, goal string) error {
 // ["claude"]) and is appended as SEPARATE argv elements, never joined into a
 // string. tmux runs a multi-argument command directly with execvp instead of
 // handing it to a shell, so there is no word splitting or quoting layer — and
-// the pane's foreground process stays literally "claude", which is what
-// LocateClaude matches `#{pane_current_command}` against (see isClaudeComm).
+// the pane's foreground process stays a claude binary, which is what
+// LocateClaude matches `#{pane_current_command}` against (see isClaudeComm
+// for the actual rule: base name, ".exe" stripped, so an absolute path works).
+//
+// That holds because internal/settings REFUSES a configured argv whose
+// argv[0] is not claude, not because of anything tmux does here — a launcher
+// form like ["mise","exec","--","claude"] would leave the pane reporting
+// "mise" and make every configured loop invisible to Tier 1a/1b. If that
+// enforcement is ever relaxed, this sentence goes with it.
 // Joining the argv into one string would have made every configured loop
 // invisible to actuation, since the pane would report a shell instead.
 //
@@ -269,8 +279,10 @@ func tmuxNewWindowCmd(cwd string, spawnArgv []string) []string {
 
 // OpenTerminal implements control.TerminalOpener: opens a new tmux window in
 // cwd running command — LoopEngine's take-over attach. Reuses
-// tmuxNewWindowCmd's exact "-c cwd" shape, generalized from the hardcoded "claude" Spawn always runs
-// to an arbitrary command (take-over's "claude --resume <id>"); command is
+// tmuxNewWindowCmd's exact "-c cwd" shape, generalized from the configured
+// spawn command Spawn runs (spawnCommandFn — internal/settings, default
+// ["claude"]) to an arbitrary command (take-over's "claude --resume <id>");
+// command is
 // already the complete shell invocation, and tmux interprets a single
 // trailing argv element as the shell-command to run in the new window's
 // pane (same convention `tmux new-window "claude --resume <id>"` documents)
@@ -338,9 +350,10 @@ func parseTmuxPanes(out string) []Target {
 	return targets
 }
 
-// parseTmuxClaudePanes returns only panes whose foreground command is
-// literally "claude" — used by LocateClaude for typed/destructive actions,
-// which must never land on a bare shell pane sharing the same directory.
+// parseTmuxClaudePanes returns only panes whose foreground command names
+// claude by isClaudeComm's rule (see its doc in control.go) — used by
+// LocateClaude for typed/destructive actions, which must never land on a
+// bare shell pane sharing the same directory.
 func parseTmuxClaudePanes(out string) []Target {
 	var targets []Target
 	for _, l := range parseTmuxPaneLines(out) {

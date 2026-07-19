@@ -234,9 +234,11 @@ func TestBind_DrivenTrue_RoundTrips(t *testing.T) {
 
 // TestBind_DrivenOmitted_DefaultsFalse is the opt-in-spike's off-by-default
 // contract: a BindSpec that never mentions Driven at all (the zero value —
-// every EXISTING caller today, since none of them offer an engine-drive
-// choice yet) must produce a NOT-driven record. No engine cycle may ever
-// fire for a loop unless it was explicitly created engine-driven.
+// the manual "n" wizard path and every caller that does not opt in) must
+// produce a NOT-driven record. Callers CAN opt in — internal/tui's
+// submitSpawnWizardEngineDrive sets Driven true — which is exactly why the
+// default must stay pinned here: no engine cycle may ever fire for a loop
+// unless it was explicitly created engine-driven.
 func TestBind_DrivenOmitted_DefaultsFalse(t *testing.T) {
 	dir := t.TempDir()
 	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {

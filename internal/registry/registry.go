@@ -107,10 +107,17 @@ type BindSpec struct {
 	Rubric        string
 	Challenger    string
 	MaxCycles     int // 0 = DefaultMaxCycles
-	// Driven opts this loop into LoopEngine at creation time — false (the
-	// zero value) for every EXISTING caller of BindSpec today, since none
-	// of them offer an engine-drive choice yet (that's a later slice's "n"
-	// wizard step). Kept on BindSpec rather than a separate Bind parameter:
+	// Driven opts this loop into LoopEngine at creation time. It is NOT
+	// inert: internal/tui's submitSpawnWizardEngineDrive sets it true when
+	// the operator picks [e] at the "n" wizard's wizardEngineDrive step,
+	// and BindPending propagates it from the pending record. It stays false
+	// on the manual wizard path (submitSpawnWizard never sets it) and for
+	// any caller that omits it — the zero value is off, deliberately.
+	//
+	// This flag is load-bearing, not decorative: it is the FIRST clause of
+	// engine.ShouldDrive's fail-closed conjunction, so a loop with Driven
+	// false can never be auto-driven no matter what the other clauses say.
+	// Audit it as a live gate. Kept on BindSpec rather than a separate Bind parameter:
 	// one value object for "everything the wizard decided about this
 	// loop's contract," matching this struct's own doc above, and it
 	// threads through WritePending/BindPending's existing plumbing for

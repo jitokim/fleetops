@@ -1081,7 +1081,7 @@ func widenedTailRead(path string, extract func([]byte) (string, bool)) (string, 
 
 // tailTextCap bounds LastText, the summarized last-assistant message. It's
 // sized to fill several wrapped lines in the detail pane's TAIL row
-// (internal/tui renders up to maxTailLines of it) at typical terminal widths,
+// (internal/tui renders up to tailMaxLines of it) at typical terminal widths,
 // while staying bounded — it is deliberately NOT the full uncapped report,
 // which LastAssistantTextFull already serves separately for the oracle. Bumped
 // from 120 (a single hard-truncated line) once the TAIL row learned to wrap.
@@ -1350,7 +1350,7 @@ func entryTimestamp(entry map[string]any) time.Time {
 
 // summarizeTailText collapses newlines to spaces and caps length, yielding a
 // single-line, bounded string (LastText). The detail pane's TAIL row re-wraps
-// it across up to maxTailLines lines at the pane's width; the DOING column
+// it across up to tailMaxLines lines at the pane's width; the DOING column
 // hard-truncates it to its own narrow column. Keeping LastText itself
 // single-line lets both callers wrap/truncate as they see fit.
 //

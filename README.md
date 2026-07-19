@@ -87,6 +87,7 @@ look at the UI, or for screenshotting it without leaking real paths/goals.
 | `↵` | attach: bring the loop's terminal to the front |
 | `a` | approve a gate (bare Enter — accepts claude's default option) |
 | `r` | resume a stalled/drifted loop (re-sends its last prompt) |
+| `i` | inject an arbitrary prompt into the selected loop (type it, `enter` sends, `esc` cancels) |
 | `p` | stop the current turn (Esc) without killing the process |
 | `k` | kill — press twice within 3s to confirm (sends `/exit`) |
 | `n` | spawn a new loop: wizard for the goal/contract (plus an optional display name for the FLEET list), then a "where" step that shows the target directory (default: the dir fleetops was launched from) and lets you change it — `[w]` new worktree, `[d]` this dir, `[c]` type a path, `[s]` the selected loop's dir |
