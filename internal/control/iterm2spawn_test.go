@@ -43,6 +43,15 @@ func skipBootWait(t *testing.T) {
 	iterm2BootWaitFn = func() {}
 }
 
+// pinForegroundIsClaude pins the "is claude actually running on that tty?"
+// probe, which otherwise shells out to a real ps against a tty no test owns.
+func pinForegroundIsClaude(t *testing.T, isClaude bool) {
+	t.Helper()
+	original := iterm2ForegroundIsClaudeFn
+	t.Cleanup(func() { iterm2ForegroundIsClaudeFn = original })
+	iterm2ForegroundIsClaudeFn = func(string) bool { return isClaude }
+}
+
 func pinHostDetect(t *testing.T, inITerm2 bool) {
 	t.Helper()
 	original := iterm2HostDetectFn
@@ -223,6 +232,7 @@ func TestParseITerm2SpawnResult_RejectsUnusableReplies(t *testing.T) {
 
 func TestITerm2Spawn_CreatesWindowThenDeliversTheGoal(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	spawnArgv := stubITerm2Spawn(t, goodSpawnOutput(), nil)
 	sendArgv := stubITerm2Send(t, iterm2SendHit, nil)
@@ -249,6 +259,7 @@ func TestITerm2Spawn_CreatesWindowThenDeliversTheGoal(t *testing.T) {
 // GUID and bound to its tty.
 func TestITerm2Spawn_DeliversAgainstTheNewSessionsGUIDAndTTY(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, goodSpawnOutput(), nil)
 	sendArgv := stubITerm2Send(t, iterm2SendHit, nil)
@@ -268,6 +279,7 @@ func TestITerm2Spawn_DeliversAgainstTheNewSessionsGUIDAndTTY(t *testing.T) {
 
 func TestITerm2Spawn_UsesTheConfiguredSpawnCommand(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, teamArgv())
 	spawnArgv := stubITerm2Spawn(t, goodSpawnOutput(), nil)
 	stubITerm2Send(t, iterm2SendHit, nil)
@@ -287,6 +299,7 @@ func TestITerm2Spawn_UsesTheConfiguredSpawnCommand(t *testing.T) {
 // must not attempt a delivery.
 func TestITerm2Spawn_UnusableReplyFailsAndNeverDelivers(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, "", nil)
 	sendArgv := stubITerm2Send(t, iterm2SendHit, nil)
@@ -303,6 +316,7 @@ func TestITerm2Spawn_UnusableReplyFailsAndNeverDelivers(t *testing.T) {
 
 func TestITerm2Spawn_OsascriptFailureIsReported(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, "", errors.New("Not authorized to send Apple events to iTerm2. (-1743)"))
 	sendArgv := stubITerm2Send(t, iterm2SendHit, nil)
@@ -325,6 +339,7 @@ func TestITerm2Spawn_OsascriptFailureIsReported(t *testing.T) {
 // retries blindly.
 func TestITerm2Spawn_TimeoutIsSurfacedAsUnknownNotFailure(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, "", ErrSendDeliveryUnknown)
 	stubITerm2Send(t, iterm2SendHit, nil)
@@ -341,6 +356,7 @@ func TestITerm2Spawn_TimeoutIsSurfacedAsUnknownNotFailure(t *testing.T) {
 // the liveness check, and this must be reported as a failure.
 func TestITerm2Spawn_WindowDiedBeforeDeliveryIsAFailure(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, goodSpawnOutput(), nil)
 	stubITerm2Send(t, iterm2SendMiss, nil)
@@ -360,6 +376,7 @@ func TestITerm2Spawn_WindowDiedBeforeDeliveryIsAFailure(t *testing.T) {
 
 func TestITerm2Spawn_TTYMismatchAtDeliveryIsAFailure(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, goodSpawnOutput(), nil)
 	stubITerm2Send(t, iterm2SendTTYMismatch, nil)
@@ -372,6 +389,7 @@ func TestITerm2Spawn_TTYMismatchAtDeliveryIsAFailure(t *testing.T) {
 // An unrecognized verdict must never read as success.
 func TestITerm2Spawn_UnrecognizedDeliveryVerdictIsAFailure(t *testing.T) {
 	skipBootWait(t)
+	pinForegroundIsClaude(t, true)
 	pinSpawnCommand(t, []string{"claude"})
 	stubITerm2Spawn(t, goodSpawnOutput(), nil)
 	stubITerm2Send(t, "something unexpected", nil)
@@ -478,5 +496,45 @@ func TestITerm2SpawnTimeout_IsLargerThanTheKeystrokeBudget(t *testing.T) {
 	if iterm2SpawnTimeout <= actuationTimeout {
 		t.Errorf("iterm2SpawnTimeout = %v, want > actuationTimeout (%v) — window creation is not a keystroke send",
 			iterm2SpawnTimeout, actuationTimeout)
+	}
+}
+
+// ── The window must be running CLAUDE, not merely be alive ───────────────
+//
+// This is the hole the other three checks leave open: iTerm2 mints a real GUID
+// and tty, and the Tier 1h send re-finds by GUID and matches the tty, so a
+// BARE LOGIN SHELL satisfies every one of them. The `|| exit 1` guard only
+// fires if the launch line ran at all.
+
+func TestITerm2Spawn_BareShellIsNotASpawnedLoop(t *testing.T) {
+	stubITerm2Spawn(t, "ABC-123\t/dev/ttys009", nil)
+	sent := stubITerm2Send(t, "ok", nil)
+	skipBootWait(t)
+	pinForegroundIsClaude(t, false) // window alive, but it's a shell
+
+	err := iterm2Spawner{}.Spawn("/repo", "goal: ship it")
+
+	if err == nil {
+		t.Fatal("Spawn reported success for a window with no claude in it")
+	}
+	if !errors.Is(err, ErrITerm2SpawnNoClaude) {
+		t.Errorf("err = %v, want ErrITerm2SpawnNoClaude", err)
+	}
+	if *sent != nil {
+		t.Errorf("the goal was typed into a session with no claude: %v", *sent)
+	}
+}
+
+// The refusal must tell the human the window is real — they have to close it.
+func TestITerm2SpawnNoClaude_SaysTheWindowIsStillOpen(t *testing.T) {
+	if !strings.Contains(ErrITerm2SpawnNoClaude.Error(), "still open") {
+		t.Errorf("err = %q, want it to say the window is still there", ErrITerm2SpawnNoClaude.Error())
+	}
+}
+
+// Fails CLOSED: a probe that cannot answer must refuse, not assume.
+func TestITerm2ForegroundIsClaude_ProbeFailureIsFalse(t *testing.T) {
+	if iterm2ForegroundIsClaude("definitely-not-a-tty") {
+		t.Error("an unanswerable probe reported claude is running")
 	}
 }

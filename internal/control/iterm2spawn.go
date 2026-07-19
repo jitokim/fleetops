@@ -108,6 +108,7 @@ var iterm2BootWaitFn = func() { time.Sleep(spawnBootWait) }
 // history of exactly that (see focus.go's verdict protocol), and a spawn is
 // the worst place to repeat it — the human walks away believing work has
 // started.
+//
 // The wording says a window LIKELY EXISTS, which is the honest reading: this
 // error means osascript exited 0 — it ran — and merely returned something
 // unrecognizable, so the create almost certainly happened and only the reply
@@ -129,7 +130,7 @@ type iterm2Session struct {
 //
 // # How this avoids reporting a false success
 //
-// Three checks, none of which trusts an exit status:
+// Four checks, none of which trusts an exit status:
 //
 //  1. The script must RETURN a GUID and a tty, both of which must pass their
 //     whitelists (parseITerm2SpawnResult). osascript exits 0 even when it
@@ -140,19 +141,30 @@ type iterm2Session struct {
 //     that died between creation and delivery returns "miss" and fails.
 //  3. The launch line ends with `|| exit 1` (see iterm2LaunchLine), so a
 //     failed cd or a missing claude binary CLOSES the window rather than
-//     leaving a bare shell behind. Without that, step 2 would happily type the
+//     leaving a bare shell behind. Without that, step 4 would happily type the
 //     goal into a shell prompt and report success — the exact false-success
 //     shape this project treats as a defect.
+//  4. The session must actually be running CLAUDE
+//     (iterm2ForegroundIsClaude). Checks 1-3 are all satisfied by a window
+//     that is merely ALIVE: iTerm2 minted the GUID and tty, and the Tier 1h
+//     send re-finds by GUID and matches the tty — a bare login shell passes
+//     every one. Check 3 only fires if the launch line RAN at all; if that
+//     text were dropped at the pty before the shell's line discipline came up,
+//     nothing would have caught it.
 //
-// So the goal delivery doubles as the liveness check: nothing here claims a
-// loop started until something is provably still alive in that session and
-// bound to the tty we created.
+// So liveness alone is never enough: nothing here claims a loop started until
+// claude is provably running on the tty we created.
 func (iterm2Spawner) Spawn(cwd, goal string) error {
 	session, err := iterm2CreateSession(cwd, spawnCommandFn())
 	if err != nil {
 		return err
 	}
 	iterm2BootWaitFn()
+	// The session must be running CLAUDE, not just be alive. Without this the
+	// goal is typed into whatever is there — see iterm2ForegroundIsClaude.
+	if !iterm2ForegroundIsClaudeFn(session.tty) {
+		return fmt.Errorf("iterm2: created a window on %s but claude is not running in it — %w", session.tty, ErrITerm2SpawnNoClaude)
+	}
 	// Re-uses the Tier 1h send path verbatim rather than writing a second
 	// osascript: the goal is untrusted free text, and hostsend.go is where the
 	// argv-only discipline for that is already established and tested.
@@ -161,6 +173,58 @@ func (iterm2Spawner) Spawn(cwd, goal string) error {
 		return fmt.Errorf("iterm2: created a window on %s but could not deliver the goal there: %w", session.tty, err)
 	}
 	return nil
+}
+
+// ErrITerm2SpawnNoClaude reports that the new window exists and is alive, but
+// is not running claude.
+//
+// Its own sentinel because the remedy differs from every other spawn failure:
+// the window is real and the human has to deal with it, and the usual causes
+// are local and fixable (claude not on PATH for a login shell, a profile that
+// runs its own startup command, a cwd that vanished).
+var ErrITerm2SpawnNoClaude = errors.New("the window is still open; check that claude is on PATH for a login shell, then close it and retry")
+
+// iterm2ForegroundIsClaudeFn reports whether tty's foreground process is
+// claude. A package var for the usual seam reason — no test may require a real
+// pty or a real claude.
+var iterm2ForegroundIsClaudeFn = iterm2ForegroundIsClaude
+
+// iterm2ForegroundIsClaude closes the last false-success hole in the spawn
+// path, and it is not theoretical.
+//
+// The other three checks all pass for a window that is merely ALIVE: the GUID
+// and tty are real because iTerm2 minted them, and the Tier 1h send re-finds
+// the session by GUID and matches its tty — a bare login shell satisfies every
+// one of those. The `|| exit 1` guard in the launch line only fires if the
+// launch line RAN; if the text were dropped or truncated at the pty before the
+// shell's line discipline came up, the shell simply sits there and the spawn
+// reports a loop that does not exist. Nothing else distinguishes claude from
+// zsh.
+//
+// So ask the OS directly. `ps -t <tty> -o comm=` lists the processes on that
+// terminal; the check is a match anywhere in the list rather than strictly the
+// foreground process, because claude spawns children and which one is
+// foreground at this instant is a race we do not need to win. Reuses
+// isClaudeComm so this agrees with how Tier 1a/1b identify a claude pane
+// instead of inventing a second definition.
+//
+// Fails CLOSED: any probe error (ps missing, tty gone, timeout) reports false
+// and the spawn refuses. Refusing a real loop is a nuisance the human can see
+// and retry; claiming a loop that is not there is the defect class this whole
+// path is written against.
+func iterm2ForegroundIsClaude(tty string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), pidTTYTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-t", tty, "-o", "comm=").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if isClaudeComm(strings.TrimSpace(line)) {
+			return true
+		}
+	}
+	return false
 }
 
 // iterm2CreateSession runs the window-creating script and validates what came
