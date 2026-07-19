@@ -131,6 +131,64 @@ func TestDefaultThresholdSeparatesCorpus(t *testing.T) {
 // doc comment claims. Without this, that comment could drift into fiction the
 // moment anyone touches the weights — which is exactly what happened to its
 // previous version.
+// TestCorpusCompositionMatchesDocumentedFigures pins the corpus's SHAPE, which
+// the accuracy test above deliberately does not.
+//
+// That test asserts RATIOS — "every labeled duplicate is caught", "exactly one
+// false positive" — and both stay true no matter how the corpus grows. The
+// absolute figures quoted in prose (30 pairs, 12/12, 1/16, true recall 12/14)
+// therefore had nothing enforcing them, so adding a single corpus entry
+// silently falsified two files while every test stayed green. That already
+// happened once: a knownMiss added on 2026-07-19 required 29→30 and 12/13→12/14
+// by hand, and the next one would have been missed.
+//
+// DefaultThreshold's comment claims "TestCorpusAccuracyMatchesDocumentedRates
+// enforces every number above." This test is what makes that claim true.
+//
+// If you changed the corpus on purpose, update the numbers here AND in the two
+// places that quote them: DefaultThreshold's doc comment in similarity.go, and
+// README.md's accuracy section.
+func TestCorpusCompositionMatchesDocumentedFigures(t *testing.T) {
+	var duplicates, distincts, knownMisses, knownFalsePositives int
+	for _, tc := range corpus {
+		switch tc.label {
+		case duplicate:
+			duplicates++
+		case distinct:
+			distincts++
+		case knownMiss:
+			knownMisses++
+		case knownFalsePositive:
+			knownFalsePositives++
+		}
+	}
+
+	// Non-duplicates are the denominator the false-positive rate is quoted
+	// against: everything a human would NOT call the same report.
+	nonDuplicates := distincts + knownFalsePositives
+	// True recall counts the duplicates no threshold can reach, which the
+	// accuracy test excludes by design.
+	reachableAndUnreachableDuplicates := duplicates + knownMisses
+
+	for _, want := range []struct {
+		name  string
+		got   int
+		want  int
+		prose string
+	}{
+		{"corpus size", len(corpus), 30, "\"over the 30 labeled pairs\""},
+		{"duplicates", duplicates, 12, "\"(12/12)\""},
+		{"non-duplicates", nonDuplicates, 16, "\"one non-duplicate (1/16)\""},
+		{"knownMiss", knownMisses, 2, "\"true recall is 12/14\""},
+		{"true-recall denominator", reachableAndUnreachableDuplicates, 14, "\"true recall is 12/14\""},
+	} {
+		if want.got != want.want {
+			t.Errorf("%s = %d, want %d — the prose %s in similarity.go and README.md is now wrong; update both or fix the corpus",
+				want.name, want.got, want.want, want.prose)
+		}
+	}
+}
+
 func TestCorpusAccuracyMatchesDocumentedRates(t *testing.T) {
 	var duplicates, flaggedDuplicates, nonDuplicates, flaggedNonDuplicates int
 	for _, tc := range corpus {
