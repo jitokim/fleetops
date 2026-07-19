@@ -49,15 +49,24 @@ func GatesDir() string {
 // Info is one pending gate marker.
 type Info struct {
 	Message string
-	Type    string // Claude Code's notification_type, e.g. "permission_prompt"; "" on older claude versions that don't send it
-	TS      time.Time
+	// Type is Claude Code's notification_type, e.g. "permission_prompt". Empty
+	// on older claude versions that don't send it — and ALSO empty on current
+	// claude whenever mergeMarker rule 3 keeps a PermissionRequest-only marker,
+	// since that payload carries no notification_type and the losing
+	// Notification is never written. Do not read "" as "old claude".
+	Type string
+	TS   time.Time
 
 	// PromptID is Claude Code's prompt_id, the key that identifies WHICH
-	// prompt a marker describes. Measured 2026-07-20: both the
-	// PermissionRequest and Notification hooks carry it and their values
-	// match for the same gate. That is what makes merging possible at all —
-	// without it the two writers cannot tell "same prompt, worse payload"
-	// from "a genuinely new prompt". Empty on claude versions that omit it.
+	// prompt a marker describes. Observed 2026-07-20 on BOTH payloads in a
+	// live probe, carrying the same value for the same gate — that is what
+	// makes merging possible at all, since without it the two writers cannot
+	// tell "same prompt, worse payload" from "a genuinely new prompt".
+	//
+	// One probe, on one claude version, and the repo's fixtures only pin the
+	// PermissionRequest half — so this is an observation, not a guarantee.
+	// mergeMarker therefore degrades safely rather than trusting it: see its
+	// empty/mismatched prompt_id branch. Empty on versions that omit it.
 	PromptID string
 
 	// Tool and ToolDetail describe what the session is asking permission to
@@ -70,9 +79,11 @@ type Info struct {
 
 // Detail returns the most informative description available for this gate.
 //
-// Falls back deliberately rather than composing: a marker written by the
-// Notification hook alone has only the generic message, and dressing that up
-// as though it named a tool would be a claim the payload does not support.
+// Composes WITHIN the PermissionRequest fields (tool plus its detail, which
+// came from one payload and belong together) but never ACROSS sources: a
+// marker written by the Notification hook alone has only the generic message,
+// and dressing that up as though it named a tool would be a claim the payload
+// does not support. So Message is a fallback, never a suffix.
 func (i Info) Detail() string {
 	switch {
 	case i.Tool != "" && i.ToolDetail != "":
@@ -85,9 +96,11 @@ func (i Info) Detail() string {
 }
 
 // isRicherThan reports whether i carries strictly more about the gate than
-// other does. Only the tool identity counts: it is the field the two hooks
-// actually differ on, and the one whose loss the merge rule exists to
-// prevent.
+// other does. Only the tool identity counts. The two hooks differ on several
+// fields (Message and Type as well), but Tool is the one the merge rule exists
+// to protect: it is the only field that answers WHAT is being asked, and it
+// has exactly one writer. Ranking by it means the loser's Type is discarded —
+// see Info.Type on why "" must not be read as "old claude".
 func (i Info) isRicherThan(other Info) bool {
 	return i.Tool != "" && other.Tool == ""
 }
@@ -115,15 +128,19 @@ type markerFile struct {
 // (may be empty on older claude versions) — see Pending's caller (the
 // scanner) for how it disambiguates a real gate from the 60s idle nudge.
 //
-// TWO hooks write here for a SINGLE gate. Measured 2026-07-20:
+// TWO hooks write here for a SINGLE gate. Observed once on 2026-07-20:
 //
-//	+0.00s  PermissionRequest  → tool_name + tool_input (what is being asked)
-//	+6.01s  Notification       → "Claude needs your permission" (generic)
+//	first        PermissionRequest  → tool_name + tool_input (what is being asked)
+//	~6s later    Notification       → "Claude needs your permission" (generic)
+//
+// The delay is a single sample, not a contract — treat only the ORDER as
+// meaningful, and not even that: mergeMarker is deliberately order-independent
+// so neither arrival sequence can lose the tool name.
 //
 // Markers are keyed by session id, so a plain write would let the generic
-// payload land second and erase the useful one — the feature would work for
-// six seconds and then silently degrade. mergeMarker prevents that; see its
-// doc for the rules and for what happens when the correlation key is absent.
+// payload land second and erase the useful one — the feature would work
+// briefly and then silently degrade. mergeMarker prevents that; see its doc
+// for the rules and for what happens when the correlation key is absent.
 func WriteMarker(dir, sessionID string, in Info) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -154,13 +171,16 @@ func WriteMarker(dir, sessionID string, in Info) error {
 //
 // Rules, in order:
 //
-//  1. No existing marker → take the new one.
+//  1. No usable existing marker (missing, corrupt, or no TS) → take the new
+//     one.
 //  2. Different prompt_id → a genuinely NEW gate. Replace wholesale, new TS.
 //  3. Same prompt_id, existing is richer → keep existing, DO NOT WRITE. This
-//     is the measured case: the generic Notification arriving 6s after the
-//     detailed PermissionRequest.
-//  4. Same prompt_id, new is richer → upgrade the detail but KEEP THE
-//     EXISTING TS.
+//     is the observed case: the generic Notification arriving seconds after
+//     the detailed PermissionRequest.
+//  4. Same prompt_id, anything else → take the new payload but KEEP THE
+//     EXISTING TS. This is the catch-all, not just the "new is richer" case:
+//     it also covers both payloads naming a tool and neither naming one, in
+//     which case the newer text simply wins.
 //
 // Rules 3 and 4 both preserving the original TS is load-bearing, not tidiness.
 // TS means "when this gate was first observed", and DeleteMarkerIfTS uses it

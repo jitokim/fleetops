@@ -560,22 +560,18 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 		l.State, l.Stall = domain.StateStalled, domain.StallNoOutput
 	}
 
-	// A pending Notification-hook marker beats any tail heuristic above —
-	// but only when it's actually asking for a decision. Claude Code fires
-	// the SAME hook for the 60s "Claude is waiting for your input" idle
-	// notification, which is NOT a gate (verified live). The official
-	// notification_type field is the authoritative signal
-	// (permission_prompt/elicitation_dialog/agent_needs_input all mean
-	// "blocked on a human"; idle_prompt and anything else don't); older
-	// claude versions that omit it (Type == "") fall back to the
-	// message-contains-"permission" heuristic. Anything that isn't a gate
-	// falls through to the normal tail classification above (→ Idle) and
+	// A pending hook marker beats any tail heuristic above — but only when
+	// it's actually asking for a decision. Claude Code fires the Notification
+	// hook for the 60s "Claude is waiting for your input" idle notification
+	// too, which is NOT a gate (verified live). isGateNotification ranks the
+	// available signals; see its doc for the precedence. Anything that isn't a
+	// gate falls through to the normal tail classification above (→ Idle) and
 	// the marker is best-effort deleted so it doesn't linger.
 	if info, ok := pending[session]; ok {
 		if gate.IsGateActive(info.TS, last) && isGateNotification(info) {
 			l.State = domain.StateGate
 			l.Stall = domain.StallNone
-			l.GatePrompt = info.Detail()  // names the requested tool when PermissionRequest supplied one; falls back to the generic notification message otherwise
+			l.GatePrompt = info.Detail()  // names the requested tool when one is known — see gate.Info.Detail
 			l.GateTS = info.TS.UnixNano() // lets approveCmd compare-and-swap delete only the marker this decision was based on
 		} else {
 			// Compare-and-swap: only delete the marker this scan actually
@@ -622,17 +618,20 @@ var gateNotificationTypes = map[string]bool{
 	"agent_needs_input":  true,
 }
 
-// isGateNotification decides whether a marker represents a real gate.
-// Type is authoritative when present; when empty (older claude versions
-// that predate notification_type), falls back to a message-text heuristic.
+// isGateNotification decides whether a marker represents a real gate, using
+// the strongest signal the marker carries. In precedence order: a named tool
+// (PermissionRequest wrote it), then notification_type, then — when the marker
+// has neither, as on claude versions predating notification_type — a
+// message-text heuristic.
 func isGateNotification(info gate.Info) bool {
-	// A marker naming a tool came from the PermissionRequest hook, which
-	// fires ONLY for a permission gate — that is stronger evidence than
-	// either signal below, and it is checked first because that payload
-	// carries no notification_type and no message at all. Without this the
-	// detailed marker would fail both tests, be judged a non-gate, and get
-	// compare-and-swap DELETED by the caller — six seconds later the generic
-	// Notification would land and the tool name would be gone for good.
+	// A marker naming a tool came from the PermissionRequest hook, which is
+	// raised to ask permission — stronger evidence than either signal below.
+	// It must be checked FIRST because the payload observed on 2026-07-20
+	// carried neither notification_type nor a message (the hook path still
+	// copies both, in case a version supplies them). Without this branch such
+	// a marker would fail both tests below, be judged a non-gate, and get
+	// compare-and-swap DELETED by the caller — the generic Notification would
+	// land seconds later and the tool name would be gone for good.
 	if info.Tool != "" {
 		return true
 	}
@@ -879,7 +878,8 @@ func lastTurnEnded(buf []byte) bool {
 
 // pendingAskUserQuestion reports whether the tail's last user/assistant entry
 // is an unanswered AskUserQuestion tool_use, and if so the first question's
-// text (already bounded for GatePrompt). AskUserQuestion — Claude Code's
+// text (already bounded for GatePrompt) plus its answer choices (bounded per
+// choice; nil when the question offers none). AskUserQuestion — Claude Code's
 // interactive numbered-choice prompt for a structured human decision — never
 // fires a Notification hook (confirmed upstream gap, anthropics/claude-code
 // #59908), so the gate.Pending marker path can't catch it; its tool_use turn
@@ -893,8 +893,8 @@ func lastTurnEnded(buf []byte) bool {
 // than mistaken for the last turn. If this assistant AskUserQuestion is
 // genuinely the last user/assistant entry, no later user tool_result answered
 // it (an answer would BE the last user entry, so last["type"] would be "user"
-// and this returns false). Any missing/malformed shape yields ("", false) —
-// never a panic, matching this file's tolerant-parse discipline.
+// and this returns false). Any missing/malformed shape yields ("", nil, false)
+// — never a panic, matching this file's tolerant-parse discipline.
 func pendingAskUserQuestion(buf []byte) (string, []string, bool) {
 	var last map[string]any
 	for _, line := range strings.Split(string(buf), "\n") {
@@ -947,15 +947,7 @@ func pendingAskUserQuestion(buf []byte) (string, []string, bool) {
 // prose sized for a decision UI, not for a cockpit that must fit the whole
 // fleet on one screen — and the label is what the human will actually pick.
 func firstAskUserQuestionOptions(block map[string]any) []string {
-	input, ok := block["input"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	questions, ok := input["questions"].([]any)
-	if !ok || len(questions) == 0 {
-		return nil
-	}
-	first, ok := questions[0].(map[string]any)
+	first, ok := firstAskUserQuestion(block)
 	if !ok {
 		return nil
 	}
@@ -981,19 +973,31 @@ func firstAskUserQuestionOptions(block map[string]any) []string {
 // truncated to be read is still more useful than no choices at all.
 const gateOptionCap = 48
 
-// firstAskUserQuestionText pulls input.questions[0].question out of an
-// AskUserQuestion tool_use block, tolerating any missing/wrong-typed shape (a
-// malformed block is treated as "no pending question", never a panic).
-func firstAskUserQuestionText(block map[string]any) (string, bool) {
+// firstAskUserQuestion navigates to input.questions[0] of an AskUserQuestion
+// tool_use block, tolerating any missing/wrong-typed shape (a malformed block
+// is treated as "no pending question", never a panic). Shared by the text and
+// options readers so the two cannot drift on the path they walk; each still
+// fails independently on the field it actually wants.
+func firstAskUserQuestion(block map[string]any) (map[string]any, bool) {
 	input, ok := block["input"].(map[string]any)
 	if !ok {
-		return "", false
+		return nil, false
 	}
 	questions, ok := input["questions"].([]any)
 	if !ok || len(questions) == 0 {
-		return "", false
+		return nil, false
 	}
 	first, ok := questions[0].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return first, true
+}
+
+// firstAskUserQuestionText pulls input.questions[0].question out of an
+// AskUserQuestion tool_use block.
+func firstAskUserQuestionText(block map[string]any) (string, bool) {
+	first, ok := firstAskUserQuestion(block)
 	if !ok {
 		return "", false
 	}

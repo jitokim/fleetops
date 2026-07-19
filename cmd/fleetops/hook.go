@@ -44,8 +44,11 @@ type hookPayload struct {
 	NotificationType string `json:"notification_type"`
 
 	// PromptID correlates this payload with the OTHER hook that fires for the
-	// same gate — see gate.WriteMarker's merge rules. Both hooks carry it
-	// (measured 2026-07-20); older claude versions omit it, handled there.
+	// same gate — see gate.WriteMarker's merge rules, which degrade safely
+	// when it is absent or the two hooks disagree. Observed on BOTH hooks'
+	// payloads 2026-07-20 with matching values; the fixture in
+	// TestPermissionHook_WritesToolDetail pins only this half. Older claude
+	// versions omit it.
 	PromptID string `json:"prompt_id"`
 
 	// ToolName and ToolInput are PermissionRequest-only: what the session is
@@ -54,18 +57,32 @@ type hookPayload struct {
 	ToolInput json.RawMessage `json:"tool_input"`
 }
 
+// readGateHookPayload decodes the stdin JSON shared by the two hooks that
+// write gate markers, reporting false when there is nothing usable to record.
+// It centralizes the swallow-every-error contract those hooks depend on: an
+// unreadable stdin, unparseable JSON, or a payload with no session id all mean
+// "do nothing", never a non-zero exit. The session hooks decode a different
+// payload type and keep their own copy.
+func readGateHookPayload() (hookPayload, bool) {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return hookPayload{}, false
+	}
+	var payload hookPayload
+	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+		return hookPayload{}, false
+	}
+	return payload, true
+}
+
 // notifyHook reads the Notification hook's JSON from stdin and writes a
 // gate marker (internal/gate.WriteMarker) — Claude Code runs this on EVERY
 // notification, so it must be fast and must NEVER fail loudly: any error
 // here is swallowed, not reported, and the process always exits 0. A bug in
 // this path must not be able to break the user's actual claude session.
 func notifyHook() {
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return
-	}
-	var payload hookPayload
-	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+	payload, ok := readGateHookPayload()
+	if !ok {
 		return
 	}
 	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, gate.Info{
@@ -92,12 +109,8 @@ func notifyHook() {
 // fleet-wide permissions change with nothing in the log to show it happened.
 // Keeping sensing and acting apart is what makes the acting auditable.
 func permissionHook() {
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return
-	}
-	var payload hookPayload
-	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+	payload, ok := readGateHookPayload()
+	if !ok {
 		return
 	}
 	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, gate.Info{
