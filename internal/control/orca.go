@@ -121,8 +121,15 @@ const (
 func (orcaController) Spawn(cwd, goal string) error {
 	ctxCreate, cancelCreate := context.WithTimeout(context.Background(), spawnCreateTimeout)
 	defer cancelCreate()
+	// --command takes a command STRING, not an argv, so the configured spawn
+	// command is shell-quoted on the way in (see shellQuoteJoin); orca's CLI
+	// contract leaves no choice. The only other spawn site that has to quote
+	// is iTerm2's launch line (iterm2LaunchLine), for its own reason — tmux
+	// and the Tier 2 redrive both pass argv straight through. Unconfigured,
+	// this renders to exactly "claude" — byte-identical to the literal that
+	// was here before.
 	createOut, err := exec.CommandContext(ctxCreate, "orca", "terminal", "create",
-		"--worktree", "path:"+cwd, "--command", "claude", "--title", spawnTitle, "--json").Output()
+		"--worktree", "path:"+cwd, "--command", shellQuoteJoin(spawnCommandFn()), "--title", spawnTitle, "--json").Output()
 	if err != nil {
 		return fmt.Errorf("orca terminal create: %w", err)
 	}
@@ -234,6 +241,15 @@ const spawnWorktreeTimeout = 15 * time.Second
 func (orcaController) SpawnWorktree(repoCwd, name, prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), spawnWorktreeTimeout)
 	defer cancel()
+	// --agent is deliberately NOT fed the configured spawn command
+	// (internal/settings). It names an AGENT KIND in orca's own vocabulary,
+	// not an executable to run — unlike `terminal create --command` just
+	// above, which really is a command string. Passing
+	// "claude --agent team --dangerously-skip-permissions" here would be a
+	// guess at an unverified contract, and this file's standing rule is that
+	// orca flags are verified live before they are relied on. A user's
+	// configured flags therefore do not reach an orca worktree spawn; that is
+	// a known, accepted gap rather than an oversight.
 	out, err := exec.CommandContext(ctx, "orca", "worktree", "create",
 		"--repo", "path:"+repoCwd, "--name", name, "--agent", "claude", "--prompt", prompt, "--json").Output()
 	if err != nil {

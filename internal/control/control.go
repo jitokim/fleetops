@@ -200,6 +200,53 @@ func Resolve() (Controller, bool) {
 	return nil, false
 }
 
+// Spawner is the narrow "start a brand new claude loop in cwd" capability —
+// the subset of Controller that creating a loop actually needs (Name,
+// Available, Spawn), and nothing else.
+//
+// It exists so a host terminal that can spawn but cannot do anything else a
+// Controller promises — iTerm2, which has no concept of locating a surface by
+// cwd and no pane addressing — can participate in spawn WITHOUT being added to
+// the `backends` slice. That distinction is the whole point: `backends` feeds
+// ResolveForLocate and ResolveActuationTarget, so an entry there would join
+// Tier 1b's cwd probe and its cross-backend ambiguity counting and thereby
+// change actuation dispatch. A separate interface keeps the new capability
+// strictly additive, the same reasoning that made WorktreeSpawner/
+// TerminalOpener/TTYLocator narrow interfaces rather than Controller methods.
+//
+// Every Controller satisfies Spawner already, so ResolveSpawner can hand back
+// either kind and callers can still type-assert for the richer capabilities
+// (spawnCmd does exactly that for WorktreeSpawner).
+type Spawner interface {
+	Name() string
+	Available() bool
+	Spawn(cwd, goal string) error
+}
+
+// ResolveSpawner returns something that can start a new loop: the first
+// available multiplexer Controller, or — only when there is NO multiplexer at
+// all — the host-terminal spawner (iTerm2). ok is false when neither exists.
+//
+// Multiplexers keep strict priority, which makes this a pure superset: on any
+// machine with orca/cmux/tmux available, this returns exactly what Resolve
+// returns and the iTerm2 path is never reached. The only behaviour that
+// changes is on a machine where spawn previously failed outright.
+//
+// iTerm2 is checked LAST rather than by host affinity on purpose. A loop
+// spawned into a multiplexer gets pane-exact addressing for every later
+// actuation (Tier 1a); one spawned into a bare iTerm2 window relies on Tier 1h
+// and on the SessionStart hook having recorded its window id. The
+// better-addressable surface should win whenever it exists.
+func ResolveSpawner() (Spawner, bool) {
+	if c, ok := Resolve(); ok {
+		return c, true
+	}
+	if host := (iterm2Spawner{}); host.Available() {
+		return host, true
+	}
+	return nil, false
+}
+
 // ResolveForLocate is the ATTACH resolver: it returns the first AVAILABLE
 // backend that can actually Locate a surface for projectDir, together with the
 // Target it located — not merely the first backend that happens to be

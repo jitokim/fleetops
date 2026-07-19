@@ -95,6 +95,50 @@ look at the UI, or for screenshotting it without leaking real paths/goals.
 | `x` | delete — press twice within 3s to confirm: hides the loop (same as `d`) and removes its `~/.fleetops/sessions/` registry entry (conversation history untouched) |
 | `q` | quit |
 
+## Configuration
+
+Optional. fleetops works with no config file at all — this exists for one
+thing: telling it **what to run** when you press `n`.
+
+`~/.fleetops/settings.json` (outside the repo, beside the rest of fleetops's
+state, so there is nothing to gitignore and nothing you can commit by accident):
+
+```json
+{
+  "spawn": {
+    "command": ["claude", "--agent", "team", "--dangerously-skip-permissions"]
+  }
+}
+```
+
+**It is an argv array, not a command string.** That is deliberate: a string
+would need a shell, and the wrapper most people want to point at is a shell
+*function* (`team() { claude --agent team; }`), which only exists inside an
+interactive shell — neither tmux nor a fresh iTerm2 window gives you one. An
+array is passed straight to `execve`, so there is no shell, no quoting to get
+wrong, and no injection surface. Write the flags out; the wrapper's body is
+what you want anyway.
+
+**`argv[0]` must be `claude`** (an absolute path to it is fine). fleetops finds
+your loops by looking for a process named `claude` on a pane or tty, so
+`["mise", "exec", "--", "claude"]` would start a loop it can then never reach —
+`a`/`r`/`i`/`p`/`k` would all stop working on it. A config that breaks this is
+ignored and the default is used.
+
+Anything unusable — missing file, bad JSON, a `command` that is a string
+instead of an array, an empty element — falls back to plain `claude` rather
+than failing. A typo in an optional convenience should never stop you starting
+a loop.
+
+Two things this setting does **not** touch:
+
+- **`fleetops --demo`** always runs plain `claude`. The demo is synthetic and
+  must not depend on your machine.
+- **The headless re-drive** (Tier 2, what `r`/`i` fall back to) always runs
+  plain `claude`. That path also serves sessions fleetops merely *observes* —
+  loops you started yourself, elsewhere — and your spawn preferences have no
+  business rewriting how those are driven.
+
 ## How it works
 
 **Observation.** `internal/claude` globs `~/.claude/projects/*/*.jsonl`, uses each

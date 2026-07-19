@@ -2013,6 +2013,42 @@ func TestAmbiguityRemedy_ObservedAndAlive_KeepsOriginalAdvice(t *testing.T) {
 	}
 }
 
+// ── noSurfaceText: a refusal must not advertise absent tools ─────────────
+//
+// The literals this replaces named orca/tmux/cmux on a machine that may have
+// none of them — which reads as "install one of these" to the very population
+// (iTerm2-only) whose loop is reachable in principle and whose real problem is
+// a missing host binding.
+
+func TestNoSurfaceText_NamesTheManualActionAndAnApplicableRemedy(t *testing.T) {
+	l := domain.Loop{Project: "fleetops"} // never bound, alive
+
+	got := noSurfaceText(l, "kill manually: type /exit in fleetops")
+
+	if !strings.Contains(got, "kill manually: type /exit in fleetops") {
+		t.Errorf("text = %q, want it to carry the manual action", got)
+	}
+	if !strings.Contains(got, "fleetops hooks install") {
+		t.Errorf("text = %q, want the remedy that applies to an unbound live loop", got)
+	}
+}
+
+// A dead loop must not be told to install hooks or attach — neither reaches a
+// process that already exited. Same rule ambiguityRemedy encodes; this asserts
+// noSurfaceText inherits it rather than re-deciding.
+func TestNoSurfaceText_ProcessGone_DoesNotAdviseHooksInstall(t *testing.T) {
+	l := domain.Loop{Project: "fleetops", Stall: domain.StallGone}
+
+	got := noSurfaceText(l, "kill manually: type /exit in fleetops")
+
+	if strings.Contains(got, "fleetops hooks install") {
+		t.Errorf("text = %q, advises installing hooks for a loop whose process is gone", got)
+	}
+	if !strings.Contains(got, "already gone") {
+		t.Errorf("text = %q, want it to say the process is gone", got)
+	}
+}
+
 // Wiring: the branch actually reaches the status line the human reads, not
 // just the helper. Same fixture as
 // TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable, with the selected
@@ -3666,13 +3702,24 @@ type fakeController struct {
 	locateOK           bool
 	focusCalled        bool
 	focusErr           error
+
+	// Spawn recording — added for the backend-agnostic worktree spawn tests,
+	// which must assert WHICH directory the loop was actually started in (the
+	// fresh worktree, never the repo the human was trying to keep clean).
+	spawnCalled bool
+	spawnCwd    string
+	spawnPrompt string
+	spawnErr    error
 }
 
 func (f *fakeController) Name() string                   { return f.name }
 func (f *fakeController) Available() bool                { return true }
 func (f *fakeController) Approve(control.Target) error   { return nil }
 func (f *fakeController) Interrupt(control.Target) error { return nil }
-func (f *fakeController) Spawn(string, string) error     { return nil }
+func (f *fakeController) Spawn(cwd, prompt string) error {
+	f.spawnCalled, f.spawnCwd, f.spawnPrompt = true, cwd, prompt
+	return f.spawnErr
+}
 func (f *fakeController) Locate(string) (control.Target, bool) {
 	f.locateCalled = true
 	return f.locateTarget, f.locateOK
@@ -9140,5 +9187,40 @@ func TestFleetPanelLines_IdenticalLabels_StillDisambiguatedByShortID(t *testing.
 	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
 	if !strings.Contains(joined, "·aaa1") || !strings.Contains(joined, "·bbb2") {
 		t.Errorf("expected ·shortID suffixes on colliding labels, got:\n%s", joined)
+	}
+}
+
+// ── spawnFailureText: an unknown outcome must not be printed as failure ──
+//
+// A deadline-killed window request may well have created a real window running
+// claude with no goal. "spawn failed" asserts the opposite in the prefix, where
+// an operator scanning the status line stops reading — and invites them to
+// press n again, which is how one orphan window becomes two.
+
+func TestSpawnFailureText_UnknownDelivery_DoesNotSayFailed(t *testing.T) {
+	got := spawnFailureText(fmt.Errorf("creating a window: %w", control.ErrSendDeliveryUnknown))
+
+	if strings.Contains(got, "spawn failed") {
+		t.Errorf("text = %q, asserts failure for an outcome that is unknown", got)
+	}
+	if !strings.Contains(got, "UNKNOWN") {
+		t.Errorf("text = %q, want it to say the outcome is unknown", got)
+	}
+	if !strings.Contains(got, "window") {
+		t.Errorf("text = %q, want it to name the orphan the human must clean up", got)
+	}
+}
+
+// The carve-out is for unknown delivery ONLY. Softening a definite failure
+// would be the same sin in the other direction: under-reporting something the
+// operator needs to act on.
+func TestSpawnFailureText_OrdinaryFailure_StillSaysFailed(t *testing.T) {
+	got := spawnFailureText(errors.New("no such profile"))
+
+	if !strings.Contains(got, "spawn failed") {
+		t.Errorf("text = %q, want a definite failure reported plainly", got)
+	}
+	if strings.Contains(got, "UNKNOWN") {
+		t.Errorf("text = %q, hedges a failure that is not in doubt", got)
 	}
 }

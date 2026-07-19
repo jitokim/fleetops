@@ -253,19 +253,28 @@ const redriveTimeout = 10 * time.Minute
 // command's own stdout is discarded and only its exit status matters — the
 // point isn't to read the reply here, it's that the turn lands in the
 // transcript, which the cockpit picks up on its next scan.
+// Deliberately NOT configurable via spawn.command. Tier 2 is the universal
+// path — it serves sessions fleetops merely OBSERVES (a human's session started
+// in another editor entirely), not just loops it spawned. Letting a setting
+// named spawn.command rewrite this invocation meant the operator's choices for
+// loops fleetops CREATES silently became the posture for re-driving loops it
+// never created: a spawn.command carrying --dangerously-skip-permissions would
+// apply that to someone else's session. That crosses the owned/observed line
+// docs/adr-loop-state-model.md draws, so the command here stays "claude".
 func Redrive(sessionID, prompt string) error {
+	argv := redriveArgv(sessionID, prompt)
 	ctx, cancel := context.WithTimeout(context.Background(), redriveTimeout)
 	defer cancel()
-	argv := redriveArgv(sessionID, prompt)
 	if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err != nil {
 		return fmt.Errorf("claude --resume: %w", err)
 	}
 	return nil
 }
 
-// redriveArgv builds Redrive's argv — pulled out as its own pure function
-// so the exact command shape is directly unit-testable, same pattern as
-// orcaResumeCmd/tmuxResumeCmds.
+// redriveArgv is Tier 2's fixed invocation. Each element is structural:
+// --resume names the session to continue, -p makes the turn headless, and
+// --output-format json is the shape this path's contract is written against.
+// Kept a function rather than inlined so the contract has one greppable home.
 func redriveArgv(sessionID, prompt string) []string {
 	return []string{"claude", "--resume", sessionID, "-p", prompt, "--output-format", "json"}
 }

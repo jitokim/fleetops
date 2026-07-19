@@ -32,6 +32,7 @@ import (
 	"github.com/jitokim/fleetops/internal/oracle"
 	"github.com/jitokim/fleetops/internal/registry"
 	"github.com/jitokim/fleetops/internal/sessions"
+	"github.com/jitokim/fleetops/internal/worktree"
 	runewidth "github.com/mattn/go-runewidth"
 )
 
@@ -74,6 +75,24 @@ var (
 	// control.Resolve does real exec/Available probes, so tests can't rely on
 	// a real orca/tmux/cmux backend being installed.
 	controlResolveFn = control.Resolve
+	// resolveSpawnerFn is control.ResolveSpawner by default — spawnCmd's own
+	// resolver seam, deliberately WIDER than controlResolveFn. Spawning is the
+	// one operation a plain host terminal can do without being a multiplexer,
+	// so it resolves over control.Spawner (every multiplexer first, then the
+	// iTerm2 host spawner) rather than over Controller. Split from
+	// controlResolveFn rather than replacing it: takeOverCmd genuinely needs a
+	// Controller (it type-asserts TerminalOpener), and widening its resolver
+	// would have changed attach/take-over behaviour, which this is not
+	// allowed to touch.
+	resolveSpawnerFn = control.ResolveSpawner
+	// worktreeCreateFn is worktree.Create by default — spawnCmd's
+	// BACKEND-AGNOSTIC worktree seam. Overridable so the worktree spawn branch
+	// (and every way it can fail: not a repo, no origin remote, a colliding
+	// path) is unit-testable without creating real git checkouts on the
+	// machine running the suite. internal/worktree's own tests cover it
+	// against a REAL git and a real temp repo; this seam is about testing what
+	// the TUI does with each outcome.
+	worktreeCreateFn = worktree.Create
 	// controlResolveForLocateFn is control.ResolveForLocate by default —
 	// attachCmd's ATTACH resolver seam. Split from controlResolveFn on purpose:
 	// attach must follow whichever backend can actually Locate the loop's
@@ -159,11 +178,15 @@ type bootstrapResultMsg struct {
 	sessionID string
 }
 
-// worktreeEligibilityMsg reports whether the resolved backend implements
-// control.WorktreeSpawner — computed off the event loop (control.Resolve
-// does real exec calls) by checkWorktreeEligibilityCmd, fired at "n"
-// keypress time so the result is (almost always) ready well before the
-// wizard reaches its final wizardWhere step.
+// worktreeEligibilityMsg reports whether a spawner resolved at all — computed
+// off the event loop (control.ResolveSpawner does real exec calls) by
+// checkWorktreeEligibilityCmd, fired at "n" keypress time so the result is
+// (almost always) ready well before the wizard reaches its final wizardWhere
+// step.
+//
+// NOT "does the backend implement control.WorktreeSpawner" any more: fleetops
+// now creates worktrees itself with plain git (spawnIntoGitWorktree), so every
+// backend that can spawn can spawn into a worktree.
 type worktreeEligibilityMsg bool
 
 // killResultMsg reports the outcome of a kill (k key, double-press confirm)
@@ -351,9 +374,11 @@ type Model struct {
 
 	// spawnWorktreeEligible/spawnHostsClaudeRepo drive the final wizardWhere
 	// step's default and whether [w] is offered:
-	//   - spawnWorktreeEligible: does the resolved backend implement
-	//     control.WorktreeSpawner (orca only)? Computed OFF the event loop
-	//     (control.Resolve does real exec calls) by checkWorktreeEligibilityCmd,
+	//   - spawnWorktreeEligible: did ANY spawner resolve (multiplexer or the
+	//     iTerm2 host spawner)? Not a control.WorktreeSpawner test — fleetops
+	//     branches worktrees itself with plain git, so orca no longer has a
+	//     monopoly on [w]. Computed OFF the event loop
+	//     (control.ResolveSpawner does real exec calls) by checkWorktreeEligibilityCmd,
 	//     fired at "n" keypress time — by the time a human types through 4-5
 	//     wizard steps the result has almost always arrived, but the
 	//     zero-value (false) is a safe fallback if it hasn't.
@@ -1789,7 +1814,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// that starts a brand new turn, not an in-place keypress).
 		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
-			return approveResultMsg{false, "no orca/tmux/cmux — approve manually: attach and press Enter"}
+			return approveResultMsg{false, noSurfaceText(l, "approve manually: attach and press Enter")}
 		}
 		if !found {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
@@ -2058,19 +2083,27 @@ func (m Model) submitSpawnWizardEngineDrive() (tea.Model, tea.Cmd) {
 	return m, bootstrapEngineCmd(m.spawnCwd, spec)
 }
 
-// checkWorktreeEligibilityCmd resolves the current backend and reports
-// whether it implements control.WorktreeSpawner — run off the event loop
-// (control.Resolve/Available do real exec calls) and fired at "n" keypress
-// time, well before the wizard reaches wizardWhere (see
-// worktreeEligibilityMsg).
+// checkWorktreeEligibilityCmd reports whether the wizard should offer [w]
+// (worktree-isolated spawn) — run off the event loop (control.Resolve/
+// Available do real exec calls) and fired at "n" keypress time, well before
+// the wizard reaches wizardWhere (see worktreeEligibilityMsg).
+//
+// Eligibility is now simply "a backend resolved at all", NOT "the backend
+// implements control.WorktreeSpawner". Since fleetops creates worktrees itself
+// with plain git (spawnIntoGitWorktree), every backend that can spawn can
+// spawn into a worktree — the old WorktreeSpawner test would hide the new
+// capability from exactly the tmux/iTerm2 users it was added for.
+//
+// It deliberately does NOT probe whether the target dir is a git repo. That
+// dir can still change later in the wizard ([c]/[s]), so an answer computed
+// here could be stale by the time it is used, and a non-repo target already
+// fails at spawn time with worktree.ErrNotARepo — a specific, honest message
+// naming the directory. Refusing to offer the choice would be the less
+// informative of the two.
 func checkWorktreeEligibilityCmd() tea.Cmd {
 	return func() tea.Msg {
-		ctrl, ok := control.Resolve()
-		if !ok {
-			return worktreeEligibilityMsg(false)
-		}
-		_, supports := ctrl.(control.WorktreeSpawner)
-		return worktreeEligibilityMsg(supports)
+		_, ok := resolveSpawnerFn()
+		return worktreeEligibilityMsg(ok)
 	}
 }
 
@@ -2085,15 +2118,20 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // the composed contract block (buildSpawnPrompt), not the bare goal — the
 // registry still stores goal/doneWhen/oracle/challenger as separate fields.
 //
-// useWorktree requests the worktree-isolated branch (Part 1 of the
-// worktree-spawn slice): when the resolved controller implements
-// control.WorktreeSpawner, cwd is treated as the REPO to branch a fresh
-// worktree from (SpawnWorktree also sends the contract prompt itself, as
-// part of orca's one-shot --agent launch — no separate Resume/send step,
-// verified live). If useWorktree is false, or the backend doesn't implement
-// WorktreeSpawner at all (tmux/cmux — a structural fallback, not a
-// preference), this falls through to the ordinary current-dir Spawn path
-// unchanged.
+// useWorktree requests the worktree-isolated branch, which now has TWO
+// implementations and cwd is the REPO to branch from in both:
+//
+//   - The resolved controller implements control.WorktreeSpawner (orca):
+//     its own one-shot `worktree create --agent` launch, which also sends the
+//     contract prompt itself — no separate Resume/send step, verified live.
+//     Unchanged.
+//   - Any other backend (tmux, iTerm2, …): fleetops creates the worktree
+//     ITSELF with plain git and then spawns into it — see
+//     spawnIntoGitWorktree. This is what stopped worktree isolation from being
+//     an orca-only capability; git worktrees are a git feature, not a vendor's.
+//
+// If useWorktree is false this falls through to the ordinary current-dir Spawn
+// path, unchanged.
 //
 // SHARED-WORKSPACE CAVEAT (verified live, see SpawnWorktree's doc): for a
 // path-registered ("folder") repo, Orca doesn't isolate at all — the
@@ -2103,9 +2141,16 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // failure.
 func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 	return func() tea.Msg {
-		ctrl, ok := control.Resolve()
+		// resolveSpawnerFn, not controlResolveFn: spawn is the one operation
+		// a host terminal can perform without being a multiplexer, so it
+		// resolves over the wider Spawner seam (multiplexers first, then
+		// iTerm2). Everything else in this file still resolves over
+		// Controller. It is also a seam because Resolve does real
+		// exec/Available probes, so without it no spawn branch could be
+		// tested on a machine with no backend installed.
+		ctrl, ok := resolveSpawnerFn()
 		if !ok {
-			return spawnResultMsg{false, "no orca/tmux/cmux — spawn manually: cd " + cwd + " && claude"}
+			return spawnResultMsg{false, "no orca/tmux/cmux/iTerm2 — spawn manually: cd " + cwd + " && claude"}
 		}
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 
@@ -2139,8 +2184,12 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 			return spawnResultMsg{true, fmt.Sprintf("spawned loop in new worktree %s via %s%s", name, ctrl.Name(), bindNote)}
 		}
 
+		if useWorktree {
+			return spawnIntoGitWorktree(ctrl, cwd, spec, prompt)
+		}
+
 		if err := ctrl.Spawn(cwd, prompt); err != nil {
-			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
+			return spawnResultMsg{false, spawnFailureText(err)}
 		}
 		if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
 			// best-effort: the loop still spawned and will show up
@@ -2149,6 +2198,62 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		}
 		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
 	}
+}
+
+// spawnIntoGitWorktree is spawnCmd's BACKEND-AGNOSTIC worktree branch: it
+// creates a real git worktree itself (internal/worktree — plain `git worktree
+// add`, branched from an explicit origin/<default-branch>) and then runs the
+// ordinary Controller.Spawn INTO that fresh directory.
+//
+// This is what makes worktree isolation available on every backend rather than
+// only on orca. It is reached only when the resolved controller does NOT
+// implement control.WorktreeSpawner — orca still takes its own one-shot
+// `worktree create --agent` path above, unchanged. Keeping orca's route intact
+// is deliberate: its worktrees are Orca-managed and show up in Orca's own UI,
+// which is a real advantage for an orca user, and demoting that path is a
+// separate decision nobody has made.
+//
+// Failure is REPORTED, never silently downgraded to a plain current-dir spawn.
+// The human explicitly asked for isolation; quietly spawning into the repo they
+// were trying to keep clean is the kind of "success" this project treats as a
+// defect. The status line names the branch AND the base it was cut from, since
+// the explicit base is the whole guarantee and a guarantee nobody can see is
+// one nobody can trust.
+func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt string) tea.Msg {
+	wt, err := worktreeCreateFn(cwd)
+	if err != nil {
+		return spawnResultMsg{false, fmt.Sprintf("worktree spawn failed: %v", err)}
+	}
+	if err := ctrl.Spawn(wt.Path, prompt); err != nil {
+		// The checkout exists but nothing is running in it. Say exactly that,
+		// and name the path — it is the human's to reuse or remove, and a
+		// message that omitted it would leave an orphan directory they never
+		// heard about.
+		return spawnResultMsg{false, fmt.Sprintf("created worktree %s but spawn failed: %v (the checkout is at %s)", wt.Branch, err, wt.Path)}
+	}
+	spawned := fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name())
+	if err := registry.WritePending(registry.PendingDir(), wt.Path, spec); err != nil {
+		// best-effort, same posture as the plain-spawn path: the loop really
+		// did start, it just won't get ORACLE/N-I tracking.
+		return spawnResultMsg{true, fmt.Sprintf("%s (goal not recorded: %v)", spawned, err)}
+	}
+	return spawnResultMsg{true, spawned}
+}
+
+// staleBaseNote renders the caveat for a worktree whose pre-branch fetch
+// failed — the base came from a local ref that may be out of date.
+//
+// It is appended to a SUCCESS message on purpose: the spawn genuinely worked
+// and must not be reported as a failure (an offline machine still deserves a
+// working spawn). But the fresh-base guarantee is the whole reason this path
+// resolves an explicit base, so when it could not be honoured the human has to
+// be told plainly rather than left to infer it from silence. Empty when the
+// fetch succeeded, so the common case reads clean.
+func staleBaseNote(wt worktree.Result) string {
+	if !wt.StaleBase {
+		return ""
+	}
+	return fmt.Sprintf(" ⚠ base may be STALE — fetch failed: %s", wt.StaleReason)
 }
 
 // ── LoopEngine: headless bootstrap ───────────────────────────────────────
@@ -2388,7 +2493,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// into via a fresh --resume -p turn).
 		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
-			return killResultMsg{false, "no orca/tmux/cmux — kill manually: type /exit in " + l.Project}
+			return killResultMsg{false, noSurfaceText(l, "kill manually: type /exit in "+l.Project)}
 		}
 		if !found {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
@@ -2434,7 +2539,7 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		// --resume -p call; that would start a brand new turn instead).
 		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
-			return interruptResultMsg{false, "no orca/tmux/cmux — stop manually: press Esc in " + l.Project}
+			return interruptResultMsg{false, noSurfaceText(l, "stop manually: press Esc in "+l.Project)}
 		}
 		if !found {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
@@ -3038,6 +3143,27 @@ func emitTransitionsCmd(transitions []transitionEvent) tea.Cmd {
 	}
 }
 
+// spawnFailureText renders a failed spawn, separating the ONE failure whose
+// outcome is unknowable from the ones that provably created nothing.
+//
+// control.ErrSendDeliveryUnknown means the window-creating osascript was
+// KILLED at its deadline, so iTerm2 may well have created a real window that
+// is now running a claude with no goal typed into it. Printing that as
+// "spawn failed" asserts the opposite of the likely state, and asserts it in
+// the prefix — where an operator scanning the status line stops reading. It
+// also invites them to press n again, which is how one orphan window becomes
+// two.
+//
+// So: say the outcome is unknown, and NAME the orphan the way
+// spawnIntoGitWorktree already names an orphan checkout, because a thing the
+// human was never told about is a thing they cannot clean up.
+func spawnFailureText(err error) string {
+	if errors.Is(err, control.ErrSendDeliveryUnknown) {
+		return "spawn outcome UNKNOWN — the window request timed out and may still have created one. Check for a new iTerm2 window running claude with no goal, and close it before retrying"
+	}
+	return fmt.Sprintf("spawn failed: %v", err)
+}
+
 // unknownDeliveryText is the operator line for a Tier 1h send whose delivery is
 // UNKNOWN (control.ErrSendDeliveryUnknown — osascript was killed at the
 // actuationTimeout deadline, so the write may or may not have reached the pty).
@@ -3312,6 +3438,27 @@ func ambiguityRemedy(l domain.Loop) string {
 		return "attach (↵) to act manually; `fleetops hooks install` can't help — registration happens at session start, so only a fresh loop gets session-exact targeting"
 	}
 	return "attach (↵) or run `fleetops hooks install` so injects can target by session"
+}
+
+// noSurfaceText is what a typed action says when NOTHING could reach the loop
+// in place: no multiplexer is available AND the host-terminal send (Tier 1h)
+// did not resolve either.
+//
+// It exists because the hand-written "no orca/tmux/cmux" literals it replaces
+// became wrong the moment iTerm2 could host a loop. On a machine with no
+// multiplexer at all — the population this tier was built for — fleetops would
+// tell the operator it spawned a loop via iterm2 and then, on the very next
+// keypress, refuse while naming three backends they do not have and never
+// mentioning the one that does apply. Naming absent tools is not a remedy; it
+// reads as "install one of these", which is exactly the wrong advice for
+// someone whose loop IS reachable in principle and whose real problem is that
+// this session has no host binding recorded.
+//
+// Shares ambiguityRemedy's branching deliberately: both answer "why can't you
+// reach this loop, and what would actually help", and the honest answer turns
+// on the same three facts (process gone / we hold a contract / neither).
+func noSurfaceText(l domain.Loop, manual string) string {
+	return "no reachable surface for this loop (no orca/tmux/cmux, and no host terminal binding) — " + manual + "; " + ambiguityRemedy(l)
 }
 
 // sameProjectDirCount counts how many loops in the current fleet (not just
