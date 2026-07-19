@@ -92,15 +92,21 @@ type Verdict struct {
 // maps to one Claude Code session (its JSONL log); Project/SessionID/Path locate it,
 // LastActivity/Stall come from tailing the log (DESIGN.md, seed spec §Observe).
 type Loop struct {
-	ID           string
-	Name         string // explicit human-given display name (wizard's "name" step, via registry.Record.Name); "" when none — see DisplayLabel
-	Goal         Goal
-	State        LoopState
-	Cycle        int
-	TokensSpent  int
-	NoImprove    int
-	Last         *Verdict
-	GatePrompt   string
+	ID          string
+	Name        string // explicit human-given display name (wizard's "name" step, via registry.Record.Name); "" when none — see DisplayLabel
+	Goal        Goal
+	State       LoopState
+	Cycle       int
+	TokensSpent int
+	NoImprove   int
+	Last        *Verdict
+	GatePrompt  string
+	// GateOptions are the answer choices a gate offers, when it offers a
+	// structured set — today only AskUserQuestion does. Empty for a permission
+	// prompt, deliberately: its choices are always some form of yes/no, so the
+	// information a human (or an agent) actually needs there is WHAT is being
+	// asked, which GatePrompt carries. Display-only; nothing selects from this.
+	GateOptions  []string
 	Project      string    // decoded project label (e.g. "myproject")
 	ProjectDir   string    // raw encoded project dir name, e.g. "-home-user-myproject"
 	Cwd          string    // best-effort decoded absolute cwd, for display only — see CwdVerified

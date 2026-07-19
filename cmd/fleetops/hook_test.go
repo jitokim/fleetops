@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/sessions"
 )
 
@@ -265,4 +269,133 @@ func truncate(s string) string {
 		return s[:40] + "..."
 	}
 	return s
+}
+
+func TestSummarizeToolInput(t *testing.T) {
+	// tool_input's shape is per-tool and open-ended. What is pinned here is
+	// that an unreadable or unfamiliar payload degrades to "" — the tool name
+	// alone is still strictly more than the generic notification carried, so a
+	// novel tool must never cost us the marker.
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"Bash command", `{"command":"go test ./...","description":"run tests"}`, "go test ./..."},
+		{"Write file_path", `{"file_path":"/tmp/x.go","content":"..."}`, "/tmp/x.go"},
+		{"WebFetch url", `{"url":"https://example.com","prompt":"summarize"}`, "https://example.com"},
+		{"field precedence: command wins over file_path", `{"file_path":"/tmp/x","command":"rm /tmp/x"}`, "rm /tmp/x"},
+		{"unknown tool shape", `{"somethingNew":{"nested":1}}`, ""},
+		{"empty object", `{}`, ""},
+		{"absent", ``, ""},
+		{"malformed json", `{not json`, ""},
+		{"not an object", `["a"]`, ""},
+		{"empty string value is skipped", `{"command":"","file_path":"/tmp/x"}`, "/tmp/x"},
+		{"non-string value is skipped", `{"command":42,"file_path":"/tmp/x"}`, "/tmp/x"},
+		{"whitespace collapsed", "{\"command\":\"go   test\\n  ./...\"}", "go test ./..."},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := summarizeToolInput([]byte(c.raw)); got != c.want {
+				t.Errorf("summarizeToolInput(%s) = %q, want %q", c.raw, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSummarizeToolInput_LongCommandBounded(t *testing.T) {
+	// A gate callout is one line in a cockpit showing a whole fleet. Bounded
+	// at write time so the marker file cannot grow without limit either.
+	raw, err := json.Marshal(map[string]string{"command": strings.Repeat("x", toolDetailCap*3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := summarizeToolInput(raw)
+	if n := utf8.RuneCountInString(got); n > toolDetailCap+1 { // +1 for the ellipsis
+		t.Errorf("detail rune length = %d, want <= %d", n, toolDetailCap+1)
+	}
+}
+
+func TestPermissionHook_WritesToolDetail(t *testing.T) {
+	// End-to-end through the hook's own stdin path: the payload shape here is
+	// a verbatim reduction of a real PermissionRequest payload measured
+	// 2026-07-20.
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	const session = "sess-perm"
+
+	payload := `{"hook_event_name":"PermissionRequest","session_id":"` + session + `",` +
+		`"prompt_id":"77e62224-b63c-4744-ae73-38eb3764e406","tool_name":"Bash",` +
+		`"tool_input":{"command":"echo PERMREQ","description":"Echo PERMREQ"},"permission_mode":"default"}`
+
+	withStdin(t, payload, permissionHook)
+
+	got := gate.Pending(gate.GatesDir())[session]
+	if got.Tool != "Bash" {
+		t.Errorf("Tool = %q, want %q", got.Tool, "Bash")
+	}
+	if got.ToolDetail != "echo PERMREQ" {
+		t.Errorf("ToolDetail = %q, want %q", got.ToolDetail, "echo PERMREQ")
+	}
+	if got.PromptID == "" {
+		t.Error("PromptID not recorded — the merge rules have nothing to correlate on")
+	}
+	if want := "Bash: echo PERMREQ"; got.Detail() != want {
+		t.Errorf("Detail() = %q, want %q", got.Detail(), want)
+	}
+}
+
+func TestPermissionHook_IsASensorOnly(t *testing.T) {
+	// A PermissionRequest hook MAY return a permissionDecision and thereby
+	// grant or deny the permission itself. fleetops must not: a decision made
+	// here leaves no event, no actor, and nothing to attribute or brake. This
+	// test guards the boundary that keeps acting auditable — if it ever fails,
+	// read permissionHook's contract before "fixing" it.
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	payload := `{"session_id":"s1","tool_name":"Bash","tool_input":{"command":"rm -rf /"}}`
+
+	out := captureStdout(t, func() { withStdin(t, payload, permissionHook) })
+
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("permission hook wrote to stdout: %q — anything here can be read as a permission decision", out)
+	}
+}
+
+func TestPermissionHook_MissingSessionID_NoWrite(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	withStdin(t, `{"tool_name":"Bash"}`, permissionHook)
+	if len(gate.Pending(gate.GatesDir())) != 0 {
+		t.Error("expected no marker without a session id")
+	}
+}
+
+func TestPermissionHook_MalformedPayload_NoPanic(t *testing.T) {
+	// Claude Code runs this on every permission prompt. It must never fail
+	// loudly — a bug here must not be able to break the user's real session.
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	for _, payload := range []string{``, `{`, `null`, `[]`, `{"session_id":123}`} {
+		withStdin(t, payload, permissionHook)
+	}
+}
+
+// captureStdout collects everything fn writes to os.Stdout.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	fn()
+	os.Stdout = orig
+	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
 }

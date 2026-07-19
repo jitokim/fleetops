@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jitokim/fleetops/internal/gate"
@@ -20,6 +21,8 @@ func runHookCmd(args []string) {
 	switch args[0] {
 	case "notify":
 		notifyHook()
+	case "permission":
+		permissionHook()
 	case "session-start":
 		sessionStartHook()
 	case "session-end":
@@ -39,6 +42,37 @@ type hookPayload struct {
 	Message          string `json:"message"`
 	Cwd              string `json:"cwd"`
 	NotificationType string `json:"notification_type"`
+
+	// PromptID correlates this payload with the OTHER hook that fires for the
+	// same gate — see gate.WriteMarker's merge rules, which degrade safely
+	// when it is absent or the two hooks disagree. Observed on BOTH hooks'
+	// payloads 2026-07-20 with matching values; the fixture in
+	// TestPermissionHook_WritesToolDetail pins only this half. Older claude
+	// versions omit it.
+	PromptID string `json:"prompt_id"`
+
+	// ToolName and ToolInput are PermissionRequest-only: what the session is
+	// asking permission to do.
+	ToolName  string          `json:"tool_name"`
+	ToolInput json.RawMessage `json:"tool_input"`
+}
+
+// readGateHookPayload decodes the stdin JSON shared by the two hooks that
+// write gate markers, reporting false when there is nothing usable to record.
+// It centralizes the swallow-every-error contract those hooks depend on: an
+// unreadable stdin, unparseable JSON, or a payload with no session id all mean
+// "do nothing", never a non-zero exit. The session hooks decode a different
+// payload type and keep their own copy.
+func readGateHookPayload() (hookPayload, bool) {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return hookPayload{}, false
+	}
+	var payload hookPayload
+	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+		return hookPayload{}, false
+	}
+	return payload, true
 }
 
 // notifyHook reads the Notification hook's JSON from stdin and writes a
@@ -47,15 +81,88 @@ type hookPayload struct {
 // here is swallowed, not reported, and the process always exits 0. A bug in
 // this path must not be able to break the user's actual claude session.
 func notifyHook() {
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
+	payload, ok := readGateHookPayload()
+	if !ok {
 		return
 	}
-	var payload hookPayload
-	if err := json.Unmarshal(data, &payload); err != nil || payload.SessionID == "" {
+	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, gate.Info{
+		Message:  payload.Message,
+		Type:     payload.NotificationType,
+		PromptID: payload.PromptID,
+	})
+}
+
+// permissionHook reads the PermissionRequest hook's JSON from stdin and
+// enriches the gate marker with WHAT is being asked — the Notification hook
+// alone only ever says "Claude needs your permission", which tells an
+// operator nothing about whether this gate is worth interrupting for.
+//
+// THIS HOOK IS A SENSOR AND MUST STAY ONE. Claude Code lets a
+// PermissionRequest hook return a permissionDecision and thereby GRANT or
+// DENY the permission itself. fleetops writes nothing to stdout and always
+// exits 0.
+//
+// The reason is not timidity about automation — deciding is a direction this
+// project is heading. It is that a decision made HERE leaves no trace: no
+// event, no actor, no way to attribute or brake it. Decisions belong on the
+// actuation path, which records them. A hook that quietly decided would let
+// fleet-wide permissions change with nothing in the log to show it happened.
+// Keeping sensing and acting apart is what makes the acting auditable.
+func permissionHook() {
+	payload, ok := readGateHookPayload()
+	if !ok {
 		return
 	}
-	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, payload.Message, payload.NotificationType)
+	_ = gate.WriteMarker(gate.GatesDir(), payload.SessionID, gate.Info{
+		Message:    payload.Message,
+		Type:       payload.NotificationType,
+		PromptID:   payload.PromptID,
+		Tool:       payload.ToolName,
+		ToolDetail: summarizeToolInput(payload.ToolInput),
+	})
+}
+
+// toolInputFields are the tool_input keys worth showing, most-specific
+// first. tool_input's shape is per-tool and open-ended, so this is a
+// deliberate small heuristic rather than an attempt at generality: these
+// cover the tools that actually trigger permission prompts, and anything
+// unrecognized simply shows the tool name alone (gate.Info.Detail), which is
+// still strictly more than the generic notification said.
+var toolInputFields = []string{"command", "file_path", "url", "pattern", "path"}
+
+// summarizeToolInput picks one human-meaningful field out of tool_input and
+// bounds it. Returns "" for anything it cannot read — a malformed or novel
+// payload must not stop the marker from being written, since the tool name
+// on its own is already useful.
+func summarizeToolInput(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ""
+	}
+	for _, key := range toolInputFields {
+		if v, ok := fields[key].(string); ok && v != "" {
+			return truncateToolDetail(v)
+		}
+	}
+	return ""
+}
+
+// toolDetailCap bounds the stored detail. A gate callout is one line in a
+// cockpit that shows a whole fleet; an unbounded shell command would push
+// everything else off it. Bounded at write time rather than render time so
+// the marker file itself cannot grow without limit.
+const toolDetailCap = 120
+
+func truncateToolDetail(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= toolDetailCap {
+		return s
+	}
+	return string(r[:toolDetailCap]) + "…"
 }
 
 // sessionHookPayload is the subset of Claude Code's SessionStart / SessionEnd

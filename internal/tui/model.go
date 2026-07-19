@@ -5495,8 +5495,18 @@ func renderResumeCallout(l domain.Loop, width int, evs []events.Event, now time.
 }
 
 // renderGateCallout is the mockup's gate-line for a loop waiting on a human
-// decision — driven by the Notification hook, not a screen-scrape guess:
+// decision — never a screen-scrape of the terminal:
 // "GATE ▸ <prompt>   a approve   ↵ attach to answer".
+//
+// Two upstream paths feed it. A permission gate comes from the hook markers
+// (Notification and PermissionRequest, merged in internal/gate). An
+// AskUserQuestion gate fires no hook at all, so it is recovered by parsing the
+// session's JSONL tail — a structured read of claude's own transcript, not a
+// guess at the screen. Only the latter carries answer choices, which a second
+// line lists when present; see domain.Loop.GateOptions.
+// The point is to make the gate judgeable WITHOUT attaching, which is what an
+// operator needs when several loops are gated at once and only one of them
+// actually deserves the interrupt.
 func renderGateCallout(l domain.Loop, width int) string {
 	contentWidth := width - 4
 	if contentWidth < 20 {
@@ -5510,7 +5520,25 @@ func renderGateCallout(l domain.Loop, width int) string {
 		" " + stInk.Render(prompt) +
 		"   " + stKeyChipAmber.Render("a") + stDim.Render(" approve") +
 		"   " + stKeyChipAmber.Render("↵") + stDim.Render(" attach to answer")
+	if choices := renderGateChoices(l.GateOptions); choices != "" {
+		line += "\n" + choices
+	}
 	return "\n" + stCalloutAmber.Width(contentWidth).Render(line)
+}
+
+// renderGateChoices lays the answer choices out as a dim second line.
+//
+// Deliberately NOT numbered, even though claude's own AskUserQuestion prompt
+// numbers them (see internal/claude's pendingAskUserQuestion). Reproducing the
+// numbers here would read as "press 2" — but fleetops does not inject answers
+// into a gate (an explicit non-goal; answering stays attach or "a"), so a
+// number would promise a keystroke that does not exist. The separator says
+// "these are the options" without implying a way to pick one from the cockpit.
+func renderGateChoices(options []string) string {
+	if len(options) == 0 {
+		return ""
+	}
+	return stDim.Render("choices: " + strings.Join(options, "  ·  "))
 }
 
 // renderDriftCallout is the mockup's red gate-line for a loop the oracle

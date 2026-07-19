@@ -104,6 +104,11 @@ fsatomic, worktree   notifications, ~/.fleetops/settings.json (spawn.command
                      creation with plain `git` (deliberately NOT in control:
                      making a checkout drives no terminal). Zero internal
                      deps each.
+                     gate is the one with a non-obvious rule: TWO hooks write
+                     a single gate's marker and the LESS informative one
+                     arrives last, so writes merge on prompt_id instead of
+                     overwriting, holding the marker's TS still because it
+                     doubles as a compare-and-swap token.
 sessions           — the session-identity registry: the hook-recorded
                      session→tty map that lets actuation target one exact
                      session rather than guessing by cwd. → fsatomic.

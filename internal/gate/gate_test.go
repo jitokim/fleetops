@@ -3,6 +3,7 @@ package gate
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,7 +11,7 @@ import (
 func TestWriteMarker_PendingRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
-	if err := WriteMarker(dir, "sess-abc123", "approve merge to main?", "permission_prompt"); err != nil {
+	if err := WriteMarker(dir, "sess-abc123", Info{Message: "approve merge to main?", Type: "permission_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 
@@ -29,7 +30,7 @@ func TestWriteMarker_PendingRoundTrip(t *testing.T) {
 
 func TestWriteMarker_CreatesDir(t *testing.T) {
 	dir := t.TempDir() + "/nested/gates"
-	if err := WriteMarker(dir, "sess-1", "hi", "permission_prompt"); err != nil {
+	if err := WriteMarker(dir, "sess-1", Info{Message: "hi", Type: "permission_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	if len(Pending(dir)) != 1 {
@@ -48,7 +49,7 @@ func TestPending_EmptyOrMissingDir(t *testing.T) {
 
 func TestPending_SkipsMalformedAndNonJSONFiles(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteMarker(dir, "good", "ok", "permission_prompt"); err != nil {
+	if err := WriteMarker(dir, "good", Info{Message: "ok", Type: "permission_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	writeRaw(t, dir+"/bad.json", "not json at all")
@@ -65,7 +66,7 @@ func TestPending_SkipsMalformedAndNonJSONFiles(t *testing.T) {
 
 func TestDeleteMarker(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteMarker(dir, "sess-1", "hi", "permission_prompt"); err != nil {
+	if err := WriteMarker(dir, "sess-1", Info{Message: "hi", Type: "permission_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	DeleteMarker(dir, "sess-1")
@@ -81,7 +82,7 @@ func TestDeleteMarker_MissingFileIsHarmless(t *testing.T) {
 
 func TestDeleteMarkerIfTS_MatchingTS_Deletes(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteMarker(dir, "s1", "msg", "permission_prompt"); err != nil {
+	if err := WriteMarker(dir, "s1", Info{Message: "msg", Type: "permission_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	ts := Pending(dir)["s1"].TS.UnixNano()
@@ -96,7 +97,7 @@ func TestDeleteMarkerIfTS_MatchingTS_Deletes(t *testing.T) {
 
 func TestDeleteMarkerIfTS_MismatchedTS_Survives(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteMarker(dir, "s1", "msg", "permission_prompt"); err != nil {
+	if err := WriteMarker(dir, "s1", Info{Message: "msg", Type: "permission_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	ts := Pending(dir)["s1"].TS.UnixNano()
@@ -222,5 +223,176 @@ func writeRaw(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write fixture %s: %v", path, err)
+	}
+}
+
+// TestWriteMarker_Merge covers the case that made merging necessary at all:
+// TWO hooks write one session's marker for a SINGLE gate, and the LESS
+// informative one arrives second (measured 2026-07-20 — PermissionRequest at
+// +0.00s with the tool name, Notification at +6.01s with "Claude needs your
+// permission"). A plain last-writer-wins would make this feature work for six
+// seconds and then quietly degrade forever.
+func TestWriteMarker_Merge(t *testing.T) {
+	const session = "sess-merge"
+	const pid = "77e62224-b63c-4744-ae73-38eb3764e406"
+
+	detailed := Info{Message: "", Type: "", PromptID: pid, Tool: "Bash", ToolDetail: "go test ./..."}
+	generic := Info{Message: "Claude needs your permission", Type: "permission_prompt", PromptID: pid}
+
+	t.Run("generic arriving second does not erase the detail", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := WriteMarker(dir, session, detailed); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+		if err := WriteMarker(dir, session, generic); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		got := Pending(dir)[session]
+		if got.Tool != "Bash" || got.ToolDetail != "go test ./..." {
+			t.Fatalf("detail lost: tool=%q detail=%q", got.Tool, got.ToolDetail)
+		}
+	})
+
+	t.Run("detail arriving second upgrades the marker", func(t *testing.T) {
+		// Hook ordering was measured once, on one machine. If it ever lands
+		// the other way round the merge must still converge on the richer
+		// payload rather than depending on which hook happened to win.
+		dir := t.TempDir()
+		if err := WriteMarker(dir, session, generic); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+		if err := WriteMarker(dir, session, detailed); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		if got := Pending(dir)[session]; got.Tool != "Bash" {
+			t.Fatalf("expected the marker upgraded to the detailed payload, got tool=%q", got.Tool)
+		}
+	})
+
+	t.Run("TS is held still across a merge so the CAS token stays valid", func(t *testing.T) {
+		// This is the subtle one. GateTS is handed to DeleteMarkerIfTS as a
+		// compare-and-swap token proving "I decided on THIS marker". If a
+		// merge bumped TS, an approve issued moments earlier would hold a
+		// token that no longer matches and would silently fail to clear the
+		// gate it just answered.
+		dir := t.TempDir()
+		if err := WriteMarker(dir, session, detailed); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+		first := Pending(dir)[session].TS
+		time.Sleep(2 * time.Millisecond) // force a distinguishable clock reading
+		if err := WriteMarker(dir, session, generic); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		after := Pending(dir)[session].TS
+		if !after.Equal(first) {
+			t.Fatalf("TS moved across a merge: %v → %v", first.UnixNano(), after.UnixNano())
+		}
+		if !DeleteMarkerIfTS(dir, session, first.UnixNano()) {
+			t.Fatal("CAS delete with the pre-merge TS failed — an approve decided before the merge could not clear its own gate")
+		}
+	})
+
+	t.Run("TS is held still on an UPGRADE too", func(t *testing.T) {
+		// Distinct from the case above, which lands on the no-write rule and
+		// therefore cannot exercise TS preservation at all. This one actually
+		// rewrites the file — the only path where a bumped TS could escape.
+		// Found by mutation: bumping TS on upgrade left the previous test
+		// green, so the invariant was being asserted only where it was free.
+		dir := t.TempDir()
+		if err := WriteMarker(dir, session, generic); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+		first := Pending(dir)[session].TS
+		time.Sleep(2 * time.Millisecond)
+		if err := WriteMarker(dir, session, detailed); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		got := Pending(dir)[session]
+		if got.Tool != "Bash" {
+			t.Fatalf("precondition: expected the upgrade to land, got tool=%q", got.Tool)
+		}
+		if !got.TS.Equal(first) {
+			t.Fatalf("TS moved on upgrade: %v → %v — a CAS token issued before the upgrade is now dead", first.UnixNano(), got.TS.UnixNano())
+		}
+		if !DeleteMarkerIfTS(dir, session, first.UnixNano()) {
+			t.Fatal("CAS delete with the pre-upgrade TS failed")
+		}
+	})
+
+	t.Run("a different prompt_id is a NEW gate and replaces wholesale", func(t *testing.T) {
+		// The opposite failure: treating a fresh prompt as the same one would
+		// pin a stale question on screen while the session waits on another.
+		dir := t.TempDir()
+		if err := WriteMarker(dir, session, detailed); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+		first := Pending(dir)[session].TS
+		time.Sleep(2 * time.Millisecond)
+		next := Info{Message: "Claude needs your permission", Type: "permission_prompt", PromptID: "different-prompt"}
+		if err := WriteMarker(dir, session, next); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		got := Pending(dir)[session]
+		if got.Tool != "" {
+			t.Errorf("stale tool detail survived into a new gate: %q", got.Tool)
+		}
+		if !got.TS.After(first) {
+			t.Errorf("a new gate must get a new TS, got %v (was %v)", got.TS.UnixNano(), first.UnixNano())
+		}
+	})
+
+	t.Run("without prompt_id correlation is impossible and the newer payload wins", func(t *testing.T) {
+		// Older claude versions omit prompt_id. Preferring the newer payload
+		// can lose detail; the alternative is a stale detailed marker that
+		// nothing can ever prove stale, which is worse.
+		dir := t.TempDir()
+		if err := WriteMarker(dir, session, Info{Tool: "Bash", ToolDetail: "rm -rf /"}); err != nil {
+			t.Fatalf("first write: %v", err)
+		}
+		if err := WriteMarker(dir, session, Info{Message: "Claude needs your permission", Type: "permission_prompt"}); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		if got := Pending(dir)[session]; got.Tool != "" {
+			t.Errorf("uncorrelatable payloads must not merge, got tool=%q", got.Tool)
+		}
+	})
+
+	t.Run("a corrupt marker on disk does not block a new gate", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, session+".json"), []byte("{not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteMarker(dir, session, detailed); err != nil {
+			t.Fatalf("write over corrupt marker: %v", err)
+		}
+		if got := Pending(dir)[session]; got.Tool != "Bash" {
+			t.Fatalf("expected the new gate recorded over a corrupt file, got tool=%q", got.Tool)
+		}
+	})
+}
+
+func TestInfoDetail(t *testing.T) {
+	// Detail falls back rather than composing: a marker with no tool must not
+	// be dressed up as though it named one.
+	cases := []struct {
+		name string
+		in   Info
+		want string
+	}{
+		{"tool and detail", Info{Tool: "Bash", ToolDetail: "go test ./..."}, "Bash: go test ./..."},
+		{"tool only", Info{Tool: "Bash", Message: "Claude needs your permission"}, "Bash"},
+		{"no tool falls back to the message", Info{Message: "Claude needs your permission"}, "Claude needs your permission"},
+		{"nothing at all", Info{}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.in.Detail(); got != c.want {
+				t.Errorf("Detail() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }

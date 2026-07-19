@@ -365,6 +365,11 @@ func TestFleetopsHookSpecs(t *testing.T) {
 		"Notification": "hook notify",
 		"SessionStart": "hook session-start",
 		"SessionEnd":   "hook session-end",
+		// PermissionRequest is the only source that names the tool a gate is
+		// asking about; the Notification hook's message for the same gate is
+		// the generic "Claude needs your permission". Registered as a SENSOR —
+		// permissionHook returns nothing and always exits 0.
+		"PermissionRequest": "hook permission",
 	}
 	if len(specs) != len(want) {
 		t.Fatalf("got %d specs, want %d: %+v", len(specs), len(want), specs)
