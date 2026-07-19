@@ -17,31 +17,54 @@ import (
 
 // actuationTimeout bounds a single typed-action exec call (Resume/Approve/
 // Focus/Interrupt) so a wedged multiplexer CLI never hangs the TUI. No
-// backend's Spawn uses it, and Spawn is NOT uniformly bounded by something
-// longer instead — do not read this constant as evidence that spawning is
-// covered elsewhere:
+// backend's Spawn uses it as ITS OWN budget — a window/terminal CREATION is
+// sized separately from a keystroke send, per backend — so do not read this
+// constant as evidence that spawning is covered elsewhere:
 //
-//   - orca.go's Spawn IS bounded, per step, via exec.CommandContext
+//   - orca.go's Spawn is bounded, per step, via exec.CommandContext
 //     (spawnCreateTimeout / spawnWaitTimeout / spawnLocateTimeout /
 //     spawnSendTextTimeout).
-//   - tmux.go's Spawn is UNBOUNDED. It shells out with bare exec.Command and
-//     no context at all, and spawnBootWait is a flat time.Sleep, not a
-//     deadline — so a wedged `tmux new-window` or `send-keys` hangs that
-//     goroutine indefinitely. Adding a timeout there is a behaviour change,
-//     tracked separately; this comment only stops claiming otherwise.
+//   - tmux.go's Spawn is bounded too (fixed #76 — see tmuxSpawnCreateTimeout
+//     for its window-creating `new-window` call; the follow-up `send-keys`
+//     goal delivery DOES reuse actuationTimeout, via runWithTimeout, same as
+//     Resume — a keystroke into an already-created pane is exactly the case
+//     this constant is sized for). spawnBootWait between the two remains a
+//     flat time.Sleep, not a deadline, but that sleep is not an exec call —
+//     it cannot hang, it always returns on its own after spawnBootWait.
 //
 // Treat a Spawn as unbounded until its own implementation shows a context,
 // rather than assuming the list above stays exhaustive as backends are added.
 const actuationTimeout = 5 * time.Second
+
+// runBounded execs argv[0] with argv[1:] under a context deadline of timeout
+// and returns only Run()'s error — the shared exec-with-deadline primitive
+// every Run()-shaped call in this package sits on. Parameterized by timeout
+// (rather than always assuming actuationTimeout) so a caller creating a new
+// surface (a heavier operation than typing into one that already exists) can
+// size its own budget while still sharing one exec path — and so a test can
+// shrink the timeout to prove the bound actually cuts off a hanging process
+// without waiting out a multi-second production budget (see
+// TestRunBounded_KillsAHangingCommand).
+func runBounded(timeout time.Duration, argv []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+}
+
+// outputBounded is runBounded's Output()-returning sibling, for a call whose
+// caller needs captured stdout (e.g. tmux new-window's -P -F pane id).
+func outputBounded(timeout time.Duration, argv []string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return exec.CommandContext(ctx, argv[0], argv[1:]...).Output()
+}
 
 // runWithTimeout runs argv[0] with argv[1:] bounded by actuationTimeout —
 // the shared exec path for every backend's Resume/Approve/Focus/Interrupt,
 // matching the same never-hang discipline availabilityTimeout already
 // enforces on Locate/Available (see cmux.go).
 func runWithTimeout(argv []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), actuationTimeout)
-	defer cancel()
-	return exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+	return runBounded(actuationTimeout, argv)
 }
 
 // isClaudeComm reports whether comm (a tmux pane_current_command / ps comm

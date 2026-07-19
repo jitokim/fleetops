@@ -1,8 +1,90 @@
 package control
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
+
+// wedgedTmuxOnPath drops a fake `tmux` script on a temp directory and
+// PREPENDS it to PATH, so exec.LookPath("tmux") (and exec.CommandContext's
+// own lookup) resolves to the hanging script before any real tmux — while the
+// REST of the real PATH stays intact behind it, because the fake script's own
+// body execs "sleep", which must itself resolve to something real or the
+// script would exit immediately (code 127, "not found") instead of actually
+// hanging, defeating the entire point of this fixture.
+//
+// The script uses `exec sleep 30`, not a plain `sleep 30`: a plain form forks
+// sleep as a CHILD of the shell, and killing only the direct child (which is
+// all exec.CommandContext's deadline kill does) leaves that grandchild alive,
+// still holding the inherited stdout pipe open — so Output()/Run() hangs
+// waiting for that pipe's EOF for the grandchild's full lifetime regardless of
+// the parent's death (a documented os/exec gotcha, and it silently defeated an
+// earlier version of this fixture: the test failed the timeout assertion for
+// exactly this reason until it was traced down). `exec` replaces the shell
+// process with sleep in place — one PID for the whole lifetime, so the
+// deadline kill actually terminates the thing holding the pipe.
+//
+// t.Setenv restores the original PATH automatically at test end.
+func wedgedTmuxOnPath(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	fakeTmux := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(fakeTmux, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatalf("writing fake tmux script: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// maxAcceptableSpawnElapsed bounds how long Spawn/OpenTerminal may take
+// against a wedged tmux before a test concludes tmuxSpawnCreateTimeout did
+// not bite: comfortably above the real 5s production timeout (allowing for
+// process-start overhead), comfortably below the fake binary's 30s hang.
+const maxAcceptableSpawnElapsed = 10 * time.Second
+
+// TestTmuxSpawn_BoundedAgainstAWedgedTmuxBinary is the #76 regression test:
+// before the fix, Spawn's `tmux new-window` ran via a bare exec.Command with
+// no context at all, so a tmux binary that hangs (wedged pipe, deadlocked
+// server, anything) blocked this goroutine FOREVER — this test's fake tmux
+// would have hung the whole test run past its timeout. With the fix, Spawn
+// returns an error within tmuxSpawnCreateTimeout instead.
+func TestTmuxSpawn_BoundedAgainstAWedgedTmuxBinary(t *testing.T) {
+	wedgedTmuxOnPath(t)
+
+	start := time.Now()
+	err := (tmuxController{}).Spawn(t.TempDir(), "goal")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("want an error from a wedged tmux new-window, got nil")
+	}
+	if elapsed >= maxAcceptableSpawnElapsed {
+		t.Fatalf("Spawn took %v against a wedged tmux — want it bounded near tmuxSpawnCreateTimeout (%v), not the fake binary's 30s hang",
+			elapsed, tmuxSpawnCreateTimeout)
+	}
+}
+
+// TestTmuxOpenTerminal_BoundedAgainstAWedgedTmuxBinary is OpenTerminal's
+// sibling of the Spawn regression test above — same fake tmux, same
+// `new-window` primitive (see OpenTerminal's doc on why it shares
+// tmuxSpawnCreateTimeout with Spawn), proving the take-over/attach path did
+// not retain the hazard fixing only Spawn would have left one function away.
+func TestTmuxOpenTerminal_BoundedAgainstAWedgedTmuxBinary(t *testing.T) {
+	wedgedTmuxOnPath(t)
+
+	start := time.Now()
+	err := (tmuxController{}).OpenTerminal(t.TempDir(), "claude --resume sess-1")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("want an error from a wedged tmux new-window, got nil")
+	}
+	if elapsed >= maxAcceptableSpawnElapsed {
+		t.Fatalf("OpenTerminal took %v against a wedged tmux — want it bounded near tmuxSpawnCreateTimeout (%v), not the fake binary's 30s hang",
+			elapsed, tmuxSpawnCreateTimeout)
+	}
+}
 
 func TestParseTmuxPanes(t *testing.T) {
 	out := "%3\t/home/user/myproject\tclaude\n%7\t/home/user/other\tzsh\n"

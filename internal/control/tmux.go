@@ -215,15 +215,50 @@ func tmuxFocusCmds(paneID string) [][]string {
 // spawnBootWait is a pragmatic fixed pause for claude's TUI to boot inside
 // the new pane before typing the goal into it — tmux has no equivalent of
 // orca's "wait --for tui-idle", so this is a flat sleep rather than a poll.
+// Unlike the two exec calls in Spawn below, this is a plain Go time.Sleep
+// with no subprocess involved — it always returns on its own after
+// spawnBootWait, so it has no unbounded-hang failure mode and needed no fix
+// for #76 (it was never able to wedge the goroutine the way a stuck `tmux`
+// process could).
 const spawnBootWait = 8 * time.Second
+
+// tmuxSpawnCreateTimeout bounds the window-creating `tmux new-window` call
+// used by both Spawn and OpenTerminal (#76 — previously these ran via bare
+// exec.Command with no context at all, so a wedged tmux hung the goroutine
+// indefinitely). A CREATION call, not a keystroke send, so it does not reuse
+// actuationTimeout (sized for Resume/Approve/Focus/Interrupt typing into a
+// pane that already exists) — the same reasoning orca.go's spawnCreateTimeout
+// and iterm2SpawnTimeout already apply to their own backend's window/terminal
+// creation call. Sized like orca's spawnCreateTimeout (5s) rather than
+// iterm2SpawnTimeout's 15s: tmux new-window is a local fork+exec against an
+// already-running tmux server, not a cross-process RPC or an app launching a
+// fresh login shell, so 5s is ample headroom for a healthy tmux while still
+// bounding a wedged one.
+const tmuxSpawnCreateTimeout = 5 * time.Second
 
 // Spawn opens a new tmux window running claude in cwd, waits for it to boot
 // (pragmatic fixed delay, see spawnBootWait), then sends the goal + Enter.
+//
+// Both exec calls are bounded (#76): new-window via outputBounded +
+// tmuxSpawnCreateTimeout (a creation, see its doc), send-keys via
+// runWithTimeout (the same helper and actuationTimeout budget Resume already
+// uses for the identical argv shape — typing into a pane that now exists).
+//
+// A deadline kill on EITHER call is returned as an ordinary error, not
+// classified as ErrSendDeliveryUnknown: that sentinel's own doc scopes it to
+// a killed osascript specifically, and orca's Spawn (terminal create, bounded
+// the same way) sets the sibling precedent of a plain wrapped error on any
+// exec failure including a deadline kill — see actuator.go's IsHostSendTier
+// doc, which draws the ambiguity-on-timeout handling as a Tier 1h (host-send)
+// property that multiplexer send-keys/new-window (Tier 1) deliberately does
+// not get. So a wedged tmux now fails fast and honestly (an error, never a
+// false success) instead of hanging forever, exactly like every other
+// backend's Spawn already fails on a genuine problem.
 func (tmuxController) Spawn(cwd, goal string) error {
 	argv := tmuxNewWindowCmd(cwd, spawnCommandFn())
-	out, err := exec.Command(argv[0], argv[1:]...).Output()
+	out, err := outputBounded(tmuxSpawnCreateTimeout, argv)
 	if err != nil {
-		return err
+		return fmt.Errorf("tmux new-window: %w", err)
 	}
 	paneID := strings.TrimSpace(string(out))
 	if paneID == "" {
@@ -233,7 +268,7 @@ func (tmuxController) Spawn(cwd, goal string) error {
 	time.Sleep(spawnBootWait)
 
 	for _, argv := range tmuxResumeCmds(paneID, goal) {
-		if err := exec.Command(argv[0], argv[1:]...).Run(); err != nil {
+		if err := runWithTimeout(argv); err != nil {
 			return err
 		}
 	}
@@ -288,9 +323,22 @@ func tmuxNewWindowCmd(cwd string, spawnArgv []string) []string {
 // pane (same convention `tmux new-window "claude --resume <id>"` documents)
 // — no -P/-F pane-id capture needed here, unlike Spawn, since there is no
 // follow-up send.
+//
+// Bounded by tmuxSpawnCreateTimeout (#76), same as Spawn's new-window call —
+// it is the identical `tmux new-window` primitive, so an identical hazard (a
+// wedged tmux hanging the goroutine indefinitely) applied here too; fixing
+// only Spawn would have left this take-over path exposed one function away.
+// outputBounded is reused for its exec-with-deadline shape even though the
+// captured stdout is discarded here — there is nothing to key off (no pane id
+// needed, see the doc above), so Output() vs Run() makes no behavioural
+// difference and sharing one exec path beats a second, near-identical one.
 func (tmuxController) OpenTerminal(cwd, command string) error {
 	argv := tmuxOpenTerminalCmd(cwd, command)
-	return exec.Command(argv[0], argv[1:]...).Run()
+	_, err := outputBounded(tmuxSpawnCreateTimeout, argv)
+	if err != nil {
+		return fmt.Errorf("tmux new-window: %w", err)
+	}
+	return nil
 }
 
 // tmuxOpenTerminalCmd builds the argv for OpenTerminal — pulled out as its
