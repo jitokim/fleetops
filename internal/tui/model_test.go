@@ -9189,3 +9189,38 @@ func TestFleetPanelLines_IdenticalLabels_StillDisambiguatedByShortID(t *testing.
 		t.Errorf("expected ·shortID suffixes on colliding labels, got:\n%s", joined)
 	}
 }
+
+// ── spawnFailureText: an unknown outcome must not be printed as failure ──
+//
+// A deadline-killed window request may well have created a real window running
+// claude with no goal. "spawn failed" asserts the opposite in the prefix, where
+// an operator scanning the status line stops reading — and invites them to
+// press n again, which is how one orphan window becomes two.
+
+func TestSpawnFailureText_UnknownDelivery_DoesNotSayFailed(t *testing.T) {
+	got := spawnFailureText(fmt.Errorf("creating a window: %w", control.ErrSendDeliveryUnknown))
+
+	if strings.Contains(got, "spawn failed") {
+		t.Errorf("text = %q, asserts failure for an outcome that is unknown", got)
+	}
+	if !strings.Contains(got, "UNKNOWN") {
+		t.Errorf("text = %q, want it to say the outcome is unknown", got)
+	}
+	if !strings.Contains(got, "window") {
+		t.Errorf("text = %q, want it to name the orphan the human must clean up", got)
+	}
+}
+
+// The carve-out is for unknown delivery ONLY. Softening a definite failure
+// would be the same sin in the other direction: under-reporting something the
+// operator needs to act on.
+func TestSpawnFailureText_OrdinaryFailure_StillSaysFailed(t *testing.T) {
+	got := spawnFailureText(errors.New("no such profile"))
+
+	if !strings.Contains(got, "spawn failed") {
+		t.Errorf("text = %q, want a definite failure reported plainly", got)
+	}
+	if strings.Contains(got, "UNKNOWN") {
+		t.Errorf("text = %q, hedges a failure that is not in doubt", got)
+	}
+}

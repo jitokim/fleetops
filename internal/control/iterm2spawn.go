@@ -108,7 +108,12 @@ var iterm2BootWaitFn = func() { time.Sleep(spawnBootWait) }
 // history of exactly that (see focus.go's verdict protocol), and a spawn is
 // the worst place to repeat it — the human walks away believing work has
 // started.
-var ErrITerm2SpawnNoSession = errors.New("control: iTerm2 did not report a usable new session — the window may not have been created")
+// The wording says a window LIKELY EXISTS, which is the honest reading: this
+// error means osascript exited 0 — it ran — and merely returned something
+// unrecognizable, so the create almost certainly happened and only the reply
+// was unusable. Saying "the window may not have been created" told the human
+// the opposite of the probable state and left them with nothing to clean up.
+var ErrITerm2SpawnNoSession = errors.New("control: iTerm2 ran but did not report a usable session id — a new window was most likely created; check for one running claude with no goal and close it")
 
 // iterm2Session is a just-created iTerm2 session, identified by the two values
 // every subsequent operation needs. The GUID is a sessionGUID, so it CANNOT

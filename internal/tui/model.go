@@ -2183,7 +2183,7 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		}
 
 		if err := ctrl.Spawn(cwd, prompt); err != nil {
-			return spawnResultMsg{false, fmt.Sprintf("spawn failed: %v", err)}
+			return spawnResultMsg{false, spawnFailureText(err)}
 		}
 		if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
 			// best-effort: the loop still spawned and will show up
@@ -3134,6 +3134,27 @@ func emitTransitionsCmd(transitions []transitionEvent) tea.Cmd {
 		}
 		return nil
 	}
+}
+
+// spawnFailureText renders a failed spawn, separating the ONE failure whose
+// outcome is unknowable from the ones that provably created nothing.
+//
+// control.ErrSendDeliveryUnknown means the window-creating osascript was
+// KILLED at its deadline, so iTerm2 may well have created a real window that
+// is now running a claude with no goal typed into it. Printing that as
+// "spawn failed" asserts the opposite of the likely state, and asserts it in
+// the prefix — where an operator scanning the status line stops reading. It
+// also invites them to press n again, which is how one orphan window becomes
+// two.
+//
+// So: say the outcome is unknown, and NAME the orphan the way
+// spawnIntoGitWorktree already names an orphan checkout, because a thing the
+// human was never told about is a thing they cannot clean up.
+func spawnFailureText(err error) string {
+	if errors.Is(err, control.ErrSendDeliveryUnknown) {
+		return "spawn outcome UNKNOWN — the window request timed out and may still have created one. Check for a new iTerm2 window running claude with no goal, and close it before retrying"
+	}
+	return fmt.Sprintf("spawn failed: %v", err)
 }
 
 // unknownDeliveryText is the operator line for a Tier 1h send whose delivery is
