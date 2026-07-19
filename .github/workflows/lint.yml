@@ -1,0 +1,68 @@
+# Lints the repo's own automation: workflow YAML, the shell inside it, and the
+# standalone scripts under .github/scripts.
+#
+# These three tools were run by hand once (2026-07-19) and found real problems
+# the Go test suite structurally cannot see — `go test` says nothing about a
+# workflow that requests the wrong token scope or a script with an unquoted
+# expansion. A one-off run only proves the state on the day it ran, so the
+# checks live here instead.
+#
+# Scoped to `.github/**` on purpose: this workflow lints AUTOMATION, not the
+# product. Go code is covered by root-test.yml, and widening the trigger would
+# make every product PR wait on a job that cannot say anything about it.
+name: lint
+
+on:
+  push:
+    paths:
+      - '.github/**'
+      - '.yamllint.yml'
+  pull_request:
+    paths:
+      - '.github/**'
+      - '.yamllint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint workflows and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # SHA-pinned per the repo-wide policy documented in
+      # pr-review-dispatch.yml's header.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # actionlint understands Actions' own schema — expression syntax, event
+      # names, `needs` references — none of which a generic YAML linter can
+      # check. It ALSO shells out to shellcheck for every `run:` block, which
+      # is why shellcheck is installed before it runs: without shellcheck on
+      # PATH actionlint silently skips that half and still exits 0, so the
+      # order here is load-bearing rather than incidental.
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Run actionlint
+        # Installed from source with the runner's Go rather than via a
+        # third-party action: one less action to pin and audit, and the
+        # version is pinned here in plain sight.
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
+
+      # The standalone scripts are not inside any `run:` block, so actionlint
+      # never sees them.
+      - name: Run shellcheck on .github/scripts
+        run: shellcheck .github/scripts/*.sh
+
+      # Config lives in .yamllint.yml, which documents why each disabled rule
+      # is disabled. What stays on is the structural half: syntax, duplicate
+      # keys, indentation, anchors.
+      - name: Run yamllint
+        run: |
+          pipx install yamllint
+          yamllint -c .yamllint.yml .github/
