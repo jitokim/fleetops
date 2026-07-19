@@ -6301,9 +6301,13 @@ func TestWhereStepLabel_ShowsTargetDir(t *testing.T) {
 	}
 }
 
+// Eligibility is now BOTH facts: a spawner exists (machine) AND the target is
+// a git repo (directory). This test covers the spawner half; the repo half and
+// the combinations live in TestWorktreeOffered_RequiresBothASpawnerAndARepo.
 func TestWhereStepLabel_OffersW_OnlyWhenEligible(t *testing.T) {
 	m := New()
 	m.spawnCwd = "/x/myproject"
+	m.spawnCwdIsRepo = true // hold the directory half fixed
 
 	if strings.Contains(m.whereStepLabel(), "new worktree") {
 		t.Errorf("whereStepLabel() = %q, want no [w] option when ineligible", m.whereStepLabel())
@@ -9222,5 +9226,51 @@ func TestSpawnFailureText_OrdinaryFailure_StillSaysFailed(t *testing.T) {
 	}
 	if strings.Contains(got, "UNKNOWN") {
 		t.Errorf("text = %q, hedges a failure that is not in doubt", got)
+	}
+}
+
+// ── [w] must not be offered where it can only fail ───────────────────────
+//
+// Reported live: pressing n → [w] in /Users/imac (not a git repo) accepted the
+// choice and failed afterwards with "worktree: not inside a git repository" —
+// after the human had typed a goal, a contract and a rubric, and after
+// submitSpawnWizard had already closed the wizard and discarded them.
+
+func TestWorktreeOffered_RequiresBothASpawnerAndARepo(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		eligible, isRepo bool
+		want             bool
+	}{
+		{"spawner and repo", true, true, true},
+		{"spawner but not a repo", true, false, false},
+		{"repo but no spawner", false, true, false},
+		{"neither", false, false, false},
+	} {
+		m := Model{spawnWorktreeEligible: tc.eligible, spawnCwdIsRepo: tc.isRepo}
+		if got := m.worktreeOffered(); got != tc.want {
+			t.Errorf("%s: worktreeOffered = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Hiding the label only stops a reader. The person who already knows the
+// keybinding is exactly the one who types it blind.
+func TestWhereStepLabel_OmitsWorktreeOutsideARepo(t *testing.T) {
+	m := Model{spawnWorktreeEligible: true, spawnCwdIsRepo: false, spawnCwd: "/Users/imac"}
+
+	if strings.Contains(m.whereStepLabel(), "[w]") {
+		t.Errorf("label offers [w] outside a repo: %q", m.whereStepLabel())
+	}
+	if !strings.Contains(m.whereStepLabel(), "[d]") {
+		t.Errorf("label lost the options that DO work: %q", m.whereStepLabel())
+	}
+}
+
+func TestWhereStepLabel_OffersWorktreeInsideARepo(t *testing.T) {
+	m := Model{spawnWorktreeEligible: true, spawnCwdIsRepo: true, spawnCwd: "/repo"}
+
+	if !strings.Contains(m.whereStepLabel(), "[w]") {
+		t.Errorf("label withholds [w] where it would work: %q", m.whereStepLabel())
 	}
 }

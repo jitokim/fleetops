@@ -668,3 +668,50 @@ func TestOneLine_ShortTextIsUnchanged(t *testing.T) {
 		t.Errorf("oneLine = %q, want it to pass short text through", got)
 	}
 }
+
+// ── IsRepo: the TUI asks this before OFFERING [w] ────────────────────────
+
+func TestIsRepo_TrueInsideARepo(t *testing.T) {
+	isolateGitEnv(t)
+	repo, _ := newRepoWithOrigin(t, "trunk")
+
+	if !IsRepo(repo) {
+		t.Error("IsRepo = false inside a real repo")
+	}
+}
+
+func TestIsRepo_FalseOutsideARepo(t *testing.T) {
+	isolateGitEnv(t)
+
+	if IsRepo(t.TempDir()) {
+		t.Error("IsRepo = true for a plain directory")
+	}
+}
+
+// Best-effort: an unanswerable probe must close the option, never offer
+// something that would fail.
+func TestIsRepo_FalseForMissingDirectory(t *testing.T) {
+	isolateGitEnv(t)
+
+	if IsRepo(filepath.Join(t.TempDir(), "does-not-exist")) {
+		t.Error("IsRepo = true for a directory that isn't there")
+	}
+}
+
+// IsRepo and Create must agree about what counts as a repo — if IsRepo said
+// yes where Create refuses, the wizard would be back to offering an option
+// that fails after the human has typed everything.
+func TestIsRepo_AgreesWithCreate(t *testing.T) {
+	isolateGitEnv(t)
+	plain := t.TempDir()
+
+	offered := IsRepo(plain)
+	_, err := Create(plain)
+
+	if offered {
+		t.Fatal("IsRepo offered [w] for a non-repo")
+	}
+	if !errors.Is(err, ErrNotARepo) {
+		t.Fatalf("Create err = %v, want ErrNotARepo — the two must agree", err)
+	}
+}
