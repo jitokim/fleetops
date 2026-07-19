@@ -1,0 +1,101 @@
+# Tests the ROOT module — cmd/ and internal/, i.e. the actual product.
+#
+# dupdetect-test.yml covers the nested tools/dupdetect module only, so until
+# this existed the product itself merged with zero automated verification: a
+# dependency bump or a refactor could break the build and nothing would notice
+# until someone ran `make build` by hand.
+#
+# This is the mirror image of dupdetect-test.yml and deliberately keeps its
+# shape (SHA-pinned actions, least-privilege permissions, the same gate names)
+# so the two read as one system.
+name: root-test
+
+# The two lists are duplicated rather than shared via a YAML anchor: anchors
+# are valid YAML but GitHub Actions' workflow parser does not support them, and
+# dupdetect-test.yml spells its filters out the same way.
+on:
+  push:
+    # Default branch only. Branch pushes are already covered by pull_request,
+    # so filtering here avoids running the same commit twice on every PR.
+    branches:
+      - main
+    paths-ignore:
+      # tools/dupdetect is a separate module with its own workflow; the root
+      # `go test ./...` deliberately does not descend into it.
+      - 'tools/dupdetect/**'
+      - 'docs/**'
+      - '**.md'
+      - '*.png'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - 'tools/dupdetect/**'
+      - 'docs/**'
+      - '**.md'
+      - '*.png'
+      - 'LICENSE'
+
+# paths-ignore rather than an allowlist `paths:` on purpose. paths-ignore skips
+# a run only when EVERY changed file matches, so a commit touching both README
+# and internal/ still runs. An allowlist would have to enumerate every path
+# that can break the build (go.mod, go.sum, Makefile, any future top-level
+# package) and would silently skip the one it forgot — a filter that misses a
+# real code change is far worse than one that runs on a typo fix.
+
+permissions:
+  contents: read
+
+# Superseded runs on the same ref are wasted work: only the tip commit's result
+# is meaningful. Unlike pr-review-dispatch, nothing here has a side effect that
+# must finish, so cancelling mid-run is safe.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # ubuntu only. The suite is platform-independent by construction: there are
+    # no build tags anywhere in the tree, the whole module and its test files
+    # compile clean under GOOS=linux, and the single runtime.GOOS reference in
+    # the product (internal/control/iterm2spawn.go) sits behind
+    # iterm2HostDetectFn, a seam every test stubs. Despite driving real
+    # multiplexers at runtime, no test execs tmux/cmux/orca/osascript — the
+    # actuation tests assert on built argv, not on a spawned process. A macOS
+    # runner would therefore execute the identical stubbed paths for 10x the
+    # billed minutes and buy no extra coverage.
+    #
+    # Revisit if a test ever actually EXECUTES a multiplexer or exercises the
+    # darwin branch unstubbed; at that point a macos-latest matrix leg earns
+    # its cost.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Pinned by SHA rather than tag, matching dupdetect-test.yml and
+      # duplicate-detect.yml — a tag is mutable.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          # Unlike tools/dupdetect, the root module has real dependencies and a
+          # go.sum, so the module cache has something to key on.
+          cache: true
+
+      # `make fmt` only LISTS unformatted files and exits 0, which would make
+      # this gate pass on unformatted code. The Makefile target stays useful
+      # locally as a query; CI needs a real assertion, so it inlines one
+      # (identical to dupdetect-test.yml's).
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      # `make build` is `go build -o fleetops ./cmd/fleetops` — a single
+      # package, and it drops a binary in the tree. CI wants every package
+      # compiled and no artifact, so it does not reuse that target.
+      - name: build
+        run: go build ./...
+
+      # vet and test reuse the Makefile so the local and CI gates cannot drift.
+      - name: vet
+        run: make vet
+
+      - name: test
+        run: make test
