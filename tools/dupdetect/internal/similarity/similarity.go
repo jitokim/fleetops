@@ -46,10 +46,17 @@ const (
 // comment that closes nothing, while a miss costs the silence this tool
 // exists to break.
 //
-// TestCorpusAccuracyMatchesDocumentedRates enforces every number above,
-// including the 0.76 counterfactual. Numbers in prose rot; that test is what
-// makes this comment trustworthy, so extend it rather than editing figures by
-// hand here.
+// Two tests enforce every number above, and the split matters if you change
+// the corpus. TestCorpusAccuracyMatchesDocumentedRates pins the RATES (every
+// labeled duplicate caught, exactly one false positive) plus the 0.76
+// counterfactual; those hold no matter how the corpus grows.
+// TestCorpusCompositionMatchesDocumentedFigures pins the ABSOLUTE figures —
+// 30 pairs, 12 duplicates, 16 non-duplicates, 2 knownMiss — which the rate
+// test cannot see, and which are exactly what a single new corpus entry
+// falsifies here and in README.md while every other test stays green.
+//
+// Numbers in prose rot; those tests are what make this comment trustworthy, so
+// extend them rather than editing figures by hand.
 const DefaultThreshold = 0.74
 
 // Candidate is an existing open item a new title is compared against. Number

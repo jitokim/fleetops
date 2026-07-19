@@ -50,9 +50,12 @@ Two signals are then combined into `[0,1]`:
 ### The threshold, and how honest it is
 
 `0.74` is measured, and the measurements are enforced by
-`TestCorpusAccuracyMatchesDocumentedRates` rather than restated here — see the
-comment on `DefaultThreshold` in `internal/similarity/similarity.go` for the
-authoritative figures. In short: over the 30 labeled pairs it flags every
+`TestCorpusAccuracyMatchesDocumentedRates` (the rates) and
+`TestCorpusCompositionMatchesDocumentedFigures` (the counts quoted below)
+rather than restated here — see the comment on `DefaultThreshold` in
+`internal/similarity/similarity.go` for the authoritative figures. Change the
+corpus and those tests will name the numbers on this page that went stale.
+In short: over the 30 labeled pairs it flags every
 duplicate that string similarity can reach (12/12) and one non-duplicate
 (1/16). Two further pairs are real duplicates no threshold can reach, so true
 recall is 12/14.
