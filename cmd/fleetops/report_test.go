@@ -132,13 +132,16 @@ func TestWriteReport_LastStateIsMostRecentEventToState(t *testing.T) {
 	}
 }
 
-func TestWriteReport_ActuationsGroupedByActor(t *testing.T) {
+// TestWriteReport_ActuationsGroupedByOutcome_AllLanded is the happy path:
+// every actuation confirmed dispatched (Outcome: events.OutcomeOK) tallies
+// under "landed".
+func TestWriteReport_ActuationsGroupedByOutcome_AllLanded(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	sessionID := "s1"
 	evs := []events.Event{
-		{TS: now.Add(-3 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman},
-		{TS: now.Add(-2 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "inject tier1 ok", Actor: events.ActorHuman},
+		{TS: now.Add(-3 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK},
+		{TS: now.Add(-2 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "inject tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK},
 	}
 	for _, ev := range evs {
 		if err := events.Append(dir, ev); err != nil {
@@ -150,8 +153,167 @@ func TestWriteReport_ActuationsGroupedByActor(t *testing.T) {
 	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
 		t.Fatalf("writeReport: %v", err)
 	}
-	if !strings.Contains(buf.String(), "actuations:   2 (human: 2)\n") {
-		t.Errorf("out = %q, want 2 actuations grouped under actor human", buf.String())
+	if !strings.Contains(buf.String(), "actuations:   2 (landed: 2)\n") {
+		t.Errorf("out = %q, want 2 actuations grouped under outcome landed", buf.String())
+	}
+}
+
+// TestWriteReport_ActuationsGroupedByOutcome_FailedNotCountedAsLanded is the
+// core regression for issue #52: every kill attempt in the session failed
+// ("no such pane"), and the report must show that — not the same "2
+// actuations" a report of two SUCCESSFUL kills would show.
+func TestWriteReport_ActuationsGroupedByOutcome_FailedNotCountedAsLanded(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	sessionID := "s1"
+	evs := []events.Event{
+		{TS: now.Add(-2 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "kill tier1h failed: no such pane", Actor: events.ActorHuman, Outcome: events.OutcomeFailed},
+		{TS: now.Add(-1 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "kill tier1h failed: no such pane", Actor: events.ActorHuman, Outcome: events.OutcomeFailed},
+	}
+	for _, ev := range evs {
+		if err := events.Append(dir, ev); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
+		t.Fatalf("writeReport: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "actuations:   2 (failed: 2)\n") {
+		t.Errorf("out = %q, want 2 actuations grouped under outcome failed, none under landed", out)
+	}
+	if strings.Contains(out, "landed") {
+		t.Errorf("out = %q, two FAILED actuations must never be tallied as landed", out)
+	}
+}
+
+// TestWriteReport_ActuationsGroupedByOutcome_DeliveryTimeoutStaysUnknown
+// guards the field's central rule: a host-send TIMEOUT
+// (events.OutcomeUnknown, see internal/control.ErrSendDeliveryUnknown) means
+// we never observed whether the action landed. The report must not collapse
+// it into either "landed" or "failed" — both would be an over-claim of
+// something that was never confirmed.
+func TestWriteReport_ActuationsGroupedByOutcome_DeliveryTimeoutStaysUnknown(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	sessionID := "s1"
+	if err := events.Append(dir, events.Event{
+		TS: now.Add(-1 * time.Hour).UnixNano(), SessionID: sessionID,
+		FromState: "running", ToState: "running", Trigger: events.TriggerActuation,
+		Detail: "kill tier1h failed: send delivery unknown", Actor: events.ActorHuman,
+		Outcome: events.OutcomeUnknown,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
+		t.Fatalf("writeReport: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "actuations:   1 (delivery unknown: 1)\n") {
+		t.Errorf("out = %q, want the timed-out actuation tallied under delivery unknown", out)
+	}
+	if strings.Contains(out, "landed: 1") || strings.Contains(out, "failed: 1") {
+		t.Errorf("out = %q, a delivery-unknown actuation must not be folded into landed or failed", out)
+	}
+}
+
+// TestWriteReport_ActuationsGroupedByOutcome_LegacyEmptyOutcomeFoldsIntoUnknown
+// covers events written before Event.Outcome existed (Outcome == "" on
+// disk). Per events.Event's doc, "" means "not confirmed" and must be
+// treated the same as an explicit delivery-unknown timeout, never silently
+// upgraded to "landed" just because it's the zero value.
+func TestWriteReport_ActuationsGroupedByOutcome_LegacyEmptyOutcomeFoldsIntoUnknown(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	sessionID := "s1"
+	// No Outcome field set at all — simulates a pre-Outcome-field event.
+	if err := events.Append(dir, events.Event{
+		TS: now.Add(-1 * time.Hour).UnixNano(), SessionID: sessionID,
+		FromState: "running", ToState: "running", Trigger: events.TriggerActuation,
+		Detail: "resume tier1 ok", Actor: events.ActorHuman,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
+		t.Fatalf("writeReport: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "actuations:   1 (delivery unknown: 1)\n") {
+		t.Errorf("out = %q, want a legacy event with no Outcome field tallied under delivery unknown", out)
+	}
+	if strings.Contains(out, "landed: 1") {
+		t.Errorf("out = %q, a legacy event with no recorded outcome must not be counted as landed", out)
+	}
+}
+
+// TestWriteReport_ActuationsGroupedByOutcome_MixedOutcomesAllBucketsDistinct
+// exercises all three buckets together in one session, guarding that they
+// stay separately countable (not, say, merged into a single "attempted"
+// number) — this is the exact "12 actuations (10 landed, 1 failed, 1
+// delivery unknown)" shape the issue asked for.
+func TestWriteReport_ActuationsGroupedByOutcome_MixedOutcomesAllBucketsDistinct(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	sessionID := "s1"
+	evs := []events.Event{
+		{TS: now.Add(-3 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "resume tier1 ok", Actor: events.ActorHuman, Outcome: events.OutcomeOK},
+		{TS: now.Add(-2 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "kill tier1h failed: no such pane", Actor: events.ActorHuman, Outcome: events.OutcomeFailed},
+		{TS: now.Add(-1 * time.Hour).UnixNano(), SessionID: sessionID, FromState: "running", ToState: "running", Trigger: events.TriggerActuation, Detail: "kill tier1h failed: send delivery unknown", Actor: events.ActorHuman, Outcome: events.OutcomeUnknown},
+	}
+	for _, ev := range evs {
+		if err := events.Append(dir, ev); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := writeReport(&buf, dir, "24h", 24*time.Hour, now); err != nil {
+		t.Fatalf("writeReport: %v", err)
+	}
+	if !strings.Contains(buf.String(), "actuations:   3 (delivery unknown: 1, failed: 1, landed: 1)\n") {
+		t.Errorf("out = %q, want all three outcome buckets reported distinctly", buf.String())
+	}
+}
+
+func TestActuationOutcomeLabel_OK_ReturnsLanded(t *testing.T) {
+	if got := actuationOutcomeLabel(events.OutcomeOK); got != "landed" {
+		t.Errorf("got %q, want %q", got, "landed")
+	}
+}
+
+func TestActuationOutcomeLabel_Failed_ReturnsFailed(t *testing.T) {
+	if got := actuationOutcomeLabel(events.OutcomeFailed); got != "failed" {
+		t.Errorf("got %q, want %q", got, "failed")
+	}
+}
+
+func TestActuationOutcomeLabel_Unknown_ReturnsDeliveryUnknown(t *testing.T) {
+	if got := actuationOutcomeLabel(events.OutcomeUnknown); got != "delivery unknown" {
+		t.Errorf("got %q, want %q", got, "delivery unknown")
+	}
+}
+
+// TestActuationOutcomeLabel_Empty_ReturnsDeliveryUnknown pins the zero-value
+// case explicitly: "" must never fall through to "landed" by accident of
+// switch-statement ordering.
+func TestActuationOutcomeLabel_Empty_ReturnsDeliveryUnknown(t *testing.T) {
+	if got := actuationOutcomeLabel(""); got != "delivery unknown" {
+		t.Errorf("got %q, want %q", got, "delivery unknown")
+	}
+}
+
+// TestActuationOutcomeLabel_UnrecognizedValue_ReturnsDeliveryUnknown covers
+// any future/garbled Outcome string that is neither a known constant nor
+// "" — the safe default is still "not confirmed," not a guess.
+func TestActuationOutcomeLabel_UnrecognizedValue_ReturnsDeliveryUnknown(t *testing.T) {
+	if got := actuationOutcomeLabel("bogus"); got != "delivery unknown" {
+		t.Errorf("got %q, want %q", got, "delivery unknown")
 	}
 }
 

@@ -38,14 +38,14 @@ func runReportCmd(args []string) {
 
 // loopSummary is one session's aggregated history over the report window.
 type loopSummary struct {
-	sessionID         string
-	lastTS            int64
-	lastState         string
-	transitions       int
-	gatesOpened       int
-	gatesAnswered     int
-	actuationsByActor map[string]int
-	verdictsByOutcome map[string]int
+	sessionID           string
+	lastTS              int64
+	lastState           string
+	transitions         int
+	gatesOpened         int
+	gatesAnswered       int
+	actuationsByOutcome map[string]int
+	verdictsByOutcome   map[string]int
 }
 
 // writeReport is runReportCmd's testable core: reads dir's full event
@@ -117,9 +117,9 @@ func writeReport(w io.Writer, dir, sinceLabel string, window time.Duration, now 
 // they're judgments/actions, not transitions themselves.
 func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 	s := loopSummary{
-		sessionID:         sessionID,
-		actuationsByActor: map[string]int{},
-		verdictsByOutcome: map[string]int{},
+		sessionID:           sessionID,
+		actuationsByOutcome: map[string]int{},
+		verdictsByOutcome:   map[string]int{},
 	}
 	for _, ev := range evs {
 		s.lastTS = ev.TS
@@ -137,7 +137,7 @@ func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 
 		switch ev.Trigger {
 		case events.TriggerActuation:
-			s.actuationsByActor[string(ev.Actor)]++
+			s.actuationsByOutcome[actuationOutcomeLabel(ev.Outcome)]++
 		case events.TriggerOracle:
 			if outcome := verdictOutcome(ev.Detail); outcome != "" {
 				s.verdictsByOutcome[outcome]++
@@ -145,6 +145,32 @@ func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 		}
 	}
 	return s
+}
+
+// actuationOutcomeLabel maps a TriggerActuation event's structured Outcome
+// field (events.Event's Outcome* constants) to the word this report shows a
+// human, so a tally of "N actuations" can never be misread as "N that
+// landed" (issue #52: every TriggerACTUATION event used to be tallied
+// unconditionally, so an operator whose five kill attempts ALL failed with
+// "no such pane" saw the same "5 actuations" a report of five that worked
+// would show).
+//
+// events.OutcomeUnknown (a host-send timeout — see
+// internal/control.ErrSendDeliveryUnknown, surfaced to the human by the TUI's
+// unknownDeliveryText) and "" (an event recorded before the Outcome field
+// existed, or by an emitter — e.g. autoRedrive429Cmd — that does not
+// classify one) are BOTH folded into "delivery unknown", never into "landed"
+// or "failed": in neither case was the action actually observed to succeed
+// or fail, and this report must not guess.
+func actuationOutcomeLabel(outcome string) string {
+	switch outcome {
+	case events.OutcomeOK:
+		return "landed"
+	case events.OutcomeFailed:
+		return "failed"
+	default: // events.OutcomeUnknown, or "" (pre-Outcome-field / unclassified)
+		return "delivery unknown"
+	}
 }
 
 // verdictOutcome pulls the outcome word out of an oracle event's Detail
@@ -163,7 +189,7 @@ func writeLoopSummary(w io.Writer, s loopSummary) {
 	fmt.Fprintf(w, "  last state:   %s\n", orDash(s.lastState))
 	fmt.Fprintf(w, "  transitions:  %d\n", s.transitions)
 	fmt.Fprintf(w, "  gates:        %d opened, %d answered\n", s.gatesOpened, s.gatesAnswered)
-	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(s.actuationsByActor))
+	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(s.actuationsByOutcome))
 	fmt.Fprintf(w, "  verdicts:     %s\n", formatByKey(s.verdictsByOutcome))
 }
 
@@ -175,7 +201,7 @@ func writeFleetTotals(w io.Writer, summaries []loopSummary) {
 		transitions += s.transitions
 		gatesOpened += s.gatesOpened
 		gatesAnswered += s.gatesAnswered
-		for k, n := range s.actuationsByActor {
+		for k, n := range s.actuationsByOutcome {
 			actuations[k] += n
 		}
 		for k, n := range s.verdictsByOutcome {
