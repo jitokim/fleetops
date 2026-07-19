@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Wrong-target actuation or other security-relevant bug
+    url: https://github.com/jitokim/fleetops/security/advisories/new
+    about: >-
+      Keystrokes or a kill landing on the wrong session, injection via untrusted transcript
+      or hook input, or a bad `hooks install` edit to ~/.claude/settings.json. Report these
+      privately, not in a public issue — see SECURITY.md.
+  - name: Is this feature already a known non-goal?
+    url: https://github.com/jitokim/fleetops/blob/main/VISION.md
+    about: >-
+      VISION.md says where the project is headed, and README's "Limitations" says what is
+      deliberately not built yet (the engine is a governance harness, not an agent runtime).
+      Worth a look before proposing a feature.

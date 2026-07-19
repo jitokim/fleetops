@@ -1,0 +1,155 @@
+name: Bug report
+description: Something in the cockpit observed the wrong thing, or an action hit the wrong target / did nothing.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Stop here if this is a wrong-target actuation bug** — anything where fleetops
+        sent keystrokes to, or killed, a session other than the one you selected.
+        Those go to [SECURITY.md](https://github.com/jitokim/fleetops/blob/main/SECURITY.md) as a
+        [private advisory](https://github.com/jitokim/fleetops/security/advisories/new),
+        not a public issue, even if the wrong action looked harmless.
+
+        Otherwise: the fields below are the ones that actually narrow a fleetops bug down.
+        Backend and version matter more here than in most projects — actuation is verified
+        against specific CLI versions by hand, so "works on cmux 0.64.15" is not a claim
+        about 0.65.
+
+  - type: input
+    id: fleetops-version
+    attributes:
+      label: fleetops version or commit
+      description: >-
+        There is no `--version` flag yet. For an installed binary:
+        `go version -m $(which fleetops)` and read the `mod` line. From a clone: `git rev-parse --short HEAD`.
+      placeholder: "v0.3.0-alpha / 1a2b3c4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part is misbehaving?
+      description: >-
+        Rough guess is fine. Observation = the state shown is wrong. Actuation = a key
+        did the wrong thing or nothing.
+      options:
+        - Observation — the state shown for a loop is wrong (run/idle/stalled/gone)
+        - Actuation — a key (attach/approve/resume/stop/kill/inject/spawn) misbehaved
+        - Gates — a permission prompt didn't show as GATE, or a stale GATE stuck around
+        - Oracle / engine — DONE/DRIFT verdict or engine drive behaviour
+        - Hooks — `fleetops hooks install` / `uninstall` / `~/.claude/settings.json`
+        - TUI — rendering, keymap, filtering, layout
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Which backend was hosting the session?
+      description: >-
+        If you don't know, the DETAIL panel shows how the loop was reached. "Bare terminal"
+        is the fallback that prints a copy-pasteable command instead of acting.
+      options:
+        - orca
+        - tmux
+        - cmux
+        - iTerm2 (no multiplexer)
+        - bare terminal (none of the above)
+        - Not applicable — this isn't an actuation bug
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: backend-version
+    attributes:
+      label: Backend CLI version
+      description: >-
+        e.g. `cmux --version`, `tmux -V`, `orca --version`, or the iTerm2 build. Leave blank
+        if the backend is not applicable. Please don't skip this for cmux — its CLI surface
+        has shifted between releases.
+      placeholder: "cmux 0.64.15"
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      description: >-
+        Only macOS has the full backend matrix. On Linux, tmux works but process-liveness
+        detection is unverified. Windows has no working backend today — see README
+        "Platform support" before filing.
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator (and whether a multiplexer was nested inside it)
+      description: >-
+        Nesting matters — a tmux pane inside iTerm2 is addressed at a different layer than
+        the iTerm2 session enclosing it.
+      placeholder: "iTerm2 3.5.x, with the loop inside a tmux pane"
+
+  - type: input
+    id: fleet-state
+    attributes:
+      label: What state did the fleet table show for that loop?
+      description: >-
+        Straight from the FLEET list. This is what separates an observation bug from an
+        actuation bug, so please include it even if it looks irrelevant.
+      placeholder: "idle / run / stalled / ◆ GATE / ✗ 429 / ✗ gone / ✓ DONE / ✗ DRIFT / —"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect instead?
+      description: Include the exact key you pressed, if any.
+      placeholder: >-
+        Pressed `a` to approve a gate on a cmux-hosted loop. Nothing happened and the GATE
+        marker stayed. Expected the prompt to accept the default option and the turn to continue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        If you can't reproduce it reliably, say so and describe what the session had been
+        doing beforehand — that's still useful.
+      placeholder: |
+        1. Spawn a loop with `n` in project X
+        2. Wait for a permission prompt
+        3. Press `a`
+
+  - type: dropdown
+    id: demo-repro
+    attributes:
+      label: Does it also happen under `fleetops --demo`?
+      description: >-
+        `--demo` runs the same TUI on a synthetic fleet with no real sessions and no disk
+        writes. If the bug reproduces there, it's in the UI rather than in observation or
+        actuation — which is a big head start. Safe to run.
+      options:
+        - "Yes — reproduces in --demo"
+        - "No — only with real sessions"
+        - "Haven't tried"
+        - "Not applicable"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >-
+        Anything fleetops printed to stderr, or relevant lines from `fleetops report`.
+        Please redact real project paths and goals if they're sensitive — and never paste
+        session transcript contents.
+      render: shell

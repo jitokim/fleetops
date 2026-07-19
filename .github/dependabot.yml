@@ -1,0 +1,30 @@
+version: 2
+
+# Monthly + grouped, deliberately: this repo has a handful of stable direct deps
+# (charmbracelet TUI stack) and one maintainer. Two PRs a month is reviewable;
+# a per-dependency weekly firehose is not. Dependabot *security* alerts are a
+# separate feature and are not throttled by this schedule.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
