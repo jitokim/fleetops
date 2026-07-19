@@ -51,7 +51,7 @@ const (
 // IsHostSendTier reports whether act dispatches through Tier 1h (an in-place
 // host send) rather than through a multiplexer.
 //
-// Exported for exactly ONE caller — the TUI's actuation dispatch — because a
+// Exported narrowly, for the TUI's actuation dispatch, because a
 // Tier 1h failure is DEGRADABLE in a way no other tier's is. Nearly every 1h
 // failure mode refuses BEFORE delivering a keystroke: a whitelist refusal never
 // execs at all, and `miss` / `ttymismatch` / an unrecognized verdict / an

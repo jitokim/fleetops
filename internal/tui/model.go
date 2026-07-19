@@ -2407,12 +2407,15 @@ func worktreeNameFromGoal(goal string) string {
 // slugFromGoal lowercases goal and keeps only [a-z0-9], collapsing every
 // other run of characters to a single dash, capped to the first maxRunes
 // INPUT runes (not output length) — "loop" if nothing alnum survives. Pure
-// function so the slugging is directly testable. Shared core: originally
-// worktreeNameFromGoal's own body (still its sole caller for the "mctl-"-
-// prefixed worktree name); LoopEngine MVP's engine-drive bootstrap reuses
-// it bare (no prefix) for the "engine: bootstrapping <slug>…" status line
-// — same "compact, filesystem/terminal-safe label from free-text goal"
-// need, not a new concept.
+// function so the slugging is directly testable.
+//
+// Shared core, deliberately not enumerated by count: it began as
+// worktreeNameFromGoal's body (which prefixes "mctl-"), and the engine-drive
+// paths reuse it bare for their status lines. An earlier version of this
+// comment listed the callers, went stale the first time one was added, and
+// the list bought a reader nothing the callers themselves do not say — grep
+// for slugFromGoal if you need them. What matters here is the CONTRACT: a
+// compact, filesystem- and terminal-safe label from free text.
 func slugFromGoal(goal string, maxRunes int) string {
 	runes := []rune(strings.ToLower(goal))
 	if len(runes) > maxRunes {
@@ -3855,7 +3858,7 @@ const headerLeftWidth = 36
 // renderHeaderLeft: logo + subtitle, the LIVE/uptime/hostname line, and a
 // free third line. Judgment call: the task's spec offered "line 3 left free
 // or gate badge" as alternatives without picking one — left free, since
-// MIDDLE's own line 3 (renderHeaderMiddle) already carries the gate badge
+// MIDDLE's own line 3 (headerMiddleContent) already carries the gate badge
 // and a second copy here would just be redundant.
 func renderHeaderLeft(m Model, width int) string {
 	line1 := stTitle.Render("◎ FLEETOPS") + stFaint.Render("  fleet cockpit")

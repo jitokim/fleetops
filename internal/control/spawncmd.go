@@ -34,8 +34,10 @@ func UseDefaultSpawnCommand() {
 }
 
 // shellQuoteJoin renders an argv as a single POSIX-shell-safe command string,
-// for the two spawn sites that cannot pass an argv and must hand a shell (or a
-// CLI that takes a command STRING) one flat word list:
+// for the spawn sites that cannot pass an argv and must hand a shell (or a
+// CLI that takes a command STRING) one flat word list. They are enumerated
+// rather than counted — a count in prose goes stale the moment a third is
+// added, while a list simply gains a bullet:
 //
 //   - orca's `terminal create --command`, whose contract takes a string (orca.go).
 //   - iTerm2's launch line, which must be a shell line because `create window`

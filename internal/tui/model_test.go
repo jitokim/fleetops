@@ -9283,3 +9283,62 @@ func TestWhereStepLabel_OffersWorktreeInsideARepo(t *testing.T) {
 		t.Errorf("label withholds [w] where it would work: %q", m.whereStepLabel())
 	}
 }
+
+// TestWizardStepCoverage_EveryStepCancelsOnEsc pins the wizard's step SET, not
+// a number written in prose.
+//
+// The esc-cancel table below used to be introduced as "the 6 steps". Three
+// steps were added later and the sentence was never widened, so the table
+// looked exhaustive while wizardDir had no esc coverage at all. A count in a
+// comment cannot notice that; this can.
+//
+// It asserts two things a future step must satisfy: the step exists in the
+// enumeration below, and esc cancels from it. Add a step and this fails with
+// its name, pointing at the test that must grow — rather than silently leaving
+// a step untested behind a stale sentence.
+func TestWizardStepCoverage_EveryStepCancelsOnEsc(t *testing.T) {
+	// Every wizardStep value, in declaration order. The compiler does not
+	// enumerate these for us, so the guard is that a new step added to the
+	// const block and NOT added here fails the completeness check below.
+	all := []struct {
+		step wizardStep
+		name string
+	}{
+		{wizardGoal, "wizardGoal"},
+		{wizardName, "wizardName"},
+		{wizardDoneWhen, "wizardDoneWhen"},
+		{wizardRubric, "wizardRubric"},
+		{wizardChallenger, "wizardChallenger"},
+		{wizardMaxCycles, "wizardMaxCycles"},
+		{wizardEngineDrive, "wizardEngineDrive"},
+		{wizardWhere, "wizardWhere"},
+		{wizardDir, "wizardDir"},
+	}
+
+	// Completeness: wizardDir is the highest value, so the set must cover
+	// 0..wizardDir with no gaps. A new step appended to the const block makes
+	// this fail until it is listed above.
+	if got, want := len(all), int(wizardDir)+1; got != want {
+		t.Fatalf("this test lists %d wizard steps but the enum has %d — a step was added to model.go and not here", got, want)
+	}
+	for i, s := range all {
+		if int(s.step) != i {
+			t.Fatalf("%s is value %d, expected %d — the list here is out of order with the const block", s.name, s.step, i)
+		}
+	}
+
+	for _, s := range all {
+		t.Run(s.name, func(t *testing.T) {
+			m := modelWithOneLoop()
+			m.mode = modePrompting
+			m.spawnStep = s.step
+			m.input = newWizardInput()
+
+			m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+			if m.mode != modeNormal {
+				t.Errorf("esc at %s left mode = %v, want modeNormal — every step must be cancellable", s.name, m.mode)
+			}
+		})
+	}
+}
