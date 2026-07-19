@@ -165,6 +165,18 @@ type approveResultMsg struct {
 type spawnResultMsg struct {
 	ok   bool
 	text string
+
+	// mayHaveSpawned marks a FAILURE that might nonetheless have left a
+	// window, a claude process, or a checkout behind. It exists to decide one
+	// thing: whether the wizard may be reopened with the operator's answers
+	// so a retry is one keystroke away.
+	//
+	// For an unambiguous failure that is a kindness — the answers took real
+	// effort to type. For an ambiguous one it is a trap: the cheap retry is
+	// precisely how a duplicate loop gets created, and the status text is
+	// already telling the operator to go LOOK before doing anything. Only
+	// meaningful when ok is false.
+	mayHaveSpawned bool
 }
 
 // bootstrapResultMsg reports the outcome of LoopEngine MVP's headless
@@ -596,13 +608,17 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 	now := time.Now()
 
 	authHarden := domain.Loop{
-		Project:      "auth-harden",
-		SessionID:    "demo-auth-harden",
-		ProjectDir:   "-home-user-api",
-		Cwd:          "/home/user/api",
-		Path:         "/home/user/.claude/projects/-home-user-api/demo-auth-harden.jsonl",
-		State:        domain.StateGate,
-		GatePrompt:   "Allow Bash(git push origin main)?",
+		Project:    "auth-harden",
+		SessionID:  "demo-auth-harden",
+		ProjectDir: "-home-user-api",
+		Cwd:        "/home/user/api",
+		Path:       "/home/user/.claude/projects/-home-user-api/demo-auth-harden.jsonl",
+		State:      domain.StateGate,
+		// Exactly the shape gate.Info.Detail() produces for a permission gate
+		// ("<tool>: <detail>"), not a prettier paraphrase — the demo is what
+		// a new reader believes the product looks like, so a divergence here
+		// is a false claim that no test would catch.
+		GatePrompt:   "Bash: git push origin main",
 		Cycle:        6,
 		Goal:         domain.Goal{Text: "Harden the auth middleware and open a PR", MaxCycles: 12, BudgetTokens: 2_000_000},
 		TokensSpent:  640000,
@@ -654,6 +670,25 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		Cycle:        3,
 		LastActivity: now.Add(-12 * time.Minute),
 	}
+	// The SECOND gate, and deliberately a different KIND. A permission gate
+	// names a tool; an AskUserQuestion gate carries a real question plus the
+	// choices on offer. Two gates at once is also the situation the callout
+	// exists for: with only one, "attach and look" costs about the same, and
+	// the demo would not show why any of this was built.
+	migrateDB := domain.Loop{
+		Project:      "migrate-db",
+		SessionID:    "demo-migrate-db",
+		ProjectDir:   "-home-user-billing",
+		Cwd:          "/home/user/billing",
+		Path:         "/home/user/.claude/projects/-home-user-billing/demo-migrate-db.jsonl",
+		State:        domain.StateGate,
+		GatePrompt:   "The migration will drop the legacy invoices table. How should I proceed?",
+		GateOptions:  []string{"Drop it", "Keep and rename", "Stop and let me look"},
+		Cycle:        2,
+		Goal:         domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
+		TokensSpent:  180000,
+		LastActivity: now.Add(-2 * time.Minute),
+	}
 	refactorCoreReason := "payment handlers moved into internal/payment, existing tests still pass — ledger reconciliation not yet covered"
 	refactorCore := domain.Loop{
 		Project:    "refactor-core",
@@ -676,7 +711,7 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		LastActivity: now.Add(-90 * time.Second),
 	}
 
-	loops = []domain.Loop{authHarden, flakyTests, depUpgrade, docsGen, coverage, refactorCore}
+	loops = []domain.Loop{authHarden, migrateDB, flakyTests, depUpgrade, docsGen, coverage, refactorCore}
 
 	detailCache = map[string]detailCacheEntry{
 		authHarden.SessionID: {events: []events.Event{
@@ -1427,6 +1462,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusKind = statusOK
 		} else {
 			m.statusKind = statusErr
+			// The wizard's answers are still in the model — submitSpawnWizard
+			// only closes the wizard, it never clears them (they are cleared
+			// on the NEXT "n"). So recovering them costs nothing but
+			// reopening, which is why this is worth doing at all.
+			//
+			// Withheld when the spawn may have landed: there the correct next
+			// action is to go look, not to retry, and putting a retry one
+			// keystroke away is how a duplicate loop gets made.
+			if !msg.mayHaveSpawned {
+				m = m.reopenSpawnWizard()
+			}
 		}
 	case bootstrapResultMsg:
 		m.status = msg.text
@@ -1543,8 +1589,9 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 				logActuationEvent(l, action, act.Tier(), err)
 				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
 				// resolves optimistically — the registry says the loop lives in
-				// an iTerm2 session, and only the send itself can discover the
-				// tab was closed, moved, or now hosts a different tty. Before
+				// an iTerm2 session, and only the send itself can discover that
+				// no session matches (closed, or a stale registry GUID after an
+				// iTerm2 restart — #62) or that it now hosts a different tty. Before
 				// Tier 1h existed such a loop fell to Tier 2 and the prompt
 				// landed; reporting the failure as terminal here would be a
 				// capability REGRESSION for exactly the sessions the tier was
@@ -1588,8 +1635,9 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			// feat/inject-headless-exact-fallback): this branch is a
 			// DOWNGRADE, not StallGone's normal Tier-2 path — Tier 1 either
 			// found no backend, or a resolved Tier 1h
-			// host send refused (the iTerm2 tab was closed, or its tty
-			// moved), or (most commonly, with N>1 sessions
+			// host send refused (no session matched — closed or a stale
+			// registry GUID, #62 — or its tty moved), or (most commonly, with
+			// N>1 sessions
 			// sharing a cwd on a backend with no per-session tty dispatch,
 			// e.g. cmux/orca — see docs/adr-vendor-independent-actuation.md
 			// §4 and ResolveActuationTarget's doc) couldn't disambiguate
@@ -2060,6 +2108,27 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 // re-checks WorktreeSpawner support itself before actually branching (ctrl is
 // re-resolved at spawn time, not reused from the earlier eligibility check,
 // in case availability changed in between).
+// reopenSpawnWizard puts the operator back in the wizard with every answer
+// intact after a spawn failed cleanly.
+//
+// Returns to the LAST step rather than the first: that is where they were when
+// they submitted, it is the step a location/backend failure is most likely
+// about, and the earlier answers are all still reachable by going back. Note
+// this does NOT re-submit — retrying stays an explicit act.
+//
+// spawnCwdIsRepo and spawnHostsClaudeRepo are recomputed rather than reused,
+// because the failure may itself have been about the directory and a stale
+// answer here decides which options the wizard offers (see worktreeOffered).
+func (m Model) reopenSpawnWizard() Model {
+	m.spawnStep = wizardWhere
+	m.spawnCwdIsRepo = worktree.IsRepo(m.spawnCwd)
+	m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(m.spawnCwd)
+	m.mode = modePrompting
+	m.input = newWizardInput()
+	m.input.Focus()
+	return m
+}
+
 func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 	m.mode = modeNormal
 	m.input.Blur()
@@ -2172,7 +2241,8 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		// tested on a machine with no backend installed.
 		ctrl, ok := resolveSpawnerFn()
 		if !ok {
-			return spawnResultMsg{false, "no orca/tmux/cmux/iTerm2 — spawn manually: cd " + cwd + " && claude"}
+			// Nothing was attempted — no backend was even resolved.
+			return spawnResultMsg{ok: false, text: "no orca/tmux/cmux/iTerm2 — spawn manually: cd " + cwd + " && claude"}
 		}
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 
@@ -2180,7 +2250,10 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 			name := worktreeNameFromGoal(spec.Goal)
 			worktreePath, err := spawner.SpawnWorktree(cwd, name, prompt)
 			if err != nil {
-				return spawnResultMsg{false, fmt.Sprintf("spawn worktree failed: %v", err)}
+				// The backend's own worktree spawn. Its error may or may not
+				// mean a window was created, so it is classified rather than
+				// assumed — see spawnMayHaveLandedWindow.
+				return spawnResultMsg{ok: false, text: fmt.Sprintf("spawn worktree failed: %v", err), mayHaveSpawned: spawnMayHaveLandedWindow(err)}
 			}
 			pendingCwd := worktreePath
 			bindNote := ""
@@ -2195,15 +2268,15 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 				bindNote = " (binding may miss — worktree path unknown)"
 			}
 			if err := registry.WritePending(registry.PendingDir(), pendingCwd, spec); err != nil {
-				return spawnResultMsg{true, fmt.Sprintf("spawned loop in new worktree %s via %s (goal not recorded: %v)", name, ctrl.Name(), err)}
+				return spawnResultMsg{ok: true, text: fmt.Sprintf("spawned loop in new worktree %s via %s (goal not recorded: %v)", name, ctrl.Name(), err)}
 			}
 			if worktreePath != "" && worktreePath == cwd {
 				// folder repo — no isolated checkout was actually created
 				// (see SpawnWorktree's shared-workspace caveat). Say so
 				// plainly rather than claiming isolation that didn't happen.
-				return spawnResultMsg{true, fmt.Sprintf("spawned in shared workspace %s (no isolated checkout — folder repo)", name)}
+				return spawnResultMsg{ok: true, text: fmt.Sprintf("spawned in shared workspace %s (no isolated checkout — folder repo)", name)}
 			}
-			return spawnResultMsg{true, fmt.Sprintf("spawned loop in new worktree %s via %s%s", name, ctrl.Name(), bindNote)}
+			return spawnResultMsg{ok: true, text: fmt.Sprintf("spawned loop in new worktree %s via %s%s", name, ctrl.Name(), bindNote)}
 		}
 
 		if useWorktree {
@@ -2211,14 +2284,14 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		}
 
 		if err := ctrl.Spawn(cwd, prompt); err != nil {
-			return spawnResultMsg{false, spawnFailureText(err)}
+			return spawnResultMsg{ok: false, text: spawnFailureText(err), mayHaveSpawned: spawnMayHaveLandedWindow(err)}
 		}
 		if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
 			// best-effort: the loop still spawned and will show up
 			// unbound — just won't get ORACLE/N-I tracking.
-			return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s (goal not recorded: %v)", cwd, ctrl.Name(), err)}
+			return spawnResultMsg{ok: true, text: fmt.Sprintf("spawned loop in %s via %s (goal not recorded: %v)", cwd, ctrl.Name(), err)}
 		}
-		return spawnResultMsg{true, fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
+		return spawnResultMsg{ok: true, text: fmt.Sprintf("spawned loop in %s via %s", cwd, ctrl.Name())}
 	}
 }
 
@@ -2244,22 +2317,25 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt string) tea.Msg {
 	wt, err := worktreeCreateFn(cwd)
 	if err != nil {
-		return spawnResultMsg{false, fmt.Sprintf("worktree spawn failed: %v", err)}
+		// The git worktree itself failed, before any terminal was driven.
+		return spawnResultMsg{ok: false, text: fmt.Sprintf("worktree spawn failed: %v", err)}
 	}
 	if err := ctrl.Spawn(wt.Path, prompt); err != nil {
 		// The checkout exists but nothing is running in it. Say exactly that,
 		// and name the path — it is the human's to reuse or remove, and a
 		// message that omitted it would leave an orphan directory they never
 		// heard about.
-		return spawnResultMsg{false, fmt.Sprintf("created worktree %s but spawn failed: %v (the checkout is at %s)", wt.Branch, err, wt.Path)}
+		// A checkout EXISTS on disk even though the spawn failed, so a
+		// one-key retry would strand it and make a second one.
+		return spawnResultMsg{ok: false, text: fmt.Sprintf("created worktree %s but spawn failed: %v (the checkout is at %s)", wt.Branch, err, wt.Path), mayHaveSpawned: true}
 	}
 	spawned := fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name())
 	if err := registry.WritePending(registry.PendingDir(), wt.Path, spec); err != nil {
 		// best-effort, same posture as the plain-spawn path: the loop really
 		// did start, it just won't get ORACLE/N-I tracking.
-		return spawnResultMsg{true, fmt.Sprintf("%s (goal not recorded: %v)", spawned, err)}
+		return spawnResultMsg{ok: true, text: fmt.Sprintf("%s (goal not recorded: %v)", spawned, err)}
 	}
-	return spawnResultMsg{true, spawned}
+	return spawnResultMsg{ok: true, text: spawned}
 }
 
 // staleBaseNote renders the caveat for a worktree whose pre-branch fetch
@@ -3182,6 +3258,24 @@ func emitTransitionsCmd(transitions []transitionEvent) tea.Cmd {
 // So: say the outcome is unknown, and NAME the orphan the way
 // spawnIntoGitWorktree already names an orphan checkout, because a thing the
 // human was never told about is a thing they cannot clean up.
+// spawnMayHaveLandedWindow reports whether a spawn error leaves it genuinely
+// unknown whether a window/process was created.
+//
+// The three sentinels below already SAY so in their own messages — they tell
+// the operator to go find a stray window and close it. This function is the
+// machine-readable half of the same statement, so that the offer to retry and
+// the text shown to the operator cannot drift apart. Anything else is a
+// failure we actually observed to be clean.
+//
+// Defaults to false deliberately: a new error type is far more likely to be a
+// plain failure, and treating one as ambiguous only costs a retry the
+// operator can do by hand.
+func spawnMayHaveLandedWindow(err error) bool {
+	return errors.Is(err, control.ErrSendDeliveryUnknown) ||
+		errors.Is(err, control.ErrITerm2SpawnNoSession) ||
+		errors.Is(err, control.ErrITerm2SpawnNoClaude)
+}
+
 func spawnFailureText(err error) string {
 	if errors.Is(err, control.ErrSendDeliveryUnknown) {
 		return "spawn outcome UNKNOWN — the window request timed out and may still have created one. Check for a new iTerm2 window running claude with no goal, and close it before retrying"

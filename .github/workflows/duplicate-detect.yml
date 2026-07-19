@@ -49,10 +49,10 @@ jobs:
       # code with a write-scoped token, which is the classic
       # pull_request_target compromise.
       #
-      # Actions are pinned by commit SHA, not tag. A tag is mutable: whoever
-      # can move `v7` can run their code here, and this job holds issues:write
-      # and pull-requests:write on the base repo. The version comment records
-      # what the SHA was at pin time; update both together.
+      # SHA-pinned per the ACTION PINNING POLICY in pr-review-dispatch.yml's
+      # header. Worth restating the stake HERE and nowhere else: this job runs
+      # under pull_request_target holding issues:write and pull-requests:write
+      # on the base repo, so a moved tag would execute with those scopes.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false

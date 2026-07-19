@@ -3086,16 +3086,17 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 // capability-regression guard for the iTerm2 Tier 1h slice.
 //
 // Tier 1h resolves OPTIMISTICALLY (the registry says the loop lives in an
-// iTerm2 session) and only discovers a closed tab / moved tty at SEND time.
-// Before 1h existed, such a loop resolved nothing and the prompt landed via
-// Tier 2. Reporting the 1h failure as terminal would therefore have made "r"/
-// "i" strictly WORSE for exactly the sessions this tier was added to serve.
+// iTerm2 session) and only discovers a missing session (closed, or a stale
+// registry GUID — #62) / moved tty at SEND time. Before 1h existed, such a
+// loop resolved nothing and the prompt landed via Tier 2. Reporting the 1h
+// failure as terminal would therefore have made "r"/"i" strictly WORSE for
+// exactly the sessions this tier was added to serve.
 //
 // Safe precisely because a 1h failure never half-delivers (see
 // control.IsHostSendTier), so the redrive cannot double-send.
 func TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive(t *testing.T) {
 	for _, sendErr := range []error{
-		control.ErrSendNoSession,    // the tab was closed
+		control.ErrSendNoSession,    // no session found (closed, or a stale GUID)
 		control.ErrSendTTYMismatch,  // the session moved / tab recycled
 		control.ErrNoSendSurface,    // refused before exec
 		errors.New("exit status 1"), // osascript itself failed
@@ -8565,8 +8566,8 @@ func TestUpdate_EnterKey_ObservedLoop_StillDispatchesAttach(t *testing.T) {
 func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	loops, detailCache, oracleCounts := demoFleet()
 
-	if len(loops) != 6 {
-		t.Fatalf("got %d loops, want 6", len(loops))
+	if len(loops) != 7 {
+		t.Fatalf("got %d loops, want 7", len(loops))
 	}
 	byProject := make(map[string]domain.Loop, len(loops))
 	for _, l := range loops {
@@ -8577,14 +8578,38 @@ func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	if !ok {
 		t.Fatal("expected an auth-harden loop")
 	}
-	if authHarden.State != domain.StateGate || authHarden.GatePrompt != "Allow Bash(git push origin main)?" {
-		t.Errorf("auth-harden = %+v, want StateGate with the git-push permission prompt", authHarden)
+	// Pinned to the exact shape gate.Info.Detail() renders for a permission
+	// gate. If the demo drifts from what the product actually produces, the
+	// demo becomes a claim nothing verifies — and the demo is what a new
+	// reader believes fleetops looks like.
+	if authHarden.State != domain.StateGate || authHarden.GatePrompt != "Bash: git push origin main" {
+		t.Errorf("auth-harden = %+v, want StateGate with the tool-named permission prompt", authHarden)
+	}
+	if len(authHarden.GateOptions) != 0 {
+		t.Errorf("auth-harden.GateOptions = %q, want none — a permission prompt has no structured choices", authHarden.GateOptions)
 	}
 	if authHarden.Goal.MaxCycles != 12 || authHarden.Cycle != 6 || authHarden.TokensSpent != 640000 || authHarden.Goal.BudgetTokens != 2_000_000 {
 		t.Errorf("auth-harden contract/usage fields = %+v, want the spec'd values", authHarden)
 	}
 	if authHarden.Cwd != "/home/user/api" {
 		t.Errorf("auth-harden.Cwd = %q, want /home/user/api", authHarden.Cwd)
+	}
+
+	// The second gate exists to show the OTHER gate kind. A demo with only a
+	// permission gate would never render a choices line, so the feature would
+	// be invisible in the one place people look before installing.
+	migrateDB, ok := byProject["migrate-db"]
+	if !ok {
+		t.Fatal("expected a migrate-db loop — the AskUserQuestion gate")
+	}
+	if migrateDB.State != domain.StateGate {
+		t.Errorf("migrate-db.State = %v, want %v", migrateDB.State, domain.StateGate)
+	}
+	if migrateDB.GatePrompt == "" {
+		t.Error("migrate-db.GatePrompt is empty — a question gate must carry its question")
+	}
+	if len(migrateDB.GateOptions) != 3 {
+		t.Errorf("migrate-db.GateOptions = %q, want three choices", migrateDB.GateOptions)
 	}
 
 	flakyTests, ok := byProject["flaky-tests"]
@@ -8640,8 +8665,8 @@ func TestNewDemo_SeedsFleetCursorOnGateAndSetsDemoFlag(t *testing.T) {
 	if !m.demo {
 		t.Error("expected m.demo = true")
 	}
-	if len(m.loops) != 6 {
-		t.Fatalf("got %d loops, want 6", len(m.loops))
+	if len(m.loops) != 7 {
+		t.Fatalf("got %d loops, want 7", len(m.loops))
 	}
 	if m.cursor != 0 || m.loops[0].Project != "auth-harden" || m.loops[0].State != domain.StateGate {
 		t.Errorf("cursor = %d on %+v, want cursor 0 on the auth-harden GATE (the hero frame)", m.cursor, m.loops[m.cursor])
@@ -9406,3 +9431,116 @@ func stripANSI(s string) string {
 }
 
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// ── spawn failure: wizard answers survive, unless a retry would be unsafe ──
+
+func TestSpawnResultMsg_CleanFailure_ReopensWizardWithAnswersIntact(t *testing.T) {
+	// The 2026-07-19 report: goal, done-condition, rubric and challenger all
+	// typed in, [w] chosen, spawn failed — and every answer was gone. The
+	// values were never actually cleared on submit, only orphaned by the
+	// wizard closing, so recovering them costs nothing but reopening.
+	m := Model{
+		mode:            modeNormal,
+		spawnGoal:       "harden the auth middleware",
+		spawnDoneWhen:   "tests green twice in a row",
+		spawnRubric:     "reject bare claims",
+		spawnChallenger: "try deleting failing tests",
+		spawnMaxCycles:  8,
+		spawnCwd:        t.TempDir(),
+	}
+
+	got, _ := m.Update(spawnResultMsg{ok: false, text: "spawn failed: no backend"})
+	after, ok := got.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want Model", got)
+	}
+
+	if after.mode != modePrompting {
+		t.Fatalf("mode = %v, want the wizard reopened (%v)", after.mode, modePrompting)
+	}
+	if after.spawnGoal != m.spawnGoal || after.spawnDoneWhen != m.spawnDoneWhen ||
+		after.spawnRubric != m.spawnRubric || after.spawnChallenger != m.spawnChallenger ||
+		after.spawnMaxCycles != m.spawnMaxCycles {
+		t.Errorf("answers not preserved: %+v", after)
+	}
+	if after.statusKind != statusErr {
+		t.Error("the failure must still be reported — reopening is not a substitute for saying it failed")
+	}
+}
+
+func TestSpawnResultMsg_MayHaveSpawned_DoesNotReopenWizard(t *testing.T) {
+	// The dangerous half. When a window may already exist, the right next
+	// action is to go LOOK — and the status text says exactly that. Reopening
+	// the wizard would put a duplicate loop one keystroke away, which is worse
+	// than losing the typed answers.
+	m := Model{mode: modeNormal, spawnGoal: "harden the auth middleware", spawnCwd: t.TempDir()}
+
+	got, _ := m.Update(spawnResultMsg{
+		ok:             false,
+		text:           "spawn outcome UNKNOWN — the window request timed out and may still have created one",
+		mayHaveSpawned: true,
+	})
+	after := got.(Model)
+
+	if after.mode != modeNormal {
+		t.Errorf("mode = %v, want the wizard left CLOSED after an ambiguous spawn", after.mode)
+	}
+	if after.statusKind != statusErr {
+		t.Error("expected the ambiguous outcome still surfaced as an error")
+	}
+}
+
+func TestSpawnResultMsg_Success_DoesNotReopenWizard(t *testing.T) {
+	m := Model{mode: modeNormal, spawnGoal: "harden the auth middleware", spawnCwd: t.TempDir()}
+	got, _ := m.Update(spawnResultMsg{ok: true, text: "spawned loop"})
+	if after := got.(Model); after.mode != modeNormal {
+		t.Errorf("mode = %v, want the wizard to stay closed on success", after.mode)
+	}
+}
+
+func TestSpawnMayHaveLandedWindow(t *testing.T) {
+	// This predicate is the machine-readable half of what these three
+	// sentinels already say in prose ("check for a stray window and close
+	// it"). If the two ever disagree, the cockpit offers a cheap retry while
+	// simultaneously telling the operator not to retry.
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"send timed out", control.ErrSendDeliveryUnknown, true},
+		{"iTerm2 gave no session id", control.ErrITerm2SpawnNoSession, true},
+		{"iTerm2 window has no claude", control.ErrITerm2SpawnNoClaude, true},
+		{"wrapped ambiguous error still counts", fmt.Errorf("spawning: %w", control.ErrITerm2SpawnNoSession), true},
+		{"an ordinary failure is clean", errors.New("exec: tmux not found"), false},
+		{"no backend resolved", errors.New("no orca/tmux/cmux/iTerm2"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := spawnMayHaveLandedWindow(c.err); got != c.want {
+				t.Errorf("spawnMayHaveLandedWindow(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSpawnMayHaveLandedWindow_MatchesWhatTheOperatorIsTold(t *testing.T) {
+	// Pins the pair together rather than trusting them to stay aligned: every
+	// error this predicate calls ambiguous must ALSO tell the operator to go
+	// look for a stray window. A sentinel whose text stopped saying that, or a
+	// new ambiguous error added here without such text, is caught here.
+	for _, err := range []error{
+		control.ErrSendDeliveryUnknown,
+		control.ErrITerm2SpawnNoSession,
+		control.ErrITerm2SpawnNoClaude,
+	} {
+		if !spawnMayHaveLandedWindow(err) {
+			t.Errorf("%v: predicate says clean", err)
+			continue
+		}
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "window") && !strings.Contains(msg, "attach") {
+			t.Errorf("%v: classified ambiguous but its text does not point the operator at anything to check", err)
+		}
+	}
+}

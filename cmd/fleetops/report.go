@@ -38,12 +38,19 @@ func runReportCmd(args []string) {
 
 // loopSummary is one session's aggregated history over the report window.
 type loopSummary struct {
-	sessionID         string
-	lastTS            int64
-	lastState         string
-	transitions       int
-	gatesOpened       int
-	gatesAnswered     int
+	sessionID           string
+	lastTS              int64
+	lastState           string
+	transitions         int
+	gatesOpened         int
+	gatesAnswered       int
+	actuationsByOutcome map[string]int
+	// actuationsByActor is kept ALONGSIDE the outcome tally rather than
+	// replaced by it. Issue #52 was about outcomes, and grouping by outcome is
+	// the fix — but "who acted" is a separate question that the roadmap's
+	// actor/brake model (§2.4) depends on being able to ask, and it becomes
+	// load-bearing the moment something other than a human is acting. Dropping
+	// it to fix #52 would have quietly removed the answer.
 	actuationsByActor map[string]int
 	verdictsByOutcome map[string]int
 }
@@ -117,9 +124,10 @@ func writeReport(w io.Writer, dir, sinceLabel string, window time.Duration, now 
 // they're judgments/actions, not transitions themselves.
 func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 	s := loopSummary{
-		sessionID:         sessionID,
-		actuationsByActor: map[string]int{},
-		verdictsByOutcome: map[string]int{},
+		sessionID:           sessionID,
+		actuationsByOutcome: map[string]int{},
+		actuationsByActor:   map[string]int{},
+		verdictsByOutcome:   map[string]int{},
 	}
 	for _, ev := range evs {
 		s.lastTS = ev.TS
@@ -137,6 +145,7 @@ func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 
 		switch ev.Trigger {
 		case events.TriggerActuation:
+			s.actuationsByOutcome[actuationOutcomeLabel(ev.Outcome)]++
 			s.actuationsByActor[string(ev.Actor)]++
 		case events.TriggerOracle:
 			if outcome := verdictOutcome(ev.Detail); outcome != "" {
@@ -145,6 +154,32 @@ func summarizeLoop(sessionID string, evs []events.Event) loopSummary {
 		}
 	}
 	return s
+}
+
+// actuationOutcomeLabel maps a TriggerActuation event's structured Outcome
+// field (events.Event's Outcome* constants) to the word this report shows a
+// human, so a tally of "N actuations" can never be misread as "N that
+// landed" (issue #52: every TriggerACTUATION event used to be tallied
+// unconditionally, so an operator whose five kill attempts ALL failed with
+// "no such pane" saw the same "5 actuations" a report of five that worked
+// would show).
+//
+// events.OutcomeUnknown (a host-send timeout — see
+// internal/control.ErrSendDeliveryUnknown, surfaced to the human by the TUI's
+// unknownDeliveryText) and "" (an event recorded before the Outcome field
+// existed, or by an emitter — e.g. autoRedrive429Cmd — that does not
+// classify one) are BOTH folded into "delivery unknown", never into "landed"
+// or "failed": in neither case was the action actually observed to succeed
+// or fail, and this report must not guess.
+func actuationOutcomeLabel(outcome string) string {
+	switch outcome {
+	case events.OutcomeOK:
+		return "landed"
+	case events.OutcomeFailed:
+		return "failed"
+	default: // events.OutcomeUnknown, or "" (pre-Outcome-field / unclassified)
+		return "delivery unknown"
+	}
 }
 
 // verdictOutcome pulls the outcome word out of an oracle event's Detail
@@ -163,20 +198,31 @@ func writeLoopSummary(w io.Writer, s loopSummary) {
 	fmt.Fprintf(w, "  last state:   %s\n", orDash(s.lastState))
 	fmt.Fprintf(w, "  transitions:  %d\n", s.transitions)
 	fmt.Fprintf(w, "  gates:        %d opened, %d answered\n", s.gatesOpened, s.gatesAnswered)
-	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(s.actuationsByActor))
+	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(s.actuationsByOutcome))
+	if len(s.actuationsByActor) > 0 {
+		fmt.Fprintf(w, "  by actor:     %s\n", formatByKey(s.actuationsByActor))
+	}
 	fmt.Fprintf(w, "  verdicts:     %s\n", formatByKey(s.verdictsByOutcome))
 }
 
 func writeFleetTotals(w io.Writer, summaries []loopSummary) {
 	var transitions, gatesOpened, gatesAnswered int
 	actuations := map[string]int{}
+	// Fleet-level actor totals are the more useful half of the actor question,
+	// not a mirror of the per-loop line: what matters about a non-human actor
+	// is how far its decisions reached ACROSS the fleet, since that is the
+	// thing a human cannot notice one loop at a time.
+	byActor := map[string]int{}
 	verdicts := map[string]int{}
 	for _, s := range summaries {
 		transitions += s.transitions
 		gatesOpened += s.gatesOpened
 		gatesAnswered += s.gatesAnswered
-		for k, n := range s.actuationsByActor {
+		for k, n := range s.actuationsByOutcome {
 			actuations[k] += n
+		}
+		for k, n := range s.actuationsByActor {
+			byActor[k] += n
 		}
 		for k, n := range s.verdictsByOutcome {
 			verdicts[k] += n
@@ -187,6 +233,9 @@ func writeFleetTotals(w io.Writer, summaries []loopSummary) {
 	fmt.Fprintf(w, "  transitions:  %d\n", transitions)
 	fmt.Fprintf(w, "  gates:        %d opened, %d answered\n", gatesOpened, gatesAnswered)
 	fmt.Fprintf(w, "  actuations:   %s\n", formatByKey(actuations))
+	if len(byActor) > 0 {
+		fmt.Fprintf(w, "  by actor:     %s\n", formatByKey(byActor))
+	}
 	fmt.Fprintf(w, "  verdicts:     %s\n", formatByKey(verdicts))
 }
 

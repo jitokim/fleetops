@@ -2,8 +2,12 @@ package gate
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -35,6 +39,90 @@ func TestWriteMarker_CreatesDir(t *testing.T) {
 	}
 	if len(Pending(dir)) != 1 {
 		t.Error("expected mkdirAll to have created the nested dir and the marker to be readable")
+	}
+}
+
+// TestWriteMarker_ConcurrentWriters_NoTornRead is issue #78's regression:
+// WriteMarker became read-modify-write when merging landed, but two hooks
+// write the SAME marker file for a single gate and can fire close together.
+// A reader (Pending, in production the scanner) that catches the file
+// mid-write gets a JSON error; readMarker degrades that to "nothing was
+// there", which mergeMarker's rule 1 then treats as a fresh marker — a torn
+// read would silently lose the tool detail rather than failing loudly,
+// exactly what the merge rules exist to prevent.
+//
+// This hammers WriteMarker from many goroutines (large ToolDetail payloads,
+// so a non-atomic os.WriteFile has a real truncate-then-write window to be
+// caught in) while a reader goroutine polls Pending concurrently, and
+// asserts the session is never reported missing once it has been written at
+// least once. Run with -race: the repo convention (see
+// internal/events.TestAppend_ConcurrentWritersToSameSession_NoDataLossAcrossRotation)
+// is to let -race's added scheduling noise widen the window rather than try
+// to force it deterministically.
+func TestWriteMarker_ConcurrentWriters_NoTornRead(t *testing.T) {
+	dir := t.TempDir()
+	const sessionID = "sess-torn"
+	const promptID = "prompt-torn"
+
+	// Seed the marker so the reader has something to lose from the first
+	// instant — every writer below shares this prompt_id and a non-empty
+	// Tool, so mergeMarker's rule 4 fires every time (same prompt_id,
+	// neither side "richer") and every call actually reaches the disk
+	// write rather than short-circuiting on rule 3.
+	seed := Info{
+		Message: "Claude needs your permission", Type: "permission_prompt",
+		PromptID: promptID, Tool: "Bash", ToolDetail: strings.Repeat("x", 4096),
+	}
+	if err := WriteMarker(dir, sessionID, seed); err != nil {
+		t.Fatalf("seed WriteMarker: %v", err)
+	}
+
+	const writers = 8
+	const iterations = 300
+
+	stop := make(chan struct{})
+	var badReads int64
+
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, ok := Pending(dir)[sessionID]; !ok {
+				atomic.AddInt64(&badReads, 1)
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = WriteMarker(dir, sessionID, Info{
+					Message:    "Claude needs your permission",
+					Type:       "permission_prompt",
+					PromptID:   promptID,
+					Tool:       "Bash",
+					ToolDetail: strings.Repeat(fmt.Sprintf("w%d-i%d-", w, i), 256),
+				})
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(stop)
+	<-readerDone
+
+	if badReads > 0 {
+		t.Errorf("Pending reported %q missing %d time(s) during concurrent WriteMarker calls — "+
+			"a torn read degraded to \"nothing was there\" and mergeMarker's rule 1 treated it as a "+
+			"fresh marker, silently discarding the tool detail the merge rules exist to protect",
+			sessionID, badReads)
 	}
 }
 

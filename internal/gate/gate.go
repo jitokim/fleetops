@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/jitokim/fleetops/internal/fsatomic"
 )
 
 // staleSlack absorbs the small gap between the hook firing and the
@@ -141,10 +143,16 @@ type markerFile struct {
 // payload land second and erase the useful one — the feature would work
 // briefly and then silently degrade. mergeMarker prevents that; see its doc
 // for the rules and for what happens when the correlation key is absent.
+//
+// The write itself goes through fsatomic (temp-file + rename) rather than a
+// bare os.WriteFile: now that this is read-modify-write, TWO hooks can land
+// close together (observed ~6s apart, but nothing enforces that gap) and a
+// reader can catch the file half-written. readMarker degrades that JSON
+// error to "nothing was there", which mergeMarker's rule 1 then treats as a
+// fresh marker — a torn read would silently lose the tool detail, exactly
+// what the merge rules above exist to prevent. internal/sessions shares the
+// same writer for the same reason (see its sessionTmpPrefix doc).
 func WriteMarker(dir, sessionID string, in Info) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
 	path := filepath.Join(dir, sessionID+".json")
 	in.TS = time.Now()
 
@@ -163,8 +171,12 @@ func WriteMarker(dir, sessionID string, in Info) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return fsatomic.WriteFile(path, data, gateTmpPrefix)
 }
+
+// gateTmpPrefix names WriteMarker's sibling temp file, so a stray temp
+// surviving a hard kill is identifiable as this registry's.
+const gateTmpPrefix = ".gate-*.tmp"
 
 // mergeMarker decides what a new payload does to the marker already on disk.
 // Returns the marker to persist and whether a write is needed at all.

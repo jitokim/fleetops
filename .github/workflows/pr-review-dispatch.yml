@@ -25,7 +25,8 @@
 #     failed job. See `.github/scripts/authorize.sh` for why the event
 #     payload's `author_association` is not an acceptable substitute.
 #
-# ACTION PINNING POLICY (applies to every workflow in this repo):
+# ACTION PINNING POLICY (canonical — every other workflow cites this block
+# rather than restating it, so there is one place to change if it changes):
 #   Third-party actions are pinned to a full commit SHA with a trailing
 #   `# vX.Y.Z` comment. A tag is a mutable pointer — whoever can move it can
 #   run their code with this repo's write scopes. The comment is for humans
