@@ -5,9 +5,15 @@
 #
 # The `area/*` labels mirror this repo's actual `internal/*` package
 # boundaries 1:1 (see CONTRIBUTING.md's "Making changes" section on keeping
-# changes focused per package). Add a new `area/*` entry only when a new
-# `internal/<pkg>` directory is actually created — do not pre-create labels
-# for packages that don't exist yet.
+# changes focused per package), plus one per real top-level `tools/<name>`
+# module. Add a new `area/*` entry only when that directory is actually
+# created — do not pre-create labels for packages that don't exist yet.
+#
+# The failure this guards against is silent: a PR touching a directory with no
+# matching rule simply receives no area label, which reads as "this change is
+# unclassified" rather than "the taxonomy is stale". Three such gaps were found
+# at once on 2026-07-19 (tools/, internal/settings/, internal/worktree/), each
+# created by a PR that added the directory without adding the rule.
 
 # --- area labels: one per real cmd/ and internal/ package ---
 
@@ -63,9 +69,21 @@ area/sessions:
   - changed-files:
       - any-glob-to-any-file: 'internal/sessions/**'
 
+area/settings:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/settings/**'
+
 area/tui:
   - changed-files:
       - any-glob-to-any-file: 'internal/tui/**'
+
+area/tools:
+  - changed-files:
+      - any-glob-to-any-file: 'tools/**'
+
+area/worktree:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/worktree/**'
 
 # --- cross-cutting labels ---
 
