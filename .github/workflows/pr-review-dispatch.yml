@@ -70,9 +70,22 @@ jobs:
       (github.event.issue.pull_request != null &&
        startsWith(github.event.comment.body, '/review'))
     permissions:
-      # Reacting to a PR comment is the issues API — PR comments are issue
-      # comments. Nothing here needs `contents` or `pull-requests: write`.
+      # Reacting to a PR comment needs BOTH scopes, which is not what the REST
+      # path suggests. The endpoint lives under /issues/ (a PR comment IS an
+      # issue comment), so `issues: write` looks sufficient — this workflow
+      # previously declared exactly that and every dispatch died at the
+      # acknowledgement step with "Resource not accessible by integration"
+      # (HTTP 403), before authorization was even reached. Token scoping keys
+      # off what the comment is ATTACHED to, not the URL shape: a comment on a
+      # PR requires the pull-requests scope too. duplicate-detect.yml already
+      # declares both for the same reason.
+      #
+      # Verified live 2026-07-19, not reasoned from docs: the repo's default
+      # workflow permission is `read`, but labeler.yml declares
+      # `pull-requests: write` and works — so the default is not a cap, and
+      # the missing scope was the only difference.
       issues: write
+      pull-requests: write
     outputs:
       authorized: ${{ steps.auth.outputs.authorized }}
       pr_number: ${{ steps.context.outputs.pr_number }}
