@@ -25,11 +25,12 @@ const (
 // DefaultThreshold is the score at or above which a pair is worth showing to a
 // human.
 //
-// Measured, not guessed: over the 29 labeled pairs in similarity_test.go,
+// Measured, not guessed: over the 30 labeled pairs in similarity_test.go,
 // 0.74 flags every duplicate that string similarity can reach (12/12) and one
-// non-duplicate (1/16). A 13th pair is a real duplicate too, but a pure
-// paraphrase — it is labeled knownMiss and scores 0.200, far out of reach of
-// any threshold, so true recall is 12/13.
+// non-duplicate (1/16). Two further pairs are real duplicates that no
+// threshold reaches — a pure paraphrase at 0.200 and a plural the normalizer
+// over-folds at 0.671 — so true recall is 12/14. Both are labeled knownMiss;
+// see their corpus entries for why neither is fixable here.
 //
 // The two classes genuinely overlap — the worst non-duplicate scores 0.757
 // and the weakest duplicate 0.746 — so NO threshold separates them cleanly.
@@ -111,15 +112,23 @@ func Rank(title string, candidates []Candidate, excludeNumber int, threshold flo
 	return matches
 }
 
-// sortByScoreDesc orders matches best-first, breaking ties by descending
-// number so output is stable regardless of input order — an unstable ranking
-// would make the tool's own tests flaky.
+// sortByScoreDesc orders matches best-first, breaking ties by ASCENDING
+// number — oldest first.
+//
+// Any fixed direction would make the output stable regardless of input order,
+// which is all determinism requires; the direction is chosen for who reads the
+// result. A maintainer triaging a repeat report wants the ORIGINAL — the item
+// the others get closed as duplicates of — and that is the lowest number. With
+// a descending tie-break the original is exactly what `-top N` drops first,
+// since it sorts last among equals. That also compounds with the workflow's
+// newest-first `--limit 200` candidate cap, which already biases the input away
+// from old items; ascending here at least stops the ranking from doing it twice.
 func sortByScoreDesc(matches []Match) {
 	sort.SliceStable(matches, func(i, j int) bool {
 		if matches[i].Score != matches[j].Score {
 			return matches[i].Score > matches[j].Score
 		}
-		return matches[i].Number > matches[j].Number
+		return matches[i].Number < matches[j].Number
 	})
 }
 

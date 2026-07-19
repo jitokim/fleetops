@@ -66,10 +66,27 @@ var sibilantPluralSuffixes = []string{"ses", "xes", "zes", "ches", "shes"}
 
 // foldPlurals collapses the singular/plural drift that splits otherwise
 // identical titles ("fleet table crashes" vs "fleet tables crash") into zero
-// token overlap. This is a crude suffix rule, not a stemmer: it will mangle
-// words like "less" -> "les". That is tolerable because it is applied to both
-// sides of every comparison, so a consistent mangling still matches itself —
-// and a real stemmer would mean a dependency, which this module cannot take.
+// token overlap. This is a crude suffix rule, not a stemmer, and it mangles
+// two different ways that must not be confused.
+//
+// Harmless: a word that is not a plural at all, like "status" -> "statu" or
+// "less" -> "les". Nothing else in a title folds to that form, so both sides of
+// a comparison get the same mangling and the pair still matches itself.
+//
+// NOT harmless: a plural whose stem already ends in "e". The sibilant rule
+// strips the whole "es", so "cases" -> "cas" while the singular "case" is left
+// untouched — the mangling lands on one side only, which is precisely the
+// comparison this function exists to serve. "cas"/"case" is 0.75 on editRatio,
+// just under tokenMatchRatio, so the soft token overlap does not rescue it
+// either, and the pair scores below the threshold. Same for sizes/size,
+// uses/use, phases/phase, releases/release.
+//
+// This is left unfixed on purpose: no dictionary-free rule separates "cases"
+// (stem "case") from "classes" (stem "class") — they are suffix-identical, so
+// any rule that saves the first breaks the second. The corpus tracks the cost
+// as the "sibilant plural over-strips" knownMiss in similarity_test.go rather
+// than hiding it, and a real stemmer would mean a dependency this module
+// cannot take.
 func foldPlurals(tokens []string) []string {
 	folded := make([]string, len(tokens))
 	for i, tok := range tokens {

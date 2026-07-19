@@ -86,6 +86,15 @@ var corpus = []corpusPair{
 	// algorithm to match on. Only a semantic model would catch it.
 	{"same bug described in different words", "fleet table shows stale session state", "sessions display outdated status in the list", knownMiss},
 
+	// Not a limit of string matching in general — a self-inflicted one. This
+	// pair is structurally identical to the "singular plural drift" duplicate
+	// above, which scores a perfect 1, but here the plural's stem ends in "e",
+	// so foldPlurals strips "cases" to "cas" while leaving "case" alone and the
+	// two stop sharing a token. See the note on foldPlurals for why no
+	// dictionary-free rule fixes it ("cases" and "classes" are suffix-identical)
+	// and why it is therefore tracked here rather than patched.
+	{"sibilant plural over-strips an e-stem", "test cases fail", "test case fails", knownMiss},
+
 	// The overlap that proves no threshold separates these classes cleanly.
 	// Structurally identical to the "korean duplicate with extra word"
 	// duplicate above — four shared tokens and one that differs — but here the
@@ -304,14 +313,16 @@ func TestRank(t *testing.T) {
 		topN      int
 		want      []int
 	}{
-		{"ranks best first", "crash on window resize", 0, DefaultThreshold, 5, []int{4, 2}},
+		// #2 and #4 tie at a perfect 1 (see the note below), so the tie-break
+		// decides the order: oldest first, hence #2 ahead of #4.
+		{"ranks best first", "crash on window resize", 0, DefaultThreshold, 5, []int{2, 4}},
 		{"excludes itself", "crash on window resize", 4, DefaultThreshold, 5, []int{2}},
-		{"topN caps results", "crash on window resize", 0, DefaultThreshold, 1, []int{4}},
+		{"topN caps results", "crash on window resize", 0, DefaultThreshold, 1, []int{2}},
 		{"zero topN returns nothing", "crash on window resize", 0, DefaultThreshold, 0, nil},
 		{"negative topN returns nothing", "crash on window resize", 0, DefaultThreshold, -3, nil},
 		// #2 differs only by a "fix:" prefix, so it normalizes to the same
 		// title and legitimately scores a perfect 1 alongside #4.
-		{"threshold of one keeps only normalization-identical matches", "crash on window resize", 0, 1, 5, []int{4, 2}},
+		{"threshold of one keeps only normalization-identical matches", "crash on window resize", 0, 1, 5, []int{2, 4}},
 		{"threshold above one keeps nothing", "crash on window resize", 0, 1.1, 5, nil},
 		{"unrelated title matches nothing", "update the contributing guide", 0, DefaultThreshold, 5, nil},
 		{"empty title matches nothing", "", 0, DefaultThreshold, 5, nil},
@@ -399,14 +410,33 @@ func TestRankIgnoresEmptyCandidateTitles(t *testing.T) {
 	}
 }
 
-func TestRankOrdersTiesDeterministically(t *testing.T) {
+// TestRankOrdersTiesOldestFirst pins the tie-break DIRECTION, not merely that
+// one exists. Determinism alone would be satisfied by either direction; the
+// direction is a product decision, so it is asserted rather than left to
+// whatever the comparator happens to do.
+//
+// The topN case is the one that actually bites: with a descending tie-break
+// the lowest number sorts last among equals, so `-top N` drops the ORIGINAL —
+// the item a maintainer is looking for — and reports only the later reports
+// that duplicate it. That is invisible in the uncapped case, which is why the
+// cap is asserted separately here.
+func TestRankOrdersTiesOldestFirst(t *testing.T) {
 	candidates := []Candidate{
-		{Number: 7, Title: "crash on resize"},
-		{Number: 9, Title: "crash on resize"},
-		{Number: 3, Title: "crash on resize"},
+		{Number: 30, Title: "crash on resize"},
+		{Number: 10, Title: "crash on resize"},
+		{Number: 40, Title: "crash on resize"},
+		{Number: 20, Title: "crash on resize"},
 	}
-	got := Rank("crash on resize", candidates, 0, DefaultThreshold, 5)
-	assertNumbers(t, got, []int{9, 7, 3})
+
+	t.Run("uncapped returns every tie oldest first", func(t *testing.T) {
+		got := Rank("crash on resize", candidates, 0, DefaultThreshold, len(candidates))
+		assertNumbers(t, got, []int{10, 20, 30, 40})
+	})
+
+	t.Run("topN keeps the oldest and drops the later duplicates", func(t *testing.T) {
+		got := Rank("crash on resize", candidates, 0, DefaultThreshold, 3)
+		assertNumbers(t, got, []int{10, 20, 30})
+	})
 }
 
 func assertNumbers(t *testing.T, got []Match, want []int) {

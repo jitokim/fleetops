@@ -52,10 +52,10 @@ Two signals are then combined into `[0,1]`:
 `0.74` is measured, and the measurements are enforced by
 `TestCorpusAccuracyMatchesDocumentedRates` rather than restated here — see the
 comment on `DefaultThreshold` in `internal/similarity/similarity.go` for the
-authoritative figures. In short: over the 29 labeled pairs it flags every
+authoritative figures. In short: over the 30 labeled pairs it flags every
 duplicate that string similarity can reach (12/12) and one non-duplicate
-(1/16). One further pair is a real duplicate no threshold can reach, so true
-recall is 12/13.
+(1/16). Two further pairs are real duplicates no threshold can reach, so true
+recall is 12/14.
 
 The classes **overlap**, so no threshold is clean. The worst non-duplicate
 scores 0.757 and the weakest duplicate 0.746:
@@ -80,6 +80,14 @@ It compares **titles only**, and only as strings.
   with almost no shared vocabulary. The corpus tracks these as `knownMiss`.
   Catching them needs semantic matching, which needs a model, which this tool
   deliberately does not have.
+- **Plural folding over-strips words whose stem ends in `e`.** "test cases
+  fail" vs "test case fails" scores 0.67 and is missed, even though the
+  structurally identical "fleet table crashes" / "fleet table crash" scores a
+  perfect 1. The `-es` rule turns `cases` into `cas` but leaves `case` alone, so
+  the plural stops matching its own singular; `sizes`/`size`, `uses`/`use` and
+  `releases`/`release` fail the same way. This is not fixable without a
+  dictionary — `cases` (stem `case`) and `classes` (stem `class`) are
+  suffix-identical — so the corpus tracks it as a `knownMiss` instead.
 - **It never reads the body**, so a detailed report and a terse one about the
   same crash will not match unless their titles do.
 - **One differing noun can be the whole bug** (`wrong count` vs `wrong
