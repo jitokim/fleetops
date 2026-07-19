@@ -48,11 +48,16 @@ jobs:
       # github.event.pull_request.head.sha here would run an unreviewed fork's
       # code with a write-scoped token, which is the classic
       # pull_request_target compromise.
-      - uses: actions/checkout@v4
+      #
+      # Actions are pinned by commit SHA, not tag. A tag is mutable: whoever
+      # can move `v4` can run their code here, and this job holds issues:write
+      # and pull-requests:write on the base repo. The version comment records
+      # what the SHA was at pin time; update both together.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: tools/dupdetect/go.mod
           cache: false

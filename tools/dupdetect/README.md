@@ -84,6 +84,12 @@ It compares **titles only**, and only as strings.
   same crash will not match unless their titles do.
 - **One differing noun can be the whole bug** (`wrong count` vs `wrong
   color`), and this cannot see that.
+- **It only sees the candidates it is given.** The workflow pipes in
+  `--limit 200`, and `gh` lists newest-first, so on a tracker with more than
+  200 open items the *oldest* silently fall out of range — and the oldest item
+  is often the original that a new report duplicates. The tool cannot tell a
+  truncated candidate list from a complete one; it reports no match either
+  way. Raise the limit if this repo ever crosses that line.
 
 Treat a silent run as "no obvious duplicate", never as "not a duplicate", and
 treat a comment as a prompt to look, never as a verdict.

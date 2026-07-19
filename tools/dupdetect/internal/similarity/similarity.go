@@ -6,6 +6,7 @@
 package similarity
 
 import (
+	"slices"
 	"sort"
 	"strings"
 )
@@ -205,16 +206,10 @@ func claimPairs(setA, setB []string, takenA, takenB []bool, isMatch func(ta, tb 
 
 // distinctSorted returns the unique tokens in a stable order, so token pairing
 // never depends on which title was passed first.
+//
+// slices.Sorted collects into a fresh slice rather than sorting in place: the
+// caller's Normalized.Tokens is read again by the other signal, so reordering
+// it here would make the two signals disagree about the same title.
 func distinctSorted(tokens []string) []string {
-	seen := make(map[string]struct{}, len(tokens))
-	unique := make([]string, 0, len(tokens))
-	for _, tok := range tokens {
-		if _, ok := seen[tok]; ok {
-			continue
-		}
-		seen[tok] = struct{}{}
-		unique = append(unique, tok)
-	}
-	sort.Strings(unique)
-	return unique
+	return slices.Compact(slices.Sorted(slices.Values(tokens)))
 }
