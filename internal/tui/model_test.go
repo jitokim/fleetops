@@ -9430,3 +9430,116 @@ func stripANSI(s string) string {
 }
 
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// ── spawn failure: wizard answers survive, unless a retry would be unsafe ──
+
+func TestSpawnResultMsg_CleanFailure_ReopensWizardWithAnswersIntact(t *testing.T) {
+	// The 2026-07-19 report: goal, done-condition, rubric and challenger all
+	// typed in, [w] chosen, spawn failed — and every answer was gone. The
+	// values were never actually cleared on submit, only orphaned by the
+	// wizard closing, so recovering them costs nothing but reopening.
+	m := Model{
+		mode:            modeNormal,
+		spawnGoal:       "harden the auth middleware",
+		spawnDoneWhen:   "tests green twice in a row",
+		spawnRubric:     "reject bare claims",
+		spawnChallenger: "try deleting failing tests",
+		spawnMaxCycles:  8,
+		spawnCwd:        t.TempDir(),
+	}
+
+	got, _ := m.Update(spawnResultMsg{ok: false, text: "spawn failed: no backend"})
+	after, ok := got.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, want Model", got)
+	}
+
+	if after.mode != modePrompting {
+		t.Fatalf("mode = %v, want the wizard reopened (%v)", after.mode, modePrompting)
+	}
+	if after.spawnGoal != m.spawnGoal || after.spawnDoneWhen != m.spawnDoneWhen ||
+		after.spawnRubric != m.spawnRubric || after.spawnChallenger != m.spawnChallenger ||
+		after.spawnMaxCycles != m.spawnMaxCycles {
+		t.Errorf("answers not preserved: %+v", after)
+	}
+	if after.statusKind != statusErr {
+		t.Error("the failure must still be reported — reopening is not a substitute for saying it failed")
+	}
+}
+
+func TestSpawnResultMsg_MayHaveSpawned_DoesNotReopenWizard(t *testing.T) {
+	// The dangerous half. When a window may already exist, the right next
+	// action is to go LOOK — and the status text says exactly that. Reopening
+	// the wizard would put a duplicate loop one keystroke away, which is worse
+	// than losing the typed answers.
+	m := Model{mode: modeNormal, spawnGoal: "harden the auth middleware", spawnCwd: t.TempDir()}
+
+	got, _ := m.Update(spawnResultMsg{
+		ok:             false,
+		text:           "spawn outcome UNKNOWN — the window request timed out and may still have created one",
+		mayHaveSpawned: true,
+	})
+	after := got.(Model)
+
+	if after.mode != modeNormal {
+		t.Errorf("mode = %v, want the wizard left CLOSED after an ambiguous spawn", after.mode)
+	}
+	if after.statusKind != statusErr {
+		t.Error("expected the ambiguous outcome still surfaced as an error")
+	}
+}
+
+func TestSpawnResultMsg_Success_DoesNotReopenWizard(t *testing.T) {
+	m := Model{mode: modeNormal, spawnGoal: "harden the auth middleware", spawnCwd: t.TempDir()}
+	got, _ := m.Update(spawnResultMsg{ok: true, text: "spawned loop"})
+	if after := got.(Model); after.mode != modeNormal {
+		t.Errorf("mode = %v, want the wizard to stay closed on success", after.mode)
+	}
+}
+
+func TestSpawnMayHaveLandedWindow(t *testing.T) {
+	// This predicate is the machine-readable half of what these three
+	// sentinels already say in prose ("check for a stray window and close
+	// it"). If the two ever disagree, the cockpit offers a cheap retry while
+	// simultaneously telling the operator not to retry.
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"send timed out", control.ErrSendDeliveryUnknown, true},
+		{"iTerm2 gave no session id", control.ErrITerm2SpawnNoSession, true},
+		{"iTerm2 window has no claude", control.ErrITerm2SpawnNoClaude, true},
+		{"wrapped ambiguous error still counts", fmt.Errorf("spawning: %w", control.ErrITerm2SpawnNoSession), true},
+		{"an ordinary failure is clean", errors.New("exec: tmux not found"), false},
+		{"no backend resolved", errors.New("no orca/tmux/cmux/iTerm2"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := spawnMayHaveLandedWindow(c.err); got != c.want {
+				t.Errorf("spawnMayHaveLandedWindow(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+func TestSpawnMayHaveLandedWindow_MatchesWhatTheOperatorIsTold(t *testing.T) {
+	// Pins the pair together rather than trusting them to stay aligned: every
+	// error this predicate calls ambiguous must ALSO tell the operator to go
+	// look for a stray window. A sentinel whose text stopped saying that, or a
+	// new ambiguous error added here without such text, is caught here.
+	for _, err := range []error{
+		control.ErrSendDeliveryUnknown,
+		control.ErrITerm2SpawnNoSession,
+		control.ErrITerm2SpawnNoClaude,
+	} {
+		if !spawnMayHaveLandedWindow(err) {
+			t.Errorf("%v: predicate says clean", err)
+			continue
+		}
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "window") && !strings.Contains(msg, "attach") {
+			t.Errorf("%v: classified ambiguous but its text does not point the operator at anything to check", err)
+		}
+	}
+}
