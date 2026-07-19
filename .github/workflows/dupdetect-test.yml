@@ -31,8 +31,8 @@ jobs:
       # Pinned by SHA rather than tag, matching duplicate-detect.yml — a tag is
       # mutable, and one pinning policy across the repo is easier to audit than
       # a per-workflow judgment call about which one "deserves" it.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: tools/dupdetect/go.mod
           # This module is stdlib-only and has no go.sum, so the dependency
