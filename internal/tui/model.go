@@ -178,11 +178,15 @@ type bootstrapResultMsg struct {
 	sessionID string
 }
 
-// worktreeEligibilityMsg reports whether the resolved backend implements
-// control.WorktreeSpawner — computed off the event loop (control.Resolve
-// does real exec calls) by checkWorktreeEligibilityCmd, fired at "n"
-// keypress time so the result is (almost always) ready well before the
-// wizard reaches its final wizardWhere step.
+// worktreeEligibilityMsg reports whether a spawner resolved at all — computed
+// off the event loop (control.ResolveSpawner does real exec calls) by
+// checkWorktreeEligibilityCmd, fired at "n" keypress time so the result is
+// (almost always) ready well before the wizard reaches its final wizardWhere
+// step.
+//
+// NOT "does the backend implement control.WorktreeSpawner" any more: fleetops
+// now creates worktrees itself with plain git (spawnIntoGitWorktree), so every
+// backend that can spawn can spawn into a worktree.
 type worktreeEligibilityMsg bool
 
 // killResultMsg reports the outcome of a kill (k key, double-press confirm)
@@ -370,9 +374,11 @@ type Model struct {
 
 	// spawnWorktreeEligible/spawnHostsClaudeRepo drive the final wizardWhere
 	// step's default and whether [w] is offered:
-	//   - spawnWorktreeEligible: does the resolved backend implement
-	//     control.WorktreeSpawner (orca only)? Computed OFF the event loop
-	//     (control.Resolve does real exec calls) by checkWorktreeEligibilityCmd,
+	//   - spawnWorktreeEligible: did ANY spawner resolve (multiplexer or the
+	//     iTerm2 host spawner)? Not a control.WorktreeSpawner test — fleetops
+	//     branches worktrees itself with plain git, so orca no longer has a
+	//     monopoly on [w]. Computed OFF the event loop
+	//     (control.ResolveSpawner does real exec calls) by checkWorktreeEligibilityCmd,
 	//     fired at "n" keypress time — by the time a human types through 4-5
 	//     wizard steps the result has almost always arrived, but the
 	//     zero-value (false) is a safe fallback if it hasn't.
@@ -2225,12 +2231,13 @@ func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSp
 		// heard about.
 		return spawnResultMsg{false, fmt.Sprintf("created worktree %s but spawn failed: %v (the checkout is at %s)", wt.Branch, err, wt.Path)}
 	}
+	spawned := fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name())
 	if err := registry.WritePending(registry.PendingDir(), wt.Path, spec); err != nil {
 		// best-effort, same posture as the plain-spawn path: the loop really
 		// did start, it just won't get ORACLE/N-I tracking.
-		return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s (goal not recorded: %v)", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name(), err)}
+		return spawnResultMsg{true, fmt.Sprintf("%s (goal not recorded: %v)", spawned, err)}
 	}
-	return spawnResultMsg{true, fmt.Sprintf("spawned loop in worktree %s (base %s)%s via %s", wt.Branch, wt.Base, staleBaseNote(wt), ctrl.Name())}
+	return spawnResultMsg{true, spawned}
 }
 
 // staleBaseNote renders the caveat for a worktree whose pre-branch fetch
