@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -642,19 +643,132 @@ func tailState(path string, idleFor time.Duration) (domain.LoopState, domain.Sta
 	return classifyLoop(buf, idleFor)
 }
 
+// backgroundLaunchToolName is the tool a session uses to start work that
+// outlives its own turn.
+const backgroundLaunchToolName = "Agent"
+
+// toolUseIDPattern extracts the tool-use id a completion notification carries,
+// which is what lets a launch be PAIRED with its completion rather than merely
+// counted. Counting would misread two launches and one completion as "all
+// done" the moment the totals happened to line up.
+var toolUseIDPattern = regexp.MustCompile(`<tool-use-id>(toolu_[A-Za-z0-9]+)</tool-use-id>`)
+
+// outstandingBackgroundWork reports whether the tail shows background work
+// that was launched and has not reported back.
+//
+// A background launch is an assistant tool_use for backgroundLaunchToolName
+// whose input sets run_in_background; its completion arrives later as a
+// notification carrying the SAME tool-use id. Unmatched launch ⇒ the session
+// is waiting on itself, not on a human.
+//
+// # Tail truncation, and which way it fails
+//
+// This sees only the tail readTail kept, so a launch older than that window is
+// invisible and the session reads as idle — exactly today's behaviour, so the
+// degradation is graceful rather than a new wrong answer. The opposite error
+// (a launch visible but its completion scrolled past) would report work that
+// is actually finished, but it is close to impossible by construction: the
+// completion is always LATER in the file than its launch, so any window
+// holding the launch holds the completion too.
+//
+// Deliberately tolerant of shape: unparseable lines are skipped rather than
+// failing the whole scan, matching lastTurnEnded's posture on a tail whose
+// first line is usually cut mid-record.
+func outstandingBackgroundWork(buf []byte) bool {
+	launched := map[string]bool{}
+	notified := map[string]bool{}
+
+	for _, line := range strings.Split(string(buf), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// The completion notification is matched against the RAW line: it
+		// arrives as injected prose whose exact envelope is not ours to
+		// depend on, so pattern-matching the id is more durable than
+		// decoding a structure that may change shape.
+		for _, m := range toolUseIDPattern.FindAllStringSubmatch(line, -1) {
+			notified[m[1]] = true
+		}
+
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if t, _ := entry["type"].(string); t != "assistant" {
+			continue
+		}
+		msg, ok := entry["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, b := range blocks {
+			block, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			if bt, _ := block["type"].(string); bt != "tool_use" {
+				continue
+			}
+			if name, _ := block["name"].(string); name != backgroundLaunchToolName {
+				continue
+			}
+			input, ok := block["input"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if bg, _ := input["run_in_background"].(bool); !bg {
+				continue
+			}
+			if id, _ := block["id"].(string); id != "" {
+				launched[id] = true
+			}
+		}
+	}
+
+	for id := range launched {
+		if !notified[id] {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyLoop is tailState's buffer-only core. "Running" means "a turn is
 // in flight", not just "the log was touched recently", so a finished turn
 // is idle regardless of how long ago that was:
 //   - the last meaningful (user/assistant) entry is an assistant message
-//     whose turn finished (stop_reason "end_turn") ⇒ StateIdle: waiting on
-//     a human, not stuck — not an incident, no matter the recency.
+//     whose turn finished (stop_reason "end_turn"), AND no background work
+//     it launched is still outstanding ⇒ StateIdle: waiting on a human, not
+//     stuck — not an incident, no matter the recency.
 //   - otherwise (mid-turn: last entry is user/tool_result, or an assistant
-//     message that hasn't finished, e.g. tool_use):
+//     message that hasn't finished, e.g. tool_use, or a finished turn with
+//     background work still outstanding):
 //   - idleFor < IdleThreshold ⇒ StateRunning: genuinely still working.
 //   - idleFor >= IdleThreshold ⇒ StateStalled (a rate-limit marker
 //     anywhere in the tail ⇒ StallRateLimit, else StallNoOutput).
+//
+// # Why a finished turn is not always idle
+//
+// StateIdle asserts something specific: "waiting on a human." When a session
+// launches a background agent it ENDS ITS TURN and then waits for that agent,
+// so the transcript looks exactly like an idle session — but the human has
+// nothing to do, and the session will wake itself. Reported live: a session
+// sat on the fleet list as idle for many minutes while a background agent
+// worked, and the operator reasonably read that as "it's my move."
+//
+// Treating an outstanding launch as "the turn hasn't really ended" puts it
+// back on the existing ladder, which gets both cases right without a new
+// state: still-recent reads as running (true — work is in flight), and a long
+// silence reads as StalledNoOutput (also true, and the more useful reading,
+// because a background agent that dies leaves its launcher waiting forever —
+// which happened twice in the same session that reported this).
 func classifyLoop(buf []byte, idleFor time.Duration) (domain.LoopState, domain.StallKind) {
-	if lastTurnEnded(buf) {
+	if lastTurnEnded(buf) && !outstandingBackgroundWork(buf) {
 		return domain.StateIdle, domain.StallNone
 	}
 	if idleFor < IdleThreshold {
