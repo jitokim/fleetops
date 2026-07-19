@@ -173,3 +173,35 @@ func TestSpawnCommand_TopLevelArray(t *testing.T) {
 func TestSpawnCommand_PathIsADirectory(t *testing.T) {
 	assertDefault(t, spawnCommandFrom(t.TempDir()), "a directory cannot be read as a file")
 }
+
+// ── argv[0] must be claude, and it is ENFORCED ───────────────────────────
+//
+// A launcher-style argv[0] costs the user their WHOLE multiplexer actuation
+// surface: tmux's LocateByTTY (Tier 1a) and LocateClaude (Tier 1b), and cmux's
+// tree walk, all filter panes through control.isClaudeComm. The loop would
+// still run — it just could not be reached by a/r/i/p/k.
+
+func TestSpawnCommand_RejectsLauncherStyleArgvZero(t *testing.T) {
+	for _, argv := range [][]string{
+		{"mise", "exec", "--", "claude"},
+		{"env", "claude", "--agent", "team"},
+		{"zsh", "-ic", "team"},
+	} {
+		got := validSpawnCommand(argv)
+		if len(got) != 1 || got[0] != defaultSpawnCommandName {
+			t.Errorf("validSpawnCommand(%v) = %v, want the default — argv[0] is not claude", argv, got)
+		}
+	}
+}
+
+// An absolute path to the same binary is fine: the rule is about the process
+// NAME the pane reports, which is the basename.
+func TestSpawnCommand_AcceptsAbsolutePathToClaude(t *testing.T) {
+	argv := []string{"/opt/homebrew/bin/claude", "--agent", "team"}
+
+	got := validSpawnCommand(argv)
+
+	if len(got) != len(argv) || got[0] != argv[0] {
+		t.Errorf("validSpawnCommand(%v) = %v, want it accepted", argv, got)
+	}
+}

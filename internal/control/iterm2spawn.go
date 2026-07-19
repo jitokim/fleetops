@@ -1,9 +1,11 @@
 package control
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"time"
@@ -70,8 +72,24 @@ func (iterm2Spawner) Available() bool { return iterm2HostDetectFn() }
 // iterm2SendFn — a deadline kill is separated out as ErrSendDeliveryUnknown,
 // because a killed osascript may have created a window we can no longer see.
 var iterm2SpawnFn = func(argv []string) (string, error) {
-	return iterm2SendFn(argv)
+	ctx, cancel := context.WithTimeout(context.Background(), iterm2SpawnTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).Output()
+	return string(out), classifySendExecError(ctx.Err(), err)
 }
+
+// iterm2SpawnTimeout bounds the window-creating osascript. Deliberately NOT
+// actuationTimeout (5s), which iterm2SendFn uses: that budget is sized for
+// delivering a keystroke into a session that already exists. This call asks
+// iTerm2 to launch a profile AND start a login shell, which on a cold or
+// loaded machine routinely takes longer — every other creation-shaped path in
+// this tree budgets far more (orca's worktree create allows 15s).
+//
+// Under-budgeting here is not a harmless retry: the deadline kill is
+// classified ErrSendDeliveryUnknown precisely because a killed osascript may
+// have left a real window behind, so a too-short timeout manufactures orphan
+// windows out of slow-but-fine machines.
+const iterm2SpawnTimeout = 15 * time.Second
 
 // iterm2BootWaitFn pauses for claude's TUI to finish booting inside the new
 // window before the goal is typed into it. iTerm2 has no equivalent of orca's

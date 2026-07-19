@@ -468,3 +468,15 @@ func (stubAvailableController) Focus(Target) error                 { return nil 
 func (stubAvailableController) Approve(Target) error               { return nil }
 func (stubAvailableController) Spawn(string, string) error         { return nil }
 func (stubAvailableController) Interrupt(Target) error             { return nil }
+
+// Creating a window launches a profile AND a login shell; the keystroke-sized
+// actuation budget under-serves it, and under-budgeting here is not a harmless
+// retry — a deadline kill is classified ErrSendDeliveryUnknown precisely
+// because the window may exist, so too short a timeout manufactures orphan
+// windows out of slow-but-fine machines.
+func TestITerm2SpawnTimeout_IsLargerThanTheKeystrokeBudget(t *testing.T) {
+	if iterm2SpawnTimeout <= actuationTimeout {
+		t.Errorf("iterm2SpawnTimeout = %v, want > actuationTimeout (%v) — window creation is not a keystroke send",
+			iterm2SpawnTimeout, actuationTimeout)
+	}
+}

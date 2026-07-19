@@ -632,3 +632,39 @@ func TestCreate_EmptyRepoRootIsNotARepo(t *testing.T) {
 		t.Fatalf("Create = %v, want ErrNotARepo", err)
 	}
 }
+
+// ── oneLine: a status-bar reason must not inject extra lines ─────────────
+//
+// withGitStderr deliberately folds git's stderr into the error so the human
+// learns WHY a fetch failed, and git's stderr is reliably multi-line. That
+// string becomes Result.StaleReason and then the cockpit's single-line status,
+// which is rendered into a fixed-height view — so the unflattened form
+// corrupts the very frame carrying the staleness warning.
+
+func TestOneLine_FlattensMultiLineGitStderr(t *testing.T) {
+	got := oneLine("fatal: unable to access 'https://example.invalid/':\nhint: check your network\nhint: or your token")
+
+	if strings.Contains(got, "\n") {
+		t.Fatalf("oneLine kept a newline: %q", got)
+	}
+	if !strings.Contains(got, "fatal: unable to access") || !strings.Contains(got, "check your network") {
+		t.Errorf("oneLine dropped meaning: %q", got)
+	}
+}
+
+func TestOneLine_BoundsLength(t *testing.T) {
+	got := oneLine(strings.Repeat("x", statusLineMaxRunes*3))
+
+	if n := len([]rune(got)); n > statusLineMaxRunes {
+		t.Errorf("oneLine = %d runes, want <= %d", n, statusLineMaxRunes)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("truncated text %q lacks the marker that says so", got)
+	}
+}
+
+func TestOneLine_ShortTextIsUnchanged(t *testing.T) {
+	if got := oneLine("could not fetch"); got != "could not fetch" {
+		t.Errorf("oneLine = %q, want it to pass short text through", got)
+	}
+}

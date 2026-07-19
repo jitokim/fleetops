@@ -23,12 +23,14 @@
 // get wrong, and no shell-injection surface — the same argv discipline
 // internal/control's hostsend.go already enforces on the osascript path.
 //
-// It also keeps the PROCESS NAME "claude", which is load-bearing:
-// tmuxController.LocateClaude matches `#{pane_current_command}` against the
-// literal "claude" (via control.isClaudeComm). argv[0] stays "claude" and the
-// flags are its arguments, so that match is unaffected. A shell-string setting
-// could have left a shell as the pane's foreground process and made every
-// configured loop invisible to actuation.
+// It also keeps the PROCESS NAME "claude", which is load-bearing: tmux's
+// LocateByTTY (Tier 1a) and LocateClaude (Tier 1b), and cmux's tree walk, all
+// filter panes through control.isClaudeComm. argv[0] is therefore REQUIRED to
+// be claude (see defaultSpawnCommandName) and the flags are its arguments, so that match
+// is unaffected. A shell-string setting, or a launcher-style argv[0] such as
+// ["mise","exec","--","claude"], would leave the pane's foreground command
+// reading something else and make every configured loop invisible to
+// a/r/i/p/k — the loop would still run, it just could not be reached.
 //
 // # Never a hard failure
 //
@@ -48,7 +50,22 @@ import (
 )
 
 // defaultSpawnCommandName is the command fleetops spawns with when nothing is
-// configured — the behaviour that predates this package.
+// configured — the behaviour that predates this package — and, by basename,
+// the ONLY accepted argv[0] (an absolute path to the same binary is fine).
+//
+// That second role is ENFORCED rather than merely documented, because a
+// launcher-style argv[0] silently costs the user their entire multiplexer
+// actuation surface, not just one tier: tmux's LocateByTTY (Tier 1a) and
+// LocateClaude (Tier 1b), and cmux's tree walk, all filter panes through
+// control.isClaudeComm. A configured ["mise","exec","--","claude"] leaves the
+// pane's foreground command reading "mise", so every configured loop becomes
+// invisible to a/r/i/p/k — the loop still runs, it just cannot be reached,
+// which is the worst of the available failures.
+//
+// KNOWN GAP: rejection falls back to the default SILENTLY, so a user whose
+// config was refused learns only by noticing it had no effect. Surfacing it
+// needs a warning channel this package does not have (SpawnCommand returns
+// []string and nothing else).
 const defaultSpawnCommandName = "claude"
 
 // DefaultSpawnCommand returns the built-in spawn argv, ["claude"].
@@ -127,6 +144,9 @@ func validSpawnCommand(argv []string) []string {
 		if strings.TrimSpace(arg) == "" {
 			return DefaultSpawnCommand()
 		}
+	}
+	if filepath.Base(argv[0]) != defaultSpawnCommandName {
+		return DefaultSpawnCommand()
 	}
 	return append([]string(nil), argv...) // copy: callers append to this
 }

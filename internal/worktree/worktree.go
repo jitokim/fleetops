@@ -219,9 +219,33 @@ func fetchBase(root, base string) string {
 		return "base " + base + " is not an " + defaultRemote + "/<branch> ref"
 	}
 	if _, err := gitFn(root, "fetch", defaultRemote, branch); err != nil {
-		return err.Error()
+		return oneLine(err.Error())
 	}
 	return ""
+}
+
+// statusLineMaxRunes bounds a reason destined for the cockpit's single-line
+// status bar. Chosen to leave room for the caller's own framing on a normal
+// terminal rather than to match any exact width — the point is a hard ceiling,
+// not a perfect fit.
+const statusLineMaxRunes = 160
+
+// oneLine flattens a message into something a single-line status bar can hold.
+//
+// Not cosmetic. withGitStderr deliberately folds git's stderr into the error so
+// the human learns WHY a fetch failed, and git's stderr is reliably multi-line
+// ("fatal: unable to access '…'" followed by hint: lines). That text becomes
+// Result.StaleReason, then the cockpit's status string, which is rendered into
+// a fixed-height view — so the unflattened form injects extra lines and
+// corrupts the very frame carrying the staleness warning this whole path
+// exists to surface. Flattening here, at the boundary that produces the
+// string, keeps every caller from having to remember.
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > statusLineMaxRunes {
+		return string(r[:statusLineMaxRunes-1]) + "…"
+	}
+	return s
 }
 
 // ensureFree refuses when path is already taken. Lstat, not Stat, so a
