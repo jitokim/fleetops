@@ -509,10 +509,7 @@ func TestResolveActuationTarget_UnavailableBackendNeverProbed(t *testing.T) {
 }
 
 func TestRedriveArgv(t *testing.T) {
-	got, err := redriveArgv([]string{"claude"}, "sess-abc123", "do the thing")
-	if err != nil {
-		t.Fatalf("redriveArgv: %v", err)
-	}
+	got := redriveArgv("sess-abc123", "do the thing")
 	want := []string{"claude", "--resume", "sess-abc123", "-p", "do the thing", "--output-format", "json"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)

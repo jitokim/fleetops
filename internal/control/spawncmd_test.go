@@ -1,7 +1,6 @@
 package control
 
 import (
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -136,132 +135,30 @@ func TestShellQuoteJoin_EmptyArgumentIsQuoted(t *testing.T) {
 	}
 }
 
-// ── Tier 2 redrive composition ───────────────────────────────────────────
-
-func TestRedriveArgv_AppendsContractFlagsAfterConfiguredCommand(t *testing.T) {
-	got, err := redriveArgv(teamArgv(), "sess-abc", "carry on")
-	if err != nil {
-		t.Fatalf("redriveArgv: %v", err)
-	}
-
-	want := []string{"claude", "--agent", "team", "--dangerously-skip-permissions",
-		"--resume", "sess-abc", "-p", "carry on", "--output-format", "json"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("argv = %#v\nwant %#v", got, want)
-	}
-}
-
-// The contract flags are Redrive's own and must survive any configuration —
-// dropping or reordering them breaks Tier 2 silently for everyone who sets
-// spawn.command.
-func TestRedriveArgv_ContractFlagsAlwaysPresentAndInOrder(t *testing.T) {
-	got, err := redriveArgv(teamArgv(), "sess-abc", "carry on")
-	if err != nil {
-		t.Fatalf("redriveArgv: %v", err)
-	}
-
-	tail := got[len(got)-6:]
-	want := []string{"--resume", "sess-abc", "-p", "carry on", "--output-format", "json"}
-	if !reflect.DeepEqual(tail, want) {
-		t.Fatalf("contract tail = %#v, want %#v", tail, want)
-	}
-}
-
-func TestRedriveArgv_DefaultIsUnchangedFromBefore(t *testing.T) {
-	got, err := redriveArgv(settings.DefaultSpawnCommand(), "sess-abc123", "do the thing")
-	if err != nil {
-		t.Fatalf("redriveArgv: %v", err)
-	}
-
-	want := []string{"claude", "--resume", "sess-abc123", "-p", "do the thing", "--output-format", "json"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("argv = %#v\nwant the pre-existing %#v", got, want)
-	}
-}
-
-// The configured argv must not be mutated by composition — spawnCommandFn's
-// result is appended to on every re-drive.
-func TestRedriveArgv_DoesNotMutateTheConfiguredArgv(t *testing.T) {
-	configured := teamArgv()
-	if _, err := redriveArgv(configured, "sess-abc", "x"); err != nil {
-		t.Fatalf("redriveArgv: %v", err)
-	}
-
-	if !reflect.DeepEqual(configured, teamArgv()) {
-		t.Fatalf("configured argv was mutated to %#v", configured)
-	}
-}
-
-// ── Tier 2 redrive: conflict refusal ─────────────────────────────────────
+// ── Tier 2 redrive is deliberately NOT configurable ──────────────────────
 //
-// A configured flag that collides with the contract is refused LOUDLY rather
-// than merged. A merged "--resume <other-id>" would produce a command with two
-// session ids, and one of the two possible outcomes is re-driving a DIFFERENT
-// session than the operator selected.
+// spawn.command reaches SPAWN only. Tier 2 is the universal path and serves
+// sessions fleetops merely OBSERVES, so letting the setting rewrite it meant
+// the operator's choices for loops fleetops CREATES silently became the
+// posture for re-driving loops it never created — a spawn.command carrying
+// --dangerously-skip-permissions would apply it to someone else's session.
+// See docs/adr-loop-state-model.md's owned/observed distinction.
 
-func TestRedriveArgv_RefusesConfiguredResume(t *testing.T) {
-	_, err := redriveArgv([]string{"claude", "--resume", "some-other-session"}, "sess-abc", "x")
+func TestRedriveArgv_IsFixedAndIgnoresTheConfiguredSpawnCommand(t *testing.T) {
+	prev := spawnCommandFn
+	spawnCommandFn = func() []string { return teamArgv() }
+	defer func() { spawnCommandFn = prev }()
 
-	if !errors.Is(err, ErrRedriveCommandConflict) {
-		t.Fatalf("err = %v, want ErrRedriveCommandConflict", err)
+	got := redriveArgv("sess-abc", "carry on")
+
+	want := []string{"claude", "--resume", "sess-abc", "-p", "carry on", "--output-format", "json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %#v\nwant the fixed %#v — the configured spawn command must not reach Tier 2", got, want)
 	}
-	if !strings.Contains(err.Error(), "--resume") {
-		t.Fatalf("err %v does not name the offending flag", err)
-	}
-}
-
-func TestRedriveArgv_RefusesConfiguredPrintShorthand(t *testing.T) {
-	if _, err := redriveArgv([]string{"claude", "-p", "hello"}, "sess-abc", "x"); !errors.Is(err, ErrRedriveCommandConflict) {
-		t.Fatalf("err = %v, want ErrRedriveCommandConflict", err)
-	}
-}
-
-func TestRedriveArgv_RefusesConfiguredPrintLongForm(t *testing.T) {
-	if _, err := redriveArgv([]string{"claude", "--print"}, "sess-abc", "x"); !errors.Is(err, ErrRedriveCommandConflict) {
-		t.Fatalf("err = %v, want ErrRedriveCommandConflict", err)
-	}
-}
-
-func TestRedriveArgv_RefusesConfiguredOutputFormat(t *testing.T) {
-	if _, err := redriveArgv([]string{"claude", "--output-format", "text"}, "sess-abc", "x"); !errors.Is(err, ErrRedriveCommandConflict) {
-		t.Fatalf("err = %v, want ErrRedriveCommandConflict", err)
-	}
-}
-
-// The joined spelling must be caught too — a check that only matched separate
-// arguments would let this through into the malformed invocation the guard
-// exists to prevent.
-func TestRedriveArgv_RefusesJoinedFlagSpelling(t *testing.T) {
-	if _, err := redriveArgv([]string{"claude", "--output-format=text"}, "sess-abc", "x"); !errors.Is(err, ErrRedriveCommandConflict) {
-		t.Fatalf("err = %v, want ErrRedriveCommandConflict for the --flag=value spelling", err)
-	}
-}
-
-func TestRedriveArgv_ConflictReturnsNoArgv(t *testing.T) {
-	argv, err := redriveArgv([]string{"claude", "--resume", "other"}, "sess-abc", "x")
-
-	if err == nil {
-		t.Fatal("expected a refusal")
-	}
-	if argv != nil {
-		t.Fatalf("argv = %#v, want nil — a refused composition must not hand back a runnable command", argv)
-	}
-}
-
-// A flag that merely CONTAINS a contract flag's name is not a conflict —
-// refusing it would block legitimate configurations.
-func TestRedriveArgv_SimilarlyNamedFlagIsNotAConflict(t *testing.T) {
-	if _, err := redriveArgv([]string{"claude", "--resume-on-error", "--print-width", "80"}, "sess-abc", "x"); err != nil {
-		t.Fatalf("refused a non-conflicting configuration: %v", err)
-	}
-}
-
-// Redrive itself must surface the refusal rather than exec anything.
-func TestRedrive_RefusesConflictingConfigurationWithoutExec(t *testing.T) {
-	pinSpawnCommand(t, []string{"claude", "--resume", "other-session"})
-
-	if err := Redrive("sess-abc", "x"); !errors.Is(err, ErrRedriveCommandConflict) {
-		t.Fatalf("Redrive err = %v, want ErrRedriveCommandConflict", err)
+	for _, arg := range got {
+		if arg == "--agent" || arg == "--dangerously-skip-permissions" {
+			t.Fatalf("configured flag %q leaked into the re-drive of a possibly-observed session", arg)
+		}
 	}
 }
 

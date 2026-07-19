@@ -15,7 +15,6 @@ package control
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -254,11 +253,16 @@ const redriveTimeout = 10 * time.Minute
 // command's own stdout is discarded and only its exit status matters — the
 // point isn't to read the reply here, it's that the turn lands in the
 // transcript, which the cockpit picks up on its next scan.
+// Deliberately NOT configurable via spawn.command. Tier 2 is the universal
+// path — it serves sessions fleetops merely OBSERVES (a human's session started
+// in another editor entirely), not just loops it spawned. Letting a setting
+// named spawn.command rewrite this invocation meant the operator's choices for
+// loops fleetops CREATES silently became the posture for re-driving loops it
+// never created: a spawn.command carrying --dangerously-skip-permissions would
+// apply that to someone else's session. That crosses the owned/observed line
+// docs/adr-loop-state-model.md draws, so the command here stays "claude".
 func Redrive(sessionID, prompt string) error {
-	argv, err := redriveArgv(spawnCommandFn(), sessionID, prompt)
-	if err != nil {
-		return err
-	}
+	argv := redriveArgv(sessionID, prompt)
 	ctx, cancel := context.WithTimeout(context.Background(), redriveTimeout)
 	defer cancel()
 	if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err != nil {
@@ -267,66 +271,10 @@ func Redrive(sessionID, prompt string) error {
 	return nil
 }
 
-// ErrRedriveCommandConflict reports that the configured spawn command
-// (~/.fleetops/settings.json) already contains one of the flags the Tier 2
-// re-drive structurally depends on, so the two cannot be composed into a
-// coherent invocation.
-//
-// It REFUSES rather than merging or overriding, and the reason is safety
-// rather than tidiness: a configured "--resume <some-other-id>" merged with
-// this call's own "--resume <sessionID>" would produce a command with two
-// session ids, and whichever one the CLI happened to honour, one of the two
-// outcomes is re-driving a DIFFERENT session than the operator selected. That
-// is the wrong-session hazard the whole tier policy exists to prevent, and it
-// is not a thing to resolve by guessing at argument precedence.
-var ErrRedriveCommandConflict = errors.New("control: the configured spawn.command already sets a flag the headless re-drive needs — remove it from ~/.fleetops/settings.json")
-
-// redriveContractFlags are the flags Redrive OWNS. They are not stylistic:
+// redriveArgv is Tier 2's fixed invocation. Each element is structural:
 // --resume names the session to continue, -p makes the turn headless, and
 // --output-format json is the shape this path's contract is written against.
-// A user's spawn.command may add flags but must never drop, duplicate or
-// reorder these, or Tier 2 breaks silently for everyone who configures one.
-var redriveContractFlags = []string{"--resume", "-p", "--print", "--output-format"}
-
-// redriveArgv composes the configured spawn command with Redrive's own
-// contract flags: spawnArgv first (the command plus whatever arguments the
-// user configured), then --resume/-p/--output-format appended in fixed order.
-//
-// # What is and is not established about --agent + --resume
-//
-// MEASURED: the flags parse together. Both
-// `claude --agent team --resume <id> -p x --output-format json` and the
-// control `claude --resume <id> -p x --output-format json` fail identically at
-// SESSION LOOKUP ("No conversation found with session ID"), not at flag
-// parsing, so the CLI does not reject the combination. `claude --help`
-// documents --agent as "Agent for the current session. Overrides the 'agent'
-// setting", with no stated incompatibility.
-//
-// NOT established: that --agent actually TAKES EFFECT on a resumed session. It
-// may be a silent no-op there. That is acceptable — a no-op degrades to the
-// behaviour this path had before, rather than breaking it — but nothing here
-// claims the agent configuration applies on a re-drive, because nothing has
-// been measured that would support the claim.
-func redriveArgv(spawnArgv []string, sessionID, prompt string) ([]string, error) {
-	if flag, conflict := conflictingRedriveFlag(spawnArgv); conflict {
-		return nil, fmt.Errorf("%w: %s", ErrRedriveCommandConflict, flag)
-	}
-	argv := append([]string(nil), spawnArgv...)
-	return append(argv, "--resume", sessionID, "-p", prompt, "--output-format", "json"), nil
-}
-
-// conflictingRedriveFlag reports the first contract flag the configured argv
-// already sets. It matches both the separate-argument form ("--output-format",
-// "json") and the joined form ("--output-format=json") — a check that only
-// caught the former would let the joined spelling through into exactly the
-// malformed invocation this guard exists to prevent.
-func conflictingRedriveFlag(spawnArgv []string) (string, bool) {
-	for _, arg := range spawnArgv {
-		for _, flag := range redriveContractFlags {
-			if arg == flag || strings.HasPrefix(arg, flag+"=") {
-				return flag, true
-			}
-		}
-	}
-	return "", false
+// Kept a function rather than inlined so the contract has one greppable home.
+func redriveArgv(sessionID, prompt string) []string {
+	return []string{"claude", "--resume", sessionID, "-p", prompt, "--output-format", "json"}
 }
