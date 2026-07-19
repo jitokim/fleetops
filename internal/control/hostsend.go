@@ -51,11 +51,21 @@ type SendAdapter interface {
 var ErrNoSendSurface = errors.New("control: no send surface for this session")
 
 // ErrSendNoSession reports that the host ran the script fine but found no
-// session with that id — the tab was closed. Distinct from an exec failure
-// because osascript exits 0 either way (the same P0 lesson that produced
-// focus.go's ok/miss verdict protocol: a script that cannot report a miss makes
-// every send look like a success).
-var ErrSendNoSession = errors.New("control: the host has no session with this id — it was closed")
+// session with that id. Distinct from an exec failure because osascript
+// exits 0 either way (the same P0 lesson that produced focus.go's ok/miss
+// verdict protocol: a script that cannot report a miss makes every send look
+// like a success).
+//
+// It does NOT mean the tab was closed, and the message must not claim that.
+// An iTerm2 restart reassigns session GUIDs for tabs whose process and tty
+// survive completely untouched (#62) — the registry's recorded WindowID goes
+// stale while the session it names keeps running under a new one. That stale
+// GUID produces the exact same "miss" verdict, from the exact same script, as
+// a tab that was genuinely closed. Nothing observable from here
+// distinguishes the two cases, so per this file's rule (see
+// ErrSendUnrecognizedVerdict below) the message states only what was
+// observed — no matching session — and leaves the cause open.
+var ErrSendNoSession = errors.New("control: no session with this id was found — it may have been closed, or its id may simply be stale (e.g. after an iTerm2 restart); attach (↵) and check")
 
 // ErrSendTTYMismatch reports the session was found but its tty no longer
 // matches the one the registry recorded for this loop, so the write was
@@ -69,11 +79,12 @@ var ErrSendTTYMismatch = errors.New("control: session found but its tty no longe
 // and returned something this package does not recognize — not "ok", not
 // "miss", not "ttymismatch". It fails closed exactly like a miss, but it is a
 // DIFFERENT fact and gets its own message: folding it into ErrSendNoSession
-// told the operator "the tab was closed", which is a claim nothing here
-// supports and which sends them looking at the wrong thing. What it actually
-// indicates is a broken script/host contract (an iTerm2 version whose
-// AppleScript dialect changed, an osascript that printed a warning on stdout),
-// and that is worth diagnosing rather than mistaking for a closed tab.
+// would tell the operator no session was found, which is a claim nothing
+// here supports (the script may have run against a session that exists) and
+// which sends them looking at the wrong thing. What it actually indicates is
+// a broken script/host contract (an iTerm2 version whose AppleScript dialect
+// changed, an osascript that printed a warning on stdout), and that is worth
+// diagnosing on its own terms rather than folded into a miss.
 var ErrSendUnrecognizedVerdict = errors.New("control: the host returned an unrecognized verdict — the send did NOT happen; iTerm2/osascript may have changed")
 
 // ErrSendNoRecordedTTY reports that the registry entry has no tty at all
@@ -327,9 +338,11 @@ func iterm2SendTarget(entry sessions.SessionEntry) (guid sessionGUID, tty string
 // enforce, and it must fail closed on outputs nobody anticipated.
 //
 // Failing closed is not a licence to invent a diagnosis, though: unrecognized
-// output gets ErrSendUnrecognizedVerdict rather than being reported as a
-// closed tab. Every verdict maps to the error that states what was actually
-// observed.
+// output gets ErrSendUnrecognizedVerdict rather than being folded into a miss,
+// and a miss itself (see ErrSendNoSession) states only that no session
+// matched — not that one was closed, since a stale registry GUID produces the
+// identical verdict. Every verdict maps to the error that states what was
+// actually observed.
 func iterm2SendVerdict(argv []string) error {
 	out, err := iterm2SendFn(argv)
 	if err != nil {
@@ -348,8 +361,9 @@ func iterm2SendVerdict(argv []string) error {
 	case iterm2SendMiss:
 		return ErrSendNoSession
 	default:
-		// Anything else fails closed too — but as its own fact, not as a
-		// fabricated "the tab was closed."
+		// Anything else fails closed too — but as its own fact, not folded
+		// into a fabricated "no session found" that a broken script/host
+		// contract does not support either.
 		return ErrSendUnrecognizedVerdict
 	}
 }

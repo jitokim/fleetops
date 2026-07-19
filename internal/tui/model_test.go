@@ -3086,16 +3086,17 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 // capability-regression guard for the iTerm2 Tier 1h slice.
 //
 // Tier 1h resolves OPTIMISTICALLY (the registry says the loop lives in an
-// iTerm2 session) and only discovers a closed tab / moved tty at SEND time.
-// Before 1h existed, such a loop resolved nothing and the prompt landed via
-// Tier 2. Reporting the 1h failure as terminal would therefore have made "r"/
-// "i" strictly WORSE for exactly the sessions this tier was added to serve.
+// iTerm2 session) and only discovers a missing session (closed, or a stale
+// registry GUID — #62) / moved tty at SEND time. Before 1h existed, such a
+// loop resolved nothing and the prompt landed via Tier 2. Reporting the 1h
+// failure as terminal would therefore have made "r"/"i" strictly WORSE for
+// exactly the sessions this tier was added to serve.
 //
 // Safe precisely because a 1h failure never half-delivers (see
 // control.IsHostSendTier), so the redrive cannot double-send.
 func TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive(t *testing.T) {
 	for _, sendErr := range []error{
-		control.ErrSendNoSession,    // the tab was closed
+		control.ErrSendNoSession,    // no session found (closed, or a stale GUID)
 		control.ErrSendTTYMismatch,  // the session moved / tab recycled
 		control.ErrNoSendSurface,    // refused before exec
 		errors.New("exit status 1"), // osascript itself failed

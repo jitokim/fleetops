@@ -369,7 +369,8 @@ func TestITerm2SendText_Verdicts(t *testing.T) {
 		"tty mismatch":      {iterm2SendTTYMismatch, ErrSendTTYMismatch},
 		"mismatch padded":   {" " + iterm2SendTTYMismatch + "\n", ErrSendTTYMismatch},
 		// Unrecognized output fails closed like a miss, but is NOT a miss:
-		// claiming "the tab was closed" here would be a fabricated diagnosis.
+		// folding it into ErrSendNoSession here would be a fabricated
+		// diagnosis (a broken script/host contract is not "no session found").
 		"empty":               {"", ErrSendUnrecognizedVerdict},
 		"whitespace only":     {"   \n", ErrSendUnrecognizedVerdict},
 		"unexpected string":   {"something else entirely", ErrSendUnrecognizedVerdict},
@@ -430,12 +431,43 @@ func TestSendErrors_AreDistinct(t *testing.T) {
 	}
 }
 
+// TestErrSendNoSession_DoesNotClaimClosure is the regression pin for #62: a
+// stale registry GUID after an iTerm2 restart (the process and tty survive,
+// only the session id changes) produces the exact same "miss" verdict, from
+// the exact same script, as a tab that was genuinely closed. This package
+// cannot tell the two apart from here, so the message must state only what
+// was observed — no matching session — and must not assert closure as if it
+// were a fact this code verified.
+func TestErrSendNoSession_DoesNotClaimClosure(t *testing.T) {
+	msg := ErrSendNoSession.Error()
+
+	// Pin the message itself, so a future edit that silently reintroduces the
+	// closure claim (or drifts some other way) fails loudly here rather than
+	// being caught only by the substring checks below.
+	const want = "control: no session with this id was found — it may have been closed, or its id may simply be stale (e.g. after an iTerm2 restart); attach (↵) and check"
+	if msg != want {
+		t.Errorf("ErrSendNoSession = %q, want %q", msg, want)
+	}
+
+	if strings.Contains(msg, "it was closed") || strings.Contains(msg, "was closed —") {
+		t.Errorf("message %q asserts closure as fact — a stale GUID produces the identical verdict and this code cannot distinguish the two", msg)
+	}
+	if !strings.Contains(msg, "may") {
+		t.Errorf("message %q must hedge the cause rather than assert one", msg)
+	}
+	if !strings.Contains(msg, "stale") {
+		t.Errorf("message %q should name staleness as a candidate cause, not just closure — that is the whole point of #62", msg)
+	}
+}
+
 // TestErrSendUnrecognizedVerdict_DoesNotClaimTheTabWasClosed: failing closed on
 // an output nobody anticipated is required; DIAGNOSING it as a closed tab is
-// not. ErrSendNoSession's message asserts the session was closed, which is a
-// claim an unrecognized verdict does not support — and it points the operator
-// at the wrong thing when the real cause is a changed iTerm2/osascript
-// contract.
+// not. Even ErrSendNoSession itself no longer asserts closure (see #62 — a
+// stale registry GUID after an iTerm2 restart produces the identical "miss"
+// verdict as a genuinely closed tab, so that message states only "no session
+// found"); an unrecognized verdict supports even less than that, and would
+// point the operator at the wrong thing when the real cause is a changed
+// iTerm2/osascript contract.
 func TestErrSendUnrecognizedVerdict_DoesNotClaimTheTabWasClosed(t *testing.T) {
 	if errors.Is(ErrSendUnrecognizedVerdict, ErrSendNoSession) || errors.Is(ErrSendNoSession, ErrSendUnrecognizedVerdict) {
 		t.Error("ErrSendUnrecognizedVerdict and ErrSendNoSession must be distinguishable")

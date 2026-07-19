@@ -1589,8 +1589,9 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 				logActuationEvent(l, action, act.Tier(), err)
 				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
 				// resolves optimistically — the registry says the loop lives in
-				// an iTerm2 session, and only the send itself can discover the
-				// tab was closed, moved, or now hosts a different tty. Before
+				// an iTerm2 session, and only the send itself can discover that
+				// no session matches (closed, or a stale registry GUID after an
+				// iTerm2 restart — #62) or that it now hosts a different tty. Before
 				// Tier 1h existed such a loop fell to Tier 2 and the prompt
 				// landed; reporting the failure as terminal here would be a
 				// capability REGRESSION for exactly the sessions the tier was
@@ -1634,8 +1635,9 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 			// feat/inject-headless-exact-fallback): this branch is a
 			// DOWNGRADE, not StallGone's normal Tier-2 path — Tier 1 either
 			// found no backend, or a resolved Tier 1h
-			// host send refused (the iTerm2 tab was closed, or its tty
-			// moved), or (most commonly, with N>1 sessions
+			// host send refused (no session matched — closed or a stale
+			// registry GUID, #62 — or its tty moved), or (most commonly, with
+			// N>1 sessions
 			// sharing a cwd on a backend with no per-session tty dispatch,
 			// e.g. cmux/orca — see docs/adr-vendor-independent-actuation.md
 			// §4 and ResolveActuationTarget's doc) couldn't disambiguate
