@@ -509,7 +509,7 @@ func TestPendingAskUserQuestion(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			buf := []byte(strings.Join(c.lines, "\n"))
-			question, ok := pendingAskUserQuestion(buf)
+			question, _, ok := pendingAskUserQuestion(buf)
 			if ok != c.wantOK {
 				t.Fatalf("pendingAskUserQuestion ok=%v, want %v (question=%q)", ok, c.wantOK, question)
 			}
@@ -531,7 +531,7 @@ func TestPendingAskUserQuestion_LongQuestionCollapsedAndCapped(t *testing.T) {
 	long := "line one\n" + strings.Repeat("字", tailTextCap+50) // "字" is a 3-byte-per-rune CJK filler, same width class as the multibyte hazard being tested
 	line := fmt.Sprintf(`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":%q}]}}]}}`, long)
 
-	question, ok := pendingAskUserQuestion([]byte(line))
+	question, _, ok := pendingAskUserQuestion([]byte(line))
 	if !ok {
 		t.Fatal("expected ok=true for a valid (if long) question")
 	}
@@ -2455,5 +2455,109 @@ func TestOutstandingBackgroundWork_SkipsUnparseableLines(t *testing.T) {
 
 	if !outstandingBackgroundWork(buf) {
 		t.Error("a truncated leading line swallowed the launch that followed it")
+	}
+}
+
+func TestPendingAskUserQuestion_Options(t *testing.T) {
+	// Options are what let an operator — human or agent — judge a gate WITHOUT
+	// attaching, which is the whole point of surfacing them. Each case below is
+	// a shape the real transcript can produce; the malformed ones assert the
+	// deliberate asymmetry: a bad options array degrades to "no options", it
+	// never sinks a question that was otherwise extracted fine.
+	line := func(input string) []byte {
+		return []byte(`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":` + input + `}]}}`)
+	}
+	cases := []struct {
+		name        string
+		input       string
+		wantOK      bool
+		wantOptions []string
+	}{
+		{
+			name:        "labels extracted in order",
+			input:       `{"questions":[{"question":"Which?","options":[{"label":"Ship it"},{"label":"Hold"}]}]}`,
+			wantOK:      true,
+			wantOptions: []string{"Ship it", "Hold"},
+		},
+		{
+			name:        "descriptions are dropped, labels kept",
+			input:       `{"questions":[{"question":"Which?","options":[{"label":"Ship it","description":"a long prose rationale that would not fit a cockpit row"}]}]}`,
+			wantOK:      true,
+			wantOptions: []string{"Ship it"},
+		},
+		{
+			name:  "only the FIRST question's options — GatePrompt shows only the first question",
+			input: `{"questions":[{"question":"Which?","options":[{"label":"A"}]},{"question":"And?","options":[{"label":"B"}]}]}`,
+			// "B" belongs to a question the operator cannot see; showing it
+			// beside question one would misattribute the choice.
+			wantOK:      true,
+			wantOptions: []string{"A"},
+		},
+		{
+			name:        "no options key: still a gate, just without choices",
+			input:       `{"questions":[{"question":"Which?"}]}`,
+			wantOK:      true,
+			wantOptions: nil,
+		},
+		{
+			name:        "options is not an array",
+			input:       `{"questions":[{"question":"Which?","options":"Ship it"}]}`,
+			wantOK:      true,
+			wantOptions: nil,
+		},
+		{
+			name:        "option entries are not objects",
+			input:       `{"questions":[{"question":"Which?","options":["Ship it","Hold"]}]}`,
+			wantOK:      true,
+			wantOptions: nil,
+		},
+		{
+			name:        "label missing or empty is skipped, siblings survive",
+			input:       `{"questions":[{"question":"Which?","options":[{"description":"no label"},{"label":""},{"label":"Hold"}]}]}`,
+			wantOK:      true,
+			wantOptions: []string{"Hold"},
+		},
+		{
+			name:        "label is not a string",
+			input:       `{"questions":[{"question":"Which?","options":[{"label":42},{"label":"Hold"}]}]}`,
+			wantOK:      true,
+			wantOptions: []string{"Hold"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, options, ok := pendingAskUserQuestion(line(c.input))
+			if ok != c.wantOK {
+				t.Fatalf("ok=%v, want %v", ok, c.wantOK)
+			}
+			if len(options) != len(c.wantOptions) {
+				t.Fatalf("options=%q, want %q", options, c.wantOptions)
+			}
+			for i := range options {
+				if options[i] != c.wantOptions[i] {
+					t.Errorf("options[%d]=%q, want %q", i, options[i], c.wantOptions[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPendingAskUserQuestion_LongOptionCapped(t *testing.T) {
+	// Several options share one callout line, so a single pathological label
+	// must not push the others off screen. Bounded by gateOptionCap, which is
+	// deliberately tighter than the cap on the question itself.
+	long := "choose\nthis\none " + strings.Repeat("字", gateOptionCap+50)
+	input := fmt.Sprintf(`{"questions":[{"question":"Which?","options":[{"label":%q}]}]}`, long)
+	line := []byte(`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"AskUserQuestion","input":` + input + `}]}}`)
+
+	_, options, ok := pendingAskUserQuestion(line)
+	if !ok || len(options) != 1 {
+		t.Fatalf("ok=%v options=%q, want ok=true with one option", ok, options)
+	}
+	if strings.Contains(options[0], "\n") {
+		t.Error("expected newlines collapsed in the option label")
+	}
+	if n := utf8.RuneCountInString(options[0]); n > gateOptionCap+1 { // +1 for the ellipsis rune
+		t.Errorf("option rune length = %d, want <= %d (bounded by gateOptionCap)", n, gateOptionCap+1)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -9342,3 +9343,66 @@ func TestWizardStepCoverage_EveryStepCancelsOnEsc(t *testing.T) {
 		})
 	}
 }
+
+func TestRenderGateCallout_Choices(t *testing.T) {
+	// The choices line is the reason this feature exists: an operator with
+	// several gated loops must be able to tell WHICH one needs the interrupt
+	// without attaching to each in turn.
+	base := domain.Loop{GatePrompt: "Which ticket?"}
+
+	t.Run("choices are listed", func(t *testing.T) {
+		l := base
+		l.GateOptions = []string{"File a new ticket", "Reuse ABC-1"}
+		out := stripANSI(renderGateCallout(l, 120))
+		for _, want := range []string{"File a new ticket", "Reuse ABC-1", "choices:"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("gate callout missing %q\ngot: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("no choices: no empty choices line", func(t *testing.T) {
+		// A permission prompt has no structured choices. It must not render a
+		// dangling "choices:" label with nothing after it.
+		out := stripANSI(renderGateCallout(base, 120))
+		if strings.Contains(out, "choices") {
+			t.Errorf("expected no choices line when GateOptions is empty\ngot: %s", out)
+		}
+	})
+
+	t.Run("choices are not numbered", func(t *testing.T) {
+		// Numbering would advertise a keystroke that does not exist — fleetops
+		// does not inject gate answers. Pins the decision in renderGateChoices.
+		l := base
+		l.GateOptions = []string{"Yes", "No"}
+		out := stripANSI(renderGateCallout(l, 120))
+		for _, forbidden := range []string{"1 Yes", "1. Yes", "[1] Yes"} {
+			if strings.Contains(out, forbidden) {
+				t.Errorf("choices must not be numbered (found %q)\ngot: %s", forbidden, out)
+			}
+		}
+	})
+
+	t.Run("survives a narrow pane", func(t *testing.T) {
+		// contentWidth clamps at 20; long choices must wrap inside the box
+		// rather than panic. The text itself is not asserted here because
+		// wrapping legitimately breaks it across lines — what is pinned is
+		// that the callout still renders as a gate.
+		l := base
+		l.GateOptions = []string{strings.Repeat("wide choice ", 6), "second"}
+		out := stripANSI(renderGateCallout(l, 10))
+		if !strings.Contains(out, "GATE") {
+			t.Errorf("expected a gate callout at narrow width\ngot: %s", out)
+		}
+	})
+}
+
+// stripANSI removes SGR/CSI escape sequences so a test can assert on the text
+// lipgloss rendered rather than on the styling around it. Styling is asserted
+// nowhere here on purpose: colors are a presentation choice that changes, the
+// words are the contract.
+func stripANSI(s string) string {
+	return ansiEscape.ReplaceAllString(s, "")
+}
+
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)

@@ -603,10 +603,11 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 	// file to compare-and-swap delete, and approveCmd treats GateTS==0 as a
 	// no-op delete (it still sends the approve keystroke to the surface).
 	if haveTail && l.State != domain.StateGate && l.State != domain.StateIdle {
-		if question, ok := pendingAskUserQuestion(buf); ok {
+		if question, options, ok := pendingAskUserQuestion(buf); ok {
 			l.State = domain.StateGate
 			l.Stall = domain.StallNone
 			l.GatePrompt = question
+			l.GateOptions = options
 		}
 	}
 	return l
@@ -884,7 +885,7 @@ func lastTurnEnded(buf []byte) bool {
 // it (an answer would BE the last user entry, so last["type"] would be "user"
 // and this returns false). Any missing/malformed shape yields ("", false) —
 // never a panic, matching this file's tolerant-parse discipline.
-func pendingAskUserQuestion(buf []byte) (string, bool) {
+func pendingAskUserQuestion(buf []byte) (string, []string, bool) {
 	var last map[string]any
 	for _, line := range strings.Split(string(buf), "\n") {
 		line = strings.TrimSpace(line)
@@ -900,15 +901,15 @@ func pendingAskUserQuestion(buf []byte) (string, bool) {
 		}
 	}
 	if last == nil || last["type"] != "assistant" {
-		return "", false
+		return "", nil, false
 	}
 	msg, ok := last["message"].(map[string]any)
 	if !ok {
-		return "", false
+		return "", nil, false
 	}
 	content, ok := msg["content"].([]any)
 	if !ok {
-		return "", false
+		return "", nil, false
 	}
 	for _, block := range content {
 		b, ok := block.(map[string]any)
@@ -919,11 +920,56 @@ func pendingAskUserQuestion(buf []byte) (string, bool) {
 			continue
 		}
 		if question, ok := firstAskUserQuestionText(b); ok {
-			return summarizeTailText(question, tailTextCap), true
+			return summarizeTailText(question, tailTextCap), firstAskUserQuestionOptions(b), true
 		}
 	}
-	return "", false
+	return "", nil, false
 }
+
+// firstAskUserQuestionOptions pulls the first question's answer choices.
+//
+// Separate from firstAskUserQuestionText because the two fail independently:
+// a question with no options is still a gate worth surfacing (the human sees
+// what is being asked and attaches), so a missing or malformed options array
+// returns nil rather than sinking the whole detection.
+//
+// Only labels. The schema also carries a per-option description, which is
+// prose sized for a decision UI, not for a cockpit that must fit the whole
+// fleet on one screen — and the label is what the human will actually pick.
+func firstAskUserQuestionOptions(block map[string]any) []string {
+	input, ok := block["input"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	questions, ok := input["questions"].([]any)
+	if !ok || len(questions) == 0 {
+		return nil
+	}
+	first, ok := questions[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, ok := first["options"].([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, o := range raw {
+		opt, ok := o.(map[string]any)
+		if !ok {
+			continue
+		}
+		if label, ok := opt["label"].(string); ok && label != "" {
+			out = append(out, summarizeTailText(label, gateOptionCap))
+		}
+	}
+	return out
+}
+
+// gateOptionCap bounds a single rendered choice. Shorter than tailTextCap
+// because several of these share one callout line, and a choice that has to be
+// truncated to be read is still more useful than no choices at all.
+const gateOptionCap = 48
 
 // firstAskUserQuestionText pulls input.questions[0].question out of an
 // AskUserQuestion tool_use block, tolerating any missing/wrong-typed shape (a
