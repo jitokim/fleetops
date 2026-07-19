@@ -1808,7 +1808,7 @@ func approveCmd(l domain.Loop) tea.Cmd {
 		// that starts a brand new turn, not an in-place keypress).
 		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
-			return approveResultMsg{false, "no orca/tmux/cmux — approve manually: attach and press Enter"}
+			return approveResultMsg{false, noSurfaceText(l, "approve manually: attach and press Enter")}
 		}
 		if !found {
 			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
@@ -2486,7 +2486,7 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// into via a fresh --resume -p turn).
 		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
-			return killResultMsg{false, "no orca/tmux/cmux — kill manually: type /exit in " + l.Project}
+			return killResultMsg{false, noSurfaceText(l, "kill manually: type /exit in "+l.Project)}
 		}
 		if !found {
 			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
@@ -2532,7 +2532,7 @@ func interruptCmd(l domain.Loop) tea.Cmd {
 		// --resume -p call; that would start a brand new turn instead).
 		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
 		if !backendAvailable {
-			return interruptResultMsg{false, "no orca/tmux/cmux — stop manually: press Esc in " + l.Project}
+			return interruptResultMsg{false, noSurfaceText(l, "stop manually: press Esc in "+l.Project)}
 		}
 		if !found {
 			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
@@ -3410,6 +3410,27 @@ func ambiguityRemedy(l domain.Loop) string {
 		return "attach (↵) to act manually; `fleetops hooks install` can't help — registration happens at session start, so only a fresh loop gets session-exact targeting"
 	}
 	return "attach (↵) or run `fleetops hooks install` so injects can target by session"
+}
+
+// noSurfaceText is what a typed action says when NOTHING could reach the loop
+// in place: no multiplexer is available AND the host-terminal send (Tier 1h)
+// did not resolve either.
+//
+// It exists because the hand-written "no orca/tmux/cmux" literals it replaces
+// became wrong the moment iTerm2 could host a loop. On a machine with no
+// multiplexer at all — the population this tier was built for — fleetops would
+// tell the operator it spawned a loop via iterm2 and then, on the very next
+// keypress, refuse while naming three backends they do not have and never
+// mentioning the one that does apply. Naming absent tools is not a remedy; it
+// reads as "install one of these", which is exactly the wrong advice for
+// someone whose loop IS reachable in principle and whose real problem is that
+// this session has no host binding recorded.
+//
+// Shares ambiguityRemedy's branching deliberately: both answer "why can't you
+// reach this loop, and what would actually help", and the honest answer turns
+// on the same three facts (process gone / we hold a contract / neither).
+func noSurfaceText(l domain.Loop, manual string) string {
+	return "no reachable surface for this loop (no orca/tmux/cmux, and no host terminal binding) — " + manual + "; " + ambiguityRemedy(l)
 }
 
 // sameProjectDirCount counts how many loops in the current fleet (not just

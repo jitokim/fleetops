@@ -2013,6 +2013,42 @@ func TestAmbiguityRemedy_ObservedAndAlive_KeepsOriginalAdvice(t *testing.T) {
 	}
 }
 
+// ── noSurfaceText: a refusal must not advertise absent tools ─────────────
+//
+// The literals this replaces named orca/tmux/cmux on a machine that may have
+// none of them — which reads as "install one of these" to the very population
+// (iTerm2-only) whose loop is reachable in principle and whose real problem is
+// a missing host binding.
+
+func TestNoSurfaceText_NamesTheManualActionAndAnApplicableRemedy(t *testing.T) {
+	l := domain.Loop{Project: "fleetops"} // never bound, alive
+
+	got := noSurfaceText(l, "kill manually: type /exit in fleetops")
+
+	if !strings.Contains(got, "kill manually: type /exit in fleetops") {
+		t.Errorf("text = %q, want it to carry the manual action", got)
+	}
+	if !strings.Contains(got, "fleetops hooks install") {
+		t.Errorf("text = %q, want the remedy that applies to an unbound live loop", got)
+	}
+}
+
+// A dead loop must not be told to install hooks or attach — neither reaches a
+// process that already exited. Same rule ambiguityRemedy encodes; this asserts
+// noSurfaceText inherits it rather than re-deciding.
+func TestNoSurfaceText_ProcessGone_DoesNotAdviseHooksInstall(t *testing.T) {
+	l := domain.Loop{Project: "fleetops", Stall: domain.StallGone}
+
+	got := noSurfaceText(l, "kill manually: type /exit in fleetops")
+
+	if strings.Contains(got, "fleetops hooks install") {
+		t.Errorf("text = %q, advises installing hooks for a loop whose process is gone", got)
+	}
+	if !strings.Contains(got, "already gone") {
+		t.Errorf("text = %q, want it to say the process is gone", got)
+	}
+}
+
 // Wiring: the branch actually reaches the status line the human reads, not
 // just the helper. Same fixture as
 // TestUpdate_RKey_AmbiguousSharedDir_MessageIsActionable, with the selected
