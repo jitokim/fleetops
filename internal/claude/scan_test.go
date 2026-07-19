@@ -2366,3 +2366,94 @@ func TestEnrichThenLiveness_RejectedVerdictAndProcessGone_ShowsGoneKeepingVerdic
 		t.Errorf("Last = %+v, want the rejected verdict preserved for the ORACLE column — gone must not erase what it was doing", out[0].Last)
 	}
 }
+
+// ── A finished turn with background work outstanding is not idle ─────────
+//
+// Reported live: a session sat on the fleet list as `idle` for minutes while a
+// background agent worked. StateIdle asserts "waiting on a human", and that
+// was false — the human had nothing to do and the session would wake itself.
+
+func bgLaunch(id string) string {
+	return `{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"` + id +
+		`","name":"Agent","input":{"run_in_background":true,"prompt":"go"}}]}}`
+}
+
+func bgNotification(id string) string {
+	return `{"type":"user","message":{"content":[{"type":"tool_result","content":"<task-notification><tool-use-id>` +
+		id + `</tool-use-id></task-notification>"}]}}`
+}
+
+const turnEnded = `{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`
+
+func TestClassifyLoop_TurnEndedButBackgroundWorkOutstanding_NotIdle(t *testing.T) {
+	buf := []byte(bgLaunch("toolu_01AAA") + "\n" + turnEnded)
+
+	state, stall := classifyLoop(buf, time.Second)
+
+	if state == domain.StateIdle {
+		t.Fatalf("state = idle, but a background agent is still outstanding — idle asserts the human's turn")
+	}
+	if state != domain.StateRunning || stall != domain.StallNone {
+		t.Errorf("state=%v stall=%v, want running/none while the work is recent", state, stall)
+	}
+}
+
+// The case that motivated this: a background agent that DIES leaves its
+// launcher waiting forever. Stalled/no-output is the honest reading, and the
+// operator gets a signal instead of a permanent lie.
+func TestClassifyLoop_BackgroundWorkOutstandingAndSilentTooLong_Stalled(t *testing.T) {
+	buf := []byte(bgLaunch("toolu_01BBB") + "\n" + turnEnded)
+
+	state, stall := classifyLoop(buf, IdleThreshold*2)
+
+	if state != domain.StateStalled || stall != domain.StallNoOutput {
+		t.Errorf("state=%v stall=%v, want stalled/no-output — the launch never reported back", state, stall)
+	}
+}
+
+// Once the completion notification arrives, the session really IS waiting on
+// the human again.
+func TestClassifyLoop_BackgroundWorkCompleted_IsIdleAgain(t *testing.T) {
+	buf := []byte(bgLaunch("toolu_01CCC") + "\n" + bgNotification("toolu_01CCC") + "\n" + turnEnded)
+
+	if state, _ := classifyLoop(buf, time.Second); state != domain.StateIdle {
+		t.Errorf("state = %v, want idle once the launch has reported back", state)
+	}
+}
+
+// Pairing is by id, not by count — two launches and one completion is not
+// "all done", which a counting implementation would get wrong.
+func TestOutstandingBackgroundWork_PairsByIDNotCount(t *testing.T) {
+	buf := []byte(bgLaunch("toolu_01DDD") + "\n" + bgLaunch("toolu_01EEE") + "\n" + bgNotification("toolu_01DDD"))
+
+	if !outstandingBackgroundWork(buf) {
+		t.Error("reported no outstanding work, but toolu_01EEE never reported back")
+	}
+}
+
+// A foreground Agent call does not outlive the turn, so it must not hold the
+// session out of idle.
+func TestOutstandingBackgroundWork_ForegroundLaunchDoesNotCount(t *testing.T) {
+	buf := []byte(`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01FFF","name":"Agent","input":{"run_in_background":false}}]}}`)
+
+	if outstandingBackgroundWork(buf) {
+		t.Error("a foreground Agent call was treated as outstanding background work")
+	}
+}
+
+// Graceful degradation: a tail with no launch in it reads as before.
+func TestOutstandingBackgroundWork_NoLaunchInTail_False(t *testing.T) {
+	if outstandingBackgroundWork([]byte(turnEnded)) {
+		t.Error("reported outstanding work with no launch in the tail")
+	}
+}
+
+// Same tolerance lastTurnEnded has: a tail's first line is usually cut
+// mid-record, and that must not fail the whole scan.
+func TestOutstandingBackgroundWork_SkipsUnparseableLines(t *testing.T) {
+	buf := []byte(`{"type":"assis` + "\n" + bgLaunch("toolu_01GGG"))
+
+	if !outstandingBackgroundWork(buf) {
+		t.Error("a truncated leading line swallowed the launch that followed it")
+	}
+}
