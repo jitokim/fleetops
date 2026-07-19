@@ -35,7 +35,8 @@
 // # Never a hard failure
 //
 // An absent file, unreadable file, malformed JSON, a wrong-typed value, an
-// empty array, or an array containing an empty element ALL fall back to
+// empty array, an array containing an empty element, or an argv whose argv[0]
+// is not claude by basename (see defaultSpawnCommandName) ALL fall back to
 // ["claude"] — today's behaviour. Configuration is a convenience; a typo in it
 // must not be able to stop a user spawning a loop, and there is a correct
 // default to fall back to. Errors are therefore not returned at all: there is

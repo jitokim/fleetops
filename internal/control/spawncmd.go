@@ -34,15 +34,21 @@ func UseDefaultSpawnCommand() {
 }
 
 // shellQuoteJoin renders an argv as a single POSIX-shell-safe command string,
-// for the one backend whose CLI takes a command STRING rather than an argv:
-// orca's `terminal create --command`.
+// for the two spawn sites that cannot pass an argv and must hand a shell (or a
+// CLI that takes a command STRING) one flat word list:
 //
-// Every other spawn site passes argv through untouched, which is strictly
-// better (see internal/settings' package doc on why argv is the right shape).
-// This exists only because orca's contract leaves no choice — and since the
-// value now comes from a user-editable settings file rather than a hardcoded
-// literal, joining with a bare space would break the moment any argument
-// contained a space and would be a shell-injection surface besides.
+//   - orca's `terminal create --command`, whose contract takes a string (orca.go).
+//   - iTerm2's launch line, which must be a shell line because `create window`
+//     starts a login shell and setting a working directory is a shell
+//     operation (iterm2LaunchLine).
+//
+// Every other spawn site — tmux's new-window, the Tier 2 redrive — passes argv
+// through untouched, which is strictly better (see internal/settings' package
+// doc on why argv is the right shape). This exists only where that is
+// impossible; and since the value now comes from a user-editable settings file
+// rather than a hardcoded literal, joining with a bare space would break the
+// moment any argument contained a space and would be a shell-injection surface
+// besides.
 //
 // Single quotes, because inside them the shell interprets nothing at all; the
 // only character needing care is the single quote itself, which is closed,

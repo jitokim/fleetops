@@ -122,10 +122,12 @@ func (orcaController) Spawn(cwd, goal string) error {
 	ctxCreate, cancelCreate := context.WithTimeout(context.Background(), spawnCreateTimeout)
 	defer cancelCreate()
 	// --command takes a command STRING, not an argv, so the configured spawn
-	// command is shell-quoted on the way in (see shellQuoteJoin). This is the
-	// ONLY spawn site that has to do that; orca's CLI contract leaves no
-	// choice. Unconfigured, this renders to exactly "claude" — byte-identical
-	// to the literal that was here before.
+	// command is shell-quoted on the way in (see shellQuoteJoin); orca's CLI
+	// contract leaves no choice. The only other spawn site that has to quote
+	// is iTerm2's launch line (iterm2LaunchLine), for its own reason — tmux
+	// and the Tier 2 redrive both pass argv straight through. Unconfigured,
+	// this renders to exactly "claude" — byte-identical to the literal that
+	// was here before.
 	createOut, err := exec.CommandContext(ctxCreate, "orca", "terminal", "create",
 		"--worktree", "path:"+cwd, "--command", shellQuoteJoin(spawnCommandFn()), "--title", spawnTitle, "--json").Output()
 	if err != nil {
