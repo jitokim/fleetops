@@ -96,19 +96,23 @@ below imports `tui`.
 domain            — the seam: Loop/Goal/Verdict/LoopState/StallKind value
                      objects that cross every other boundary, and the
                      ports the sections below describe. Zero internal deps.
-events, gate,      — low-level, dependency-free infrastructure primitives:
-notify, settings,    the append-only event log, gate marker files, desktop
-fsatomic, worktree   notifications, ~/.fleetops/settings.json (spawn.command
-                     — what `n` actually runs), the temp-file+rename atomic
-                     write the on-disk registries share, and git-worktree
-                     creation with plain `git` (deliberately NOT in control:
-                     making a checkout drives no terminal). Zero internal
-                     deps each.
-                     gate is the one with a non-obvious rule: TWO hooks write
-                     a single gate's marker and the LESS informative one
-                     arrives last, so writes merge on prompt_id instead of
-                     overwriting, holding the marker's TS still because it
-                     doubles as a compare-and-swap token.
+events, notify,    — low-level, dependency-free infrastructure primitives:
+settings,            the append-only event log, desktop notifications,
+fsatomic, worktree   ~/.fleetops/settings.json (spawn.command — what `n`
+                     actually runs), the temp-file+rename atomic write the
+                     on-disk registries share, and git-worktree creation
+                     with plain `git` (deliberately NOT in control: making a
+                     checkout drives no terminal). Zero internal deps each.
+gate               — gate marker files. TWO hooks write a single gate's
+                     marker and the LESS informative one arrives last, so
+                     writes merge on prompt_id instead of overwriting,
+                     holding the marker's TS still because it doubles as a
+                     compare-and-swap token. → fsatomic: merging made the
+                     write read-modify-write, so a torn read on a
+                     half-written file must not be possible — the same
+                     failure mode sessions/hidden guard against, and the
+                     one that would otherwise silently defeat the merge
+                     rules above (issue #78).
 sessions           — the session-identity registry: the hook-recorded
                      session→tty map that lets actuation target one exact
                      session rather than guessing by cwd. → fsatomic.
