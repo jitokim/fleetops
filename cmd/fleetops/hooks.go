@@ -43,6 +43,10 @@ func fleetopsHookSpecs() []hookSpec {
 		{eventName: "Notification", subcommandSuffix: "hook notify"},
 		{eventName: "SessionStart", subcommandSuffix: "hook session-start"},
 		{eventName: "SessionEnd", subcommandSuffix: "hook session-end"},
+		// PermissionRequest is what makes a permission gate legible: it is the
+		// only source that names the tool being requested. Registered as a
+		// sensor only — see permissionHook's contract.
+		{eventName: "PermissionRequest", subcommandSuffix: "hook permission"},
 	}
 }
 

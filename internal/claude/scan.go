@@ -575,7 +575,7 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 		if gate.IsGateActive(info.TS, last) && isGateNotification(info) {
 			l.State = domain.StateGate
 			l.Stall = domain.StallNone
-			l.GatePrompt = info.Message
+			l.GatePrompt = info.Detail()  // names the requested tool when PermissionRequest supplied one; falls back to the generic notification message otherwise
 			l.GateTS = info.TS.UnixNano() // lets approveCmd compare-and-swap delete only the marker this decision was based on
 		} else {
 			// Compare-and-swap: only delete the marker this scan actually
@@ -626,6 +626,16 @@ var gateNotificationTypes = map[string]bool{
 // Type is authoritative when present; when empty (older claude versions
 // that predate notification_type), falls back to a message-text heuristic.
 func isGateNotification(info gate.Info) bool {
+	// A marker naming a tool came from the PermissionRequest hook, which
+	// fires ONLY for a permission gate — that is stronger evidence than
+	// either signal below, and it is checked first because that payload
+	// carries no notification_type and no message at all. Without this the
+	// detailed marker would fail both tests, be judged a non-gate, and get
+	// compare-and-swap DELETED by the caller — six seconds later the generic
+	// Notification would land and the tool name would be gone for good.
+	if info.Tool != "" {
+		return true
+	}
 	if info.Type != "" {
 		return gateNotificationTypes[info.Type]
 	}

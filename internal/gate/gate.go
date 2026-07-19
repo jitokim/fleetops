@@ -51,6 +51,45 @@ type Info struct {
 	Message string
 	Type    string // Claude Code's notification_type, e.g. "permission_prompt"; "" on older claude versions that don't send it
 	TS      time.Time
+
+	// PromptID is Claude Code's prompt_id, the key that identifies WHICH
+	// prompt a marker describes. Measured 2026-07-20: both the
+	// PermissionRequest and Notification hooks carry it and their values
+	// match for the same gate. That is what makes merging possible at all —
+	// without it the two writers cannot tell "same prompt, worse payload"
+	// from "a genuinely new prompt". Empty on claude versions that omit it.
+	PromptID string
+
+	// Tool and ToolDetail describe what the session is asking permission to
+	// DO — only PermissionRequest supplies them. The Notification hook's
+	// message for the same gate is the useless generic "Claude needs your
+	// permission", which is precisely why these exist.
+	Tool       string
+	ToolDetail string
+}
+
+// Detail returns the most informative description available for this gate.
+//
+// Falls back deliberately rather than composing: a marker written by the
+// Notification hook alone has only the generic message, and dressing that up
+// as though it named a tool would be a claim the payload does not support.
+func (i Info) Detail() string {
+	switch {
+	case i.Tool != "" && i.ToolDetail != "":
+		return i.Tool + ": " + i.ToolDetail
+	case i.Tool != "":
+		return i.Tool
+	default:
+		return i.Message
+	}
+}
+
+// isRicherThan reports whether i carries strictly more about the gate than
+// other does. Only the tool identity counts: it is the field the two hooks
+// actually differ on, and the one whose loss the merge rule exists to
+// prevent.
+func (i Info) isRicherThan(other Info) bool {
+	return i.Tool != "" && other.Tool == ""
 }
 
 // markerFile is Info's on-disk JSON shape. TS is unix NANOSECONDS (see
@@ -60,27 +99,123 @@ type Info struct {
 // happen to land within the same second (a gate answered and immediately
 // replaced by a fresh one), which whole-second TS could not.
 type markerFile struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	TS      int64  `json:"ts"`
+	Message    string `json:"message"`
+	Type       string `json:"type"`
+	TS         int64  `json:"ts"`
+	PromptID   string `json:"prompt_id,omitempty"`
+	Tool       string `json:"tool,omitempty"`
+	ToolDetail string `json:"tool_detail,omitempty"`
 }
 
 // WriteMarker records that sessionID is waiting on a human decision. Called
-// from the Notification hook on every notification — must be fast, and its
-// error is only ever used by the hook to decide what to log; the hook
-// itself always exits 0 regardless (see cmd/fleetops's hook subcommand).
-// notificationType is Claude Code's notification_type field verbatim (may
-// be empty on older claude versions) — see Pending's caller (the scanner)
-// for how it disambiguates a real gate from the 60s idle nudge.
-func WriteMarker(dir, sessionID, message, notificationType string) error {
+// from the hook path on every notification and permission request — must be
+// fast, and its error is only ever used by the hook to decide what to log;
+// the hook itself always exits 0 regardless (see cmd/fleetops's hook
+// subcommand). Info.Type is Claude Code's notification_type field verbatim
+// (may be empty on older claude versions) — see Pending's caller (the
+// scanner) for how it disambiguates a real gate from the 60s idle nudge.
+//
+// TWO hooks write here for a SINGLE gate. Measured 2026-07-20:
+//
+//	+0.00s  PermissionRequest  → tool_name + tool_input (what is being asked)
+//	+6.01s  Notification       → "Claude needs your permission" (generic)
+//
+// Markers are keyed by session id, so a plain write would let the generic
+// payload land second and erase the useful one — the feature would work for
+// six seconds and then silently degrade. mergeMarker prevents that; see its
+// doc for the rules and for what happens when the correlation key is absent.
+func WriteMarker(dir, sessionID string, in Info) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.Marshal(markerFile{Message: message, Type: notificationType, TS: time.Now().UnixNano()})
+	path := filepath.Join(dir, sessionID+".json")
+	in.TS = time.Now()
+
+	merged, write := mergeMarker(readMarker(path), in)
+	if !write {
+		return nil
+	}
+	data, err := json.Marshal(markerFile{
+		Message:    merged.Message,
+		Type:       merged.Type,
+		TS:         merged.TS.UnixNano(),
+		PromptID:   merged.PromptID,
+		Tool:       merged.Tool,
+		ToolDetail: merged.ToolDetail,
+	})
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, sessionID+".json"), data, 0o644)
+	return os.WriteFile(path, data, 0o644)
+}
+
+// mergeMarker decides what a new payload does to the marker already on disk.
+// Returns the marker to persist and whether a write is needed at all.
+//
+// Rules, in order:
+//
+//  1. No existing marker → take the new one.
+//  2. Different prompt_id → a genuinely NEW gate. Replace wholesale, new TS.
+//  3. Same prompt_id, existing is richer → keep existing, DO NOT WRITE. This
+//     is the measured case: the generic Notification arriving 6s after the
+//     detailed PermissionRequest.
+//  4. Same prompt_id, new is richer → upgrade the detail but KEEP THE
+//     EXISTING TS.
+//
+// Rules 3 and 4 both preserving the original TS is load-bearing, not tidiness.
+// TS means "when this gate was first observed", and DeleteMarkerIfTS uses it
+// as a compare-and-swap token so a caller cannot delete a marker that changed
+// under it. If a merge bumped the TS, a decision made moments earlier would
+// hold a token that no longer matches and the approve path would silently
+// stop being able to clear the gate it just answered. Holding TS still makes
+// the merge invisible to the CAS — the two writers look like one.
+//
+// When prompt_id is absent on either side (older claude), correlation is
+// impossible and the newer payload wins, which is the pre-merge behavior.
+// That can still lose detail; it is preferred over the alternative, where a
+// stale detailed marker outlives its gate forever because nothing can prove
+// it is stale.
+func mergeMarker(existing Info, in Info) (Info, bool) {
+	if existing.TS.IsZero() {
+		return in, true
+	}
+	if existing.PromptID == "" || in.PromptID == "" || existing.PromptID != in.PromptID {
+		return in, true
+	}
+	if existing.isRicherThan(in) {
+		return existing, false
+	}
+	in.TS = existing.TS
+	return in, true
+}
+
+// readMarker returns the marker at path, or a zero Info if it is missing or
+// unreadable. Missing is the common case (first gate of a session), and a
+// corrupt file must not be able to block a new gate from being recorded — so
+// both degrade to "nothing was there", which mergeMarker treats as rule 1.
+func readMarker(path string) Info {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Info{}
+	}
+	var m markerFile
+	if err := json.Unmarshal(data, &m); err != nil {
+		return Info{}
+	}
+	return infoFrom(m)
+}
+
+// infoFrom converts the on-disk shape to Info, applying the legacy-TS
+// upgrade. Shared by readMarker and Pending so the two cannot drift.
+func infoFrom(m markerFile) Info {
+	return Info{
+		Message:    m.Message,
+		Type:       m.Type,
+		TS:         time.Unix(0, normalizeTSNanos(m.TS)),
+		PromptID:   m.PromptID,
+		Tool:       m.Tool,
+		ToolDetail: m.ToolDetail,
+	}
 }
 
 // Pending reads every marker file in dir into sessionID → Info. Unreadable
@@ -105,7 +240,7 @@ func Pending(dir string) map[string]Info {
 			continue
 		}
 		sessionID := strings.TrimSuffix(e.Name(), ".json")
-		pending[sessionID] = Info{Message: m.Message, Type: m.Type, TS: time.Unix(0, normalizeTSNanos(m.TS))}
+		pending[sessionID] = infoFrom(m)
 	}
 	return pending
 }

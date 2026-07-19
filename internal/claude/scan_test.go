@@ -340,7 +340,7 @@ func TestLoopFromLog_ActiveIdlePromptType_NotGated_MarkerDeleted(t *testing.T) {
 	}
 	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	gatesDir := t.TempDir()
-	if err := gate.WriteMarker(gatesDir, session, "Claude is waiting for your input", "idle_prompt"); err != nil {
+	if err := gate.WriteMarker(gatesDir, session, gate.Info{Message: "Claude is waiting for your input", Type: "idle_prompt"}); err != nil {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	// Read back the REAL on-disk TS rather than fabricating one — mirroring
