@@ -59,6 +59,31 @@ jobs:
       - name: Run shellcheck on .github/scripts
         run: shellcheck .github/scripts/*.sh
 
+      # Tripwire, not a linter rule: actions/checkout v7 made fork-PR code
+      # checkout an explicit opt-in under `pull_request_target`/`workflow_run`.
+      # That flag is precisely the "pwn request" escape hatch — turning it on
+      # runs untrusted contributor code in a context that already holds write
+      # scopes and repository secrets. Two workflows here use
+      # pull_request_target (duplicate-detect, labeler), so the hatch is
+      # reachable.
+      #
+      # This is deliberately a HARD FAIL rather than a warning. If the flag
+      # ever appears it is a security decision, not a config tweak, and it
+      # should not be able to ride in on a routine PR — someone has to remove
+      # this check on purpose, which is a reviewable act.
+      #
+      # The exclusion is not laziness: this file necessarily CONTAINS the
+      # string it searches for, so an unexcluded grep would match its own
+      # source and fail forever. Excluding exactly one path keeps the check
+      # honest everywhere else.
+      - name: Refuse unsafe fork-PR checkout
+        run: |
+          if grep -rn --exclude=lint.yml 'allow-unsafe-pr-checkout' .github/; then
+            echo "::error::allow-unsafe-pr-checkout found. This runs untrusted fork code with write scopes — it is a security decision, not a config change. If it is genuinely intended, remove this check in the same PR so the intent is reviewable."
+            exit 1
+          fi
+          echo "No unsafe fork-PR checkout opt-in found."
+
       # Config lives in .yamllint.yml, which documents why each disabled rule
       # is disabled. What stays on is the structural half: syntax, duplicate
       # keys, indentation, anchors.
