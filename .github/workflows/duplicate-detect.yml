@@ -1,0 +1,122 @@
+# Comments on newly opened issues/PRs when an existing open one has a very
+# similar title. Advisory only: it never closes, labels, or blocks anything —
+# a false positive should cost a reader one glance, nothing more.
+#
+# The matching is done by tools/dupdetect, a stdlib-only Go module in this
+# repo. No model, no external service, no API key beyond the built-in
+# GITHUB_TOKEN.
+name: duplicate-detect
+
+on:
+  issues:
+    types: [opened]
+  # pull_request_target (not pull_request) because a PR from a fork gets a
+  # read-only token under pull_request, which cannot post the comment. The
+  # tradeoff is that this workflow runs with write access in the context of
+  # the BASE repo, so it must never execute code from the PR — see the
+  # checkout step.
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  contents: read
+
+# De-duplicates runs for the SAME item (e.g. an issue reopened twice in quick
+# succession). Note this is not burst throttling: issue and PR numbers come
+# from one per-repo sequence, so every newly opened item gets its own group and
+# ten new issues still produce ten concurrent runs.
+concurrency:
+  group: duplicate-detect-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Both write scopes are required, despite `gh issue comment` hitting a
+    # single endpoint. GITHUB_TOKEN authorization is resource-based, not
+    # route-based: POST /issues/{n}/comments is checked against `issues` when
+    # {n} is an issue and against `pull-requests` when {n} is a PR. Dropping
+    # either one 403s exactly one of the two triggers above.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      # No `ref:` on purpose. For pull_request_target this checks out the base
+      # branch — trusted code that the maintainers reviewed. Checking out
+      # github.event.pull_request.head.sha here would run an unreviewed fork's
+      # code with a write-scoped token, which is the classic
+      # pull_request_target compromise.
+      #
+      # Actions are pinned by commit SHA, not tag. A tag is mutable: whoever
+      # can move `v4` can run their code here, and this job holds issues:write
+      # and pull-requests:write on the base repo. The version comment records
+      # what the SHA was at pin time; update both together.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: tools/dupdetect/go.mod
+          cache: false
+
+      # Issues are compared against issues and PRs against PRs: a PR that
+      # implements an issue is not a duplicate of it.
+      #
+      # --limit 200 caps the API cost. gh lists newest-first, so on a tracker
+      # with more than 200 open items the oldest — often the original an issue
+      # duplicates — fall out of range. Raise it if this repo ever gets there.
+      - name: Collect open items
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          IS_PR: ${{ github.event_name == 'pull_request_target' }}
+        run: |
+          set -euo pipefail
+          if [ "$IS_PR" = "true" ]; then
+            gh pr list --state open --limit 200 --json number,title > candidates.json
+          else
+            gh issue list --state open --limit 200 --json number,title > candidates.json
+          fi
+
+      # Title and number go through the environment, never spliced into the
+      # script text: an issue titled `$(...)` or a backtick is attacker-
+      # controlled input and would otherwise be shell code.
+      - name: Score candidates
+        env:
+          ITEM_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          ITEM_TITLE: ${{ github.event.issue.title || github.event.pull_request.title }}
+        working-directory: tools/dupdetect
+        run: |
+          set -euo pipefail
+          go run . -number "$ITEM_NUMBER" -title "$ITEM_TITLE" -top 3 \
+            < "$GITHUB_WORKSPACE/candidates.json" \
+            > "$GITHUB_WORKSPACE/matches.json"
+
+      # matches.json contains candidate titles, which are attacker-controlled.
+      # The jq template below therefore reads ONLY .number (an integer) and
+      # .score (a float) — never .title. GitHub expands "#123" into the real
+      # title itself, so the comment stays informative without any untrusted
+      # text passing through it. Keep it that way: adding .title here is what
+      # would turn a candidate title into comment markup.
+      - name: Comment when duplicates are likely
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ITEM_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$(jq '.matches | length' matches.json)" -eq 0 ]; then
+            echo "No candidate cleared the similarity threshold."
+            exit 0
+          fi
+          {
+            echo "These open items have similar titles — worth a look before this one goes further:"
+            echo
+            jq -r '.matches[] | "- #\(.number) — \((.score * 100) | floor)% title similarity"' matches.json
+            echo
+            echo "_Automated title-similarity check (\`tools/dupdetect\`). Advisory only: nothing has been closed, and it compares titles only, so it can be wrong in both directions._"
+          } > comment.md
+          gh issue comment "$ITEM_NUMBER" --body-file comment.md

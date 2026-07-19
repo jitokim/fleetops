@@ -1,0 +1,51 @@
+# Tests tools/dupdetect. It needs its own workflow because it is a nested
+# module: the root `make test` runs `go test ./...` from the repo root, which
+# deliberately does not descend into a directory with its own go.mod.
+#
+# Without this, the tool that runs on every new issue would have no automated
+# verification at all, and a regression would first show up as a failed run on
+# a contributor's brand-new issue.
+name: dupdetect-test
+
+on:
+  push:
+    paths:
+      - 'tools/dupdetect/**'
+      - '.github/workflows/dupdetect-test.yml'
+  pull_request:
+    paths:
+      - 'tools/dupdetect/**'
+      - '.github/workflows/dupdetect-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/dupdetect
+    steps:
+      # Pinned by SHA rather than tag, matching duplicate-detect.yml — a tag is
+      # mutable, and one pinning policy across the repo is easier to audit than
+      # a per-workflow judgment call about which one "deserves" it.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: tools/dupdetect/go.mod
+          # This module is stdlib-only and has no go.sum, so the dependency
+          # cache has nothing to key on and only emits a warning.
+          cache: false
+
+      # Same three gates the repo applies to the root module (see Makefile),
+      # run here because ./... at the root cannot reach this module.
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./... -count=1 -race
