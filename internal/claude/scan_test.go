@@ -2561,3 +2561,51 @@ func TestPendingAskUserQuestion_LongOptionCapped(t *testing.T) {
 		t.Errorf("option rune length = %d, want <= %d (bounded by gateOptionCap)", n, gateOptionCap+1)
 	}
 }
+
+// TestLoopFromLog_PermissionRequestOnlyMarker_IsAGate covers the window
+// between the two hooks that write one gate's marker. Measured 2026-07-20:
+// PermissionRequest lands first with tool_name/tool_input, and the generic
+// Notification follows 6.01s later.
+//
+// A PermissionRequest payload carries NO notification_type and NO message, so
+// during those six seconds the marker satisfies neither of the original gate
+// tests. Without the tool check the loop would be judged a non-gate and the
+// marker compare-and-swap DELETED — then the late generic notification would
+// land and the tool name would be gone permanently. The visible symptom would
+// be "the feature works sometimes", which is the worst kind to diagnose.
+func TestLoopFromLog_PermissionRequestOnlyMarker_IsAGate(t *testing.T) {
+	path := writeJSONL(t,
+		`{"type":"user","message":{"content":"push the branch"}}`,
+		`{"type":"assistant","message":{"content":"ok","stop_reason":"end_turn"}}`,
+	)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat fixture: %v", err)
+	}
+	session := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	gatesDir := t.TempDir()
+
+	// Exactly what cmd/fleetops's permission hook writes: no Type, no Message.
+	if err := gate.WriteMarker(gatesDir, session, gate.Info{
+		PromptID: "77e62224-b63c-4744-ae73-38eb3764e406",
+		Tool:     "Bash", ToolDetail: "git push origin main",
+	}); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	pending := gate.Pending(gatesDir)
+
+	l := loopFromLog(path, fi, fi.ModTime(), gatesDir, pending)
+
+	if l.State != domain.StateGate {
+		t.Fatalf("got State=%v, want %v — a tool-bearing marker is a permission gate by construction", l.State, domain.StateGate)
+	}
+	if want := "Bash: git push origin main"; l.GatePrompt != want {
+		t.Errorf("GatePrompt = %q, want %q", l.GatePrompt, want)
+	}
+	if len(gate.Pending(gatesDir)) == 0 {
+		t.Error("the marker was deleted — the detail is now unrecoverable, and the late generic notification will be all that is left")
+	}
+	if l.GateTS == 0 {
+		t.Error("GateTS not set — approve's compare-and-swap has no token to delete this marker with")
+	}
+}
