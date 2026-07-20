@@ -82,6 +82,18 @@ always exits 0. A decision made inside a hook leaves no event, no actor and
 nothing to attribute or brake; decisions belong on the actuation path, which
 records them.
 
+> **Install the hooks before starting the sessions you want to act on.** The
+> `SessionStart` hook records a session's identity (pid ↔ tty ↔ window) only
+> when that session *starts*. A `claude` session that was already running when
+> you ran `hooks install` is **observed** (fleetops reads its transcript and
+> shows it in the fleet) but was never **registered**, so a typed action
+> against it can't resolve an unambiguous target and falls back to a manual
+> hint — you'll see something like `no unambiguous claude surface — attach (↵)
+> and act manually`. That is fleetops refusing to guess which terminal to type
+> into, not a crash. Restart such a session (or just act on it manually) and
+> every session you start from then on registers and is actionable. Nothing
+> re-registers a session retroactively.
+
 **Try it without any real loops:** `fleetops --demo` launches the cockpit
 seeded with a small synthetic fleet instead of scanning `~/.claude/projects` —
 no disk reads of real session data, no writes anywhere. Useful for a first
@@ -450,3 +462,14 @@ live" or "reproduced and fixed live" was verified by a human manually driving
 the real CLI once, on one version, not by automated tests. Treat those
 claims as "known to have worked at some point," not "guaranteed to keep
 working."
+
+**`no unambiguous claude surface` on a typed action.** The most common cause
+is not a bug: the target session isn't in the identity registry, so fleetops
+won't guess which terminal to type into. It happens when the session started
+before `hooks install` ran (see "Install the hooks before starting the
+sessions you want to act on," above), or when it's a headless `claude -p`
+session that never had a terminal surface. A session with a genuinely stale
+binding — e.g. an iTerm2 window reopened after a restart, so the recorded
+`window_id` no longer matches — can also land here; that case is tracked and
+still being hardened. Either way the fallback is honest: it refuses to act
+rather than act on the wrong session.
