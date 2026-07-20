@@ -261,14 +261,40 @@ const redriveTimeout = 10 * time.Minute
 // never created: a spawn.command carrying --dangerously-skip-permissions would
 // apply that to someone else's session. That crosses the owned/observed line
 // docs/adr-loop-state-model.md draws, so the command here stays "claude".
-func Redrive(sessionID, prompt string) error {
-	argv := redriveArgv(sessionID, prompt)
+//
+// cwd is the loop's OWN working directory and is load-bearing, not cosmetic:
+// Claude Code scopes sessions by project (their cwd), so `claude --resume
+// <id>` can only find <id>'s transcript when it runs from that session's OWN
+// project directory. Run it from anywhere else (e.g. fleetops' own cwd) and
+// resume fails with exit status 1 — the whole reason this parameter exists.
+// This is exactly why the sibling bootstrapClaudeFn sets cmd.Dir=cwd too, and
+// why Redrive was the one actuation path silently broken for loops living in a
+// different directory than fleetops: it execs claude but forgot to. Do NOT
+// re-drop cmd.Dir — see buildRedriveCmd. An empty cwd is refused up front
+// rather than allowed to fall back to the process dir (cmd.Dir=""), which is
+// the exact broken behavior this fixes.
+func Redrive(cwd, sessionID, prompt string) error {
+	if cwd == "" {
+		return fmt.Errorf("claude --resume: refusing to re-drive %s with no cwd — sessions are cwd/project-scoped, so resuming from the wrong directory silently fails", sessionID)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), redriveTimeout)
 	defer cancel()
-	if err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run(); err != nil {
+	if err := buildRedriveCmd(ctx, cwd, sessionID, prompt).Run(); err != nil {
 		return fmt.Errorf("claude --resume: %w", err)
 	}
 	return nil
+}
+
+// buildRedriveCmd assembles Tier 2's exec.Cmd with its working directory set to
+// the session's own project cwd. Split out from Redrive as a testable seam (the
+// same shape bootstrap uses) so a unit test can assert cmd.Dir == cwd and the
+// argv is redriveArgv's fixed invocation WITHOUT spawning a real claude — the
+// cwd wiring was invisible precisely because nothing exercised it in isolation.
+func buildRedriveCmd(ctx context.Context, cwd, sessionID, prompt string) *exec.Cmd {
+	argv := redriveArgv(sessionID, prompt)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = cwd
+	return cmd
 }
 
 // redriveArgv is Tier 2's fixed invocation. Each element is structural:
