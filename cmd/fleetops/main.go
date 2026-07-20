@@ -63,6 +63,7 @@ Usage:
   fleetops report [--since D]  plain-text summary of the event history (default 24h)
   fleetops hooks install       register fleetops's Claude Code hooks (gate/idle detection)
   fleetops hooks uninstall     remove them
+  fleetops hooks status        report whether the hooks are installed and healthy
   fleetops hook <event>        Claude Code hook entry point (notify|session-start|session-end)
                                   — invoked BY Claude Code itself, not typically run by hand
   fleetops help | --help | -h  show this help

@@ -6,12 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/jitokim/fleetops/internal/hooks"
 )
 
 // runHooksCmd dispatches `fleetops hooks <sub>`.
 func runHooksCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "fleetops hooks: expected install|uninstall")
+		fmt.Fprintln(os.Stderr, "fleetops hooks: expected install|uninstall|status")
 		os.Exit(1)
 	}
 	switch args[0] {
@@ -19,6 +21,8 @@ func runHooksCmd(args []string) {
 		installHooks()
 	case "uninstall":
 		uninstallHooks()
+	case "status":
+		statusHooks()
 	default:
 		fmt.Fprintf(os.Stderr, "fleetops hooks: unknown subcommand %q\n", args[0])
 		os.Exit(1)
@@ -35,19 +39,19 @@ type hookSpec struct {
 	subcommandSuffix string
 }
 
-// fleetopsHookSpecs is the full set of hook events fleetops manages. The
-// suffix must match what installHooks appends to the executable path (exe +
-// " " + suffix) so uninstall recognizes exactly what install wrote.
+// fleetopsHookSpecs is the full set of hook events fleetops manages, derived
+// from the canonical internal/hooks.Specs() so the install/uninstall driver
+// and the hooks.Health detection can never drift on WHICH events are ours or
+// WHAT suffix identifies them. The suffix must match what installHooks appends
+// to the executable path (exe + " " + suffix) so uninstall recognizes exactly
+// what install wrote.
 func fleetopsHookSpecs() []hookSpec {
-	return []hookSpec{
-		{eventName: "Notification", subcommandSuffix: "hook notify"},
-		{eventName: "SessionStart", subcommandSuffix: "hook session-start"},
-		{eventName: "SessionEnd", subcommandSuffix: "hook session-end"},
-		// PermissionRequest is what makes a permission gate legible: it is the
-		// only source that names the tool being requested. Registered as a
-		// sensor only — see permissionHook's contract.
-		{eventName: "PermissionRequest", subcommandSuffix: "hook permission"},
+	specs := hooks.Specs()
+	out := make([]hookSpec, len(specs))
+	for i, s := range specs {
+		out[i] = hookSpec{eventName: s.EventName, subcommandSuffix: s.SubcommandSuffix}
 	}
+	return out
 }
 
 // installHookEntry idempotently ensures settings["hooks"][eventName] contains
@@ -145,12 +149,13 @@ func uninstallHookEntry(settings map[string]any, eventName, subcommandSuffix str
 	return true
 }
 
-// isFleetopsHookCommand identifies our own hook command line for a given
-// subcommand suffix (e.g. "hook notify"), so uninstall only ever removes
-// entries we installed — never another tool's, and never one of our OTHER
-// events (each event keys on its own distinct suffix).
+// isFleetopsHookCommand delegates to the canonical matcher in internal/hooks,
+// so uninstall and hooks.Health share ONE definition of "an entry that is
+// recognizably ours" and cannot drift. It still removes only entries we
+// installed — never another tool's, and never one of our OTHER events (each
+// event keys on its own distinct suffix).
 func isFleetopsHookCommand(cmd, subcommandSuffix string) bool {
-	return strings.Contains(cmd, "fleetops") && strings.HasSuffix(strings.TrimSpace(cmd), subcommandSuffix)
+	return hooks.IsFleetopsHookCommand(cmd, subcommandSuffix)
 }
 
 // asSlice normalizes a decoded JSON field that's expected to be an array;
@@ -162,12 +167,10 @@ func asSlice(v any) []any {
 
 // ── driver funcs (file IO — not unit tested directly; the pure funcs above are) ──
 
+// settingsPath delegates to hooks.DefaultSettingsPath so the audited WRITE
+// path and the read-only detection resolve the exact same file.
 func settingsPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claude", "settings.json"), nil
+	return hooks.DefaultSettingsPath()
 }
 
 // loadSettings decodes into map[string]any (not a struct) so unknown fields
@@ -289,4 +292,41 @@ func uninstallHooks() {
 		os.Exit(1)
 	}
 	fmt.Printf("uninstalled fleetops's hooks\n(backup: %s.bak-fleetops)\n", path)
+}
+
+// statusHooks prints the current hook health without touching settings.json —
+// the read-only counterpart to install/uninstall. It exists so the
+// uninstall→reinstall acceptance path is observable from the CLI (and so a
+// stale-path breakage is legible) without launching the TUI: `fleetops hooks
+// status` after an uninstall reports Missing, after a reinstall reports OK.
+func statusHooks() {
+	path, err := settingsPath()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fleetops hooks status:", err)
+		os.Exit(1)
+	}
+	report := hooks.HealthAt(path, hooks.BinaryExists)
+	fmt.Print(formatHookStatus(report))
+}
+
+// formatHookStatus renders a Report as human-readable status lines plus a
+// one-line verdict. Pure (no I/O) so it is unit-testable — statusHooks only
+// resolves the path and prints what this returns.
+func formatHookStatus(report hooks.Report) string {
+	var b strings.Builder
+	for _, e := range report.Events {
+		line := fmt.Sprintf("%-18s %s", e.Event, e.State)
+		if e.State == hooks.StateStalePath {
+			line += fmt.Sprintf(" (points at missing binary: %s)", e.Binary)
+		}
+		b.WriteString(line + "\n")
+	}
+	if report.OK {
+		b.WriteString("\nall fleetops hooks installed and healthy\n")
+	} else if report.HasStalePath() {
+		b.WriteString("\nhooks point at a missing binary — run: fleetops hooks install\n")
+	} else {
+		b.WriteString("\nhooks not fully installed — run: fleetops hooks install\n")
+	}
+	return b.String()
 }
