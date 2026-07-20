@@ -19,6 +19,7 @@ import (
 	"github.com/jitokim/fleetops/internal/domain"
 	"github.com/jitokim/fleetops/internal/engine"
 	"github.com/jitokim/fleetops/internal/events"
+	"github.com/jitokim/fleetops/internal/hooks"
 	"github.com/jitokim/fleetops/internal/registry"
 	"github.com/jitokim/fleetops/internal/sessions"
 	runewidth "github.com/mattn/go-runewidth"
@@ -44,6 +45,12 @@ func TestMain(m *testing.M) {
 	hiddenFileFn = func() string {
 		return filepath.Join(os.TempDir(), "fleetops-tui-tests-unused-hidden.json")
 	}
+	// Hermeticity net for the self-verify banner: New() reads hook health at
+	// startup, and the vast majority of tests have no reason to care about the
+	// real machine's ~/.claude/settings.json (and would render an unexpected
+	// banner line if it were half-installed). Default to a healthy report; the
+	// banner/H/esc tests override hookHealthFn themselves (save-then-restore).
+	hookHealthFn = func() hooks.Report { return hooks.Report{OK: true} }
 	os.Exit(m.Run())
 }
 
@@ -9563,5 +9570,238 @@ func TestSpawnMayHaveLandedWindow_MatchesWhatTheOperatorIsTold(t *testing.T) {
 		if !strings.Contains(msg, "window") && !strings.Contains(msg, "attach") {
 			t.Errorf("%v: classified ambiguous but its text does not point the operator at anything to check", err)
 		}
+	}
+}
+
+// ── feat/hooks-self-verify: startup banner + H install + esc dismiss ─────────
+
+func notOKMissingReport() hooks.Report {
+	return hooks.Report{OK: false, Events: []hooks.EventStatus{
+		{Event: "SessionStart", State: hooks.StateMissing},
+	}}
+}
+
+func notOKStaleReport() hooks.Report {
+	return hooks.Report{OK: false, Events: []hooks.EventStatus{
+		{Event: "SessionStart", State: hooks.StateStalePath, Binary: "/old/removed/fleetops"},
+	}}
+}
+
+func TestHookBanner_RendersWhenNotOK_HiddenWhenOKOrDismissed(t *testing.T) {
+	const width = 120
+	m := modelWithOneLoop()
+
+	m.hookHealth = notOKMissingReport()
+	got := m.renderHookBanner(width)
+	if got == "" {
+		t.Fatal("expected a banner when hooks are not OK")
+	}
+	if !strings.Contains(got, "won't be actionable") || !strings.Contains(got, "[H] install") {
+		t.Errorf("banner = %q, want it to name the consequence and the [H] remedy", got)
+	}
+
+	m.hookHealth = hooks.Report{OK: true}
+	if got := m.renderHookBanner(width); got != "" {
+		t.Errorf("banner = %q, want empty when hooks are healthy", got)
+	}
+
+	m.hookHealth = notOKMissingReport()
+	m.hookDismissed = true
+	if got := m.renderHookBanner(width); got != "" {
+		t.Errorf("banner = %q, want empty when dismissed", got)
+	}
+}
+
+// TestHookBanner_StalePathMessageDiffersFromMissing pins that "looks installed
+// but the binary is gone" gets its own, scarier wording — distinct from plain
+// "not installed".
+func TestHookBanner_StalePathMessageDiffersFromMissing(t *testing.T) {
+	const width = 120
+	m := modelWithOneLoop()
+
+	m.hookHealth = notOKStaleReport()
+	stale := m.renderHookBanner(width)
+	if !strings.Contains(stale, "missing binary") {
+		t.Errorf("stale-path banner = %q, want it to say hooks point at a missing binary", stale)
+	}
+
+	m.hookHealth = notOKMissingReport()
+	missing := m.renderHookBanner(width)
+	if strings.Contains(missing, "missing binary") {
+		t.Errorf("plain-missing banner = %q, must NOT use the stale-path 'missing binary' wording", missing)
+	}
+}
+
+// TestView_ShowsHookBannerWhenNotOK proves the banner is actually composed into
+// the frame (not just the pure renderer) and clears once health reads OK.
+func TestView_ShowsHookBannerWhenNotOK(t *testing.T) {
+	m := modelWithOneLoop()
+	m.w, m.h = 120, 40
+
+	m.hookHealth = notOKMissingReport()
+	out := m.View()
+	if !strings.Contains(out, "HOOKS") || !strings.Contains(out, "won't be actionable") {
+		t.Errorf("View did not include the hook banner; output:\n%s", out)
+	}
+
+	m.hookHealth = hooks.Report{OK: true}
+	if strings.Contains(m.View(), "won't be actionable") {
+		t.Error("View still shows the banner after health went OK")
+	}
+}
+
+// TestView_HookBannerKeepsWidthAndHeightBudget proves the banner's extra line
+// is properly accounted for: no line exceeds the terminal width, and the frame
+// never grows past the height budget while the banner is up (bannerLines is
+// subtracted from the panel area, not added on top of it).
+func TestView_HookBannerKeepsWidthAndHeightBudget(t *testing.T) {
+	for _, width := range []int{45, 70, 120, 175} {
+		for _, height := range []int{18, 24, 40} {
+			t.Run(fmt.Sprintf("width=%d/height=%d", width, height), func(t *testing.T) {
+				m := New()
+				m.w, m.h = width, height
+				m.loops = viewRegressionLoops()
+				m.cursor = 0
+				m.hookHealth = notOKStaleReport() // banner shown
+
+				out := m.View()
+				lines := strings.Split(out, "\n")
+				for i, line := range lines {
+					if got := lipgloss.Width(line); got > width {
+						t.Errorf("line %d is %d cols wide, want <= %d: %q", i, got, width, line)
+					}
+				}
+				if got := len(lines); got > height {
+					t.Errorf("frame is %d lines with the banner up, want <= %d", got, height)
+				}
+			})
+		}
+	}
+}
+
+// TestUpdate_HKey_InstallsAndRechecks: H shells out via the install seam, then
+// re-verifies — asserted with a fake seam that records the call and a health
+// seam that flips to OK only once install has run.
+func TestUpdate_HKey_InstallsAndRechecks(t *testing.T) {
+	origInstall, origHealth := installHooksFn, hookHealthFn
+	t.Cleanup(func() { installHooksFn, hookHealthFn = origInstall, origHealth })
+
+	var installCalled bool
+	installHooksFn = func() error {
+		installCalled = true
+		return nil
+	}
+	// Model the real causality: health reads OK only after install ran.
+	hookHealthFn = func() hooks.Report {
+		if installCalled {
+			return hooks.Report{OK: true}
+		}
+		return notOKMissingReport()
+	}
+
+	m := New() // reads degraded health at startup
+	if m.hookHealth.OK {
+		t.Fatal("precondition: expected not-OK health at startup")
+	}
+
+	m, cmd := updateModel(t, m, runeKey('H'))
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from H (installHooksCmd)")
+	}
+
+	msg := cmd() // runs installHooksFn + the recheck off the event loop
+	if !installCalled {
+		t.Error("install seam was not called by H")
+	}
+
+	m, _ = updateModel(t, m, msg)
+	if !m.hookHealth.OK {
+		t.Error("health was not refreshed to OK after a successful install")
+	}
+	if m.hookBannerVisible() {
+		t.Error("banner still visible after a successful install")
+	}
+	if m.statusKind != statusOK {
+		t.Errorf("statusKind = %v, want statusOK after a successful install", m.statusKind)
+	}
+}
+
+// TestUpdate_HKey_InstallFailure_KeepsBannerAndReportsError proves a failed
+// install neither clears the banner nor lies about success.
+func TestUpdate_HKey_InstallFailure_KeepsBannerAndReportsError(t *testing.T) {
+	origInstall, origHealth := installHooksFn, hookHealthFn
+	t.Cleanup(func() { installHooksFn, hookHealthFn = origInstall, origHealth })
+
+	installHooksFn = func() error { return fmt.Errorf("boom") }
+	hookHealthFn = func() hooks.Report { return notOKMissingReport() } // still broken
+
+	m := New()
+	m, cmd := updateModel(t, m, runeKey('H'))
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from H")
+	}
+	m, _ = updateModel(t, m, cmd())
+
+	if m.statusKind != statusErr {
+		t.Errorf("statusKind = %v, want statusErr on install failure", m.statusKind)
+	}
+	if !m.hookBannerVisible() {
+		t.Error("banner cleared despite the install failing")
+	}
+}
+
+// TestUpdate_HKey_NoOpWhenHealthy: H must not shell out when hooks are already
+// healthy (which also makes it inert in demo mode, where health is forced OK).
+func TestUpdate_HKey_NoOpWhenHealthy(t *testing.T) {
+	origInstall := installHooksFn
+	t.Cleanup(func() { installHooksFn = origInstall })
+	installHooksFn = func() error {
+		t.Fatal("install seam must not be called when hooks are already healthy")
+		return nil
+	}
+
+	m := modelWithOneLoop()
+	m.hookHealth = hooks.Report{OK: true}
+
+	_, cmd := updateModel(t, m, runeKey('H'))
+	if cmd != nil {
+		t.Error("expected no tea.Cmd — H is inert when hooks are healthy")
+	}
+}
+
+// TestUpdate_Esc_DismissesHookBanner: esc with nothing else to consume it
+// dismisses the banner for the run.
+func TestUpdate_Esc_DismissesHookBanner(t *testing.T) {
+	m := modelWithOneLoop()
+	m.hookHealth = notOKMissingReport()
+	if !m.hookBannerVisible() {
+		t.Fatal("precondition: banner should be visible")
+	}
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if !m.hookDismissed {
+		t.Error("esc did not set hookDismissed")
+	}
+	if m.hookBannerVisible() {
+		t.Error("banner still visible after esc dismiss")
+	}
+}
+
+// TestUpdate_Esc_FilterTakesPrecedenceOverBannerDismiss: an active filter still
+// owns esc — a single press clears the filter and must NOT also swallow the
+// banner in the same keystroke.
+func TestUpdate_Esc_FilterTakesPrecedenceOverBannerDismiss(t *testing.T) {
+	m := modelWithOneLoop()
+	m.hookHealth = notOKMissingReport()
+	m.filterQuery = "foo"
+
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if m.filterQuery != "" {
+		t.Error("esc did not clear the active filter")
+	}
+	if m.hookDismissed {
+		t.Error("esc cleared the filter but must NOT also dismiss the banner in the same press")
 	}
 }

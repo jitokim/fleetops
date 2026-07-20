@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/jitokim/fleetops/internal/hooks"
 )
 
 const (
@@ -392,4 +395,48 @@ func deepCopyJSON(t *testing.T, m map[string]any) map[string]any {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	return out
+}
+
+// ── hooks status (observability for the uninstall→reinstall acceptance path) ──
+
+func TestFormatHookStatus_Healthy(t *testing.T) {
+	report := hooks.Report{OK: true, Events: []hooks.EventStatus{
+		{Event: "SessionStart", State: hooks.StateOK, Binary: "/usr/local/bin/fleetops"},
+	}}
+	out := formatHookStatus(report)
+	if !strings.Contains(out, "SessionStart") || !strings.Contains(out, "ok") {
+		t.Errorf("status = %q, want it to list SessionStart ok", out)
+	}
+	if !strings.Contains(out, "installed and healthy") {
+		t.Errorf("status = %q, want the healthy verdict", out)
+	}
+}
+
+func TestFormatHookStatus_Missing(t *testing.T) {
+	report := hooks.Report{OK: false, Events: []hooks.EventStatus{
+		{Event: "SessionStart", State: hooks.StateMissing},
+	}}
+	out := formatHookStatus(report)
+	if !strings.Contains(out, "missing") {
+		t.Errorf("status = %q, want it to show the missing event", out)
+	}
+	if !strings.Contains(out, "not fully installed") {
+		t.Errorf("status = %q, want the 'not fully installed' verdict", out)
+	}
+}
+
+// TestFormatHookStatus_StalePath proves a dead-path install is reported as its
+// own scarier state, naming the missing binary — the missionctl case, made
+// observable from the CLI without launching the TUI.
+func TestFormatHookStatus_StalePath(t *testing.T) {
+	report := hooks.Report{OK: false, Events: []hooks.EventStatus{
+		{Event: "SessionStart", State: hooks.StateStalePath, Binary: "/old/removed/fleetops"},
+	}}
+	out := formatHookStatus(report)
+	if !strings.Contains(out, "stale-path") || !strings.Contains(out, "/old/removed/fleetops") {
+		t.Errorf("status = %q, want it to flag the stale path and name the missing binary", out)
+	}
+	if !strings.Contains(out, "point at a missing binary") {
+		t.Errorf("status = %q, want the stale-path verdict distinct from plain 'not installed'", out)
+	}
 }

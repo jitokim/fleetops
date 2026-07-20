@@ -28,6 +28,7 @@ import (
 	"github.com/jitokim/fleetops/internal/events"
 	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/hidden"
+	"github.com/jitokim/fleetops/internal/hooks"
 	"github.com/jitokim/fleetops/internal/notify"
 	"github.com/jitokim/fleetops/internal/oracle"
 	"github.com/jitokim/fleetops/internal/registry"
@@ -125,6 +126,26 @@ var (
 		entry, _ := sessions.ReadSession(sessionsDirFn(), sessionID)
 		return entry
 	}
+	// hookHealthFn is hooks.DefaultHealth by default — the startup hook-health
+	// probe behind the self-verifying banner. Same package-level func-var seam
+	// as judgeFn/redriveFn: overridable so the banner's render/dismiss and the
+	// H-key install-and-recheck can be tested without reading a real captain's
+	// ~/.claude/settings.json. Detection is PURE (hooks.Health); this seam only
+	// swaps the "read the real file" adapter.
+	hookHealthFn = hooks.DefaultHealth
+	// installHooksFn shells out to `fleetops hooks install` (this same
+	// executable, resolved via os.Executable) to perform the settings.json
+	// WRITE through the existing audited, idempotent, backup-taking path — the
+	// TUI never reimplements hook installation. Behind a seam (same shape as
+	// hookHealthFn) so H-key tests record the call and flip health instead of
+	// spawning a real process.
+	installHooksFn = func() error {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		return exec.Command(exe, "hooks", "install").Run()
+	}
 )
 
 type loopsMsg []domain.Loop
@@ -213,6 +234,16 @@ type killResultMsg struct {
 type interruptResultMsg struct {
 	ok   bool
 	text string
+}
+
+// hookInstallResultMsg reports the outcome of an H-key hook install: the
+// install seam's error (nil on success) plus a FRESH health report computed
+// right after the write, so the banner reflects reality rather than the
+// pre-install snapshot. Computed off the event loop by installHooksCmd,
+// mirroring resumeResultMsg's discipline (no exec on the event loop).
+type hookInstallResultMsg struct {
+	err    error
+	report hooks.Report
 }
 
 // verdictMsg reports the outcome of a background oracle judgment, computed
@@ -534,6 +565,20 @@ type Model struct {
 	// last one, from scheduling another.
 	autoRedriveAttempts    map[string]int
 	autoRedriveScheduledAt map[string]time.Time
+
+	// hookHealth is the startup verdict on whether fleetops's Claude Code
+	// hooks are fully installed AND pointing at a live binary (see
+	// internal/hooks). Computed once in New() via hookHealthFn and refreshed
+	// after an H-key install. When it is not OK, sessions started without the
+	// SessionStart hook are observed but never REGISTERED, so actuation
+	// (kill/interrupt/inject) silently dead-ends — the exact failure the
+	// header banner exists to surface before a keypress fails.
+	hookHealth hooks.Report
+	// hookDismissed suppresses the banner for THIS run only (esc while it
+	// shows). Deliberately not persisted: a fresh launch re-verifies and
+	// re-surfaces a still-broken install, since "dismissed once" must never
+	// mean "silently half-working forever".
+	hookDismissed bool
 }
 
 func New() Model {
@@ -551,6 +596,12 @@ func New() Model {
 		// human hid or deleted last session. Fail-open: a missing/corrupt file
 		// loads as an empty set (see hidden.Load).
 		hidden: hidden.Load(hiddenFileFn()),
+		// Self-verify at launch: read hook health once so a half-installed
+		// setup (missing hooks, or hooks pointing at a dead binary) shows a
+		// banner immediately instead of only surfacing when a keypress fails.
+		// Fail-open: hookHealthFn degrades to a not-OK report rather than
+		// blocking the launch (see hooks.DefaultHealth).
+		hookHealth: hookHealthFn(),
 	}
 }
 
@@ -577,6 +628,11 @@ func NewDemo() Model {
 	// filter the synthetic fleet, and so d/x (demo-blocked anyway) have
 	// nothing real to touch.
 	m.hidden = nil
+	// Demo is hermetic: force hook health OK so the self-verify banner never
+	// shows over a synthetic fleet (it would reflect the real machine's
+	// settings.json, which --demo promises not to read), and so H is inert.
+	m.hookHealth = hooks.Report{OK: true}
+	m.hookDismissed = false
 	return m
 }
 
@@ -1139,6 +1195,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		case "esc":
 			if m.filterQuery == "" {
+				// Nothing else consumed esc: if the hook self-verify banner is
+				// showing, dismiss it for THIS run only (not persisted — a
+				// relaunch re-verifies and re-surfaces a still-broken install).
+				if m.hookBannerVisible() {
+					m.hookDismissed = true
+					m.status, m.statusKind = "hook banner dismissed — fix later with: fleetops hooks install", statusNeutral
+				}
 				return m, nil
 			}
 			m.filterQuery = ""
@@ -1146,6 +1209,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = maxInt(0, len(m.visibleLoops())-1)
 			}
 			m.status, m.statusKind = "filter cleared", statusNeutral
+		case "H":
+			// Self-verify install: shell out to the audited `fleetops hooks
+			// install` (installHooksFn), then re-check health. Inert when hooks
+			// are already healthy (nothing to install) — which also makes it a
+			// no-op in demo mode, where health is forced OK.
+			if m.hookHealth.OK {
+				return m, nil
+			}
+			m.status, m.statusKind = "installing fleetops hooks…", statusNeutral
+			return m, installHooksCmd()
 		case "r":
 			sel, ok := m.selected()
 			if !ok || (sel.State != domain.StateStalled && sel.State != domain.StateDrift) {
@@ -1496,6 +1569,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusKind = statusOK
 		} else {
 			m.statusKind = statusErr
+		}
+	case hookInstallResultMsg:
+		// Adopt the freshly-computed health regardless of outcome — if the
+		// write half-worked, the banner should reflect exactly what's still
+		// wrong (and clears the moment health reads OK).
+		m.hookHealth = msg.report
+		switch {
+		case msg.err != nil:
+			m.status, m.statusKind = fmt.Sprintf("hook install failed: %v", msg.err), statusErr
+		case msg.report.OK:
+			m.status, m.statusKind = "fleetops hooks installed — new sessions will register", statusOK
+		default:
+			m.status, m.statusKind = "hook install ran but health is still degraded — check ~/.claude/settings.json", statusErr
 		}
 	case logClosedMsg:
 		if msg.err != nil {
@@ -3797,24 +3883,37 @@ func (m Model) View() string {
 	b.WriteString(renderRule(width))
 	b.WriteString("\n")
 
+	// Self-verify banner (feat/hooks-self-verify): one extra line in the
+	// header area when hooks aren't fully installed and the banner hasn't been
+	// dismissed. Its line count is variable but ACCOUNTED for — subtracted
+	// from the panel budget below — so the fixed-chrome height guarantee still
+	// holds (the panel just gets one fewer line while the banner is up).
+	banner := m.renderHookBanner(width)
+	bannerLines := 0
+	if banner != "" {
+		b.WriteString(banner)
+		b.WriteString("\n")
+		bannerLines = 1
+	}
+
 	// Chrome accounted for above (the 3-line header block + rule =
-	// topChromeLines) and below (just the bottom line = bottomChromeLines)
-	// is a FIXED line count regardless of content — renderBottomLine always
-	// returns exactly one line (even if blank), which is what makes this
-	// budget a real guarantee rather than an estimate. Whatever's left goes
-	// to the panel area, floored so the UI never collapses to nothing at an
-	// absurdly short terminal — layoutStacked needs a taller floor than the
-	// other two modes since it renders two bordered panels, not one (see
-	// stackedPanelHeightFloor). feat/top-hint-grid removed the bottom
-	// keybar (its keybindings moved into the header block's hint grid) and
-	// the blank lines around both chrome regions, handing every freed line
-	// to the panel area.
+	// topChromeLines, plus the optional banner) and below (just the bottom
+	// line = bottomChromeLines) is a FIXED line count regardless of content —
+	// renderBottomLine always returns exactly one line (even if blank), which
+	// is what makes this budget a real guarantee rather than an estimate.
+	// Whatever's left goes to the panel area, floored so the UI never
+	// collapses to nothing at an absurdly short terminal — layoutStacked needs
+	// a taller floor than the other two modes since it renders two bordered
+	// panels, not one (see stackedPanelHeightFloor). feat/top-hint-grid
+	// removed the bottom keybar (its keybindings moved into the header block's
+	// hint grid) and the blank lines around both chrome regions, handing every
+	// freed line to the panel area.
 	mode := layoutModeFor(width)
 	floor := panelHeightFloor
 	if mode == layoutStacked {
 		floor = stackedPanelHeightFloor
 	}
-	panelHeight := height - topChromeLines - bottomChromeLines
+	panelHeight := height - topChromeLines - bottomChromeLines - bannerLines
 	if panelHeight < floor {
 		panelHeight = floor
 	}
@@ -3874,6 +3973,48 @@ const headerLines = 3
 
 func renderRule(width int) string {
 	return lipgloss.NewStyle().Foreground(cLine).Render(strings.Repeat("─", width))
+}
+
+// hookBannerVisible reports whether the self-verify banner should render:
+// hooks are not fully OK AND the operator hasn't dismissed it this run. Also
+// the gate for esc's dismiss (only consume esc when a banner is actually up).
+func (m Model) hookBannerVisible() bool {
+	return !m.hookHealth.OK && !m.hookDismissed
+}
+
+// renderHookBanner is the dismissible amber self-verify banner — mirrors the
+// "GATE NEEDS YOU" badge treatment (stBadgeStalled + amber text) so it reads
+// as the same class of "needs you" attention cue. Returns "" when hooks are
+// healthy or the banner was dismissed. A StalePath install gets a distinct,
+// scarier message than plain "not installed": "looks installed" but the
+// referenced binary is gone, which is why the two are different states.
+func (m Model) renderHookBanner(width int) string {
+	if !m.hookBannerVisible() {
+		return ""
+	}
+	var msg string
+	if m.hookHealth.HasStalePath() {
+		msg = "hooks point at a missing binary — new sessions won't be actionable · [H] reinstall · [esc] dismiss"
+	} else {
+		msg = "hooks not fully installed — new sessions won't be actionable · [H] install · [esc] dismiss"
+	}
+	line := stBadgeStalled.Render("▲ HOOKS") + " " + lipgloss.NewStyle().Foreground(cAmber).Render(msg)
+	// Width-clamp exactly like every header line (fitWithin is ANSI-aware),
+	// so the banner never exceeds the terminal width — the invariant
+	// TestView_NoLineExceedsTerminalWidth enforces across the whole frame.
+	return padToWidth(fitWithin(line, width), width)
+}
+
+// installHooksCmd shells out to the audited `fleetops hooks install` off the
+// event loop (installHooksFn), then re-verifies health so the resulting
+// hookInstallResultMsg carries the POST-install picture — the banner clears
+// the moment health reads OK. Same non-blocking discipline as every other
+// side-effecting action in this file.
+func installHooksCmd() tea.Cmd {
+	return func() tea.Msg {
+		err := installHooksFn()
+		return hookInstallResultMsg{err: err, report: hookHealthFn()}
+	}
 }
 
 // renderHeaderBlock composes the 3-line header. Width priority order
