@@ -17,7 +17,7 @@
 
 _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_
 
-> **Status: experimental / 0.4.0-alpha.** This is a young, actively-changing
+> **Status: experimental / 0.5.0-alpha.** This is a young, actively-changing
 > project — expect rough edges, and read the "Known rough edges" and
 > "Limitations" sections below before trusting it with anything you can't
 > afford to have go wrong (it does send real keystrokes and can kill real

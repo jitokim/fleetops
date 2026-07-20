@@ -1,6 +1,12 @@
 package control
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/jitokim/fleetops/internal/sessions"
@@ -518,5 +524,90 @@ func TestRedriveArgv(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("argv[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestBuildRedriveCmd_SetsDirToPassedCwd is the regression guard for the whole
+// bug: Tier 2's `claude --resume` is cwd/project-scoped, so the built command's
+// working directory MUST be the loop's own cwd (not fleetops' process cwd, not
+// ""), while the argv stays redriveArgv's fixed invocation. This is what a real
+// claude never has to run to prove — dropping cmd.Dir here made the exec fall
+// back to the process dir and exit 1 for any loop living elsewhere.
+func TestBuildRedriveCmd_SetsDirToPassedCwd(t *testing.T) {
+	// A directory that is deliberately NOT the test process's own cwd.
+	wantDir := t.TempDir()
+	if procCwd, err := os.Getwd(); err == nil && wantDir == procCwd {
+		t.Fatalf("test setup: TempDir %q coincided with the process cwd — this test can't tell right from wrong", wantDir)
+	}
+
+	cmd := buildRedriveCmd(context.Background(), wantDir, "sess-abc123", "do the thing")
+
+	if cmd.Dir != wantDir {
+		t.Errorf("cmd.Dir = %q, want the passed cwd %q — resuming from any other dir fails (sessions are project-scoped)", cmd.Dir, wantDir)
+	}
+	if procCwd, err := os.Getwd(); err == nil && cmd.Dir == procCwd {
+		t.Errorf("cmd.Dir = %q is the process cwd — the exact broken behavior this fixes", cmd.Dir)
+	}
+	wantArgv := redriveArgv("sess-abc123", "do the thing")
+	if !reflect.DeepEqual(cmd.Args, wantArgv) {
+		t.Errorf("cmd.Args = %#v, want the fixed redrive argv %#v (only the working dir changes)", cmd.Args, wantArgv)
+	}
+}
+
+// TestRedrive_EmptyCwd_RefusesWithoutSpawning pins the honest edge-case
+// decision: an empty cwd is NOT allowed to fall through to cmd.Dir="" (which
+// runs in the process dir — the exact bug). Redrive refuses up front with a
+// clear error, and does so instantly (no exec, no 10-minute redriveTimeout).
+func TestRedrive_EmptyCwd_RefusesWithoutSpawning(t *testing.T) {
+	err := Redrive("", "sess-abc123", "do the thing")
+	if err == nil {
+		t.Fatal("Redrive with empty cwd returned nil — it must refuse rather than silently run in the process dir")
+	}
+	if !strings.Contains(err.Error(), "cwd") {
+		t.Errorf("error %q does not explain the missing cwd", err.Error())
+	}
+}
+
+// TestBuildRedriveCmd_CrossWorktree_UsesWorktreePath exercises the bug in the
+// exact topology that hid it: a loop whose cwd is a git WORKTREE distinct from
+// the repo root. fleetops was dogfooded on its own checkout, so the loop's cwd
+// and fleetops' cwd always coincided and the missing cmd.Dir was invisible. A
+// worktree makes the two paths provably different — the redrive must target the
+// worktree, not the main checkout, not the process dir.
+func TestBuildRedriveCmd_CrossWorktree_UsesWorktreePath(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not installed; cross-worktree topology can't be built")
+	}
+
+	repo := t.TempDir()
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command(git, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit(repo, "init", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	runGit(repo, "add", ".")
+	runGit(repo, "commit", "-q", "-m", "seed")
+	worktree := filepath.Join(t.TempDir(), "wt")
+	runGit(repo, "worktree", "add", "-q", worktree, "HEAD")
+
+	cmd := buildRedriveCmd(context.Background(), worktree, "sess-wt", "carry on")
+
+	if cmd.Dir != worktree {
+		t.Errorf("cmd.Dir = %q, want the worktree path %q", cmd.Dir, worktree)
+	}
+	if cmd.Dir == repo {
+		t.Errorf("cmd.Dir = %q is the main checkout, not the loop's worktree — a resume there resolves the wrong project", cmd.Dir)
 	}
 }

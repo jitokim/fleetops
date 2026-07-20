@@ -1625,7 +1625,7 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		// Tier 2: vendor-independent headless re-drive. Works on every
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
-		if err := redriveFn(l.SessionID, prompt); err != nil {
+		if err := redriveFn(l.Cwd, l.SessionID, prompt); err != nil {
 			logActuationEvent(l, action, "tier2", err)
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
@@ -2767,7 +2767,7 @@ func driveCmd(l domain.Loop) tea.Cmd {
 			Detail:    fmt.Sprintf("cycle %d", l.Cycle),
 			Actor:     events.ActorAuto,
 		})
-		err := redriveFn(l.SessionID, prompt)
+		err := redriveFn(l.Cwd, l.SessionID, prompt)
 		if err != nil {
 			return resumeResultMsg{sessionID: l.SessionID, ok: false,
 				text: fmt.Sprintf("engine: cycle %d failed — %v", l.Cycle, err)}
@@ -3049,7 +3049,7 @@ type autoRedriveResultMsg struct {
 func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
 	return func() tea.Msg {
 		prompt, _ := claude.LastUserPrompt(l.Path) // an empty/absent prior prompt still redrives — same tolerance as resumeCmd
-		err := redriveFn(l.SessionID, prompt)
+		err := redriveFn(l.Cwd, l.SessionID, prompt)
 		_ = events.Append(historyDirFn(), events.Event{
 			TS:        time.Now().UnixNano(),
 			SessionID: l.SessionID,
