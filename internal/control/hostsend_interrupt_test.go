@@ -76,12 +76,13 @@ func TestITerm2InterruptScript_KeepsTheTTYGuard(t *testing.T) {
 // TestITerm2InterruptScript_DiffersFromTextPathOnlyInTheWriteStatement pins
 // that the two paths share one skeleton: everything but the write statement is
 // identical, so a future fix to the guard cannot land on one path and miss the
-// other.
+// other. The write statement now appears in BOTH the GUID pass and the #62 tty
+// fallback pass, so every occurrence is normalized (not just the first).
 func TestITerm2InterruptScript_DiffersFromTextPathOnlyInTheWriteStatement(t *testing.T) {
 	interruptScript := iterm2InterruptArgv(testGUID(t, "ABC-123"), "ttys006")[2]
 	textScript := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "whatever")[2]
 
-	normalized := strings.Replace(interruptScript, iterm2EscStmt, iterm2WriteTextStmt, 1)
+	normalized := strings.ReplaceAll(interruptScript, iterm2EscStmt, iterm2WriteTextStmt)
 	if normalized != textScript {
 		t.Errorf("interrupt and text scripts diverge beyond the write statement:\ninterrupt(normalized):\n%s\n\ntext:\n%s", normalized, textScript)
 	}
