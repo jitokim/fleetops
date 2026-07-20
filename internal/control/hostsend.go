@@ -77,7 +77,8 @@ var ErrSendTTYMismatch = errors.New("control: session found but its tty no longe
 
 // ErrSendUnrecognizedVerdict reports that the host ran the script, exited 0,
 // and returned something this package does not recognize — not "ok", not
-// "miss", not "ttymismatch". It fails closed exactly like a miss, but it is a
+// "okviatty", not "miss", not "ttymismatch". It fails closed exactly like a
+// miss, but it is a
 // DIFFERENT fact and gets its own message: folding it into ErrSendNoSession
 // would tell the operator no session was found, which is a claim nothing
 // here supports (the script may have run against a session that exists) and
@@ -219,6 +220,17 @@ const (
 	iterm2SendHit         = "ok"
 	iterm2SendMiss        = "miss"
 	iterm2SendTTYMismatch = "ttymismatch"
+	// iterm2SendHitViaTTY is a SUCCESS verdict — the write landed — but a
+	// deliberately distinct one: the delivery went through the Pass-2 tty
+	// fallback because no session carried the recorded GUID anymore. That only
+	// happens on #62's stale-GUID condition (an iTerm2 restart reassigned the
+	// session id while the process and tty survived), so keeping it separate from
+	// a plain "ok" lets fleetops honestly report "delivered via tty fallback —
+	// the recorded window_id was stale" rather than pretend nothing was off, and
+	// it is the exact seam a future "rewrite window_id" (issue #62 option B)
+	// would hook. It maps to nil in iterm2SendVerdict — a working delivery must
+	// not be turned into a warning the operator has to act on.
+	iterm2SendHitViaTTY = "okviatty"
 )
 
 // sessionGUID is a session id that HAS BEEN CHECKED against itermGUIDPattern.
@@ -356,6 +368,13 @@ func iterm2SendVerdict(argv []string) error {
 	switch strings.TrimSpace(out) {
 	case iterm2SendHit:
 		return nil
+	case iterm2SendHitViaTTY:
+		// SUCCESS, same as a plain hit — the write reached the pty. Distinct only
+		// so the delivery-via-tty-fallback fact stays observable at the verdict
+		// seam (a stale window_id self-healed); see iterm2SendHitViaTTY's doc and
+		// Pass 2 in iterm2SendScript. Kept nil deliberately: turning a working
+		// delivery into an error would defeat the whole self-heal.
+		return nil
 	case iterm2SendTTYMismatch:
 		return ErrSendTTYMismatch
 	case iterm2SendMiss:
@@ -426,9 +445,47 @@ func iterm2SendArgvPrefix(guid sessionGUID, writeStmt, tty string) []string {
 // (design §8b/E1) and is the property that makes this the right shape for
 // background fleet actuation.
 //
-// It walks windows → tabs → sessions read-only. It never mutates the
-// collection it iterates (closing a session mid-iteration invalidates the
-// index), and it returns from inside the loop on the first GUID match.
+// It walks windows → tabs → sessions read-only in TWO passes. It never mutates
+// the collection it iterates (closing a session mid-iteration invalidates the
+// index), and each pass returns from inside the loop on its first match.
+//
+// # PASS 1 — GUID-anchored, precise (unchanged)
+//
+// Find the session whose id is the recorded GUID; verify its tty matches the
+// registry's before writing (the binding check below). A GUID match with a tty
+// MISMATCH returns "ttymismatch" and does NOT fall through to Pass 2 — that is
+// the genuine wrong-terminal case (tmux-inside-iTerm2, tab recycling) and must
+// stay a refusal, never a "find some other session" retry.
+//
+// # PASS 2 — tty fallback, the #62 self-heal (only reached when NO GUID matched)
+//
+// Reaching Pass 2 means Pass 1's loop returned nothing: no session anywhere
+// carries the recorded GUID. That is exactly #62's stale-GUID condition — an
+// iTerm2 restart with window restoration keeps the process and its tty but
+// reassigns the session id, so the recorded window_id names a session that no
+// longer exists while the one hosting our process runs on under a new GUID. The
+// tty survived. Pass 2 locates the session by `tty of aSession is (item 1 of
+// argv)` and writes the new HitViaTTY verdict.
+//
+// This is a re-VERIFIED self-heal, not a blind swap of a stale GUID for "some
+// session on that tty" (the wrong-pane hazard #62's honesty constraint and ADR
+// §4 E5 warn about). By the time this script runs, ResolveActuationTarget has
+// ALREADY verified pidTTYFn(entry.PID) == normalizeTTY(entry.TTY): the recorded
+// pid controls the recorded tty right now. So the iTerm2 session whose tty
+// equals argv item 1 is, by construction, the one hosting our process — the tty
+// match IS the re-verified binding, simultaneously the locator and the check.
+//
+// Pass 2 is tmux-safe BY CONSTRUCTION, needing no separate guard: if claude runs
+// inside a tmux pane, its controlling tty is the pane's inner pty, and no iTerm2
+// session reports that inner tty as its own `tty of aSession`. So Pass 2 matches
+// nothing in the tmux case and returns "miss" — it can only ever match a bare
+// iTerm2 session whose OWN tty equals claude's tty, which is precisely #62's
+// scenario and nothing else.
+//
+// INJECTION SAFETY holds identically across both passes: Pass 2 compares against
+// `item 1 of argv` exactly as Pass 1 does — the tty never enters the script
+// source. The only interpolated values remain guid, writeStmt, and the verdict
+// literals (all class A). The script stays BYTE-IDENTICAL across payloads.
 func iterm2SendScript(guid sessionGUID, writeStmt string) string {
 	return "on run argv\n" +
 		"\ttell application \"iTerm2\"\n" +
@@ -449,6 +506,22 @@ func iterm2SendScript(guid sessionGUID, writeStmt string) string {
 		"\t\t\t\t\t\tend if\n" +
 		"\t\t\t\t\t\t" + writeStmt + "\n" +
 		"\t\t\t\t\t\treturn \"" + iterm2SendHit + "\"\n" +
+		"\t\t\t\t\tend if\n" +
+		"\t\t\t\tend repeat\n" +
+		"\t\t\tend repeat\n" +
+		"\t\tend repeat\n" +
+		// PASS 2 — reached ONLY when Pass 1 matched no GUID anywhere (#62's
+		// stale-GUID self-heal; see the doc above). Keyed purely on the tty,
+		// which the upstream pid↔tty check already anchored to our process, so the
+		// tty match is the re-verified binding. tmux-safe by construction: no
+		// iTerm2 session reports a tmux pane's inner pty, so this matches nothing
+		// in the tmux case.
+		"\t\trepeat with aWindow in windows\n" +
+		"\t\t\trepeat with aTab in tabs of aWindow\n" +
+		"\t\t\t\trepeat with aSession in sessions of aTab\n" +
+		"\t\t\t\t\tif tty of aSession is (item 1 of argv) then\n" +
+		"\t\t\t\t\t\t" + writeStmt + "\n" +
+		"\t\t\t\t\t\treturn \"" + iterm2SendHitViaTTY + "\"\n" +
 		"\t\t\t\t\tend if\n" +
 		"\t\t\t\tend repeat\n" +
 		"\t\t\tend repeat\n" +

@@ -361,13 +361,19 @@ func TestITerm2SendText_Verdicts(t *testing.T) {
 		stdout  string
 		wantErr error
 	}{
-		"hit":               {iterm2SendHit, nil},
-		"hit with newline":  {iterm2SendHit + "\n", nil},
-		"hit padded":        {"  " + iterm2SendHit + "  \n", nil},
-		"miss":              {iterm2SendMiss, ErrSendNoSession},
-		"miss with newline": {iterm2SendMiss + "\n", ErrSendNoSession},
-		"tty mismatch":      {iterm2SendTTYMismatch, ErrSendTTYMismatch},
-		"mismatch padded":   {" " + iterm2SendTTYMismatch + "\n", ErrSendTTYMismatch},
+		"hit":              {iterm2SendHit, nil},
+		"hit with newline": {iterm2SendHit + "\n", nil},
+		"hit padded":       {"  " + iterm2SendHit + "  \n", nil},
+		// The Pass-2 tty-fallback hit is SUCCESS too — the write landed. It maps
+		// to nil exactly like a plain hit; the distinctness lives at the verdict
+		// wire value, not the error (see TestITerm2SendHitViaTTY_IsSuccessButDistinct).
+		"hit via tty fallback":         {iterm2SendHitViaTTY, nil},
+		"hit via tty fallback newline": {iterm2SendHitViaTTY + "\n", nil},
+		"hit via tty fallback padded":  {"  " + iterm2SendHitViaTTY + "  \n", nil},
+		"miss":                         {iterm2SendMiss, ErrSendNoSession},
+		"miss with newline":            {iterm2SendMiss + "\n", ErrSendNoSession},
+		"tty mismatch":                 {iterm2SendTTYMismatch, ErrSendTTYMismatch},
+		"mismatch padded":              {" " + iterm2SendTTYMismatch + "\n", ErrSendTTYMismatch},
 		// Unrecognized output fails closed like a miss, but is NOT a miss:
 		// folding it into ErrSendNoSession here would be a fabricated
 		// diagnosis (a broken script/host contract is not "no session found").
@@ -534,6 +540,74 @@ func TestITerm2SendScript_ReportsAllThreeVerdicts(t *testing.T) {
 	// And the GUID match must gate both.
 	if matchAt := strings.Index(script, "id of aSession is"); matchAt < 0 || matchAt > guardAt {
 		t.Errorf("the GUID match must gate the tty guard and the write:\n%s", script)
+	}
+}
+
+// TestITerm2SendScript_HasTTYFallbackPassAfterGUIDLoop is the #62 structural
+// pin: the script must carry a SECOND pass that is reachable only after the
+// GUID loop finds nothing, keyed purely on the argv tty, returning the distinct
+// HitViaTTY verdict. That is the stale-GUID self-heal — and keying on argv
+// (never an interpolated tty) is what keeps it injection-safe and byte-identical.
+func TestITerm2SendScript_HasTTYFallbackPassAfterGUIDLoop(t *testing.T) {
+	script := iterm2SendTextArgv(testGUID(t, "ABC-123"), "ttys006", "x")[2]
+
+	// Pass 2 exists and reports the new verdict.
+	fallbackReturn := `return "` + iterm2SendHitViaTTY + `"`
+	if !strings.Contains(script, fallbackReturn) {
+		t.Fatalf("script has no tty-fallback verdict %q — the #62 self-heal is missing:\n%s", iterm2SendHitViaTTY, script)
+	}
+
+	// Pass 2 locates by a POSITIVE tty match against argv (the locator that IS
+	// the re-verified binding), distinct from Pass 1's `is not` refusal guard.
+	positiveMatch := "if tty of aSession is (item 1 of argv) then"
+	if !strings.Contains(script, positiveMatch) {
+		t.Errorf("script has no positive tty match for the fallback pass:\n%s", script)
+	}
+
+	// The tty is argv, never interpolated — the byte-identity invariant. (The
+	// dedicated ByteIdentical/TTYIsArgv tests own this too; asserted here so a
+	// Pass-2 edit that bakes the tty in fails at the pass that introduced it.)
+	if strings.Contains(script, "ttys006") {
+		t.Errorf("the fallback pass interpolated the tty instead of comparing argv:\n%s", script)
+	}
+
+	// Reachability: the fallback match/verdict must come AFTER the GUID match
+	// block, so it is only ever entered when no GUID matched anywhere. If it sat
+	// before or inside Pass 1 it would fire on the precise-GUID path too.
+	guidMatchAt := strings.Index(script, `id of aSession is "`)
+	guidHitAt := strings.Index(script, `return "`+iterm2SendHit+`"`)
+	fallbackMatchAt := strings.Index(script, positiveMatch)
+	fallbackReturnAt := strings.Index(script, fallbackReturn)
+	if guidMatchAt < 0 || guidHitAt < 0 || fallbackMatchAt < 0 {
+		t.Fatalf("could not locate the two passes in the script:\n%s", script)
+	}
+	if fallbackMatchAt < guidHitAt {
+		t.Errorf("the tty-fallback pass precedes the GUID hit — it must be reachable ONLY after the GUID loop finds nothing:\n%s", script)
+	}
+	// And the final miss must still be last: no GUID match AND no tty match.
+	if missAt := strings.Index(script, `return "`+iterm2SendMiss+`"`); missAt < fallbackReturnAt {
+		t.Errorf("the miss verdict must come after the tty-fallback pass — miss is the both-passes-failed outcome:\n%s", script)
+	}
+}
+
+// TestITerm2SendHitViaTTY_IsSuccessButDistinct pins the verdict contract: the
+// fallback verdict is observably DISTINCT from a plain hit on the wire, yet maps
+// to nil (success) — a working delivery must never become an operator-facing
+// warning. It is the seam #62 option B (rewrite window_id) would hook.
+func TestITerm2SendHitViaTTY_IsSuccessButDistinct(t *testing.T) {
+	if iterm2SendHitViaTTY == iterm2SendHit {
+		t.Fatal("the tty-fallback verdict must be observably distinct from a normal hit")
+	}
+	// It must not be a prefix/substring collision that the verdict switch would
+	// misread (TrimSpace + exact-match protects this, but the literals should be
+	// cleanly separable too).
+	if strings.TrimSpace(iterm2SendHitViaTTY) != iterm2SendHitViaTTY {
+		t.Errorf("the fallback verdict %q has surrounding whitespace", iterm2SendHitViaTTY)
+	}
+
+	withFakeITerm2Send(t, func([]string) (string, error) { return iterm2SendHitViaTTY, nil })
+	if err := (iterm2SendAdapter{}).SendText(sendEntry(), "hello"); err != nil {
+		t.Errorf("SendText on a tty-fallback verdict = %v, want nil (success)", err)
 	}
 }
 
