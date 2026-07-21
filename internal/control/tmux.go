@@ -255,7 +255,7 @@ const tmuxSpawnCreateTimeout = 5 * time.Second
 // false success) instead of hanging forever, exactly like every other
 // backend's Spawn already fails on a genuine problem.
 func (tmuxController) Spawn(cwd, goal string) error {
-	argv := tmuxNewWindowCmd(cwd, spawnCommandFn())
+	argv := tmuxNewWindowCmd(cwd, spawnArgvForCwd(cwd))
 	out, err := outputBounded(tmuxSpawnCreateTimeout, argv)
 	if err != nil {
 		return fmt.Errorf("tmux new-window: %w", err)

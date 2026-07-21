@@ -156,7 +156,7 @@ type iterm2Session struct {
 // So liveness alone is never enough: nothing here claims a loop started until
 // claude is provably running on the tty we created.
 func (iterm2Spawner) Spawn(cwd, goal string) error {
-	session, err := iterm2CreateSession(cwd, spawnCommandFn())
+	session, err := iterm2CreateSession(cwd, spawnArgvForCwd(cwd))
 	if err != nil {
 		return err
 	}

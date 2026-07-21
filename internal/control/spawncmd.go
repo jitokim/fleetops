@@ -1,8 +1,12 @@
 package control
 
 import (
+	"context"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
+	"github.com/jitokim/fleetops/internal/accounts"
 	"github.com/jitokim/fleetops/internal/settings"
 )
 
@@ -79,4 +83,112 @@ func shellQuote(arg string) string {
 		return arg
 	}
 	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+}
+
+// claudeConfigDirEnv is the environment variable that scopes which Claude
+// account a spawned loop runs as (see internal/accounts' package doc). fleetops
+// injects it, per spawn, as the account bound to the spawn's cwd — never a
+// token, only the config-dir PATH the user already logged into.
+const claudeConfigDirEnv = "CLAUDE_CONFIG_DIR"
+
+// accountConfigDirFn resolves the CLAUDE_CONFIG_DIR a spawn in cwd should run
+// under, ok=false meaning "no account bound to cwd" — the zero-config default,
+// where spawn behaves exactly as it did before this feature.
+//
+// A package var for the same reason spawnCommandFn is one: it is the seam that
+// lets spawnArgvForCwd (and thus every spawn site routed through it) be tested
+// with a fake resolver, asserting the env prefix is added for a bound cwd and
+// NOT added for an unbound one, without writing a real ~/.fleetops/accounts.json.
+var accountConfigDirFn = defaultAccountConfigDir
+
+// defaultAccountConfigDir is accountConfigDirFn's production implementation:
+// load ~/.fleetops/accounts.json and resolve cwd through it, with git-based
+// worktree→origin resolution wired in via gitMainRepoDir.
+//
+// A Load ERROR (malformed JSON, or a binding naming an unknown alias) is
+// treated as INACTIVE here — the spawn proceeds with no account prefix, exactly
+// as if no config existed. This is a deliberate Phase A limitation, not the
+// package's own posture: internal/accounts.Load fails CLOSED (it returns the
+// error rather than silently resolving to "no account"), but blocking every
+// spawn tool-wide on a single JSON typo is too hostile a failure mode for the
+// only Phase A consumer, which is this optional prefix. Surfacing that
+// misconfiguration to the human belongs to Phase B's display layer, which has a
+// warning channel this spawn path does not. Flagged there.
+func defaultAccountConfigDir(cwd string) (configDir string, ok bool) {
+	cfg, err := accounts.Load(accounts.DefaultPath())
+	if err != nil {
+		return "", false
+	}
+	_, configDir, ok = cfg.ResolveForCwd(cwd, gitMainRepoDir)
+	return configDir, ok
+}
+
+// gitMainRepoDir maps cwd to the MAIN repo root of the git repository that
+// contains it, so a linked worktree resolves to the repo it was branched from
+// (its account binding lives on the origin, not on the freshly-created
+// worktree). ok=false on any failure — not a repo, no git binary — in which
+// case the caller matches on cwd itself, today's behavior.
+//
+// It uses `git rev-parse --git-common-dir`, NOT --show-toplevel, on purpose:
+// --show-toplevel returns a worktree's OWN root (the not-yet-bound path we must
+// avoid), whereas --git-common-dir names the single shared .git directory of
+// the origin for BOTH a main checkout and a linked worktree — and its parent is
+// the origin repo root. git may report that path relative to cwd, so a
+// non-absolute result is joined onto cwd before its parent is taken.
+//
+// This is the one git-touching seam the accounts feature needs; it lives HERE,
+// outside internal/accounts, so that package stays pure and git-free. The
+// worktree→origin resolution LOGIC it feeds is unit-tested in internal/accounts
+// via an injected fake; this thin production glue is exercised at spawn time.
+func gitMainRepoDir(cwd string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return "", false
+	}
+	commonDir := strings.TrimSpace(string(out))
+	if commonDir == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(cwd, commonDir)
+	}
+	return filepath.Dir(filepath.Clean(commonDir)), true
+}
+
+// spawnArgvForCwd is the cwd-aware spawn argv: the configured base command
+// (spawnCommandFn), with an `env CLAUDE_CONFIG_DIR=<dir>` prefix layered on
+// when — and only when — accountConfigDirFn resolves an account for cwd. When
+// no account is bound it returns the base argv UNCHANGED, so a machine with no
+// accounts.json spawns byte-identically to before.
+//
+// # Why `env VAR=val cmd` as the uniform mechanism
+//
+// It composes across every backend regardless of whether the backend takes an
+// argv (tmux new-window, iTerm2's launch line) or a shell-quoted STRING (orca's
+// --command): `env VAR=val cmd` is valid in all of them, and shellQuoteJoin
+// passes the "CLAUDE_CONFIG_DIR=<dir>" token through intact (its characters are
+// shell-inert unless the dir contains a space, in which case the whole token is
+// quoted as one word — still correct).
+//
+// # Why argv[0] becoming "env" does NOT break actuation
+//
+// /usr/bin/env is not a launcher that lingers: it sets the variable and
+// execve's claude in place, REPLACING itself, so the running process image —
+// and therefore the pane's foreground command (tmux's #{pane_current_command},
+// ps comm) — is "claude", exactly what control.isClaudeComm matches on. This is
+// the crucial difference from a wrapper like ["mise","exec","--","claude"],
+// which internal/settings rejects precisely because mise would STAY the
+// foreground process. env does not stay, so LocateClaude/LocateByTTY still find
+// the loop. (A vanishingly short window exists between exec of env and exec of
+// claude; every spawn site already waits for the TUI to boot long after it, so
+// no locate ever observes "env".)
+func spawnArgvForCwd(cwd string) []string {
+	argv := spawnCommandFn()
+	configDir, ok := accountConfigDirFn(cwd)
+	if !ok {
+		return argv
+	}
+	return append([]string{"env", claudeConfigDirEnv + "=" + configDir}, argv...)
 }

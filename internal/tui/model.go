@@ -2406,6 +2406,13 @@ func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSp
 		// The git worktree itself failed, before any terminal was driven.
 		return spawnResultMsg{ok: false, text: fmt.Sprintf("worktree spawn failed: %v", err)}
 	}
+	// Account inheritance (multi-account Phase A): Spawn resolves the
+	// CLAUDE_CONFIG_DIR for wt.Path, and wt.Path is a git worktree of cwd's
+	// repo — so control's gitMainRepoDir maps it back to the ORIGIN repo and the
+	// new worktree inherits the origin's account binding, even though the fresh
+	// worktree path is bound to nothing itself. That is by design: we spawn into
+	// the worktree but the account follows the origin, exactly per the accounts
+	// package's worktree→main-repo resolution.
 	if err := ctrl.Spawn(wt.Path, prompt); err != nil {
 		// The checkout exists but nothing is running in it. Say exactly that,
 		// and name the path — it is the human's to reuse or remove, and a

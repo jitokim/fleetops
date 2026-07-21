@@ -273,6 +273,22 @@ const redriveTimeout = 10 * time.Minute
 // re-drop cmd.Dir — see buildRedriveCmd. An empty cwd is refused up front
 // rather than allowed to fall back to the process dir (cmd.Dir=""), which is
 // the exact broken behavior this fixes.
+//
+// # Multi-account (Phase A): deliberately NO CLAUDE_CONFIG_DIR here
+//
+// Redrive RESUMES an existing session; its account was fixed when the session
+// was first started. Prefixing it with the accounts binding's config dir would
+// let a re-drive SWITCH accounts out from under a live session, which is never
+// what a resume should do — so the account injection that spawncmd.go layers
+// onto SPAWN (spawnArgvForCwd) is intentionally absent from this path.
+//
+// There is a real Phase B nuance to revisit: a session first started under a
+// non-default CLAUDE_CONFIG_DIR may need that SAME dir set to be found on
+// resume. But the right source for that is the config dir RECORDED for the
+// session (Phase B captures it via the SessionStart hook), NOT the accounts
+// binding for cwd — the two can disagree, and a resume must honor the session's
+// own recorded account, not whatever the directory is currently bound to. Phase
+// A leaves Redrive untouched; wiring the recorded config dir is Phase B's job.
 func Redrive(cwd, sessionID, prompt string) error {
 	if cwd == "" {
 		return fmt.Errorf("claude --resume: refusing to re-drive %s with no cwd — sessions are cwd/project-scoped, so resuming from the wrong directory silently fails", sessionID)

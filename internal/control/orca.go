@@ -129,7 +129,7 @@ func (orcaController) Spawn(cwd, goal string) error {
 	// this renders to exactly "claude" — byte-identical to the literal that
 	// was here before.
 	createOut, err := exec.CommandContext(ctxCreate, "orca", "terminal", "create",
-		"--worktree", "path:"+cwd, "--command", shellQuoteJoin(spawnCommandFn()), "--title", spawnTitle, "--json").Output()
+		"--worktree", "path:"+cwd, "--command", shellQuoteJoin(spawnArgvForCwd(cwd)), "--title", spawnTitle, "--json").Output()
 	if err != nil {
 		return fmt.Errorf("orca terminal create: %w", err)
 	}
@@ -251,6 +251,14 @@ func (orcaController) SpawnWorktree(repoCwd, name, prompt string) (string, error
 	// orca flags are verified live before they are relied on. A user's
 	// configured flags therefore do not reach an orca worktree spawn; that is
 	// a known, accepted gap rather than an oversight.
+	//
+	// The multi-account CLAUDE_CONFIG_DIR prefix does not reach this path
+	// either, for the same reason: --agent names an agent KIND, not a command
+	// we can front with `env CLAUDE_CONFIG_DIR=…`. An orca-managed worktree
+	// spawn thus runs under the default account. The backend-agnostic git
+	// worktree path (spawnIntoGitWorktree → Controller.Spawn) DOES inherit the
+	// origin's account; only orca's own one-shot worktree launch is exempt.
+	// Accepted Phase A gap, flagged for Phase B.
 	out, err := exec.CommandContext(ctx, "orca", "worktree", "create",
 		"--repo", "path:"+repoCwd, "--name", name, "--agent", "claude", "--prompt", prompt, "--json").Output()
 	if err != nil {
