@@ -227,11 +227,26 @@ func spawnArgvWithConfigDir(configDir string) []string {
 	return append([]string{"env", claudeConfigDirEnv + "=" + configDir}, argv...)
 }
 
-// LoginTerminalCommand renders the shell command string that authenticates the
-// account scoped by configDir — `env CLAUDE_CONFIG_DIR=<configDir> claude
-// login`, or a bare `claude login` for the default account (configDir==""). It
-// is what the "n"-wizard's account picker hands to a TerminalOpener so the
-// human can complete the browser OAuth for an alias that is not yet logged in.
+// LoginArgv is the ONE definition of the `claude login` invocation that
+// authenticates the account scoped by configDir: `env
+// CLAUDE_CONFIG_DIR=<configDir> claude login`, or a bare `["claude", "login"]`
+// for the default account (configDir==""). It is the argv form both consumers
+// share — the TUI wizard, which flattens it to a shell string for a
+// TerminalOpener (LoginTerminalCommand), and the `fleetops accounts` CLI, which
+// runs it directly with inherited stdio. Keeping a single builder is why the
+// browser flow the two trigger can never drift on WHICH command scopes the
+// account. No token passes through here: it only names the login subcommand and
+// the config-dir path.
+func LoginArgv(configDir string) []string {
+	if configDir == "" {
+		return []string{"claude", "login"}
+	}
+	return []string{"env", claudeConfigDirEnv + "=" + configDir, "claude", "login"}
+}
+
+// LoginTerminalCommand renders LoginArgv as a shell command string for the
+// "n"-wizard's account picker, which hands it to a TerminalOpener so the human
+// can complete the browser OAuth for an alias that is not yet logged in.
 //
 // A STRING (not an argv) because that is the shape TerminalOpener.OpenTerminal
 // consumes — orca's `terminal create --command` takes a command string and
@@ -241,8 +256,5 @@ func spawnArgvWithConfigDir(configDir string) []string {
 // browser half, and the credential write into configDir, are claude's and the
 // human's — no token ever passes through here.
 func LoginTerminalCommand(configDir string) string {
-	if configDir == "" {
-		return shellQuoteJoin([]string{"claude", "login"})
-	}
-	return shellQuoteJoin([]string{"env", claudeConfigDirEnv + "=" + configDir, "claude", "login"})
+	return shellQuoteJoin(LoginArgv(configDir))
 }

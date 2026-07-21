@@ -116,6 +116,31 @@ func TestSpawnWithAccount_NonEmpty_BackendCannotPin_FailsClosed(t *testing.T) {
 	}
 }
 
+// ── LoginArgv: the ONE login invocation both consumers share ────────────────
+
+// The account-scoped form: `env CLAUDE_CONFIG_DIR=<dir> claude login` as an
+// argv, exactly what the `fleetops accounts` CLI runs directly.
+func TestLoginArgv_NonEmpty_PrefixesConfigDir(t *testing.T) {
+	got := LoginArgv("/abs/.claude-work")
+	want := []string{"env", "CLAUDE_CONFIG_DIR=/abs/.claude-work", "claude", "login"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("arg %d = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// The default account carries NO env prefix — a bare ["claude", "login"].
+func TestLoginArgv_Empty_IsBareLogin(t *testing.T) {
+	got := LoginArgv("")
+	if len(got) != 2 || got[0] != "claude" || got[1] != "login" {
+		t.Fatalf("got %v, want [claude login] (default account must not carry an env prefix)", got)
+	}
+}
+
 // ── LoginTerminalCommand: the D2 login invocation ───────────────────────────
 
 func TestLoginTerminalCommand_NonEmpty_PrefixesConfigDir(t *testing.T) {
