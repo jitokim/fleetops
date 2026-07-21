@@ -120,6 +120,18 @@ hidden             — the persisted hide-set: `d`/`x` tombstones the TUI
                      filters every scan through, so a hidden loop stays
                      hidden across restarts. Never touches ~/.claude and
                      never removes a registry record. → fsatomic.
+accounts,          — multi-account support, keyed by CLAUDE_CONFIG_DIR.
+accountstatus        accounts is pure (~/.fleetops/accounts.json: alias→
+                     config-dir plus dir→alias bindings; longest-prefix
+                     resolution, ~ expanded, absolute enforced; holds names
+                     and paths only, never a token). accountstatus is the one
+                     definition of the `claude auth status --json` probe
+                     (logged-in/email/plan), shared by the SessionStart hook
+                     and the spawn wizard so the two can't drift. Zero
+                     internal deps each. The load-bearing fact behind the
+                     feature: a session's transcript AND settings live under
+                     its own config dir, so scan reads projects/ from every
+                     alias root and hooks install into every alias dir.
 engine             — governor.Check (a pure function, domain.Loop in,
                      Decision out) plus the LoopEngine drive predicate
                      (ShouldDrive/NextWorkPrompt, §0.1) — also pure.

@@ -161,6 +161,84 @@ Two things this setting does **not** touch:
   loops you started yourself, elsewhere — and your spawn preferences have no
   business rewriting how those are driven.
 
+## Multiple Claude accounts
+
+If you run more than one Claude account — a work login and a personal one, say —
+fleetops can spawn each loop under the right account, show you which account
+every loop is on, and keep a resume on the same account it started with.
+
+The mechanism is Claude Code's own `CLAUDE_CONFIG_DIR`. Point it at a directory
+and that directory holds the whole account: its credentials, its settings, and
+its session transcripts. Two directories, two accounts, side by side. (Claude's
+docs describe macOS credentials as a single global keychain item; on the CLI
+versions this was built against, `CLAUDE_CONFIG_DIR` does scope the account —
+`CLAUDE_CONFIG_DIR=/some/empty/dir claude auth status` reports logged-out while
+the default reports your account. If a future version changes that, the
+`hooks status` / account display below will show it, rather than fleetops
+guessing.)
+
+### 1. Log each account into its own directory
+
+```bash
+CLAUDE_CONFIG_DIR="$HOME/.claude-work"     claude login   # the work account
+CLAUDE_CONFIG_DIR="$HOME/.claude-personal" claude login   # the personal account
+```
+
+Each `login` is the normal browser flow; the credentials land in that directory.
+
+### 2. Name them, and bind directories to them
+
+`~/.fleetops/accounts.json` — **aliases** give each config dir a short name, and
+**bindings** attach a directory (or repo) to an alias. A loop spawned anywhere
+under a bound path — including a git worktree derived from it — runs on that
+account, fixed.
+
+```json
+{
+  "aliases": {
+    "work":     "/Users/you/.claude-work",
+    "personal": "/Users/you/.claude-personal"
+  },
+  "bindings": [
+    { "path": "/Users/you/src/acme",     "alias": "work" },
+    { "path": "/Users/you/side-projects", "alias": "personal" }
+  ]
+}
+```
+
+Paths must be absolute (a leading `~` is expanded); anything else is rejected so
+a mistyped binding can't silently fall back to the wrong account. The longest
+matching binding wins, so a specific repo can override a broader parent. Holds
+names and paths only — never a token.
+
+### 3. Install the hooks into every account
+
+```bash
+fleetops hooks install     # installs into ~/.claude AND every alias config dir
+fleetops hooks status      # reports install + login state per account
+```
+
+This matters: a session's transcript lives under *its* `CLAUDE_CONFIG_DIR`, so
+without the hooks installed there, a loop on the `work` account would run but be
+invisible to the cockpit. `hooks status` shows each account's state so a
+"not installed in work" gap is visible, not silent.
+
+### What you get
+
+- **Spawn** (`n`): when the target directory is bound, the account is fixed and
+  shown; when it isn't, the wizard offers a one-key picker across your aliases
+  (plus the default account). Each choice shows its login state, and `l` launches
+  `claude login` for an account that isn't signed in yet.
+- **Observe**: every loop's `DETAIL` panel carries an `ACCOUNT` row with the
+  alias (and email, when available). Loops across different accounts share one
+  cockpit.
+- **Resume**: `r`/`i` re-drive a session under the account it was *recorded*
+  with, never whatever the current directory happens to be bound to — a live
+  session can't be switched onto the wrong account under you.
+
+If you never create `~/.fleetops/accounts.json`, none of this activates: one
+account, one config dir, no account row, no extra work — exactly as before.
+
 ## How it works
 
 **Observation.** `internal/claude` globs `~/.claude/projects/*/*.jsonl`, uses each
