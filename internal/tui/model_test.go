@@ -6209,9 +6209,14 @@ func TestWizard_EngineEnabled_ReachesEngineDriveStep(t *testing.T) {
 func TestUpdate_WizardEngineDrive_EKey_SubmitsBootstrap(t *testing.T) {
 	origBootstrap := bootstrapClaudeFn
 	defer func() { bootstrapClaudeFn = origBootstrap }()
-	bootstrapClaudeFn = func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	bootstrapClaudeFn = func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return []byte(`{"session_id":"s-new"}`), nil
 	}
+	// Keep account resolution hermetic (no dependence on the dev's real
+	// ~/.fleetops/accounts.json, no git subprocess): unbound → default account.
+	origLoadAccounts := loadAccountsFn
+	defer func() { loadAccountsFn = origLoadAccounts }()
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil }
 	registryDirFn = func() string { return t.TempDir() }
 	historyDirFn = func() string { return t.TempDir() }
 
@@ -7594,11 +7599,16 @@ func TestParseBootstrapSessionID_ControlCharInResult_FallsBackToRegex(t *testing
 
 // withFakeBootstrapClaude overrides bootstrapClaudeFn for the duration of
 // one test, restoring the original on cleanup.
-func withFakeBootstrapClaude(t *testing.T, fn func(ctx context.Context, cwd, prompt string) ([]byte, error)) {
+func withFakeBootstrapClaude(t *testing.T, fn func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error)) {
 	t.Helper()
 	orig := bootstrapClaudeFn
 	t.Cleanup(func() { bootstrapClaudeFn = orig })
 	bootstrapClaudeFn = fn
+	// Default the account resolution to "unbound" so bootstrap tests that don't
+	// care about accounts stay hermetic (no real accounts.json, no git).
+	origLoad := loadAccountsFn
+	t.Cleanup(func() { loadAccountsFn = origLoad })
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil }
 }
 
 func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T) {
@@ -7609,7 +7619,7 @@ func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T)
 	historyDirFn = func() string { return historyDir }
 
 	var gotCwd, gotPrompt string
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		gotCwd, gotPrompt = cwd, prompt
 		return []byte(`{"session_id":"sess-boot-1","result":"cycle 1 done","is_error":false}`), nil
 	})
@@ -7674,7 +7684,7 @@ func TestBootstrapEngineCmd_CallerDrivenFalse_StillBindsDrivenTrue(t *testing.T)
 	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
 	registryDirFn = func() string { return loopsDir }
 	historyDirFn = func() string { return t.TempDir() }
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return []byte(`{"session_id":"sess-boot-2"}`), nil
 	})
 
@@ -7696,7 +7706,7 @@ func TestBootstrapEngineCmd_ExecError_NoRecordCreated(t *testing.T) {
 	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
 	registryDirFn = func() string { return loopsDir }
 	historyDirFn = func() string { return t.TempDir() }
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return nil, errTestJudgeFailed // any non-nil error — the sentinel already used elsewhere in this file for exactly this purpose
 	})
 
@@ -7729,7 +7739,7 @@ func TestBootstrapEngineCmd_NoSessionIDInResponse_NoRecordCreated(t *testing.T) 
 	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
 	registryDirFn = func() string { return loopsDir }
 	historyDirFn = func() string { return t.TempDir() }
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return []byte(`{"result":"something went sideways","is_error":true}`), nil // no session_id at all
 	})
 
@@ -7764,7 +7774,7 @@ func TestBootstrapEngineCmd_ReusesBuildSpawnPromptVerbatim(t *testing.T) {
 	historyDirFn = func() string { return t.TempDir() }
 
 	var gotPrompt string
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		gotPrompt = prompt
 		return []byte(`{"session_id":"s1"}`), nil
 	})

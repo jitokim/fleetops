@@ -112,8 +112,10 @@ var accountConfigDirFn = defaultAccountConfigDir
 // error rather than silently resolving to "no account"), but blocking every
 // spawn tool-wide on a single JSON typo is too hostile a failure mode for the
 // only Phase A consumer, which is this optional prefix. Surfacing that
-// misconfiguration to the human belongs to Phase B's display layer, which has a
-// warning channel this spawn path does not. Flagged there.
+// misconfiguration to the human belongs to the Phase C "n"-wizard account step
+// (internal/tui's proceedFromWhere), which DOES surface a Load error as a
+// one-line "accounts.json invalid — spawning under the default account" warning
+// before it spawns — the warning channel this spawn path does not have.
 func defaultAccountConfigDir(cwd string) (configDir string, ok bool) {
 	cfg, err := accounts.Load(accounts.DefaultPath())
 	if err != nil {
