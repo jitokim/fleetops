@@ -100,21 +100,77 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("accounts: parsing %s: %w", path, err)
 	}
+	// Expand a leading "~"/"~/" to the home dir BEFORE validating, so a
+	// config written the way the design doc's own example is ("~/.claude-work")
+	// works: a "~" left literal would be shell-quoted verbatim at spawn into a
+	// bogus RELATIVE config dir (an unauthenticated session), and a "~/work"
+	// binding would never match an absolute cwd (a silent default-account
+	// spawn). Both are the exact wrong-account failures this package exists to
+	// prevent, so expansion is not a convenience — it is part of failing closed.
+	home, _ := os.UserHomeDir()
+	cfg.expandPaths(home)
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
+// expandPaths rewrites every alias config dir and binding path in place,
+// expanding a leading "~" or "~/" to home. An empty home (UserHomeDir failed)
+// leaves a "~" path untouched, which validate then rejects as non-absolute —
+// failing closed rather than expanding to a bogus root.
+func (c Config) expandPaths(home string) {
+	for name, dir := range c.Aliases {
+		c.Aliases[name] = expandTilde(dir, home)
+	}
+	for i := range c.Bindings {
+		c.Bindings[i].Path = expandTilde(c.Bindings[i].Path, home)
+	}
+}
+
+// expandTilde replaces a leading "~" (alone) or "~/" prefix with home. Any
+// other form — a bare relative path, an absolute path, "~user/…" (another
+// user's home, which this package does not resolve) — is returned unchanged and
+// left for validate to accept (absolute) or reject (still relative).
+func expandTilde(path, home string) string {
+	if home == "" || path == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
 // validate rejects a config whose binding references an alias that "aliases"
-// does not define. This is the fail-closed guarantee: a mistyped alias must
-// stop the config from loading rather than degrade to the default account.
+// does not define, OR whose alias config dir / binding path is not absolute
+// after tilde expansion. Both are the fail-closed guarantee: a mistyped alias
+// or a relative path must stop the config from loading rather than degrade to
+// the default account. A relative alias dir would be shell-quoted verbatim at
+// spawn into a bogus config dir (an unauthenticated session), and a relative
+// binding path could never match an absolute cwd — exactly the wrong-account
+// mistakes this package exists to prevent.
 func (c Config) validate() error {
+	for name, dir := range c.Aliases {
+		if dir != "" && !filepath.IsAbs(dir) {
+			return fmt.Errorf(
+				"accounts: alias %q config dir %q is not absolute — use an absolute path or a \"~\"-prefixed one (a relative config dir spawns an unauthenticated session)",
+				name, dir)
+		}
+	}
 	for _, b := range c.Bindings {
 		if _, ok := c.Aliases[b.Alias]; !ok {
 			return fmt.Errorf(
 				"accounts: binding for %q references unknown alias %q — add %q to \"aliases\" (a typo must not silently fall back to the default account)",
 				b.Path, b.Alias, b.Alias)
+		}
+		if !filepath.IsAbs(b.Path) {
+			return fmt.Errorf(
+				"accounts: binding path %q is not absolute — use an absolute path or a \"~\"-prefixed one (a relative binding never matches an absolute cwd, silently falling back to the default account)",
+				b.Path)
 		}
 	}
 	return nil
@@ -136,6 +192,14 @@ func (c Config) validate() error {
 // longest path wins (the most specific binding). Equal-length matches can only
 // arise from a duplicate path, where the FIRST in file order wins.
 func (c Config) ResolveForCwd(cwd string, mainRepoDir func(cwd string) (string, bool)) (alias, configDir string, ok bool) {
+	// No bindings ⇒ nothing can ever match, so skip mainRepoDir entirely. That
+	// call shells out to git (2s budget) in production, and running it on a
+	// zero-config machine would add a git subprocess to every spawn for no
+	// possible gain — the whole "zero-config is byte-identical and adds no
+	// subprocess" promise depends on this early exit.
+	if len(c.Bindings) == 0 {
+		return "", "", false
+	}
 	matchKey := filepath.Clean(cwd)
 	if mainRepoDir != nil {
 		if root, found := mainRepoDir(cwd); found && root != "" {

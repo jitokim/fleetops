@@ -83,7 +83,77 @@ func TestLoad_ValidConfigLoads(t *testing.T) {
 	}
 }
 
+// ── tilde expansion + absolute validation (fail closed) ────────────────────
+
+// The design doc's own example binds "~/.claude-work". A "~" must expand to the
+// home dir on load, so a "~/work" binding matches an absolute cwd and the alias
+// dir is a real absolute config dir — not a "~" shell-quoted verbatim into a
+// bogus relative path at spawn (an unauthenticated session).
+func TestLoad_TildeExpandsInAliasAndBinding(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := writeConfig(t, `{
+	  "aliases": { "company": "~/.claude-work" },
+	  "bindings": [ { "path": "~/work", "alias": "company" } ] }`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("valid ~-config errored: %v", err)
+	}
+	alias, dir, ok := cfg.ResolveForCwd(filepath.Join(home, "work", "repo"), nil)
+	if !ok || alias != "company" {
+		t.Fatalf("a ~/work binding did not match an absolute cwd: (%q,%v)", alias, ok)
+	}
+	if want := filepath.Join(home, ".claude-work"); dir != want {
+		t.Fatalf("alias dir = %q, want the home-expanded %q", dir, want)
+	}
+}
+
+// A path that is STILL relative after expansion (no leading ~) must fail the
+// load closed, not degrade to the default account.
+func TestLoad_RelativeAliasDirIsAnError(t *testing.T) {
+	path := writeConfig(t, `{ "aliases": { "company": "relative/.claude-work" } }`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("a relative alias config dir loaded without error; want fail-closed")
+	}
+	if !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("error %q does not explain the absolute-path requirement", err)
+	}
+}
+
+func TestLoad_RelativeBindingPathIsAnError(t *testing.T) {
+	path := writeConfig(t, `{
+	  "aliases": { "company": "/abs/.claude-work" },
+	  "bindings": [ { "path": "work", "alias": "company" } ] }`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("a relative binding path loaded without error; want fail-closed")
+	}
+	if !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("error %q does not explain the absolute-path requirement", err)
+	}
+}
+
 // ── ResolveForCwd ──────────────────────────────────────────────────────────
+
+// Zero-config perf: with NO bindings, ResolveForCwd must return before ever
+// touching the (git-shelling) mainRepoDir seam — otherwise every zero-config
+// spawn pays for a git subprocess it can never use.
+func TestResolveForCwd_NoBindings_SkipsGitSeam(t *testing.T) {
+	cfg := Config{Aliases: map[string]string{"company": "/abs/.claude-work"}} // no bindings
+	called := false
+	seam := func(string) (string, bool) {
+		called = true
+		return "", false
+	}
+	if _, _, ok := cfg.ResolveForCwd("/anywhere", seam); ok {
+		t.Fatal("resolved an account with no bindings; want ok=false")
+	}
+	if called {
+		t.Fatal("mainRepoDir (git) seam was called despite there being no bindings — the zero-config early exit is gone")
+	}
+}
 
 func cfgFixture() Config {
 	return Config{
