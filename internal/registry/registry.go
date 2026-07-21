@@ -76,6 +76,18 @@ type Record struct {
 	// copy-in. MarkDriven flips it later (e.g. a take-over clearing it back
 	// to false — a later slice, see the seed spec's attach-preservation AC).
 	Driven bool
+	// ConfigDir is the DURABLE CLAUDE_CONFIG_DIR (Claude account) this loop was
+	// spawned under — "" for the default account. Unlike the session-registry
+	// entry's ConfigDir (internal/sessions.SessionEntry, a live-only signal that
+	// vanishes on SessionEnd / when the headless `claude -p` process ends), this
+	// survives for the loop's whole lifetime. It is what lets an engine cycle 2+
+	// (driveCmd) and a Tier-2 resume of a DEAD alias-account loop (resumeCmd/
+	// sendPromptCmd) run under the correct account: without it, once the session
+	// entry is gone the redrive would fire with no CLAUDE_CONFIG_DIR and
+	// `claude --resume` couldn't find a session living under the alias root.
+	// Copied onto domain.Loop.Account.ConfigDir by claude.enrichFromRegistry,
+	// where it takes precedence over the transient entry (see enrichAccounts).
+	ConfigDir string
 }
 
 // recordFile is Record's on-disk JSON shape. The "oracle" JSON tag on
@@ -93,6 +105,7 @@ type recordFile struct {
 	Verdict        *verdictFile `json:"verdict,omitempty"`
 	NoImprove      int          `json:"noImprove"`
 	Driven         bool         `json:"driven,omitempty"`
+	ConfigDir      string       `json:"configDir,omitempty"`
 }
 
 // BindSpec is a loop's goal-bound contract, as collected by the wizard (the
@@ -123,6 +136,15 @@ type BindSpec struct {
 	// threads through WritePending/BindPending's existing plumbing for
 	// free without a second parallel parameter list.
 	Driven bool
+	// ConfigDir is the CLAUDE_CONFIG_DIR (Claude account) the loop was spawned
+	// under, resolved at bind time by the caller (bootstrapEngineCmd or the
+	// manual spawn wizard). "" = the default account. It is persisted onto the
+	// DURABLE record specifically so a driven/dead loop can be redriven under
+	// the right account AFTER its transient session-registry entry is gone: the
+	// session entry (internal/sessions) is deleted on SessionEnd / pruned when
+	// the pid dies, so a later engine cycle or a Tier-2 resume that sourced the
+	// account only from there would lose it. See Record.ConfigDir.
+	ConfigDir string
 }
 
 type verdictFile struct {
@@ -152,6 +174,7 @@ func Bind(dir, sessionID string, spec BindSpec) error {
 		MaxCycles:      maxCycles,
 		NoImproveLimit: DefaultNoImproveLimit,
 		Driven:         spec.Driven,
+		ConfigDir:      spec.ConfigDir,
 	})
 }
 
@@ -181,6 +204,7 @@ func recordFromFile(rf recordFile) Record {
 		NoImproveLimit: rf.NoImproveLimit,
 		NoImprove:      rf.NoImprove,
 		Driven:         rf.Driven,
+		ConfigDir:      rf.ConfigDir,
 	}
 	if rf.Verdict != nil {
 		r.Verdict = &domain.Verdict{
@@ -219,7 +243,8 @@ func SaveVerdict(dir, sessionID string, verdict domain.Verdict, atCycle int) err
 		MaxCycles:      rec.MaxCycles,
 		NoImproveLimit: rec.NoImproveLimit,
 		NoImprove:      rec.NoImprove,
-		Driven:         rec.Driven, // LoopEngine MVP: a verdict save must not silently un-drive a loop
+		Driven:         rec.Driven,    // LoopEngine MVP: a verdict save must not silently un-drive a loop
+		ConfigDir:      rec.ConfigDir, // ...nor silently drop the account: a verdict save must preserve it so later cycles still redrive on the right account
 		Verdict: &verdictFile{
 			Outcome: string(rec.Verdict.Outcome),
 			Reason:  rec.Verdict.Reason,
@@ -282,6 +307,11 @@ type PendingSpawn struct {
 	// session got matched, since BindPending rebuilds a fresh BindSpec from
 	// PendingSpawn's fields, not from the original spec.
 	Driven bool
+	// ConfigDir carries the spawn's CLAUDE_CONFIG_DIR (Claude account) through
+	// the pending→bound round trip so the manual spawn path's chosen account
+	// lands on the DURABLE record — same reason as Driven above (BindPending
+	// rebuilds BindSpec from PendingSpawn, not the original spec). "" = default.
+	ConfigDir string
 }
 
 // pendingFile is PendingSpawn's on-disk JSON shape — same "oracle" JSON
@@ -296,6 +326,7 @@ type pendingFile struct {
 	MaxCycles     int    `json:"maxCycles,omitempty"`
 	TS            int64  `json:"ts"`
 	Driven        bool   `json:"driven,omitempty"`
+	ConfigDir     string `json:"configDir,omitempty"`
 }
 
 // WritePending records a just-spawned loop's full contract (spec) under
@@ -317,6 +348,7 @@ func WritePending(dir, cwd string, spec BindSpec) error {
 		MaxCycles:     spec.MaxCycles,
 		TS:            time.Now().Unix(),
 		Driven:        spec.Driven,
+		ConfigDir:     spec.ConfigDir,
 	})
 	if err != nil {
 		return err
@@ -355,6 +387,7 @@ func listPending(dir string) map[string]PendingSpawn {
 			MaxCycles:     pf.MaxCycles,
 			TS:            time.Unix(pf.TS, 0),
 			Driven:        pf.Driven,
+			ConfigDir:     pf.ConfigDir,
 		}
 	}
 	return out
@@ -416,6 +449,7 @@ func BindPending(loopsDir, pendingDir string, loops []domain.Loop, now time.Time
 			Challenger:    p.Challenger,
 			MaxCycles:     p.MaxCycles,
 			Driven:        p.Driven,
+			ConfigDir:     p.ConfigDir,
 		}
 		if err := Bind(loopsDir, best.SessionID, spec); err != nil {
 			continue // best-effort; retry next scan

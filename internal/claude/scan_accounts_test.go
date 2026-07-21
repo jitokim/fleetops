@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/jitokim/fleetops/internal/domain"
 	"github.com/jitokim/fleetops/internal/sessions"
@@ -116,6 +117,114 @@ func TestEnrichAccounts_NoSessionEntry_LeavesZeroAccount(t *testing.T) {
 
 	if got[0].Account != (domain.Account{}) {
 		t.Errorf("Account = %+v, want the zero value for a loop with no session entry", got[0].Account)
+	}
+}
+
+// ── FINDING #1 (2nd review): durable account ConfigDir over the live entry ────
+
+// THE WEDGE this fixes: a driven loop's transient session entry is GONE (deleted
+// on SessionEnd / when the headless process ends), but the DURABLE registry
+// ConfigDir — seeded onto Account.ConfigDir by enrichFromRegistry, which runs
+// first — must survive enrichAccounts so a cycle-2 redrive still targets the
+// right account. Simulated here by pre-seeding Account.ConfigDir with NO session
+// entry present.
+func TestEnrichAccounts_DurableConfigDir_SurvivesMissingSessionEntry(t *testing.T) {
+	sessionsDir := t.TempDir() // no entry for this session — the wedge scenario
+	accountsPath := filepath.Join(t.TempDir(), "accounts.json")
+	writeAccountsConfig(t, accountsPath, "company", "/home/user/.claude-work")
+
+	loops := []domain.Loop{{SessionID: "sess-gone", Account: domain.Account{ConfigDir: "/home/user/.claude-work"}}}
+	got := enrichAccounts(loops, sessionsDir, accountsPath)
+
+	if got[0].Account.ConfigDir != "/home/user/.claude-work" {
+		t.Fatalf("ConfigDir = %q, want the durable value — a redrive after the session entry is gone would run the DEFAULT account", got[0].Account.ConfigDir)
+	}
+	if got[0].Account.Alias != "company" {
+		t.Errorf("Alias = %q, want company (resolved from the durable ConfigDir even with no live entry)", got[0].Account.Alias)
+	}
+}
+
+// When BOTH exist, the durable record ConfigDir WINS over the transient session
+// entry's — the record is the source of truth; the entry is a live-only signal.
+// Email/Plan still come from the live entry (display-only, best-effort).
+func TestEnrichAccounts_DurableConfigDir_WinsOverSessionEntry(t *testing.T) {
+	sessionsDir := t.TempDir()
+	if err := sessions.WriteSession(sessionsDir, "sess-1", sessions.SessionEntry{
+		ConfigDir:    "/home/user/.claude-personal", // a STALE/other value on the live entry
+		AccountEmail: "jito@company.com",
+		AccountPlan:  "team",
+	}); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	accountsPath := filepath.Join(t.TempDir(), "accounts.json")
+	writeAccountsConfig(t, accountsPath, "company", "/home/user/.claude-work")
+
+	loops := []domain.Loop{{SessionID: "sess-1", Account: domain.Account{ConfigDir: "/home/user/.claude-work"}}}
+	got := enrichAccounts(loops, sessionsDir, accountsPath)
+
+	if got[0].Account.ConfigDir != "/home/user/.claude-work" {
+		t.Errorf("ConfigDir = %q, want the durable record value to win over the session entry", got[0].Account.ConfigDir)
+	}
+	if got[0].Account.Alias != "company" {
+		t.Errorf("Alias = %q, want company", got[0].Account.Alias)
+	}
+	if got[0].Account.Email != "jito@company.com" {
+		t.Errorf("Email = %q, want the live entry's email (display-only, best-effort)", got[0].Account.Email)
+	}
+}
+
+// ── FINDING #4 (2nd review): collapse the same session under two roots ────────
+
+// A `cp -R ~/.claude ~/.claude-work` seeds an alias config dir that is a COPY of
+// the default one, so the identical session file exists under both roots and the
+// cross-root glob lists it TWICE. dedupBySessionID collapses it, keeping the
+// newest transcript — otherwise one session is two rows and kill/resume become
+// ambiguous.
+func TestDedupBySessionID_CollapsesCopyRoots_KeepsNewest(t *testing.T) {
+	newer := time.Now()
+	older := newer.Add(-time.Hour)
+
+	// Both orderings must land on the newer transcript (the dedup can't rely on
+	// the caller's sort).
+	cases := []struct {
+		name  string
+		loops []domain.Loop
+	}{
+		{"older first", []domain.Loop{
+			{SessionID: "sess-1", Path: "/home/user/.claude-work/projects/p/sess-1.jsonl", LastActivity: older},
+			{SessionID: "sess-1", Path: "/home/user/.claude/projects/p/sess-1.jsonl", LastActivity: newer},
+			{SessionID: "sess-2", Path: "/x/sess-2.jsonl", LastActivity: newer},
+		}},
+		{"newer first", []domain.Loop{
+			{SessionID: "sess-1", Path: "/home/user/.claude/projects/p/sess-1.jsonl", LastActivity: newer},
+			{SessionID: "sess-1", Path: "/home/user/.claude-work/projects/p/sess-1.jsonl", LastActivity: older},
+			{SessionID: "sess-2", Path: "/x/sess-2.jsonl", LastActivity: newer},
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := dedupBySessionID(c.loops)
+			if len(got) != 2 {
+				t.Fatalf("got %d loops, want 2 (the duplicate session-1 must collapse): %+v", len(got), got)
+			}
+			for _, l := range got {
+				if l.SessionID == "sess-1" && !l.LastActivity.Equal(newer) {
+					t.Errorf("kept the OLDER transcript for sess-1 (%v), want the newest (%v)", l.LastActivity, newer)
+				}
+			}
+		})
+	}
+}
+
+// A single unique session per SessionID passes through untouched — the common
+// (no copied roots) case must not be perturbed.
+func TestDedupBySessionID_NoDuplicates_Unchanged(t *testing.T) {
+	loops := []domain.Loop{
+		{SessionID: "a", LastActivity: time.Now()},
+		{SessionID: "b", LastActivity: time.Now()},
+	}
+	if got := dedupBySessionID(loops); len(got) != 2 {
+		t.Fatalf("got %d, want 2 — dedup must not drop distinct sessions", len(got))
 	}
 }
 

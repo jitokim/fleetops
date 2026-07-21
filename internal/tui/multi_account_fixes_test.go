@@ -2,6 +2,9 @@ package tui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -101,6 +104,67 @@ func TestBootstrapEngineCmd_UnboundCwd_ThreadsEmptyConfigDir(t *testing.T) {
 	}
 }
 
+// ── FINDING #1 (2nd review): the account lands on the DURABLE record ──────────
+
+// The engine path is the exact wedge: bootstrapEngineCmd Binds directly, so it
+// must write the resolved account onto the durable record — else cycle 2+
+// (driveCmd), which redrives after the transient session entry is gone, runs on
+// the default account.
+func TestBootstrapEngineCmd_PersistsConfigDirOnRecord(t *testing.T) {
+	loopsDir, historyDir := t.TempDir(), t.TempDir()
+	origRegistryDir, origHistoryDir := registryDirFn, historyDirFn
+	t.Cleanup(func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir })
+	registryDirFn = func() string { return loopsDir }
+	historyDirFn = func() string { return historyDir }
+
+	withFakeBootstrapClaude(t, func(context.Context, string, string, string) ([]byte, error) {
+		return []byte(`{"session_id":"sess-1"}`), nil
+	})
+	pinAccounts(t, accounts.Config{
+		Aliases:  map[string]string{"company": "/abs/.claude-work"},
+		Bindings: []accounts.Binding{{Path: "/repo", Alias: "company"}},
+	}, func(string) (string, bool) { return "", false }, nil)
+
+	bootstrapEngineCmd("/repo", registry.BindSpec{Goal: "g"})()
+
+	rec, ok := registry.Load(loopsDir, "sess-1")
+	if !ok {
+		t.Fatal("expected sess-1 to be bound")
+	}
+	if rec.ConfigDir != "/abs/.claude-work" {
+		t.Fatalf("durable record ConfigDir = %q, want /abs/.claude-work — cycle 2+ would redrive on the DEFAULT account", rec.ConfigDir)
+	}
+}
+
+// The manual spawn path threads the account onto the PENDING record (the next
+// scan binds it onto the durable record) — without it the same wedge hits after
+// the session entry is gone.
+func TestSpawnCmd_PersistsConfigDirOnPendingRecord(t *testing.T) {
+	home := isolateFleetopsHome(t)
+	sp := &fakeAccountWorktreeSpawner{fakeController: &fakeController{name: "tmux"}}
+	stubSpawner(t, sp, true)
+
+	if result := spawnCmd("/repo", testBindSpec(), false, "/abs/.claude-work")().(spawnResultMsg); !result.ok {
+		t.Fatalf("spawn failed: %s", result.text)
+	}
+
+	pendingDir := filepath.Join(home, ".fleetops", "pending")
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("no pending record written: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		data, _ := os.ReadFile(filepath.Join(pendingDir, e.Name()))
+		if strings.Contains(string(data), "/abs/.claude-work") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the pending record does not carry the account configDir — the durable record (and every later redrive) would default it")
+	}
+}
+
 // ── HIGH: a stale accountDecisionMsg must be discarded ────────────────────────
 
 // unboundResolvableProbe is a login probe that always reports logged-in — the
@@ -127,12 +191,14 @@ func TestAccountDecision_StaleGeneration_IsDiscarded(t *testing.T) {
 		t.Fatalf("precondition: spawnGeneration = %d, want 1", m.spawnGeneration)
 	}
 
-	// The human cancels and restarts the whole wizard: generation advances to 2.
+	// The human cancels and restarts the whole wizard. esc bumps the generation
+	// (1→2, see TestAccountDecision_EscBumpsGeneration_DiscardsInFlight) and the
+	// re-entry bumps again (2→3), so the fresh decision is gen 3.
 	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
 	m = driveToWhere(t, m)
 	m, cmd2 := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.spawnGeneration != 2 {
-		t.Fatalf("precondition: spawnGeneration = %d, want 2 after re-entry", m.spawnGeneration)
+	if m.spawnGeneration != 3 {
+		t.Fatalf("precondition: spawnGeneration = %d, want 3 after esc+re-entry", m.spawnGeneration)
 	}
 
 	// The STALE gen-1 decision lands late — it must be ignored, leaving the
@@ -146,6 +212,36 @@ func TestAccountDecision_StaleGeneration_IsDiscarded(t *testing.T) {
 	m = updateModelResult(t, m, cmd2())
 	if m.accountResolving {
 		t.Fatal("the current gen-2 accountDecisionMsg was NOT applied")
+	}
+}
+
+// NIT #6 (2nd review): esc at the account step must BUMP the generation, so an
+// account decision STILL IN FLIGHT (slow git + probes) can't land after the
+// cancel and mutate the picker fields — even when the wizard is NOT restarted.
+// Without the bump the stale gen still matches (spawnStep stays wizardAccount)
+// and applyAccountDecision would run post-cancel.
+func TestAccountDecision_EscBumpsGeneration_DiscardsInFlight(t *testing.T) {
+	pinAccounts(t, twoAliasConfig(), func(string) (string, bool) { return "", false }, unboundResolvableProbe)
+
+	m := driveToWhere(t, New())
+	m, cmd1 := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.spawnStep != wizardAccount {
+		t.Fatalf("precondition: spawnStep = %v, want wizardAccount", m.spawnStep)
+	}
+	genBefore := m.spawnGeneration
+
+	// Cancel at the account step (no wizard restart). esc must still invalidate
+	// the in-flight generation.
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.spawnGeneration == genBefore {
+		t.Fatal("esc did not bump spawnGeneration — an in-flight decision could still land post-cancel")
+	}
+
+	// The stale decision lands after esc: it must be discarded, picker fields
+	// left untouched (still nil, never populated from the aliases).
+	m = updateModelResult(t, m, cmd1())
+	if m.accountFixed || m.accountConfigDirs != nil || m.accountAliasNames != nil {
+		t.Fatal("an accountDecisionMsg landed after esc and mutated picker fields; the race guard is not airtight")
 	}
 }
 
@@ -189,19 +285,24 @@ func (f *fakeAccountWorktreeSpawner) SpawnWithConfigDir(cwd, goal, configDir str
 	return nil
 }
 
-// For a NON-default account, orca's own worktree route (which cannot carry the
-// CLAUDE_CONFIG_DIR prefix) must NOT be taken. Instead the backend-agnostic git
-// worktree path runs, spawning via SpawnWithConfigDir INTO the fresh checkout —
-// so the account is honored, not silently dropped to the default.
-func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_RoutesThroughGitWorktree(t *testing.T) {
+// FINDING #3 (2nd review, CONFIRMED LIVE): orca + a non-default account + a
+// worktree request cannot all coexist — orca's `terminal create --worktree
+// path:<p>` only accepts a worktree orca itself registered, so handing it a
+// fleetops-created checkout returns selector_not_found. The OLD fix routed this
+// through the git-worktree path (creating a checkout, then SpawnWithConfigDir
+// into it) — which strands an ORPHANED worktree orca rejects. The correct
+// behavior: create NO fleetops worktree, spawn in the bound repo dir orca DOES
+// know with the account preserved via the env prefix, and say so.
+func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_SpawnsInRepoNoWorktree(t *testing.T) {
 	isolateFleetopsHome(t)
 	orca := &fakeAccountWorktreeSpawner{
 		fakeController: &fakeController{name: "orca"},
 		worktreePath:   "/should-not-be-used",
 	}
 	stubSpawner(t, orca, true)
-	wtPath := "/repo-wt-20260722-010101"
-	gotRepoDir := stubWorktreeCreate(t, worktree.Result{Path: wtPath, Branch: "b", Base: "origin/main"}, nil)
+	// Stubbed but must NOT be called: creating a worktree here is exactly the
+	// orphaned-checkout bug this fix removes.
+	gotRepoDir := stubWorktreeCreate(t, worktree.Result{Path: "/repo-wt-should-not-exist", Branch: "b", Base: "origin/main"}, nil)
 
 	msg := spawnCmd("/repo", testBindSpec(), true, "/abs/.claude-work")()
 	result, ok := msg.(spawnResultMsg)
@@ -212,8 +313,8 @@ func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_RoutesThroughGitWorktree(t *tes
 	if orca.spawnWorktreeCalled {
 		t.Fatal("orca's native SpawnWorktree ran for a non-default account — it silently drops CLAUDE_CONFIG_DIR")
 	}
-	if *gotRepoDir != "/repo" {
-		t.Fatalf("git worktree path did not run (branched from %q, want /repo)", *gotRepoDir)
+	if *gotRepoDir != "" {
+		t.Fatalf("a fleetops worktree WAS created (branched from %q) — orca will reject it (selector_not_found), stranding an orphan", *gotRepoDir)
 	}
 	if !orca.spawnWithConfigCalled {
 		t.Fatal("SpawnWithConfigDir was never called — the account was not honored")
@@ -221,8 +322,11 @@ func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_RoutesThroughGitWorktree(t *tes
 	if orca.gotConfigDir != "/abs/.claude-work" {
 		t.Errorf("SpawnWithConfigDir configDir = %q, want /abs/.claude-work", orca.gotConfigDir)
 	}
-	if orca.gotConfigCwd != wtPath {
-		t.Errorf("SpawnWithConfigDir cwd = %q, want the fresh worktree %q", orca.gotConfigCwd, wtPath)
+	if orca.gotConfigCwd != "/repo" {
+		t.Errorf("SpawnWithConfigDir cwd = %q, want the bound repo dir /repo (NOT a worktree)", orca.gotConfigCwd)
+	}
+	if !strings.Contains(result.text, "no separate checkout") || !strings.Contains(result.text, "/abs/.claude-work") {
+		t.Errorf("status %q must tell the human isolation was forfeited AND name the account", result.text)
 	}
 }
 

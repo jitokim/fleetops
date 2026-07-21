@@ -151,6 +151,11 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].LastActivity.After(loops[j].LastActivity)
 	})
+	// Collapse the same session appearing under two roots (an alias config dir
+	// that is a copy/symlink of ~/.claude) BEFORE any per-loop enrichment or
+	// display — otherwise one session becomes two rows and kill/resume go
+	// ambiguous. See dedupBySessionID.
+	loops = dedupBySessionID(loops)
 
 	historyDir := events.HistoryDir()
 	loopsDir := registry.LoopsDir()
@@ -171,6 +176,33 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	pruneMetricsCache(keep)
 
 	return loops, nil
+}
+
+// dedupBySessionID collapses loops that share a SessionID but live under
+// different transcript roots — the case where an alias config dir is a COPY (or
+// symlink) of ~/.claude, e.g. `cp -R ~/.claude ~/.claude-work`: the identical
+// session file then exists under both roots, so the cross-root glob in
+// DiscoverLoops lists it twice. Left unmerged the same session renders as two
+// rows and a kill/resume can't tell which is "the" one. Keeps the newest
+// transcript per SessionID (latest LastActivity — the copy still being written,
+// if either is), preserving the caller's existing order. A pure path-string
+// root dedup (projectsRootsFrom) cannot catch this: a copy is a genuinely
+// different path, not a symlink EvalSymlinks would fold — deduping on the
+// SessionID the transcripts actually share is the robust cut.
+func dedupBySessionID(loops []domain.Loop) []domain.Loop {
+	slotFor := make(map[string]int, len(loops)) // SessionID → index in out
+	out := make([]domain.Loop, 0, len(loops))
+	for _, l := range loops {
+		if idx, seen := slotFor[l.SessionID]; seen {
+			if l.LastActivity.After(out[idx].LastActivity) {
+				out[idx] = l // a newer copy of the same session wins its slot
+			}
+			continue
+		}
+		slotFor[l.SessionID] = len(out)
+		out = append(out, l)
+	}
+	return out
 }
 
 // enrichFromRegistry attaches goal-bound metadata (Name, Goal.Text/MaxCycles/
@@ -213,6 +245,14 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		// (false) — exactly right, since it was never handed to the engine.
 		loops[i].Driven = rec.Driven
 
+		// Seed the DURABLE account config dir from the record (enrichAccounts,
+		// which runs next, prefers this over the transient session entry — the
+		// entry is a live-only signal that vanishes when the headless process
+		// ends, wedging cycle 2+ / dead-loop resume otherwise). "" for a record
+		// predating this field or a default-account loop; enrichAccounts then
+		// falls back to the entry, preserving pre-ConfigDir loops' behavior.
+		loops[i].Account.ConfigDir = rec.ConfigDir
+
 		// A live gate always wins over a stale verdict: the loop is blocked
 		// on a human decision RIGHT NOW, which is more urgent and more
 		// current than a judgment rendered against an earlier cycle's
@@ -235,58 +275,70 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 	return loops
 }
 
-// enrichAccounts attaches multi-account Phase B's display metadata
-// (domain.Loop.Account) from the session-identity registry
-// (internal/sessions, written by the SessionStart hook) onto each loop that
-// has a matching entry. An observed loop the hook never ran for (or whose
-// entry predates this field) is left with the zero Account — Account.Label()
-// renders that as "", so it is indistinguishable from "no account feature at
-// all" anywhere this is displayed.
+// enrichAccounts attaches multi-account Phase B's account metadata
+// (domain.Loop.Account) onto each loop, from TWO sources with a deliberate
+// precedence:
+//
+//   - ConfigDir (the load-bearing field a redrive acts on) comes from the
+//     DURABLE registry record when present — seeded onto loops[i].Account.
+//     ConfigDir by enrichFromRegistry, which runs first. This is what survives
+//     after a loop's transient session-registry entry is gone (deleted on
+//     SessionEnd / pruned when the headless `claude -p` process ends), so an
+//     engine cycle 2+ or a Tier-2 resume of a dead alias-account loop still
+//     redrives on the RIGHT account instead of wedging under no config dir.
+//     Only when the record has none (a loop predating registry.Record.ConfigDir,
+//     or one never spawned via fleetops) does it fall back to the live session
+//     entry's ConfigDir.
+//   - Alias/Email/Plan are DISPLAY-only. Alias is resolved from the effective
+//     ConfigDir; Email/Plan are live-only, taken from the session entry when it
+//     still exists (best-effort, "" otherwise).
+//
+// A loop with neither a record ConfigDir nor a session entry is left with the
+// zero Account — Account.Label() renders that as "", indistinguishable from
+// "no account feature at all", the zero-config posture.
 //
 // Both the session registry and the accounts config are read ONCE per scan,
-// not once per loop: sessions.ListSessions already reads its whole directory
-// in one pass, and accounts.Load parses one small JSON file — re-loading
-// either per loop would multiply disk I/O across a fleet with no benefit,
-// since neither changes mid-scan.
+// not once per loop: sessions.ListSessions reads its whole directory in one
+// pass, and accounts.Load parses one small JSON file — neither changes
+// mid-scan.
 //
-// A malformed accounts.json (Load's error case — a binding naming an unknown
-// alias, or unparseable JSON) is treated as INACTIVE here, exactly like
-// control.defaultAccountConfigDir's own precedent for the same file: this is
-// a DISPLAY enrichment, not the fail-closed control-path guarantee
-// internal/accounts.Load itself upholds, and blocking every loop's alias
-// label on one JSON typo would be a worse failure mode than simply showing
-// no alias (the loop's raw ConfigDir/Email still render via Account.Label's
-// fallback chain).
+// A malformed accounts.json (Load's error case) is treated as INACTIVE here,
+// exactly like control.defaultAccountConfigDir's own precedent for the same
+// file: this is a DISPLAY enrichment, not the fail-closed control-path
+// guarantee internal/accounts.Load itself upholds, and blocking every loop's
+// alias label on one JSON typo would be a worse failure mode than simply
+// showing no alias (the loop's raw ConfigDir/Email still render via
+// Account.Label's fallback chain).
 func enrichAccounts(loops []domain.Loop, sessionsDir, accountsPath string) []domain.Loop {
 	entries := sessions.ListSessions(sessionsDir)
-	if len(entries) == 0 {
-		return loops
-	}
 	cfg, err := accounts.Load(accountsPath)
 	if err != nil {
 		cfg = accounts.Config{}
 	}
 	for i := range loops {
-		entry, ok := entries[loops[i].SessionID]
-		if !ok {
-			continue
+		entry, hasEntry := entries[loops[i].SessionID]
+
+		// Durable record ConfigDir (seeded by enrichFromRegistry) wins over the
+		// transient session entry — see this function's doc.
+		configDir := loops[i].Account.ConfigDir
+		if configDir == "" && hasEntry {
+			configDir = entry.ConfigDir
 		}
+
 		var alias string
-		if entry.ConfigDir != "" {
-			// Guarded on a non-empty ConfigDir rather than calling
-			// AliasForConfigDir("") unconditionally: an empty ConfigDir is the
-			// default account by definition (domain.Account.IsDefault), and
-			// Account.Label() already refuses to show an alias for it
-			// defensively — resolving one here would just be wasted work
-			// chasing a value that can never be displayed.
-			alias, _ = cfg.AliasForConfigDir(entry.ConfigDir)
+		if configDir != "" {
+			// Guarded on a non-empty ConfigDir: an empty one is the default
+			// account by definition (domain.Account.IsDefault), and
+			// Account.Label() refuses to show an alias for it defensively —
+			// resolving one here would be wasted work on a never-displayed value.
+			alias, _ = cfg.AliasForConfigDir(configDir)
 		}
-		loops[i].Account = domain.Account{
-			ConfigDir: entry.ConfigDir,
-			Alias:     alias,
-			Email:     entry.AccountEmail,
-			Plan:      entry.AccountPlan,
+		acct := domain.Account{ConfigDir: configDir, Alias: alias}
+		if hasEntry {
+			acct.Email = entry.AccountEmail
+			acct.Plan = entry.AccountPlan
 		}
+		loops[i].Account = acct
 	}
 	return loops
 }

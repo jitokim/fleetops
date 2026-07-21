@@ -68,6 +68,82 @@ func TestUninstallHooksAt_ReversesInstall(t *testing.T) {
 	}
 }
 
+// ── FINDING #2 (2nd review): a bad dir must not stop the others ───────────────
+
+// installHooksAllAt must CONTINUE past a per-dir failure (a hand-broken
+// settings.json in one alias) so every OTHER dir still gets hooks — the "each
+// dir independent" contract. The prior os.Exit(1)-on-first-error left every
+// alias after the broken one without hooks (recording nothing).
+func TestInstallHooksAllAt_OneBadDirDoesNotStopOthers(t *testing.T) {
+	exe := "/usr/local/bin/fleetops"
+	good1 := filepath.Join(t.TempDir(), "settings.json")
+	bad := filepath.Join(t.TempDir(), "settings.json")
+	good2 := filepath.Join(t.TempDir(), "settings.json")
+	// A hand-broken settings.json in the MIDDLE dir — loadSettings can't parse it.
+	if err := os.WriteFile(bad, []byte("{ this is not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	results := installHooksAllAt([]hooks.ConfigDirLocation{
+		{Label: "default", Path: good1},
+		{Label: "company", Path: bad},
+		{Label: "personal", Path: good2},
+	}, exe)
+
+	if len(results) != 3 {
+		t.Fatalf("got %d results, want 3 — the loop aborted early instead of visiting every dir", len(results))
+	}
+	if results[0].err != nil || len(results[0].installed) == 0 {
+		t.Errorf("first dir should have installed cleanly: %+v", results[0])
+	}
+	if results[1].err == nil {
+		t.Error("the broken middle dir should have reported an error")
+	}
+	// The load-bearing assertion: the dir AFTER the broken one still installed.
+	if results[2].err != nil || len(results[2].installed) == 0 {
+		t.Errorf("the dir after the broken one must still install — the loop must not abort on the first error: %+v", results[2])
+	}
+	if report := hooks.HealthAt(good2, func(string) bool { return true }); !report.OK {
+		t.Error("hooks did not actually land in the dir after the broken one")
+	}
+}
+
+// uninstallHooksAllAt has the same each-dir-independent contract: a broken
+// settings.json in one alias must not strand stale hooks in every other alias.
+func TestUninstallHooksAllAt_OneBadDirDoesNotStopOthers(t *testing.T) {
+	exe := "/usr/local/bin/fleetops"
+	good1 := filepath.Join(t.TempDir(), "settings.json")
+	bad := filepath.Join(t.TempDir(), "settings.json")
+	good2 := filepath.Join(t.TempDir(), "settings.json")
+	for _, p := range []string{good1, good2} {
+		if _, err := installHooksAt(p, exe); err != nil {
+			t.Fatalf("seed install %s: %v", p, err)
+		}
+	}
+	if err := os.WriteFile(bad, []byte("{ broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	results := uninstallHooksAllAt([]hooks.ConfigDirLocation{
+		{Label: "default", Path: good1},
+		{Label: "company", Path: bad},
+		{Label: "personal", Path: good2},
+	})
+
+	if len(results) != 3 {
+		t.Fatalf("got %d results, want 3 — the loop aborted early", len(results))
+	}
+	if !results[0].changed {
+		t.Error("first dir should have had hooks removed")
+	}
+	if results[1].err == nil {
+		t.Error("the broken middle dir should have reported an error")
+	}
+	if !results[2].changed || results[2].err != nil {
+		t.Errorf("the dir after the broken one must still be uninstalled: %+v", results[2])
+	}
+}
+
 // formatMultiHookStatus must render one legible section PER config dir, so a
 // per-alias gap ("company: missing") is visible rather than silent.
 func TestFormatMultiHookStatus_PerDirSections(t *testing.T) {

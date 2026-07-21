@@ -260,6 +260,32 @@ func installHooksAt(path, exe string) ([]string, error) {
 	return installed, nil
 }
 
+// hookDirResult is one config dir's install/uninstall outcome. Collected across
+// ALL dirs so a per-dir failure (e.g. a hand-broken settings.json in one alias)
+// is reported without aborting the rest — the "each dir independent" contract
+// installHooks/uninstallHooks document. err != "" ⇒ that dir failed; the driver
+// exits non-zero at the end if any did.
+type hookDirResult struct {
+	loc       hooks.ConfigDirLocation
+	installed []string // events newly installed (install path); empty ⇒ already installed
+	changed   bool     // whether uninstall removed anything (uninstall path)
+	err       error    // per-dir failure — collected, never aborts the others
+}
+
+// installHooksAllAt installs into every location, CONTINUING past a per-dir
+// error rather than aborting: a broken settings.json in one alias must not leave
+// every subsequent alias without hooks. Pure (no os.Exit / process state) so a
+// test can prove one bad dir doesn't stop the others. The driver (installHooks)
+// prints and decides the exit code from the returned results.
+func installHooksAllAt(locations []hooks.ConfigDirLocation, exe string) []hookDirResult {
+	results := make([]hookDirResult, 0, len(locations))
+	for _, loc := range locations {
+		installed, err := installHooksAt(loc.Path, exe)
+		results = append(results, hookDirResult{loc: loc, installed: installed, err: err})
+	}
+	return results
+}
+
 func installHooks() {
 	exe, err := os.Executable()
 	if err != nil {
@@ -275,23 +301,26 @@ func installHooks() {
 	// Install into every account's config dir (default + each alias), so a loop
 	// spawned under a non-default account fires our hooks too. Each dir is
 	// independent; a failure in one is reported but does not abort the rest.
-	anyInstalled := false
-	for _, loc := range locations {
-		installed, err := installHooksAt(loc.Path, exe)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "fleetops hooks install [%s]: %v\n", loc.Label, err)
-			os.Exit(1)
+	anyInstalled, anyFailed := false, false
+	for _, r := range installHooksAllAt(locations, exe) {
+		if r.err != nil {
+			anyFailed = true
+			fmt.Fprintf(os.Stderr, "fleetops hooks install [%s]: %v\n", r.loc.Label, r.err)
+			continue
 		}
-		if len(installed) == 0 {
-			fmt.Printf("[%s] already installed (%s)\n", loc.Label, loc.Path)
+		if len(r.installed) == 0 {
+			fmt.Printf("[%s] already installed (%s)\n", r.loc.Label, r.loc.Path)
 			continue
 		}
 		anyInstalled = true
 		fmt.Printf("[%s] installed hooks: %s (%s)\n(backup: %s.bak-fleetops)\n",
-			loc.Label, strings.Join(installed, ", "), loc.Path, loc.Path)
+			r.loc.Label, strings.Join(r.installed, ", "), r.loc.Path, r.loc.Path)
 	}
-	if !anyInstalled {
+	if !anyInstalled && !anyFailed {
 		fmt.Println("all config dirs already installed")
+	}
+	if anyFailed {
+		os.Exit(1)
 	}
 }
 
@@ -320,6 +349,22 @@ func uninstallHooksAt(path string) (bool, error) {
 	return true, nil
 }
 
+// uninstallHooksAllAt removes from every location, CONTINUING past a per-dir
+// error (same "each dir independent" contract as installHooksAllAt): a broken
+// settings.json in one alias must not leave stale hooks in every other alias.
+// Note (#5/#7): uninstall only reverses config dirs STILL listed in
+// accounts.json — an alias removed from accounts.json AFTER install keeps its
+// hooks, since hookLocations no longer enumerates it. `hooks status` on the
+// still-listed dirs won't reveal that orphan either. Documented, not fixed here.
+func uninstallHooksAllAt(locations []hooks.ConfigDirLocation) []hookDirResult {
+	results := make([]hookDirResult, 0, len(locations))
+	for _, loc := range locations {
+		changed, err := uninstallHooksAt(loc.Path)
+		results = append(results, hookDirResult{loc: loc, changed: changed, err: err})
+	}
+	return results
+}
+
 func uninstallHooks() {
 	locations, err := hookLocations()
 	if err != nil {
@@ -329,22 +374,25 @@ func uninstallHooks() {
 
 	// Remove from every account's config dir, so `uninstall` fully reverses
 	// `install` and never leaves a stale hook behind in an alias dir.
-	anyChanged := false
-	for _, loc := range locations {
-		changed, err := uninstallHooksAt(loc.Path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "fleetops hooks uninstall [%s]: %v\n", loc.Label, err)
-			os.Exit(1)
+	anyChanged, anyFailed := false, false
+	for _, r := range uninstallHooksAllAt(locations) {
+		if r.err != nil {
+			anyFailed = true
+			fmt.Fprintf(os.Stderr, "fleetops hooks uninstall [%s]: %v\n", r.loc.Label, r.err)
+			continue
 		}
-		if !changed {
-			fmt.Printf("[%s] not installed (%s)\n", loc.Label, loc.Path)
+		if !r.changed {
+			fmt.Printf("[%s] not installed (%s)\n", r.loc.Label, r.loc.Path)
 			continue
 		}
 		anyChanged = true
-		fmt.Printf("[%s] uninstalled fleetops's hooks (%s)\n(backup: %s.bak-fleetops)\n", loc.Label, loc.Path, loc.Path)
+		fmt.Printf("[%s] uninstalled fleetops's hooks (%s)\n(backup: %s.bak-fleetops)\n", r.loc.Label, r.loc.Path, r.loc.Path)
 	}
-	if !anyChanged {
+	if !anyChanged && !anyFailed {
 		fmt.Println("not installed in any config dir")
+	}
+	if anyFailed {
+		os.Exit(1)
 	}
 }
 

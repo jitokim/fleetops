@@ -267,6 +267,76 @@ func TestSaveVerdict_PreservesDriven(t *testing.T) {
 	}
 }
 
+// ── FINDING #1 (2nd review): durable account ConfigDir on the record ─────────
+
+// The wedge this fixes: a driven loop's transient session-registry entry is
+// gone after cycle 1's headless process ends, so the account must live on the
+// DURABLE record or cycle 2+ redrives on the wrong (default) account.
+func TestBind_ConfigDir_RoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal", ConfigDir: "/abs/.claude-work"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	rec, ok := Load(dir, "sess-1")
+	if !ok {
+		t.Fatal("expected a record to load")
+	}
+	if rec.ConfigDir != "/abs/.claude-work" {
+		t.Errorf("ConfigDir = %q, want /abs/.claude-work — the durable account must round-trip", rec.ConfigDir)
+	}
+}
+
+// A BindSpec that never mentions ConfigDir (default account) produces a "" —
+// the zero-config posture, byte-identical to before this field.
+func TestBind_ConfigDirOmitted_DefaultsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if rec, _ := Load(dir, "sess-1"); rec.ConfigDir != "" {
+		t.Errorf("ConfigDir = %q, want \"\" for a default-account bind", rec.ConfigDir)
+	}
+}
+
+// The load-mutate-write hazard: SaveVerdict rebuilds the record from Record, so
+// it must carry ConfigDir forward — otherwise the FIRST oracle judgment silently
+// un-accounts the loop and every later redrive runs on the default account.
+func TestSaveVerdict_PreservesConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal", ConfigDir: "/abs/.claude-work"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := SaveVerdict(dir, "sess-1", domain.Verdict{Outcome: domain.OutcomeProgress}, 1); err != nil {
+		t.Fatalf("SaveVerdict: %v", err)
+	}
+	if rec, _ := Load(dir, "sess-1"); rec.ConfigDir != "/abs/.claude-work" {
+		t.Errorf("ConfigDir = %q after SaveVerdict, want it preserved", rec.ConfigDir)
+	}
+}
+
+// The manual spawn path threads the account through the pending round trip
+// (WritePending → BindPending → Bind), so it must survive onto the durable
+// record — same plumbing check as Driven's own round-trip test.
+func TestWritePending_BindPending_ConfigDirSurvivesRoundTrip(t *testing.T) {
+	loopsDir, pendingDir, historyDir := t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Now()
+	if err := WritePending(pendingDir, "/x/myproject", BindSpec{Goal: "fix it", ConfigDir: "/abs/.claude-work"}); err != nil {
+		t.Fatalf("WritePending: %v", err)
+	}
+	loops := []domain.Loop{
+		{SessionID: "sess-1", ProjectDir: domain.EncodeCwd("/x/myproject"), LastActivity: now.Add(time.Minute)},
+	}
+	BindPending(loopsDir, pendingDir, loops, now, historyDir)
+
+	rec, ok := Load(loopsDir, "sess-1")
+	if !ok {
+		t.Fatal("expected sess-1 to be bound")
+	}
+	if rec.ConfigDir != "/abs/.claude-work" {
+		t.Errorf("ConfigDir = %q after BindPending, want it carried through the pending round trip", rec.ConfigDir)
+	}
+}
+
 func TestMarkDriven_SetsAndClearsFlag(t *testing.T) {
 	dir := t.TempDir()
 	if err := Bind(dir, "sess-1", BindSpec{Goal: "goal"}); err != nil {

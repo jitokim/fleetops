@@ -2454,6 +2454,13 @@ func (m Model) handleAccountStepKey(key string) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		m.input.Blur()
 		m.accountLoginPrompt = false
+		// Bump the generation so an account decision STILL IN FLIGHT (the git +
+		// per-alias probes are slow) can't land after this cancel and mutate the
+		// picker fields (accountFixed/accountConfigDirs/…) post-esc — the
+		// accountDecisionMsg guard discards any generation != current. Benign
+		// today (mode is normal so nothing acts on those fields), but keeps the
+		// race guard airtight against a future reader.
+		m.spawnGeneration++
 		m.status, m.statusKind = "cancelled", statusNeutral
 		return m, nil
 	}
@@ -2688,6 +2695,11 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // failure.
 func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool, configDir string) tea.Cmd {
 	return func() tea.Msg {
+		// Persist the chosen account onto the DURABLE record (via the pending
+		// round trip): without this, a redrive after the loop's transient
+		// session-registry entry is gone would fire on the wrong account. "" =
+		// default, byte-identical to before. See registry.BindSpec.ConfigDir.
+		spec.ConfigDir = configDir
 		// resolveSpawnerFn, not controlResolveFn: spawn is the one operation
 		// a host terminal can perform without being a multiplexer, so it
 		// resolves over the wider Spawner seam (multiplexers first, then
@@ -2702,18 +2714,26 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool, configDir st
 		}
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 
-		// orca's OWN `worktree create --agent` cannot take the
-		// `env CLAUDE_CONFIG_DIR=…` account prefix (--agent names an agent KIND,
-		// not a command to front — see orca.go's SpawnWorktree doc). So for a
-		// NON-default account (configDir != "") we deliberately DO NOT take
-		// orca's native path — it would silently run the default account. We
-		// fall through instead to the backend-agnostic git-worktree path below,
-		// which spawns via SpawnWithAccount and DOES honour the config dir. The
-		// orca-managed path stays for the default account only, where it has no
-		// account to lose and keeps its Orca-UI advantage.
-		if spawner, supports := ctrl.(control.WorktreeSpawner); useWorktree && supports && configDir == "" {
+		// orca (the only WorktreeSpawner) worktree requests split on the account:
+		//
+		//   - DEFAULT account (configDir == ""): orca's native `worktree create
+		//     --agent`, which carries no env prefix but needs none. Unchanged.
+		//   - NON-default account (configDir != ""): all three of orca + a chosen
+		//     account + an isolated worktree cannot coexist. orca's `terminal
+		//     create --worktree path:<p>` only accepts a worktree ORCA itself
+		//     registered — handing it a fleetops-created checkout returns
+		//     selector_not_found (verified live). Creating one and routing it
+		//     through SpawnWithAccount would strand an orphaned checkout orca
+		//     rejects. So we spawn in the bound repo dir orca DOES know, with the
+		//     account preserved via the env prefix, and tell the human isolation
+		//     was forfeited (spawnOrcaAccountNoWorktree). The account — the whole
+		//     point of the feature — is kept; the worktree is honestly dropped.
+		if wtSpawner, supports := ctrl.(control.WorktreeSpawner); useWorktree && supports {
+			if configDir != "" {
+				return spawnOrcaAccountNoWorktree(ctrl, cwd, spec, prompt, configDir)
+			}
 			name := worktreeNameFromGoal(spec.Goal)
-			worktreePath, err := spawner.SpawnWorktree(cwd, name, prompt)
+			worktreePath, err := wtSpawner.SpawnWorktree(cwd, name, prompt)
 			if err != nil {
 				// The backend's own worktree spawn. Its error may or may not
 				// mean a window was created, so it is classified rather than
@@ -2760,18 +2780,45 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool, configDir st
 	}
 }
 
+// spawnOrcaAccountNoWorktree handles the one combination orca cannot serve:
+// orca + a non-default account + a worktree request. orca's `terminal create
+// --worktree path:<p>` only accepts a worktree orca itself registered, so a
+// fleetops-created checkout comes back selector_not_found (verified live) — and
+// creating one anyway would strand an orphaned checkout. Instead it spawns in
+// the bound repo dir (cwd), which orca DOES know, with the account preserved via
+// SpawnWithAccount's env prefix, and reports plainly that no isolated checkout
+// was made. Account kept (the feature's point); isolation honestly forfeited.
+//
+// spec.ConfigDir is already set (spawnCmd's closure head), so the pending record
+// this writes carries the account onto the durable record like every other path.
+func spawnOrcaAccountNoWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt, configDir string) tea.Msg {
+	if err := control.SpawnWithAccount(ctrl, cwd, prompt, configDir); err != nil {
+		return spawnResultMsg{ok: false, text: spawnFailureText(err), mayHaveSpawned: spawnMayHaveLandedWindow(err)}
+	}
+	forfeit := fmt.Sprintf("spawned in %s under account %s via %s — orca can't isolate a worktree under a non-default account, so no separate checkout",
+		cwd, configDir, ctrl.Name())
+	if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
+		// best-effort, same posture as the plain-spawn path: the loop really did
+		// start, it just won't get ORACLE/N-I tracking.
+		return spawnResultMsg{ok: true, text: fmt.Sprintf("%s (goal not recorded: %v)", forfeit, err)}
+	}
+	return spawnResultMsg{ok: true, text: forfeit}
+}
+
 // spawnIntoGitWorktree is spawnCmd's BACKEND-AGNOSTIC worktree branch: it
 // creates a real git worktree itself (internal/worktree — plain `git worktree
 // add`, branched from an explicit origin/<default-branch>) and then runs the
 // ordinary Controller.Spawn INTO that fresh directory.
 //
 // This is what makes worktree isolation available on every backend rather than
-// only on orca. It is reached only when the resolved controller does NOT
-// implement control.WorktreeSpawner — orca still takes its own one-shot
-// `worktree create --agent` path above, unchanged. Keeping orca's route intact
-// is deliberate: its worktrees are Orca-managed and show up in Orca's own UI,
-// which is a real advantage for an orca user, and demoting that path is a
-// separate decision nobody has made.
+// only on orca. It is reached only for backends that do NOT implement
+// control.WorktreeSpawner (tmux/cmux/iTerm2) — which honor the env prefix on a
+// fresh checkout — for EITHER account. orca never reaches here: its default-
+// account worktree takes orca's own `worktree create --agent` path, and its
+// non-default-account worktree is redirected to spawnOrcaAccountNoWorktree
+// (orca rejects a fleetops-created worktree — see there). Keeping orca's native
+// route intact for the default account is deliberate: its worktrees are Orca-
+// managed and show up in Orca's own UI, a real advantage for an orca user.
 //
 // Failure is REPORTED, never silently downgraded to a plain current-dir spawn.
 // The human explicitly asked for isolation; quietly spawning into the repo they
@@ -2847,6 +2894,15 @@ func staleBaseNote(wt worktree.Result) string {
 // or [e]. Returns "" (default account) whenever accounts.json is absent/
 // malformed or cwd is unbound: a Load error must never wedge the engine-drive
 // spawn, just fall back to the default account as Phase A's spawn path does.
+//
+// KNOWN GAP (#5/#7): on an UNBOUND cwd that nonetheless has aliases configured,
+// this silently defaults to the default account — the engine-drive path has no
+// interactive account picker, unlike the manual spawn wizard (proceedFromWhere →
+// wizardAccount) which would prompt. So [e] engine-drive on an unbound dir can
+// only ever run the default account today; pick the account by binding the dir
+// (or spawn manually) if a non-default one is wanted. Deliberate for now, not a
+// silent wrong-account bug: a bound cwd — the case that matters for accounts —
+// is always honored.
 func bootstrapConfigDirForCwd(cwd string) string {
 	cfg, err := loadAccountsFn()
 	if err != nil {
@@ -2972,6 +3028,10 @@ func bootstrapEngineCmd(cwd string, spec registry.BindSpec) tea.Cmd {
 		// An unbound cwd (or any resolve failure) yields "" — the default
 		// account, byte-identical to before.
 		configDir := bootstrapConfigDirForCwd(cwd)
+		// Persist it onto the DURABLE record too, so engine cycle 2+ (driveCmd)
+		// redrives on the SAME account — the session-registry entry it would
+		// otherwise source from is gone once cycle 1's headless process ends.
+		spec.ConfigDir = configDir
 
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapTimeout)
 		defer cancel()
