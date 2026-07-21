@@ -20,7 +20,17 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"time"
 )
+
+// waitDelay bounds how long Wait blocks AFTER ctx's deadline fires before the
+// child's I/O pipes are force-closed. Without it, a lingering grandchild that
+// inherited the stdout pipe (a background helper claude spawned) keeps the pipe
+// open and blocks cmd.Wait indefinitely PAST the 2s ctx cancel — and Query runs
+// inside the SessionStart hook, so that hang delays session start. Matched to
+// the same 2s the callers give ctx: once the deadline is blown, do not wait
+// another moment on a pipe no one is going to close.
+const waitDelay = 2 * time.Second
 
 // configDirEnv scopes which Claude account the probe observes — the same
 // variable fleetops injects at spawn (internal/control's claudeConfigDirEnv).
@@ -43,11 +53,7 @@ type Status struct {
 // treats a failed probe identically to "nothing to show", never as an error
 // worth surfacing: this is best-effort display metadata, never load-bearing.
 func Query(ctx context.Context, configDir string) (Status, bool) {
-	cmd := exec.CommandContext(ctx, "claude", "auth", "status", "--json")
-	if configDir != "" {
-		cmd.Env = append(os.Environ(), configDirEnv+"="+configDir)
-	}
-	out, err := cmd.Output()
+	out, err := buildQueryCmd(ctx, configDir).Output()
 	if err != nil {
 		return Status{}, false
 	}
@@ -56,4 +62,18 @@ func Query(ctx context.Context, configDir string) (Status, bool) {
 		return Status{}, false
 	}
 	return st, true
+}
+
+// buildQueryCmd assembles the `claude auth status --json` probe with configDir
+// scoping (CLAUDE_CONFIG_DIR) and — critically — a WaitDelay so a wedged child
+// cannot outlive ctx. Split out from Query as a testable seam: a unit test can
+// assert the WaitDelay and env WITHOUT spawning a real claude, since the pipe-
+// hang it guards against is otherwise invisible until it strands a session.
+func buildQueryCmd(ctx context.Context, configDir string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "claude", "auth", "status", "--json")
+	if configDir != "" {
+		cmd.Env = append(os.Environ(), configDirEnv+"="+configDir)
+	}
+	cmd.WaitDelay = waitDelay
+	return cmd
 }
