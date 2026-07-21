@@ -208,8 +208,22 @@ func (d *Document) RemoveAlias(alias string, force bool) error {
 // BindingsForAlias returns the paths currently bound to alias, in file order —
 // what RemoveAlias reports as blockers and what `list` groups under each alias.
 func (d *Document) BindingsForAlias(alias string) []string {
+	return bindingPathsFor(d.Bindings, alias)
+}
+
+// BindingsForAlias returns the paths a resolved Config binds to alias, in file
+// order — the read-side twin of Document.BindingsForAlias, so the `list`
+// surface groups bindings under each alias without re-implementing the filter.
+func (c Config) BindingsForAlias(alias string) []string {
+	return bindingPathsFor(c.Bindings, alias)
+}
+
+// bindingPathsFor is the single filter both BindingsForAlias methods share:
+// the paths of every binding naming alias, in slice order. Extracted so the
+// Config and Document twins cannot drift on what "bound to this alias" means.
+func bindingPathsFor(bindings []Binding, alias string) []string {
 	var paths []string
-	for _, b := range d.Bindings {
+	for _, b := range bindings {
 		if b.Alias == alias {
 			paths = append(paths, b.Path)
 		}
@@ -223,6 +237,13 @@ func (d *Document) BindingsForAlias(alias string) []string {
 // never leave a file Load would reject. The write is fsatomic (sibling temp +
 // rename), so a reader — or a crash mid-write — sees either the old file or the
 // new one, never a torn mix.
+//
+// Preservation is TOP-LEVEL only: an unknown key beside "aliases"/"bindings"
+// round-trips via d.other, but "aliases" and "bindings" are re-serialized from
+// the typed fields, so an unknown key added INSIDE an individual binding object
+// (a future per-binding note, say) would not survive a Save. Binding has only
+// {path, alias} everywhere in the codebase today; this is a known limitation to
+// revisit if per-binding metadata is ever introduced.
 func (d *Document) Save() error {
 	if err := d.expandedConfig().validate(); err != nil {
 		return err

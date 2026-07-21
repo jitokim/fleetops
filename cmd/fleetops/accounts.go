@@ -325,7 +325,7 @@ func listAccounts() {
 	rows := make([]accountRow, 0, len(names))
 	for _, name := range names {
 		dir := cfg.Aliases[name]
-		row := accountRow{alias: name, configDir: dir, bindings: bindingsForAlias(cfg, name)}
+		row := accountRow{alias: name, configDir: dir, bindings: cfg.BindingsForAlias(name)}
 		if st, ok := probeStatus(dir); ok {
 			row.probeOK = true
 			row.loggedIn = st.LoggedIn
@@ -350,17 +350,6 @@ func probeStatus(configDir string) (accountstatus.Status, bool) {
 // not-installed account (whose loops would record nothing) surfaces here too.
 func hooksInstalledIn(configDir string) bool {
 	return hooks.HealthAt(filepath.Join(configDir, "settings.json"), hooks.BinaryExists).OK
-}
-
-// bindingsForAlias collects the paths bound to alias, in file order.
-func bindingsForAlias(cfg accounts.Config, alias string) []string {
-	var paths []string
-	for _, b := range cfg.Bindings {
-		if b.Alias == alias {
-			paths = append(paths, b.Path)
-		}
-	}
-	return paths
 }
 
 // formatAccountsList renders resolved rows as human-readable blocks. Pure (no

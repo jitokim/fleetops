@@ -280,6 +280,30 @@ func TestSave_FreshFileHasEmptyBindingsArray(t *testing.T) {
 	}
 }
 
+// ── BindingsForAlias twins ─────────────────────────────────────────────────
+
+// The Config and Document twins must return the SAME paths, in file order, for
+// the same bindings — they share bindingPathsFor so they cannot drift.
+func TestBindingsForAlias_ConfigAndDocumentAgree(t *testing.T) {
+	doc := emptyDoc(t)
+	mustAdd(t, doc, "work", "/abs/work")
+	mustAdd(t, doc, "personal", "/abs/personal")
+	mustBind(t, doc, "/abs/a", "work")
+	mustBind(t, doc, "/abs/b", "personal")
+	mustBind(t, doc, "/abs/c", "work")
+
+	cfg := Config{Aliases: doc.Aliases, Bindings: doc.Bindings}
+	want := []string{"/abs/a", "/abs/c"}
+	for _, got := range [][]string{doc.BindingsForAlias("work"), cfg.BindingsForAlias("work")} {
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("BindingsForAlias(work) = %v, want %v", got, want)
+		}
+	}
+	if len(cfg.BindingsForAlias("ghost")) != 0 {
+		t.Fatalf("unknown alias should have no bindings")
+	}
+}
+
 // ── NormalizePath ──────────────────────────────────────────────────────────
 
 func TestNormalizePath_RejectsEmpty(t *testing.T) {
