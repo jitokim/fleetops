@@ -21,7 +21,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/jitokim/fleetops/internal/accounts"
 )
 
 // Spec pairs a Claude Code hook event name with the `fleetops hook <sub>`
@@ -266,14 +269,113 @@ func loadSettings(path string) (map[string]any, error) {
 	return settings, nil
 }
 
-// DefaultHealth reads the real ~/.claude/settings.json and probes the
-// filesystem — the production entry point the TUI's startup check calls. A
-// home-directory lookup failure degrades to a not-OK zero Report rather than
-// crashing the launch.
+// ConfigDirLocation names one Claude config dir whose settings.json fleetops
+// manages hooks in: the default account, or a named alias. Label is for human
+// output ("default"/"company"); Path is the settings.json to read or write.
+type ConfigDirLocation struct {
+	Label string
+	Path  string
+}
+
+// DefaultLabel is the Label used for the default account's ~/.claude config dir
+// — the account with no CLAUDE_CONFIG_DIR override.
+const DefaultLabel = "default"
+
+// SettingsLocations enumerates every settings.json fleetops installs hooks
+// into: the default ~/.claude/settings.json FIRST, then one per alias config
+// dir declared in accountsPath ("<configDir>/settings.json"), ordered by alias
+// name and deduped by cleaned path so an alias that names the default dir does
+// not double it.
+//
+// This is the SINGLE source of "which config dirs" shared by install/uninstall
+// (cmd/fleetops, the write path) and health (this package, read-only), so they
+// can never disagree about where hooks belong — the same discipline Specs()
+// enforces for WHICH events. A missing/malformed accounts.json yields JUST the
+// default location, so zero-config install/status behave byte-identically.
+func SettingsLocations(defaultSettingsPath, accountsPath string) []ConfigDirLocation {
+	locs := make([]ConfigDirLocation, 0, 1)
+	seen := map[string]bool{}
+	add := func(label, path string) {
+		if path == "" {
+			return
+		}
+		clean := filepath.Clean(path)
+		if seen[clean] {
+			return
+		}
+		seen[clean] = true
+		locs = append(locs, ConfigDirLocation{Label: label, Path: clean})
+	}
+	add(DefaultLabel, defaultSettingsPath)
+
+	cfg, err := accounts.Load(accountsPath)
+	if err != nil {
+		return locs // a typo in accounts.json must not drop the default location
+	}
+	names := make([]string, 0, len(cfg.Aliases))
+	for name := range cfg.Aliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if dir := cfg.Aliases[name]; dir != "" {
+			add(name, filepath.Join(dir, "settings.json"))
+		}
+	}
+	return locs
+}
+
+// ConfigDirHealth pairs one config dir's location with its hook-health report,
+// so status and the launch self-verify can say "installed in default, MISSING
+// in company" per dir instead of one blurred verdict that hides a non-default
+// account whose loops record nothing.
+type ConfigDirHealth struct {
+	Location ConfigDirLocation
+	Report   Report
+}
+
+// HealthAllAt computes per-config-dir health across SettingsLocations. Each
+// dir's settings.json is read and probed independently (a missing one degrades
+// to that dir's own all-Missing report, never affecting the others). Injectable
+// exists probe, so it is testable without touching a real filesystem beyond the
+// fixture paths a test supplies.
+func HealthAllAt(defaultSettingsPath, accountsPath string, exists func(string) bool) []ConfigDirHealth {
+	locs := SettingsLocations(defaultSettingsPath, accountsPath)
+	out := make([]ConfigDirHealth, 0, len(locs))
+	for _, loc := range locs {
+		out = append(out, ConfigDirHealth{Location: loc, Report: HealthAt(loc.Path, exists)})
+	}
+	return out
+}
+
+// Merge folds per-config-dir reports into ONE Report for the launch banner,
+// which only needs "is everything OK, and if not is any of it the scarier
+// stale-path kind". OK is the AND across all dirs; Events are concatenated so
+// HasStalePath/Missing still answer across every dir. A dir not fully installed
+// (e.g. "company") thus flips the merged report not-OK — making a silent
+// per-alias gap visible, the whole point of CRITICAL-1's hooks half.
+func Merge(healths []ConfigDirHealth) Report {
+	merged := Report{OK: true}
+	for _, h := range healths {
+		merged.Events = append(merged.Events, h.Report.Events...)
+		if !h.Report.OK {
+			merged.OK = false
+		}
+	}
+	return merged
+}
+
+// DefaultHealth reads the real ~/.claude/settings.json AND every alias config
+// dir's settings.json (from ~/.fleetops/accounts.json), probes the filesystem,
+// and MERGES them — the production entry point the TUI's startup check calls,
+// so the banner fires when hooks are missing in ANY account, not only the
+// default one. A home-directory lookup failure degrades to a not-OK zero Report
+// rather than crashing the launch. Zero-config (no accounts.json) merges a
+// single default-dir report, byte-identical to the pre-multi-account check.
 func DefaultHealth() Report {
 	path, err := DefaultSettingsPath()
 	if err != nil {
 		return Report{}
 	}
-	return HealthAt(path, BinaryExists)
+	return Merge(HealthAllAt(path, accounts.DefaultPath(), BinaryExists))
 }
