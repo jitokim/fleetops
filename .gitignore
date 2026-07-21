@@ -3,5 +3,5 @@
 *.out
 .DS_Store
 /.venv/
-/.claude/
-.notes/
+/.claude
+.notes
