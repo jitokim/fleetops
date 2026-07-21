@@ -34,10 +34,10 @@ func (orcaController) Locate(projectDir string) (Target, bool) {
 	return parseOrcaTerminals(out, projectDir)
 }
 
-// LocateClaude is like Locate, but returns only a tier-1 terminal (✳-titled,
-// connected, writable) — a confirmed Claude Code surface. Typed/destructive
-// actions must never fall back to tier-2/3 (a bare shell tab sharing the
-// same worktreePath), which Locate's 3-tier fallback exists to hand back for
+// LocateClaude is like Locate, but returns only a confirmed Claude Code
+// surface (isClaudeSurfaceTitle, connected, writable). Typed/destructive
+// actions must never fall back to a bare shell tab sharing the same
+// worktreePath, which Locate's 3-tier fallback exists to hand back for
 // attach — see selectClaudeOrcaTerminal.
 func (orcaController) LocateClaude(projectDir string) (Target, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
@@ -396,16 +396,17 @@ func parseOrcaCreateHandle(jsonBytes []byte) (string, bool) {
 }
 
 // selectSpawnedOrcaTerminal finds the freshest (highest lastOutputAt)
-// terminal at cwd whose title is spawnTitle or Claude-Code-prefixed
-// (claudeTabPrefix) — i.e. the terminal Spawn just created, re-found by
-// cwd+title since its create-time handle can go stale (see Spawn's doc).
+// terminal at cwd whose title marks a confirmed Claude surface
+// (isClaudeSurfaceTitle: spawnTitle / takeOverTitle, or claudeTabPrefix) —
+// i.e. the terminal Spawn just created, re-found by cwd+title since its
+// create-time handle can go stale (see Spawn's doc).
 func selectSpawnedOrcaTerminal(terminals []orcaTerminal, cwd string) (Target, bool) {
 	var matches []orcaTerminal
 	for _, t := range terminals {
 		if t.WorktreePath != cwd {
 			continue
 		}
-		if t.Title == spawnTitle || strings.HasPrefix(t.Title, claudeTabPrefix) {
+		if isClaudeSurfaceTitle(t.Title) {
 			matches = append(matches, t)
 		}
 	}
@@ -444,11 +445,38 @@ type orcaTerminal struct {
 	LastOutputAt int64  `json:"lastOutputAt"`
 }
 
-// claudeTabPrefix is the marker Claude Code puts on a terminal tab's title.
-// Sending a prompt into a bare shell tab (no prefix) would execute it as a
-// shell command instead of driving the agent, so a Claude Code tab is
-// strongly preferred over any other tab sharing the same worktreePath.
+// claudeTabPrefix is the marker Claude Code puts on a terminal tab's title
+// via a DYNAMIC OSC title update once it is running. Sending a prompt into a
+// bare shell tab (no prefix) would execute it as a shell command instead of
+// driving the agent, so a Claude Code tab is strongly preferred over any
+// other tab sharing the same worktreePath.
+//
+// Caveat (verified live): `orca terminal list --json`'s `title` field is the
+// STATIC create-time `--title`, NOT the dynamic OSC title claude sets — so a
+// fleetops-spawned loop reports its create-time title (spawnTitle /
+// takeOverTitle) and NEVER "✳", even while an active claude session is
+// running in it. Recognizing a Claude surface therefore cannot rely on "✳"
+// alone; see isClaudeSurfaceTitle.
 const claudeTabPrefix = "✳"
+
+// isClaudeSurfaceTitle reports whether an orca terminal `title` marks a
+// confirmed Claude Code surface — one it is safe to type/actuate into (never
+// a bare shell). It is the SINGLE source of truth shared by both the
+// spawn-time re-finder (selectSpawnedOrcaTerminal) and the actuation-time
+// locator (selectClaudeOrcaTerminal), so the two can never disagree on what
+// counts as actionable.
+//
+// Three titles qualify:
+//   - spawnTitle ("mctl loop") — fleetops created this terminal running the
+//     configured claude command, so it is a confirmed Claude surface even
+//     though orca reports the static create-time title, never "✳".
+//   - takeOverTitle ("mctl take-over") — same rationale, via OpenTerminal.
+//   - a "✳"-prefixed title — claude's own dynamic OSC title, on the rare
+//     runtime/path where orca does surface it (e.g. a non-fleetops tab a user
+//     opened claude in by hand).
+func isClaudeSurfaceTitle(title string) bool {
+	return title == spawnTitle || title == takeOverTitle || strings.HasPrefix(title, claudeTabPrefix)
+}
 
 // parseOrcaTerminals decodes `orca terminal list --json` and returns the
 // best terminal whose worktreePath encodes to projectDir (same "/"→"-"
@@ -519,21 +547,29 @@ func selectOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bo
 }
 
 // selectClaudeOrcaTerminal picks the SOLE confirmed Claude Code terminal
-// (✳-titled, connected, writable) sharing projectDir's worktreePath — tier-1
-// only, no fallback to a bare shell tab (see LocateClaude). Unlike
+// (isClaudeSurfaceTitle, connected, writable) sharing projectDir's
+// worktreePath — no fallback to a bare shell tab (see LocateClaude). Unlike
 // selectOrcaTerminal's 3-tier fallback (which picks the freshest match for
 // attach), this refuses on ambiguity rather than picking a "best" one: if
-// MORE THAN ONE tier-1 terminal matches, there is no way to tell which one
-// the human actually meant, so ok=false — the authoritative backstop behind
-// the TUI's keypress-time fleet-ambiguity guard (see Controller.LocateClaude
-// and Model.refuseIfAmbiguous).
+// MORE THAN ONE confirmed-Claude terminal matches, there is no way to tell
+// which one the human actually meant, so ok=false — the authoritative
+// backstop behind the TUI's keypress-time fleet-ambiguity guard (see
+// Controller.LocateClaude and Model.refuseIfAmbiguous).
+//
+// The title test is shared with selectSpawnedOrcaTerminal
+// (isClaudeSurfaceTitle) so the actuation-time locator and the spawn-time
+// re-finder can never disagree: a fleetops-spawned loop findable at spawn
+// time must stay actuable at keypress time. Recognizing "✳" alone here (the
+// old behavior) rejected EVERY fleetops-spawned loop, because orca reports
+// the static create-time title (spawnTitle / takeOverTitle), never claude's
+// dynamic "✳" — see claudeTabPrefix's caveat.
 func selectClaudeOrcaTerminal(terminals []orcaTerminal, projectDir string) (Target, bool) {
 	var matches []orcaTerminal
 	for _, t := range terminals {
 		if encodeCwd(t.WorktreePath) != projectDir {
 			continue
 		}
-		if t.Connected && t.Writable && strings.HasPrefix(t.Title, claudeTabPrefix) {
+		if t.Connected && t.Writable && isClaudeSurfaceTitle(t.Title) {
 			matches = append(matches, t)
 		}
 	}

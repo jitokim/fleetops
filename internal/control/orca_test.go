@@ -362,6 +362,109 @@ func TestParseOrcaCreateHandle_GarbageJSON(t *testing.T) {
 	}
 }
 
+// realSpawnedLoopFixture is a faithful `orca terminal list --json` capture
+// for the regression this fix targets: a fleetops-spawned loop (title
+// spawnTitle "mctl loop", connected+writable) living in the fleetops
+// worktree, alongside a bare shell tab (title:"") in the SAME worktree and
+// unrelated terminals in OTHER worktrees. Extra fields orca emits (ptyId,
+// tabId, preview) are present but ignored by the decoder. The loop's title
+// is the STATIC create-time --title, NEVER "✳" — the exact live-proven shape
+// that made the old ✳-only selectClaudeOrcaTerminal return not-found.
+const realSpawnedLoopFixture = `{
+	"id": "9f13aa02-...",
+	"ok": true,
+	"result": {
+		"terminals": [
+			{"handle":"term_loop","ptyId":"pty_1","tabId":"tab_1","worktreePath":"/Users/imac/IdeaProjects/fleetops","title":"mctl loop","connected":true,"writable":true,"lastOutputAt":1784134661341,"preview":"● Running…"},
+			{"handle":"term_shell","ptyId":"pty_2","tabId":"tab_2","worktreePath":"/Users/imac/IdeaProjects/fleetops","title":"","connected":true,"writable":true,"lastOutputAt":1784134600000,"preview":"imac@host fleetops %"},
+			{"handle":"term_other","ptyId":"pty_3","tabId":"tab_3","worktreePath":"/Users/imac/IdeaProjects/other","title":"mctl loop","connected":true,"writable":true,"lastOutputAt":1784134574859,"preview":""},
+			{"handle":"term_dotfiles","ptyId":"pty_4","tabId":"tab_4","worktreePath":"/Users/imac/dotfiles","title":"✳ team","connected":true,"writable":true,"lastOutputAt":1784028618065,"preview":""}
+		],
+		"visualLayouts": [],
+		"totalCount": 4,
+		"truncated": false
+	},
+	"_meta": {"runtimeId":"..."}
+}`
+
+// locateClaudeFromJSON mirrors LocateClaude's body (decode then select) so a
+// realistic raw `orca terminal list --json` payload can be driven through the
+// actuation-time locator end-to-end, exactly as LocateClaude does at runtime.
+func locateClaudeFromJSON(t *testing.T, jsonBytes []byte, projectDir string) (Target, bool) {
+	t.Helper()
+	terminals, ok := decodeOrcaTerminals(jsonBytes)
+	if !ok {
+		t.Fatal("decodeOrcaTerminals failed on the fixture")
+	}
+	return selectClaudeOrcaTerminal(terminals, projectDir)
+}
+
+func TestSelectClaudeOrcaTerminal_FindsSpawnTitleLoop_RealPayload(t *testing.T) {
+	// THE BUG: a fleetops-spawned loop (title "mctl loop", connected+writable)
+	// in the fleetops worktree must be ACTUABLE. orca reports the static
+	// create-time --title, never "✳", so the old ✳-only check returned
+	// not-found — killing kill/inject/resume/approve for every spawned loop.
+	target, ok := locateClaudeFromJSON(t, []byte(realSpawnedLoopFixture), "-Users-imac-IdeaProjects-fleetops")
+	if !ok {
+		t.Fatal("expected ok=true — the spawnTitle loop is a confirmed Claude surface and must be found")
+	}
+	want := Target{Backend: "orca", ID: "term_loop", Cwd: "/Users/imac/IdeaProjects/fleetops"}
+	if target != want {
+		t.Errorf("got %+v, want %+v (the \"mctl loop\" tab, unambiguously — the bare shell must not compete)", target, want)
+	}
+}
+
+func TestSelectClaudeOrcaTerminal_AcceptsSpawnTitle(t *testing.T) {
+	terminals := []orcaTerminal{
+		{Handle: "term_loop", WorktreePath: "/home/user/myproject", Title: spawnTitle, Connected: true, Writable: true, LastOutputAt: 1},
+	}
+	target, ok := selectClaudeOrcaTerminal(terminals, "-home-user-myproject")
+	if !ok {
+		t.Fatal("expected ok=true — spawnTitle is a confirmed Claude surface")
+	}
+	if target.ID != "term_loop" {
+		t.Errorf("got ID %q, want term_loop", target.ID)
+	}
+}
+
+func TestSelectClaudeOrcaTerminal_AcceptsTakeOverTitle(t *testing.T) {
+	// take-over terminals (OpenTerminal, title "mctl take-over") are confirmed
+	// Claude surfaces too — fleetops launched the claude command in them.
+	terminals := []orcaTerminal{
+		{Handle: "term_takeover", WorktreePath: "/home/user/myproject", Title: takeOverTitle, Connected: true, Writable: true, LastOutputAt: 1},
+	}
+	target, ok := selectClaudeOrcaTerminal(terminals, "-home-user-myproject")
+	if !ok {
+		t.Fatal("expected ok=true — takeOverTitle is a confirmed Claude surface")
+	}
+	if target.ID != "term_takeover" {
+		t.Errorf("got ID %q, want term_takeover", target.ID)
+	}
+}
+
+func TestSelectClaudeOrcaTerminal_BareShellTitle_Rejected(t *testing.T) {
+	// The safety property: a bare shell tab (title:"") sharing the worktree
+	// must NEVER be actuated — a prompt sent there executes as a shell command.
+	terminals := []orcaTerminal{
+		{Handle: "term_shell", WorktreePath: "/home/user/myproject", Title: "", Connected: true, Writable: true, LastOutputAt: 999},
+	}
+	if _, ok := selectClaudeOrcaTerminal(terminals, "-home-user-myproject"); ok {
+		t.Error("expected ok=false — a bare-shell (title:\"\") tab is not a Claude surface, must never actuate")
+	}
+}
+
+func TestSelectClaudeOrcaTerminal_SpawnTitleAmbiguity_Refuses(t *testing.T) {
+	// Two confirmed-Claude terminals (both spawnTitle) at the same worktree —
+	// the exactly-one guard must still refuse rather than pick the freshest.
+	terminals := []orcaTerminal{
+		{Handle: "term_a", WorktreePath: "/home/user/myproject", Title: spawnTitle, Connected: true, Writable: true, LastOutputAt: 1},
+		{Handle: "term_b", WorktreePath: "/home/user/myproject", Title: spawnTitle, Connected: true, Writable: true, LastOutputAt: 999},
+	}
+	if _, ok := selectClaudeOrcaTerminal(terminals, "-home-user-myproject"); ok {
+		t.Error("expected ok=false — two confirmed-Claude matches is ambiguous, must refuse")
+	}
+}
+
 func TestSelectSpawnedOrcaTerminal_PicksSpawnTitleAtCwd(t *testing.T) {
 	terminals := []orcaTerminal{
 		{Handle: "term_wrong_cwd", WorktreePath: "/x/other", Title: spawnTitle, LastOutputAt: 999},
@@ -389,6 +492,22 @@ func TestSelectSpawnedOrcaTerminal_AlsoMatchesClaudeTabPrefix(t *testing.T) {
 	}
 	if target.ID != "term_relabeled" {
 		t.Errorf("got ID %q, want term_relabeled", target.ID)
+	}
+}
+
+func TestSelectSpawnedOrcaTerminal_AlsoMatchesTakeOverTitle(t *testing.T) {
+	// After unifying on isClaudeSurfaceTitle, the spawn re-finder also accepts
+	// takeOverTitle — harmless and consistent: a take-over terminal is a
+	// confirmed Claude surface, and the freshest match still wins.
+	terminals := []orcaTerminal{
+		{Handle: "term_takeover", WorktreePath: "/x/myproject", Title: takeOverTitle, LastOutputAt: 1},
+	}
+	target, ok := selectSpawnedOrcaTerminal(terminals, "/x/myproject")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if target.ID != "term_takeover" {
+		t.Errorf("got ID %q, want term_takeover", target.ID)
 	}
 }
 
