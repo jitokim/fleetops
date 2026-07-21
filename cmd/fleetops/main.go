@@ -29,6 +29,9 @@ func main() {
 		case "hooks":
 			runHooksCmd(os.Args[2:])
 			return
+		case "accounts":
+			runAccountsCmd(os.Args[2:])
+			return
 		case "report":
 			runReportCmd(os.Args[2:])
 			return
@@ -64,6 +67,13 @@ Usage:
   fleetops hooks install       register fleetops's Claude Code hooks (gate/idle detection)
   fleetops hooks uninstall     remove them
   fleetops hooks status        report whether the hooks are installed and healthy
+  fleetops accounts            list the Claude accounts, their login + hook state, and bindings
+  fleetops accounts add <alias> [--dir <path>] [--no-login]
+                                  register an account and (by default) log it in
+  fleetops accounts login <alias>    (re)run the browser login for an account
+  fleetops accounts bind <alias> <path>   bind a directory/repo to an account
+  fleetops accounts unbind <path>         remove a directory binding
+  fleetops accounts remove <alias> [--force]   un-name an account (never logs it out)
   fleetops hook <event>        Claude Code hook entry point (notify|session-start|session-end)
                                   — invoked BY Claude Code itself, not typically run by hand
   fleetops help | --help | -h  show this help
