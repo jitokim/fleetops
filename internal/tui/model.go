@@ -732,17 +732,22 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 	// exists for: with only one, "attach and look" costs about the same, and
 	// the demo would not show why any of this was built.
 	migrateDB := domain.Loop{
-		Project:      "migrate-db",
-		SessionID:    "demo-migrate-db",
-		ProjectDir:   "-home-user-billing",
-		Cwd:          "/home/user/billing",
-		Path:         "/home/user/.claude/projects/-home-user-billing/demo-migrate-db.jsonl",
-		State:        domain.StateGate,
-		GatePrompt:   "The migration will drop the legacy invoices table. How should I proceed?",
-		GateOptions:  []string{"Drop it", "Keep and rename", "Stop and let me look"},
-		Cycle:        2,
-		Goal:         domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
-		TokensSpent:  180000,
+		Project:     "migrate-db",
+		SessionID:   "demo-migrate-db",
+		ProjectDir:  "-home-user-billing",
+		Cwd:         "/home/user/billing",
+		Path:        "/home/user/.claude/projects/-home-user-billing/demo-migrate-db.jsonl",
+		State:       domain.StateGate,
+		GatePrompt:  "The migration will drop the legacy invoices table. How should I proceed?",
+		GateOptions: []string{"Drop it", "Keep and rename", "Stop and let me look"},
+		Cycle:       2,
+		Goal:        domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
+		TokensSpent: 180000,
+		// multi-account Phase B: the one demo loop carrying an account label,
+		// so the DETAIL panel's ACCOUNT row is visible in demo QA without
+		// needing a real ~/.fleetops/accounts.json — see
+		// TestDemoFleet_MigrateDB_CarriesAccountLabel.
+		Account:      domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "work"},
 		LastActivity: now.Add(-2 * time.Minute),
 	}
 	refactorCoreReason := "payment handlers moved into internal/payment, existing tests still pass — ledger reconciliation not yet covered"
@@ -1711,7 +1716,7 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		// Tier 2: vendor-independent headless re-drive. Works on every
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
-		if err := redriveFn(l.Cwd, l.SessionID, prompt); err != nil {
+		if err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir); err != nil {
 			logActuationEvent(l, action, "tier2", err)
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
@@ -2860,7 +2865,7 @@ func driveCmd(l domain.Loop) tea.Cmd {
 			Detail:    fmt.Sprintf("cycle %d", l.Cycle),
 			Actor:     events.ActorAuto,
 		})
-		err := redriveFn(l.Cwd, l.SessionID, prompt)
+		err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir)
 		if err != nil {
 			return resumeResultMsg{sessionID: l.SessionID, ok: false,
 				text: fmt.Sprintf("engine: cycle %d failed — %v", l.Cycle, err)}
@@ -3142,7 +3147,7 @@ type autoRedriveResultMsg struct {
 func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
 	return func() tea.Msg {
 		prompt, _ := claude.LastUserPrompt(l.Path) // an empty/absent prior prompt still redrives — same tolerance as resumeCmd
-		err := redriveFn(l.Cwd, l.SessionID, prompt)
+		err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir)
 		_ = events.Append(historyDirFn(), events.Event{
 			TS:        time.Now().UnixNano(),
 			SessionID: l.SessionID,
@@ -5194,6 +5199,14 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	}
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
+	// multi-account Phase B: omitted ENTIRELY (not shown blank) when
+	// l.Account.Label() is "" — the default account (the common
+	// zero-config case) renders no row at all here, matching the DRIVE
+	// row's own presence/absence pattern just above rather than adding a
+	// third "not applicable" state to parse.
+	if label := l.Account.Label(); label != "" {
+		d.WriteString(detailRow("ACCOUNT", stDim.Render(trunc(label, valueWidth))))
+	}
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
 
 	switch l.State {

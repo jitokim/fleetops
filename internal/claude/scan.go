@@ -16,11 +16,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jitokim/fleetops/internal/accounts"
 	"github.com/jitokim/fleetops/internal/domain"
 	"github.com/jitokim/fleetops/internal/engine"
 	"github.com/jitokim/fleetops/internal/events"
 	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/registry"
+	"github.com/jitokim/fleetops/internal/sessions"
 )
 
 // IdleThreshold: no log write for this long ⇒ the loop is considered stuck.
@@ -83,6 +85,7 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	loopsDir := registry.LoopsDir()
 	registry.BindPending(loopsDir, registry.PendingDir(), loops, now, historyDir)
 	loops = enrichFromRegistry(loops, loopsDir, historyDir)
+	loops = enrichAccounts(loops, sessions.SessionsDir(), accounts.DefaultPath())
 
 	live, liveOK := LiveClaudeCwds()
 	loops = applyLiveness(loops, live, liveOK, historyDir, now, within)
@@ -157,6 +160,62 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		}
 
 		applyGovernor(&loops[i], historyDir)
+	}
+	return loops
+}
+
+// enrichAccounts attaches multi-account Phase B's display metadata
+// (domain.Loop.Account) from the session-identity registry
+// (internal/sessions, written by the SessionStart hook) onto each loop that
+// has a matching entry. An observed loop the hook never ran for (or whose
+// entry predates this field) is left with the zero Account — Account.Label()
+// renders that as "", so it is indistinguishable from "no account feature at
+// all" anywhere this is displayed.
+//
+// Both the session registry and the accounts config are read ONCE per scan,
+// not once per loop: sessions.ListSessions already reads its whole directory
+// in one pass, and accounts.Load parses one small JSON file — re-loading
+// either per loop would multiply disk I/O across a fleet with no benefit,
+// since neither changes mid-scan.
+//
+// A malformed accounts.json (Load's error case — a binding naming an unknown
+// alias, or unparseable JSON) is treated as INACTIVE here, exactly like
+// control.defaultAccountConfigDir's own precedent for the same file: this is
+// a DISPLAY enrichment, not the fail-closed control-path guarantee
+// internal/accounts.Load itself upholds, and blocking every loop's alias
+// label on one JSON typo would be a worse failure mode than simply showing
+// no alias (the loop's raw ConfigDir/Email still render via Account.Label's
+// fallback chain).
+func enrichAccounts(loops []domain.Loop, sessionsDir, accountsPath string) []domain.Loop {
+	entries := sessions.ListSessions(sessionsDir)
+	if len(entries) == 0 {
+		return loops
+	}
+	cfg, err := accounts.Load(accountsPath)
+	if err != nil {
+		cfg = accounts.Config{}
+	}
+	for i := range loops {
+		entry, ok := entries[loops[i].SessionID]
+		if !ok {
+			continue
+		}
+		var alias string
+		if entry.ConfigDir != "" {
+			// Guarded on a non-empty ConfigDir rather than calling
+			// AliasForConfigDir("") unconditionally: an empty ConfigDir is the
+			// default account by definition (domain.Account.IsDefault), and
+			// Account.Label() already refuses to show an alias for it
+			// defensively — resolving one here would just be wasted work
+			// chasing a value that can never be displayed.
+			alias, _ = cfg.AliasForConfigDir(entry.ConfigDir)
+		}
+		loops[i].Account = domain.Account{
+			ConfigDir: entry.ConfigDir,
+			Alias:     alias,
+			Email:     entry.AccountEmail,
+			Plan:      entry.AccountPlan,
+		}
 	}
 	return loops
 }

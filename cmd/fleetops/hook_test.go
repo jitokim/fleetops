@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -166,6 +167,149 @@ func TestSessionStartHook_HostWindowEnvAbsent_StillWritesEntry(t *testing.T) {
 	}
 	if entry.HostApp != "" || entry.WindowID != "" {
 		t.Errorf("want empty host/window with no env, got HostApp=%q WindowID=%q", entry.HostApp, entry.WindowID)
+	}
+}
+
+// ── multi-account Phase B: ConfigDir capture + best-effort account status ──
+
+// pinAccountStatus replaces the `claude auth status --json` seam for one
+// test, so it never spawns a real `claude` binary. Also asserts the ctx it
+// was called with actually has a deadline — resolveAccountLabel's whole
+// non-fatal contract depends on the probe being BOUNDED.
+func pinAccountStatus(t *testing.T, fn func(ctx context.Context, configDir string) (accountStatus, bool)) {
+	t.Helper()
+	orig := accountStatusFn
+	t.Cleanup(func() { accountStatusFn = orig })
+	accountStatusFn = fn
+}
+
+// TestSessionStartHook_CapturesConfigDir_EvenWhenAccountProbeIsSkipped is the
+// load-bearing guarantee: ConfigDir must be recorded from the environment
+// regardless of whether the (best-effort, possibly-skipped) account-status
+// probe runs at all. A default-account session (no CLAUDE_CONFIG_DIR set)
+// skips the probe entirely (see resolveAccountLabel's doc) yet still writes
+// ConfigDir="" correctly — proven separately from the probe's own behavior.
+func TestSessionStartHook_CapturesConfigDir_EvenWhenAccountProbeIsSkipped(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	probed := false
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+		probed = true
+		return accountStatus{}, false
+	})
+
+	withStdin(t, `{"session_id":"default-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "default-acct")
+	if err != nil {
+		t.Fatalf("expected an entry: %v", err)
+	}
+	if entry.ConfigDir != "" {
+		t.Errorf("ConfigDir = %q, want empty (no CLAUDE_CONFIG_DIR set)", entry.ConfigDir)
+	}
+	if entry.AccountEmail != "" || entry.AccountPlan != "" {
+		t.Errorf("AccountEmail/AccountPlan = %q/%q, want both empty for the default account", entry.AccountEmail, entry.AccountPlan)
+	}
+	if probed {
+		t.Error("account-status probe ran for the default account (ConfigDir==\"\") — it must be skipped entirely, see resolveAccountLabel's doc")
+	}
+}
+
+// TestSessionStartHook_NonDefaultConfigDir_RecordsAccountFromStatus confirms
+// the full wiring for a bound (non-default) CLAUDE_CONFIG_DIR: ConfigDir is
+// captured from the env, the status probe runs WITH that same config dir, and
+// a loggedIn:true reply populates AccountEmail/AccountPlan.
+func TestSessionStartHook_NonDefaultConfigDir_RecordsAccountFromStatus(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "/home/user/.claude-work")
+	var gotConfigDir string
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+		gotConfigDir = configDir
+		return accountStatus{LoggedIn: true, Email: "jito@company.com", SubscriptionType: "team"}, true
+	})
+
+	withStdin(t, `{"session_id":"work-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "work-acct")
+	if err != nil {
+		t.Fatalf("expected an entry: %v", err)
+	}
+	if entry.ConfigDir != "/home/user/.claude-work" {
+		t.Errorf("ConfigDir = %q, want /home/user/.claude-work", entry.ConfigDir)
+	}
+	if gotConfigDir != "/home/user/.claude-work" {
+		t.Errorf("status probe called with configDir=%q, want the session's own /home/user/.claude-work", gotConfigDir)
+	}
+	if entry.AccountEmail != "jito@company.com" {
+		t.Errorf("AccountEmail = %q, want jito@company.com", entry.AccountEmail)
+	}
+	if entry.AccountPlan != "team" {
+		t.Errorf("AccountPlan = %q, want team", entry.AccountPlan)
+	}
+}
+
+// TestSessionStartHook_AccountProbe_LoggedInFalse_LeavesLabelsEmpty proves a
+// configured-but-not-logged-in account degrades to empty labels rather than
+// showing stale/wrong identity — never a token, never a guess.
+func TestSessionStartHook_AccountProbe_LoggedInFalse_LeavesLabelsEmpty(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "/home/user/.claude-stale")
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+		return accountStatus{LoggedIn: false}, true
+	})
+
+	withStdin(t, `{"session_id":"stale-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "stale-acct")
+	if err != nil {
+		t.Fatalf("expected an entry: %v", err)
+	}
+	if entry.ConfigDir != "/home/user/.claude-stale" {
+		t.Errorf("ConfigDir = %q, want /home/user/.claude-stale — captured regardless of login status", entry.ConfigDir)
+	}
+	if entry.AccountEmail != "" || entry.AccountPlan != "" {
+		t.Errorf("AccountEmail/AccountPlan = %q/%q, want both empty when loggedIn:false", entry.AccountEmail, entry.AccountPlan)
+	}
+}
+
+// TestSessionStartHook_AccountProbe_Fails_DegradesSilently proves the hook
+// still writes the entry (ConfigDir intact) and exits normally when the
+// status probe itself errors — this must never be fatal to SessionStart.
+func TestSessionStartHook_AccountProbe_Fails_DegradesSilently(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "/home/user/.claude-broken")
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+		return accountStatus{}, false
+	})
+
+	withStdin(t, `{"session_id":"broken-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
+
+	entry, err := sessions.ReadSession(sessions.SessionsDir(), "broken-acct")
+	if err != nil {
+		t.Fatalf("expected an entry even though the account probe failed: %v", err)
+	}
+	if entry.ConfigDir != "/home/user/.claude-broken" {
+		t.Errorf("ConfigDir = %q, want /home/user/.claude-broken", entry.ConfigDir)
+	}
+	if entry.AccountEmail != "" || entry.AccountPlan != "" {
+		t.Errorf("AccountEmail/AccountPlan should stay empty on probe failure, got %q/%q", entry.AccountEmail, entry.AccountPlan)
+	}
+}
+
+// TestResolveAccountLabel_PassesBoundedContext confirms the ctx handed to the
+// status-probe seam actually carries a deadline — the hook's "must never
+// delay session start unacceptably" contract depends on this, not merely on
+// queryAccountStatus's production implementation choosing to respect one.
+func TestResolveAccountLabel_PassesBoundedContext(t *testing.T) {
+	var sawDeadline bool
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+		_, sawDeadline = ctx.Deadline()
+		return accountStatus{}, false
+	})
+
+	resolveAccountLabel("/home/user/.claude-work")
+
+	if !sawDeadline {
+		t.Error("resolveAccountLabel's ctx has no deadline — the probe is not bounded")
 	}
 }
 

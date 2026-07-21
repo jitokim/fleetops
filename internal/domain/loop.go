@@ -135,6 +135,14 @@ type Loop struct {
 	// driven==false clause already covers that pause with no extra code
 	// (see its doc).
 	Driven bool
+
+	// Account is this session's Claude account identity (multi-account Phase
+	// B), copied in by the scanner from the session registry
+	// (internal/sessions.SessionEntry) plus the accounts.json alias lookup —
+	// see Account's own doc. Zero value for every session on a machine with
+	// no ~/.fleetops/accounts.json and no CLAUDE_CONFIG_DIR ever set: the
+	// common case, rendering nothing new anywhere this is displayed.
+	Account Account
 }
 
 // DisplayLabel is the loop's human-facing list label, in falling priority:

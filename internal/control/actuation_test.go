@@ -540,7 +540,7 @@ func TestBuildRedriveCmd_SetsDirToPassedCwd(t *testing.T) {
 		t.Fatalf("test setup: TempDir %q coincided with the process cwd — this test can't tell right from wrong", wantDir)
 	}
 
-	cmd := buildRedriveCmd(context.Background(), wantDir, "sess-abc123", "do the thing")
+	cmd := buildRedriveCmd(context.Background(), wantDir, "sess-abc123", "do the thing", "")
 
 	if cmd.Dir != wantDir {
 		t.Errorf("cmd.Dir = %q, want the passed cwd %q — resuming from any other dir fails (sessions are project-scoped)", cmd.Dir, wantDir)
@@ -559,7 +559,7 @@ func TestBuildRedriveCmd_SetsDirToPassedCwd(t *testing.T) {
 // runs in the process dir — the exact bug). Redrive refuses up front with a
 // clear error, and does so instantly (no exec, no 10-minute redriveTimeout).
 func TestRedrive_EmptyCwd_RefusesWithoutSpawning(t *testing.T) {
-	err := Redrive("", "sess-abc123", "do the thing")
+	err := Redrive("", "sess-abc123", "do the thing", "")
 	if err == nil {
 		t.Fatal("Redrive with empty cwd returned nil — it must refuse rather than silently run in the process dir")
 	}
@@ -602,12 +602,57 @@ func TestBuildRedriveCmd_CrossWorktree_UsesWorktreePath(t *testing.T) {
 	worktree := filepath.Join(t.TempDir(), "wt")
 	runGit(repo, "worktree", "add", "-q", worktree, "HEAD")
 
-	cmd := buildRedriveCmd(context.Background(), worktree, "sess-wt", "carry on")
+	cmd := buildRedriveCmd(context.Background(), worktree, "sess-wt", "carry on", "")
 
 	if cmd.Dir != worktree {
 		t.Errorf("cmd.Dir = %q, want the worktree path %q", cmd.Dir, worktree)
 	}
 	if cmd.Dir == repo {
 		t.Errorf("cmd.Dir = %q is the main checkout, not the loop's worktree — a resume there resolves the wrong project", cmd.Dir)
+	}
+}
+
+// ── Phase B: resume honors the session's RECORDED config dir ───────────────
+
+// TestBuildRedriveCmd_ConfigDir_SetsEnvOnTopOfInherited pins the load-bearing
+// wiring this slice adds: a non-empty configDir must land in the child's
+// CLAUDE_CONFIG_DIR, and it must be ADDED to the inherited environment, not
+// substituted for it — a bare cmd.Env=[]string{"CLAUDE_CONFIG_DIR=..."} would
+// starve the child of PATH/HOME and everything else exec.Cmd's zero-Env
+// default (os.Environ()) provides today.
+func TestBuildRedriveCmd_ConfigDir_SetsEnvOnTopOfInherited(t *testing.T) {
+	t.Setenv("FLEETOPS_REDRIVE_CONFIGDIR_TEST_MARKER", "present")
+	const wantConfigDir = "/abs/.claude-work"
+
+	cmd := buildRedriveCmd(context.Background(), t.TempDir(), "sess-abc123", "do the thing", wantConfigDir)
+
+	var gotConfigDir string
+	var sawMarker bool
+	for _, kv := range cmd.Env {
+		switch {
+		case strings.HasPrefix(kv, "CLAUDE_CONFIG_DIR="):
+			gotConfigDir = strings.TrimPrefix(kv, "CLAUDE_CONFIG_DIR=")
+		case kv == "FLEETOPS_REDRIVE_CONFIGDIR_TEST_MARKER=present":
+			sawMarker = true
+		}
+	}
+	if gotConfigDir != wantConfigDir {
+		t.Errorf("CLAUDE_CONFIG_DIR = %q, want %q", gotConfigDir, wantConfigDir)
+	}
+	if !sawMarker {
+		t.Error("cmd.Env dropped the inherited environment — configDir must be ADDED to os.Environ(), not replace it")
+	}
+}
+
+// TestBuildRedriveCmd_EmptyConfigDir_AddsNoEnvOverride is the zero-config
+// guarantee: an empty configDir (the default account, or a session recorded
+// before this field existed) must leave cmd.Env untouched (nil) — exactly
+// today's pre-Phase-B behavior, where the child simply inherits the calling
+// process's environment via exec.Cmd's documented nil-Env default.
+func TestBuildRedriveCmd_EmptyConfigDir_AddsNoEnvOverride(t *testing.T) {
+	cmd := buildRedriveCmd(context.Background(), t.TempDir(), "sess-abc123", "do the thing", "")
+
+	if cmd.Env != nil {
+		t.Errorf("cmd.Env = %#v, want nil for an empty configDir — no env override at all", cmd.Env)
 	}
 }

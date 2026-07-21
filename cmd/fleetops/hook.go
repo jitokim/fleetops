@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -197,6 +199,8 @@ func sessionStartHook() {
 	}
 	pid, tty := sessions.ResolveClaudeTTY(os.Getppid())
 	hostApp, windowID := resolveHostWindow()
+	configDir := os.Getenv(claudeConfigDirEnvVar)
+	email, plan := resolveAccountLabel(configDir)
 	_ = sessions.WriteSession(sessions.SessionsDir(), payload.SessionID, sessions.SessionEntry{
 		PID:            pid,
 		TTY:            tty,
@@ -206,7 +210,90 @@ func sessionStartHook() {
 		StartedAt:      time.Now(),
 		HostApp:        hostApp,
 		WindowID:       windowID,
+		ConfigDir:      configDir,
+		AccountEmail:   email,
+		AccountPlan:    plan,
 	})
+}
+
+// claudeConfigDirEnvVar is the environment variable that fixes which Claude
+// account a session runs as (see internal/accounts' package doc) — read here,
+// once, at SessionStart, since that is the ONLY point in a session's life this
+// hook fires with the launching environment still in scope. "" means the
+// default account.
+const claudeConfigDirEnvVar = "CLAUDE_CONFIG_DIR"
+
+// accountStatusTimeout bounds the `claude auth status --json` probe below.
+// The hook must never delay SessionStart unacceptably — a wedged or slow
+// `claude` binary must not hold up the user's actual session starting.
+const accountStatusTimeout = 2 * time.Second
+
+// accountStatus is the subset of `claude auth status --json`'s output this
+// hook reads (measured live, claude 2.1.215 — see .notes/design-multi-account.md):
+// {loggedIn, email, orgName, subscriptionType, authMethod}. No token in this
+// shape — safe to read and to persist.
+type accountStatus struct {
+	LoggedIn         bool   `json:"loggedIn"`
+	Email            string `json:"email"`
+	SubscriptionType string `json:"subscriptionType"`
+}
+
+// accountStatusFn is the injectable seam for the `claude auth status --json`
+// probe, so tests never spawn a real `claude` binary. Production default is
+// queryAccountStatus.
+var accountStatusFn = queryAccountStatus
+
+// queryAccountStatus runs `claude auth status --json` with CLAUDE_CONFIG_DIR
+// set to configDir (configDir=="" leaves the child's environment
+// un-overridden — the default account), bounded by ctx's deadline. ok=false
+// on any failure (binary missing, non-zero exit, timeout, unparseable
+// output) — the caller treats that identically to "nothing to show", never
+// as an error worth surfacing: this hook must degrade silently (see
+// sessionStartHook's and resolveAccountLabel's own non-fatal contract).
+func queryAccountStatus(ctx context.Context, configDir string) (accountStatus, bool) {
+	cmd := exec.CommandContext(ctx, "claude", "auth", "status", "--json")
+	if configDir != "" {
+		cmd.Env = append(os.Environ(), claudeConfigDirEnvVar+"="+configDir)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return accountStatus{}, false
+	}
+	var st accountStatus
+	if err := json.Unmarshal(out, &st); err != nil {
+		return accountStatus{}, false
+	}
+	return st, true
+}
+
+// resolveAccountLabel best-effort resolves the display email/plan for the
+// account scoped by configDir, for the SessionStart hook to persist onto the
+// session registry.
+//
+// configDir=="" (the default account — the overwhelmingly common,
+// zero-config case) SKIPS the probe entirely rather than merely being one
+// more input to it: a single-account user never displays this pair (see
+// domain.Account.Label's unconditional default-account guard), so spawning
+// `claude auth status` for every one of their sessions would cost a
+// subprocess for information nothing ever shows — exactly the "no behavior
+// change" this feature promises the common case.
+//
+// Any other failure — timeout, non-zero exit, malformed JSON, or a genuine
+// loggedIn:false for a configured-but-not-logged-in account — degrades to
+// ("", "") just as silently: this is display metadata, never load-bearing
+// (ConfigDir alone is what a resume needs), so there is nothing here worth
+// failing loudly over.
+func resolveAccountLabel(configDir string) (email, plan string) {
+	if configDir == "" {
+		return "", ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), accountStatusTimeout)
+	defer cancel()
+	st, ok := accountStatusFn(ctx, configDir)
+	if !ok || !st.LoggedIn {
+		return "", ""
+	}
+	return st.Email, st.SubscriptionType
 }
 
 // Host terminal markers this hook recognizes: the $TERM_PROGRAM value each one
