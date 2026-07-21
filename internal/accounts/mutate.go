@@ -115,18 +115,6 @@ func LoadDocument(path string) (*Document, error) {
 	return doc, nil
 }
 
-// Config returns a resolution-ready snapshot of the current in-memory state:
-// tilde-expanded and validated exactly as Load would return it, so the CLI's
-// read surfaces (list) reuse the same expansion the resolver does. It never
-// touches disk — call Save to persist edits.
-func (d *Document) Config() (Config, error) {
-	cfg := d.expandedConfig()
-	if err := cfg.validate(); err != nil {
-		return Config{}, err
-	}
-	return cfg, nil
-}
-
 // AddAlias registers alias → configDir. It rejects a name that is not a safe
 // slug, a duplicate name, and a non-absolute configDir — the three ways an add
 // could seed a file that later resolves to the wrong (or an unauthenticated)
