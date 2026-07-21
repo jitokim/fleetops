@@ -30,13 +30,71 @@ var IdleThreshold = 4 * time.Minute
 
 const tailBytes = 24 * 1024
 
-// ProjectsDir is ~/.claude/projects (override for tests).
+// ProjectsDir is ~/.claude/projects — the DEFAULT account's transcript root
+// (override for tests).
 func ProjectsDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
 	return filepath.Join(home, ".claude", "projects")
+}
+
+// ProjectsRoots is the full set of transcript roots the scanner reads: the
+// default ~/.claude/projects, plus "<configDir>/projects" for every alias in
+// ~/.fleetops/accounts.json. A loop spawned under a non-default account
+// (CLAUDE_CONFIG_DIR=~/.claude-work) writes its transcript under
+// ~/.claude-work/projects, which the single default root never saw — so
+// without every alias root here, half the accounts feature (observation) is
+// unreachable: such a loop never enters the fleet, gets no governor/budget/
+// actuation, shows no ACCOUNT badge.
+//
+// Zero-config is byte-identical: no (or unreadable/malformed) accounts.json ⇒
+// exactly one root, ~/.claude/projects, exactly as before this feature.
+func ProjectsRoots() []string {
+	return projectsRootsFrom(ProjectsDir(), accounts.DefaultPath())
+}
+
+// projectsRootsFrom is ProjectsRoots' pure, injectable core: the default root
+// first, then one "<configDir>/projects" per alias loaded from accountsPath,
+// deduped by cleaned path (so an alias that names the default dir — e.g.
+// "main" → ~/.claude — does not double it) and ordered by alias name for a
+// stable scan order. A Load ERROR is tolerated (returns just the default root),
+// never fatal: a typo in accounts.json must not blind the scanner to the
+// default account's loops. A missing/unreadable alias projects dir needs no
+// handling here — filepath.Glob simply yields no matches for it (see
+// DiscoverLoops), so it is skipped, not an error.
+func projectsRootsFrom(defaultRoot, accountsPath string) []string {
+	roots := make([]string, 0, 1)
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" {
+			return
+		}
+		clean := filepath.Clean(dir)
+		if seen[clean] {
+			return
+		}
+		seen[clean] = true
+		roots = append(roots, clean)
+	}
+	add(defaultRoot)
+
+	cfg, err := accounts.Load(accountsPath)
+	if err != nil {
+		return roots // a malformed config must not hide the default account's loops
+	}
+	names := make([]string, 0, len(cfg.Aliases))
+	for name := range cfg.Aliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if dir := cfg.Aliases[name]; dir != "" {
+			add(filepath.Join(dir, "projects"))
+		}
+	}
+	return roots
 }
 
 // ActiveWindow: only sessions written within this window are part of "the fleet".
@@ -56,10 +114,23 @@ var IncludeHidden = false
 // sessions active within `within` (0 = keep all). Seed spec AC-1 + filter decision:
 // "recent activity + not cleanly ended" — the window drops days-old noise.
 func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
-	root := ProjectsDir()
-	matches, err := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
-	if err != nil {
-		return nil, err
+	// Glob transcripts across EVERY account's root (default + each alias config
+	// dir), not just ~/.claude/projects — otherwise a loop spawned under a
+	// non-default account is invisible to the whole fleet (see ProjectsRoots).
+	// A transcript's absolute path still uniquely identifies its loop, so
+	// merging matches across roots introduces no collision. A missing/unreadable
+	// alias root yields no matches (glob returns nil) and is silently skipped —
+	// never fatal.
+	var matches []string
+	for _, root := range ProjectsRoots() {
+		m, err := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
+		if err != nil {
+			// The only error filepath.Glob returns is ErrBadPattern; our pattern
+			// is a fixed shape, so this is unreachable in practice. Skip the root
+			// rather than abort the whole scan on one bad root.
+			continue
+		}
+		matches = append(matches, m...)
 	}
 	gatesDir := gate.GatesDir()
 	pending := gate.Pending(gatesDir)
