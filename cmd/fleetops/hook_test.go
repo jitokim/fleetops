@@ -9,6 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/sessions"
 )
@@ -176,7 +177,7 @@ func TestSessionStartHook_HostWindowEnvAbsent_StillWritesEntry(t *testing.T) {
 // test, so it never spawns a real `claude` binary. Also asserts the ctx it
 // was called with actually has a deadline — resolveAccountLabel's whole
 // non-fatal contract depends on the probe being BOUNDED.
-func pinAccountStatus(t *testing.T, fn func(ctx context.Context, configDir string) (accountStatus, bool)) {
+func pinAccountStatus(t *testing.T, fn func(ctx context.Context, configDir string) (accountstatus.Status, bool)) {
 	t.Helper()
 	orig := accountStatusFn
 	t.Cleanup(func() { accountStatusFn = orig })
@@ -192,9 +193,9 @@ func pinAccountStatus(t *testing.T, fn func(ctx context.Context, configDir strin
 func TestSessionStartHook_CapturesConfigDir_EvenWhenAccountProbeIsSkipped(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	probed := false
-	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountstatus.Status, bool) {
 		probed = true
-		return accountStatus{}, false
+		return accountstatus.Status{}, false
 	})
 
 	withStdin(t, `{"session_id":"default-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
@@ -222,9 +223,9 @@ func TestSessionStartHook_NonDefaultConfigDir_RecordsAccountFromStatus(t *testin
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CLAUDE_CONFIG_DIR", "/home/user/.claude-work")
 	var gotConfigDir string
-	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountstatus.Status, bool) {
 		gotConfigDir = configDir
-		return accountStatus{LoggedIn: true, Email: "jito@company.com", SubscriptionType: "team"}, true
+		return accountstatus.Status{LoggedIn: true, Email: "jito@company.com", Plan: "team"}, true
 	})
 
 	withStdin(t, `{"session_id":"work-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
@@ -253,8 +254,8 @@ func TestSessionStartHook_NonDefaultConfigDir_RecordsAccountFromStatus(t *testin
 func TestSessionStartHook_AccountProbe_LoggedInFalse_LeavesLabelsEmpty(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CLAUDE_CONFIG_DIR", "/home/user/.claude-stale")
-	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
-		return accountStatus{LoggedIn: false}, true
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountstatus.Status, bool) {
+		return accountstatus.Status{LoggedIn: false}, true
 	})
 
 	withStdin(t, `{"session_id":"stale-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
@@ -277,8 +278,8 @@ func TestSessionStartHook_AccountProbe_LoggedInFalse_LeavesLabelsEmpty(t *testin
 func TestSessionStartHook_AccountProbe_Fails_DegradesSilently(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CLAUDE_CONFIG_DIR", "/home/user/.claude-broken")
-	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
-		return accountStatus{}, false
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountstatus.Status, bool) {
+		return accountstatus.Status{}, false
 	})
 
 	withStdin(t, `{"session_id":"broken-acct","cwd":"/tmp/proj","source":"startup"}`, sessionStartHook)
@@ -301,9 +302,9 @@ func TestSessionStartHook_AccountProbe_Fails_DegradesSilently(t *testing.T) {
 // queryAccountStatus's production implementation choosing to respect one.
 func TestResolveAccountLabel_PassesBoundedContext(t *testing.T) {
 	var sawDeadline bool
-	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountStatus, bool) {
+	pinAccountStatus(t, func(ctx context.Context, configDir string) (accountstatus.Status, bool) {
 		_, sawDeadline = ctx.Deadline()
-		return accountStatus{}, false
+		return accountstatus.Status{}, false
 	})
 
 	resolveAccountLabel("/home/user/.claude-work")

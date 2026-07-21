@@ -103,7 +103,7 @@ var accountConfigDirFn = defaultAccountConfigDir
 
 // defaultAccountConfigDir is accountConfigDirFn's production implementation:
 // load ~/.fleetops/accounts.json and resolve cwd through it, with git-based
-// worktree→origin resolution wired in via gitMainRepoDir.
+// worktree→origin resolution wired in via GitMainRepoDir.
 //
 // A Load ERROR (malformed JSON, or a binding naming an unknown alias) is
 // treated as INACTIVE here — the spawn proceeds with no account prefix, exactly
@@ -119,11 +119,11 @@ func defaultAccountConfigDir(cwd string) (configDir string, ok bool) {
 	if err != nil {
 		return "", false
 	}
-	_, configDir, ok = cfg.ResolveForCwd(cwd, gitMainRepoDir)
+	_, configDir, ok = cfg.ResolveForCwd(cwd, GitMainRepoDir)
 	return configDir, ok
 }
 
-// gitMainRepoDir maps cwd to the MAIN repo root of the git repository that
+// GitMainRepoDir maps cwd to the MAIN repo root of the git repository that
 // contains it, so a linked worktree resolves to the repo it was branched from
 // (its account binding lives on the origin, not on the freshly-created
 // worktree). ok=false on any failure — not a repo, no git binary — in which
@@ -140,7 +140,12 @@ func defaultAccountConfigDir(cwd string) (configDir string, ok bool) {
 // outside internal/accounts, so that package stays pure and git-free. The
 // worktree→origin resolution LOGIC it feeds is unit-tested in internal/accounts
 // via an injected fake; this thin production glue is exercised at spawn time.
-func gitMainRepoDir(cwd string) (string, bool) {
+//
+// Exported so the TUI's "n"-wizard account picker can resolve the SAME
+// worktree→origin binding this spawn path resolves — one git helper, not two
+// (see internal/tui's resolveAccountCmd, which feeds it to
+// accounts.Config.ResolveForCwd exactly as defaultAccountConfigDir does above).
+func GitMainRepoDir(cwd string) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), availabilityTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--git-common-dir").Output()
@@ -185,10 +190,57 @@ func gitMainRepoDir(cwd string) (string, bool) {
 // claude; every spawn site already waits for the TUI to boot long after it, so
 // no locate ever observes "env".)
 func spawnArgvForCwd(cwd string) []string {
-	argv := spawnCommandFn()
 	configDir, ok := accountConfigDirFn(cwd)
 	if !ok {
+		// Unbound cwd — the zero-config default. Return the base command
+		// UNCHANGED (no env, no CLAUDE_CONFIG_DIR): a machine with no
+		// accounts.json spawns byte-identically to before this feature.
+		return spawnCommandFn()
+	}
+	return spawnArgvWithConfigDir(configDir)
+}
+
+// spawnArgvWithConfigDir is spawnArgvForCwd's EXPLICIT-account sibling: it
+// fronts the configured base command with `env CLAUDE_CONFIG_DIR=<configDir>`
+// for a configDir supplied by the CALLER rather than re-resolved from a cwd.
+//
+// The "n"-wizard's account picker is the caller: once the human has chosen an
+// account for an UNBOUND spawn dir, re-resolving by cwd (spawnArgvForCwd) would
+// resolve to nothing (no binding) and silently discard their choice — so the
+// wizard threads the chosen configDir here instead. A "" configDir means the
+// DEFAULT account (the picker's explicit default choice, or a bound-but-empty
+// alias that ResolveForCwd already fails closed on): return the base command
+// unchanged, exactly as an unbound cwd does, so an explicit default and an
+// absent config land on the identical byte-for-byte spawn.
+//
+// The mechanism (why `env VAR=val cmd` composes across every backend, and why
+// argv[0] becoming "env" does not break actuation) is spawnArgvForCwd's — see
+// its doc; this only changes WHERE the configDir comes from, never how it is
+// injected.
+func spawnArgvWithConfigDir(configDir string) []string {
+	argv := spawnCommandFn()
+	if configDir == "" {
 		return argv
 	}
 	return append([]string{"env", claudeConfigDirEnv + "=" + configDir}, argv...)
+}
+
+// LoginTerminalCommand renders the shell command string that authenticates the
+// account scoped by configDir — `env CLAUDE_CONFIG_DIR=<configDir> claude
+// login`, or a bare `claude login` for the default account (configDir==""). It
+// is what the "n"-wizard's account picker hands to a TerminalOpener so the
+// human can complete the browser OAuth for an alias that is not yet logged in.
+//
+// A STRING (not an argv) because that is the shape TerminalOpener.OpenTerminal
+// consumes — orca's `terminal create --command` takes a command string and
+// tmux's `new-window` takes a single trailing shell word; both interpret this
+// through a shell, so it is shell-quoted (shellQuoteJoin) exactly as the spawn
+// sites that must flatten an argv are. fleetops only LAUNCHES the flow; the
+// browser half, and the credential write into configDir, are claude's and the
+// human's — no token ever passes through here.
+func LoginTerminalCommand(configDir string) string {
+	if configDir == "" {
+		return shellQuoteJoin([]string{"claude", "login"})
+	}
+	return shellQuoteJoin([]string{"env", claudeConfigDirEnv + "=" + configDir, "claude", "login"})
 }

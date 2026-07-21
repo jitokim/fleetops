@@ -14,6 +14,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/jitokim/fleetops/internal/accounts"
+	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/claude"
 	"github.com/jitokim/fleetops/internal/control"
 	"github.com/jitokim/fleetops/internal/domain"
@@ -51,6 +53,19 @@ func TestMain(m *testing.M) {
 	// banner line if it were half-installed). Default to a healthy report; the
 	// banner/H/esc tests override hookHealthFn themselves (save-then-restore).
 	hookHealthFn = func() hooks.Report { return hooks.Report{OK: true} }
+	// Hermeticity net for the multi-account picker: proceedFromWhere calls
+	// loadAccountsFn the instant wizardWhere commits, and its production default
+	// reads the real ~/.fleetops/accounts.json — on a machine that actually has
+	// aliases configured (e.g. the captain's QA box) that would divert EVERY
+	// existing wizard test into the new account step. Default to the empty
+	// config (zero-config: no account step, submit straight through); the
+	// account-picker tests override loadAccountsFn/gitMainRepoDirFn/
+	// accountStatusProbeFn themselves. The latter two also never shell out here.
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil }
+	gitMainRepoDirFn = func(string) (string, bool) { return "", false }
+	accountStatusProbeFn = func(context.Context, string) (accountstatus.Status, bool) {
+		return accountstatus.Status{}, false
+	}
 	os.Exit(m.Run())
 }
 

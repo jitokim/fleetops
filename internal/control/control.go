@@ -8,11 +8,13 @@ package control
 
 import (
 	"context"
-	"github.com/jitokim/fleetops/internal/domain"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/jitokim/fleetops/internal/domain"
 )
 
 // actuationTimeout bounds a single typed-action exec call (Resume/Approve/
@@ -257,6 +259,43 @@ type Spawner interface {
 	Name() string
 	Available() bool
 	Spawn(cwd, goal string) error
+}
+
+// AccountSpawner is an OPTIONAL capability a Spawner may additionally
+// implement — spawning a loop under an EXPLICIT Claude account (a caller-
+// supplied CLAUDE_CONFIG_DIR) rather than the one auto-resolved from cwd. Same
+// narrow-interface idiom as WorktreeSpawner/TerminalOpener (don't widen Spawner
+// with a method every caller must implement): callers type-assert and, for the
+// account feature, MUST fail closed when a backend lacks it (see
+// SpawnWithAccount) — silently dropping the override would spawn under the
+// wrong account, the exact mistake the accounts feature exists to prevent.
+//
+// The distinction from plain Spawn is only WHERE the config dir comes from:
+// Spawn re-resolves it from cwd (spawnArgvForCwd), whereas this pins the one
+// the "n"-wizard's picker chose for an unbound dir (spawnArgvWithConfigDir).
+type AccountSpawner interface {
+	SpawnWithConfigDir(cwd, goal, configDir string) error
+}
+
+// SpawnWithAccount spawns a loop pinned to an explicit account, or — when
+// configDir is "" — falls straight through to the ordinary cwd-resolved Spawn,
+// so the zero-config path is byte-for-byte unchanged (the wizard passes "" for
+// its explicit-default choice and whenever no account was chosen at all).
+//
+// It FAILS CLOSED: a non-empty configDir with a backend that cannot pin an
+// account returns an error rather than spawning under whatever account cwd
+// happens to resolve to. Every backend fleetops ships implements AccountSpawner,
+// so this guard only ever fires for a future one — and when it does, refusing
+// is the honest outcome, matching internal/accounts' own fail-closed posture.
+func SpawnWithAccount(s Spawner, cwd, goal, configDir string) error {
+	if configDir == "" {
+		return s.Spawn(cwd, goal)
+	}
+	as, ok := s.(AccountSpawner)
+	if !ok {
+		return fmt.Errorf("backend %s cannot pin a Claude account (CLAUDE_CONFIG_DIR); refusing to spawn under the wrong account", s.Name())
+	}
+	return as.SpawnWithConfigDir(cwd, goal, configDir)
 }
 
 // ResolveSpawner returns something that can start a new loop: the first

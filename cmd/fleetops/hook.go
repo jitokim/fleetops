@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/sessions"
 )
@@ -228,43 +228,11 @@ const claudeConfigDirEnvVar = "CLAUDE_CONFIG_DIR"
 // `claude` binary must not hold up the user's actual session starting.
 const accountStatusTimeout = 2 * time.Second
 
-// accountStatus is the subset of `claude auth status --json`'s output this
-// hook reads (measured live, claude 2.1.215 — see .notes/design-multi-account.md):
-// {loggedIn, email, orgName, subscriptionType, authMethod}. No token in this
-// shape — safe to read and to persist.
-type accountStatus struct {
-	LoggedIn         bool   `json:"loggedIn"`
-	Email            string `json:"email"`
-	SubscriptionType string `json:"subscriptionType"`
-}
-
 // accountStatusFn is the injectable seam for the `claude auth status --json`
 // probe, so tests never spawn a real `claude` binary. Production default is
-// queryAccountStatus.
-var accountStatusFn = queryAccountStatus
-
-// queryAccountStatus runs `claude auth status --json` with CLAUDE_CONFIG_DIR
-// set to configDir (configDir=="" leaves the child's environment
-// un-overridden — the default account), bounded by ctx's deadline. ok=false
-// on any failure (binary missing, non-zero exit, timeout, unparseable
-// output) — the caller treats that identically to "nothing to show", never
-// as an error worth surfacing: this hook must degrade silently (see
-// sessionStartHook's and resolveAccountLabel's own non-fatal contract).
-func queryAccountStatus(ctx context.Context, configDir string) (accountStatus, bool) {
-	cmd := exec.CommandContext(ctx, "claude", "auth", "status", "--json")
-	if configDir != "" {
-		cmd.Env = append(os.Environ(), claudeConfigDirEnvVar+"="+configDir)
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		return accountStatus{}, false
-	}
-	var st accountStatus
-	if err := json.Unmarshal(out, &st); err != nil {
-		return accountStatus{}, false
-	}
-	return st, true
-}
+// accountstatus.Query — the single definition of that subprocess and its JSON
+// shape, shared with the TUI's account picker (see internal/accountstatus).
+var accountStatusFn = accountstatus.Query
 
 // resolveAccountLabel best-effort resolves the display email/plan for the
 // account scoped by configDir, for the SessionStart hook to persist onto the
@@ -293,7 +261,7 @@ func resolveAccountLabel(configDir string) (email, plan string) {
 	if !ok || !st.LoggedIn {
 		return "", ""
 	}
-	return st.Email, st.SubscriptionType
+	return st.Email, st.Plan
 }
 
 // Host terminal markers this hook recognizes: the $TERM_PROGRAM value each one

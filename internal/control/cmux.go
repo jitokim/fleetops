@@ -138,6 +138,14 @@ func (cmuxController) Spawn(cwd, goal string) error {
 	return fmt.Errorf("spawn not supported on cmux yet")
 }
 
+// SpawnWithConfigDir implements control.AccountSpawner so a wizard account
+// choice fails with cmux's OWN honest "spawn not supported" reason rather than
+// SpawnWithAccount's generic "cannot pin an account" fallback — cmux cannot
+// spawn at all yet, account or not (see Spawn's doc).
+func (cmuxController) SpawnWithConfigDir(cwd, goal, configDir string) error {
+	return fmt.Errorf("spawn not supported on cmux yet")
+}
+
 // Interrupt stops the current turn without killing claude — a bare Escape.
 //
 // Verified on cmux 0.64.15: `send-key --surface <ref> <key>` exists (see
