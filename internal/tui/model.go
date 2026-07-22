@@ -515,6 +515,13 @@ type Model struct {
 	// non-empty value is the picker's explicit choice for an UNBOUND dir, or a
 	// bound dir's fixed binding — either way it OVERRIDES cwd re-resolution.
 	spawnConfigDir string
+	// spawnAlias is the human-readable alias for spawnConfigDir, set alongside
+	// it at every assignment (bound-dir resolution, the picker's digit choice)
+	// so the status the human reads back says "under account work" rather than
+	// the raw config-dir path. Stays "" wherever spawnConfigDir does — the
+	// zero-config/default-account case — and submitSpawnWizard falls back to
+	// filepath.Base(spawnConfigDir) in the unexpected case they disagree.
+	spawnAlias string
 	// spawnUseWorktree carries wizardWhere's resolved worktree-vs-dir choice
 	// across the account step to submit — the account step sits BETWEEN the
 	// where choice and the spawn, so the choice has to survive it.
@@ -1519,6 +1526,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// stale pick can never leak into this spawn. spawnConfigDir="" keeps
 			// the zero-config path byte-identical until the picker sets it.
 			m.spawnConfigDir = ""
+			m.spawnAlias = ""
 			m.spawnUseWorktree = false
 			m.accountResolving = false
 			m.accountFixed = false
@@ -2352,6 +2360,7 @@ func (m Model) proceedFromWhere(useWorktree bool) (tea.Model, tea.Cmd) {
 		// SAY so — the warning is set AFTER submit because submitSpawnWizard
 		// overwrites the status with its own "spawning…" line.
 		m.spawnConfigDir = ""
+		m.spawnAlias = ""
 		model, cmd := m.submitSpawnWizard(useWorktree)
 		mm := model.(Model)
 		mm.status, mm.statusKind = "accounts.json invalid — spawning under the default account: "+err.Error(), statusNeutral
@@ -2360,6 +2369,7 @@ func (m Model) proceedFromWhere(useWorktree bool) (tea.Model, tea.Cmd) {
 	if len(cfg.Aliases) == 0 {
 		// Zero-config: no aliases → no account step, byte-identical spawn.
 		m.spawnConfigDir = ""
+		m.spawnAlias = ""
 		return m.submitSpawnWizard(useWorktree)
 	}
 	// Aliases exist — enter the account step and resolve the decision off the
@@ -2480,6 +2490,7 @@ func (m Model) handleFixedAccountKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
 	case "enter":
 		m.spawnConfigDir = m.accountFixedDir
+		m.spawnAlias = m.accountFixedAlias
 		return m.submitSpawnWizard(m.spawnUseWorktree)
 	case "l":
 		return m, loginLaunchCmd(m.spawnCwd, m.accountFixedDir, m.accountFixedAlias)
@@ -2506,6 +2517,7 @@ func (m Model) handlePickerKey(key string) (tea.Model, tea.Cmd) {
 	case "enter":
 		// Default account — the pre-highlighted choice. No override.
 		m.spawnConfigDir = ""
+		m.spawnAlias = ""
 		return m.submitSpawnWizard(m.spawnUseWorktree)
 	case "l":
 		m.accountLoginPrompt = true
@@ -2513,6 +2525,7 @@ func (m Model) handlePickerKey(key string) (tea.Model, tea.Cmd) {
 	}
 	if name, ok := m.aliasForDigit(key); ok {
 		m.spawnConfigDir = m.accountConfigDirs[name]
+		m.spawnAlias = name
 		return m.submitSpawnWizard(m.spawnUseWorktree)
 	}
 	return m, nil // ignore any other key at this single-key step
@@ -2596,8 +2609,16 @@ func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 	// The chosen account is part of the spawn's identity, so it goes in the
 	// status the human reads back — "" (default account) stays silent, exactly
 	// as it did before this feature, keeping the zero-config line unchanged.
+	// Shown by ALIAS, never the raw config-dir path: spawnAlias is set
+	// alongside spawnConfigDir at every assignment site, so it should always be
+	// non-empty here; filepath.Base is a defensive fallback only, never the
+	// full path a human would have to squint at.
 	if m.spawnConfigDir != "" {
-		note += " under account " + m.spawnConfigDir
+		alias := m.spawnAlias
+		if alias == "" {
+			alias = filepath.Base(m.spawnConfigDir)
+		}
+		note += " under account " + alias
 	}
 	if useWorktree {
 		m.status, m.statusKind = fmt.Sprintf("spawning loop in a new worktree of %s...%s", m.spawnCwd, note), statusNeutral
@@ -2780,6 +2801,25 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool, configDir st
 	}
 }
 
+// configDirAlias resolves a CLAUDE_CONFIG_DIR back to its human-readable
+// alias for display, so a status line can say "under account work" instead
+// of the raw path. It runs off the event loop (spawnOrcaAccountNoWorktree's
+// caller already does), so loading accounts.json here is safe. A load error
+// or an unmapped configDir (should not happen via the wizard, which only ever
+// hands back a dir it resolved FROM an alias, but a stale/edited config could
+// still produce one) both fall back to filepath.Base(configDir) — never the
+// full path.
+func configDirAlias(configDir string) string {
+	cfg, err := loadAccountsFn()
+	if err != nil {
+		return filepath.Base(configDir)
+	}
+	if alias, ok := cfg.AliasForConfigDir(configDir); ok {
+		return alias
+	}
+	return filepath.Base(configDir)
+}
+
 // spawnOrcaAccountNoWorktree handles the one combination orca cannot serve:
 // orca + a non-default account + a worktree request. orca's `terminal create
 // --worktree path:<p>` only accepts a worktree orca itself registered, so a
@@ -2796,7 +2836,7 @@ func spawnOrcaAccountNoWorktree(ctrl control.Spawner, cwd string, spec registry.
 		return spawnResultMsg{ok: false, text: spawnFailureText(err), mayHaveSpawned: spawnMayHaveLandedWindow(err)}
 	}
 	forfeit := fmt.Sprintf("spawned in %s under account %s via %s — orca can't isolate a worktree under a non-default account, so no separate checkout",
-		cwd, configDir, ctrl.Name())
+		cwd, configDirAlias(configDir), ctrl.Name())
 	if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
 		// best-effort, same posture as the plain-spawn path: the loop really did
 		// start, it just won't get ORACLE/N-I tracking.
