@@ -70,3 +70,25 @@ func (a Account) Label() string {
 	}
 	return filepath.Base(filepath.Clean(a.ConfigDir))
 }
+
+// DetailValue is the DETAIL panel's CLAUDE row text: the alias and the login
+// email together when both are known ("my — a@b.com"), so the row reads
+// symmetrically with the GIT identity row beside it. Falls back gracefully:
+// alias alone when no email was captured, email alone when the config dir has
+// no registered alias, and "" for the default account (no row — same as
+// Label). Never a token; Email is login identity only.
+func (a Account) DetailValue() string {
+	if a.IsDefault() {
+		return ""
+	}
+	switch {
+	case a.Alias != "" && a.Email != "":
+		return a.Alias + " — " + a.Email
+	case a.Alias != "":
+		return a.Alias
+	case a.Email != "":
+		return a.Email
+	default:
+		return filepath.Base(filepath.Clean(a.ConfigDir))
+	}
+}

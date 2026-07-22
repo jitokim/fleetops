@@ -70,3 +70,24 @@ func TestAccount_Label_Precedence(t *testing.T) {
 		})
 	}
 }
+
+func TestAccount_DetailValue(t *testing.T) {
+	cases := []struct {
+		name string
+		a    Account
+		want string
+	}{
+		{"alias and email", Account{ConfigDir: "/x/.claude-work", Alias: "my", Email: "me@gmail.com"}, "my — me@gmail.com"},
+		{"alias only (no email captured)", Account{ConfigDir: "/x/.claude-work", Alias: "my"}, "my"},
+		{"email only (no registered alias)", Account{ConfigDir: "/x/.claude-work", Email: "me@gmail.com"}, "me@gmail.com"},
+		{"neither — falls back to config dir base", Account{ConfigDir: "/x/.claude-work"}, ".claude-work"},
+		{"default account — no row", Account{}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.a.DetailValue(); got != c.want {
+				t.Errorf("DetailValue() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

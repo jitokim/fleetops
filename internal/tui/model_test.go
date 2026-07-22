@@ -8484,13 +8484,16 @@ func TestRenderDetail_ObservedLoop_NoDriveRow(t *testing.T) {
 // ACCOUNT row showing exactly that label.
 func TestRenderDetail_AccountLabelSet_ShowsAccountRow(t *testing.T) {
 	l := domain.Loop{Project: "myproject", SessionID: "s1", State: domain.StateIdle,
-		Account: domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "company"}}
+		Account: domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "company", Email: "jito@lbox.kr"}}
 	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
-	if !strings.Contains(out, "ACCOUNT") {
-		t.Errorf("expected an ACCOUNT row when Account.Label() is non-empty:\n%s", out)
+	if !strings.Contains(out, "CLAUDE") {
+		t.Errorf("expected a CLAUDE row when the account is non-default:\n%s", out)
 	}
 	if !strings.Contains(out, "company") {
-		t.Errorf("expected the ACCOUNT row to show the resolved alias:\n%s", out)
+		t.Errorf("expected the CLAUDE row to show the alias:\n%s", out)
+	}
+	if !strings.Contains(out, "jito@lbox.kr") {
+		t.Errorf("expected the CLAUDE row to show the login email beside the alias:\n%s", out)
 	}
 }
 
@@ -8501,8 +8504,8 @@ func TestRenderDetail_AccountLabelSet_ShowsAccountRow(t *testing.T) {
 func TestRenderDetail_ZeroValueAccount_NoAccountRow(t *testing.T) {
 	l := domain.Loop{Project: "myproject", SessionID: "s1", State: domain.StateIdle}
 	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
-	if strings.Contains(out, "ACCOUNT") {
-		t.Errorf("did not expect an ACCOUNT row for a loop with no account info:\n%s", out)
+	if strings.Contains(out, "CLAUDE") {
+		t.Errorf("did not expect a CLAUDE row for a loop with no account info:\n%s", out)
 	}
 }
 
@@ -8549,7 +8552,7 @@ func TestRenderDetail_GitIdentityOK_ShowsGitRow(t *testing.T) {
 	}
 	// Adjacency: ACCOUNT then GIT, in that order — the mismatch is only
 	// glance-able if they sit together.
-	acctAt := strings.Index(out, "ACCOUNT")
+	acctAt := strings.Index(out, "CLAUDE")
 	gitAt := strings.Index(out, "GIT")
 	if acctAt < 0 || gitAt < 0 || gitAt < acctAt {
 		t.Errorf("expected ACCOUNT (at %d) to precede GIT (at %d) — they must read adjacently:\n%s", acctAt, gitAt, out)
@@ -8865,8 +8868,8 @@ func TestDemoFleet_GitIdentity_SurfacesMismatch(t *testing.T) {
 		t.Fatalf("migrate-db demo identity must be the configured-mismatch case (⚠), got %+v", id)
 	}
 	out := strings.Join(m.detailPanelLines(100, 60), "\n")
-	if !strings.Contains(out, "ACCOUNT") || !strings.Contains(out, "GIT") {
-		t.Errorf("demo DETAIL for migrate-db must show BOTH ACCOUNT and GIT rows:\n%s", out)
+	if !strings.Contains(out, "CLAUDE") || !strings.Contains(out, "GIT") {
+		t.Errorf("demo DETAIL for migrate-db must show BOTH CLAUDE and GIT rows:\n%s", out)
 	}
 	if !strings.Contains(out, "work") || !strings.Contains(out, id.email) {
 		t.Errorf("demo DETAIL for migrate-db must juxtapose the 'work' alias with the personal git email:\n%s", out)
