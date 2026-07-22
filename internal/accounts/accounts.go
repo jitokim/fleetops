@@ -60,6 +60,36 @@ type Config struct {
 	// preserved from the file but does not affect resolution: the LONGEST
 	// matching path wins regardless of position (see ResolveForCwd).
 	Bindings []Binding `json:"bindings"`
+	// AliasGitEmails is the OPTIONAL, opt-in git-identity expectation: alias →
+	// the git user.email the user DECLARES that account should commit as. Its
+	// sole use is the DETAIL panel's ⚠ mismatch marker, shown only when a repo's
+	// actual user.email disagrees with its alias's declared email. Absent for
+	// the common user — and absence means no check, EVER: fleetops never infers
+	// that a Claude-account / git-identity difference is wrong (committing a
+	// company repo under a personal email is a legitimate signed-off-by
+	// workflow, not a bug). Holds emails only, never a token.
+	//
+	// Unlike Bindings, a stale/unknown alias key here is NOT a validation error:
+	// this is a cosmetic display hint, and it must never fail the config LOAD
+	// that gates spawning. A typo just yields no expectation (no check), never a
+	// blocked spawn.
+	AliasGitEmails map[string]string `json:"alias_git_emails,omitempty"`
+}
+
+// GitEmailForAlias returns the git committer email the user has DECLARED this
+// alias should commit as (via "alias_git_emails"), and ok=false when none is
+// declared. This is the ONLY source of a mismatch expectation — a missing
+// entry (the common case) means "no expectation, never warn". fleetops flags a
+// git-identity disagreement only when the user explicitly asked it to.
+func (c Config) GitEmailForAlias(alias string) (email string, ok bool) {
+	if alias == "" {
+		return "", false
+	}
+	email, ok = c.AliasGitEmails[alias]
+	if !ok || email == "" {
+		return "", false
+	}
+	return email, true
 }
 
 // Binding ties a directory to an account alias.

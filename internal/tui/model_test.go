@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -8374,6 +8375,421 @@ func TestRenderDetail_ZeroValueAccount_NoAccountRow(t *testing.T) {
 	}
 }
 
+// ── feat/detail-git-identity: DETAIL panel's GIT row ───────────────────────
+
+// gitIdentityLabel is pure — pin all four value shapes, the "neither" case
+// (empty) noted as never reaching here (ok=false omits the row) but still
+// defined behaviour worth pinning failure-first.
+func TestGitIdentityLabel_AllShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		id   gitIdentityResult
+		want string
+	}{
+		{"neither set renders empty", gitIdentityResult{}, ""},
+		{"name only", gitIdentityResult{name: "Jito Kim"}, "Jito Kim"},
+		{"email only", gitIdentityResult{email: "jito@company.com"}, "jito@company.com"},
+		{"both set renders name <email>", gitIdentityResult{name: "Jito Kim", email: "jito@company.com"}, "Jito Kim <jito@company.com>"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := gitIdentityLabel(c.id); got != c.want {
+				t.Errorf("gitIdentityLabel(%+v) = %q, want %q", c.id, got, c.want)
+			}
+		})
+	}
+}
+
+// TestRenderDetail_GitIdentityOK_ShowsGitRow: a resolved identity gets a GIT
+// row showing "name <email>", placed AFTER the ACCOUNT row so the two read
+// together (the whole point — a company Claude account beside a personal git
+// email). Mutation: drop the `if data.gitIdentity.ok` block → this fails.
+func TestRenderDetail_GitIdentityOK_ShowsGitRow(t *testing.T) {
+	l := domain.Loop{Project: "lbox", SessionID: "s1", State: domain.StateIdle,
+		Account: domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "company"}}
+	data := detailData{now: time.Now(), gitIdentity: gitIdentityResult{name: "Jito Kim", email: "pigberger70@gmail.com", ok: true}}
+	out := renderDetail(l, 100, 40, data)
+
+	if !strings.Contains(out, "GIT") {
+		t.Fatalf("expected a GIT row when the identity resolved:\n%s", out)
+	}
+	if !strings.Contains(out, "Jito Kim <pigberger70@gmail.com>") {
+		t.Errorf("expected the GIT row to show name <email>:\n%s", out)
+	}
+	// Adjacency: ACCOUNT then GIT, in that order — the mismatch is only
+	// glance-able if they sit together.
+	acctAt := strings.Index(out, "ACCOUNT")
+	gitAt := strings.Index(out, "GIT")
+	if acctAt < 0 || gitAt < 0 || gitAt < acctAt {
+		t.Errorf("expected ACCOUNT (at %d) to precede GIT (at %d) — they must read adjacently:\n%s", acctAt, gitAt, out)
+	}
+	// The clarified default rule: with NO declared expectation (mismatch=false),
+	// the row shows ZERO warning even though the Claude alias ("company") and the
+	// git email (personal gmail) plainly differ — that difference is not itself a
+	// bug and must never be flagged on its own.
+	if strings.Contains(out, "⚠") {
+		t.Errorf("a non-configured identity difference must show NO ⚠ marker:\n%s", out)
+	}
+}
+
+// TestRenderDetail_GitIdentityMismatch_ShowsWarning: the OPT-IN path — an
+// identity flagged as a mismatch (a declared git_email expectation disagrees)
+// shows the ⚠ marker AND the expected email so the human can act. Mutation:
+// make renderGitRow ignore id.mismatch → this fails.
+func TestRenderDetail_GitIdentityMismatch_ShowsWarning(t *testing.T) {
+	l := domain.Loop{Project: "lbox", SessionID: "s1", State: domain.StateIdle,
+		Account: domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "company"}}
+	data := detailData{now: time.Now(), gitIdentity: gitIdentityResult{
+		name: "Jito Kim", email: "pigberger70@gmail.com", ok: true,
+		mismatch: true, expected: "jito@company.com"}}
+	out := renderDetail(l, 100, 40, data)
+	if !strings.Contains(out, "⚠") {
+		t.Errorf("expected a ⚠ marker on the configured mismatch:\n%s", out)
+	}
+	if !strings.Contains(out, "jito@company.com") {
+		t.Errorf("expected the declared email shown beside the ⚠ so the human can act:\n%s", out)
+	}
+}
+
+// TestGitEmailMismatch pins the opt-in gate at the source, failure cases first,
+// via the loadAccountsFn seam so no real accounts.json is touched.
+func TestGitEmailMismatch(t *testing.T) {
+	orig := loadAccountsFn
+	defer func() { loadAccountsFn = orig }()
+
+	withConfig := func(cfg accounts.Config, err error) {
+		loadAccountsFn = func() (accounts.Config, error) { return cfg, err }
+	}
+
+	t.Run("no declared expectation → no warning", func(t *testing.T) {
+		withConfig(accounts.Config{Aliases: map[string]string{"company": "/x"}}, nil)
+		if got, _ := gitEmailMismatch("company", "anyone@anywhere.com"); got {
+			t.Error("absent expectation must never warn")
+		}
+	})
+	t.Run("declared and DIFFERS → warn with expected", func(t *testing.T) {
+		withConfig(accounts.Config{AliasGitEmails: map[string]string{"company": "jito@company.com"}}, nil)
+		got, expected := gitEmailMismatch("company", "pigberger70@gmail.com")
+		if !got || expected != "jito@company.com" {
+			t.Errorf("gitEmailMismatch = (%v, %q), want (true, jito@company.com)", got, expected)
+		}
+	})
+	t.Run("declared and MATCHES → no warning", func(t *testing.T) {
+		withConfig(accounts.Config{AliasGitEmails: map[string]string{"company": "jito@company.com"}}, nil)
+		if got, _ := gitEmailMismatch("company", "jito@company.com"); got {
+			t.Error("a matching identity must not warn")
+		}
+	})
+	t.Run("config load error → no warning (never manufacture one)", func(t *testing.T) {
+		withConfig(accounts.Config{}, errors.New("broken accounts.json"))
+		if got, _ := gitEmailMismatch("company", "anyone@anywhere.com"); got {
+			t.Error("a broken config must never produce a warning")
+		}
+	})
+}
+
+// TestGitStatsCmd_MismatchFold_UsesDeclaredExpectation proves the opt-in check
+// rides gitStatsCmd end-to-end: a real repo + a seeded config with a declared,
+// disagreeing git_email for the loop's alias yields identity.mismatch on the
+// message. Mutation: drop the `gitEmailMismatch` call in gitStatsCmd → mismatch
+// stays false and this fails.
+func TestGitStatsCmd_MismatchFold_UsesDeclaredExpectation(t *testing.T) {
+	repo := initTestGitRepo(t)
+
+	origProbe := gitIdentityProbeFn
+	defer func() { gitIdentityProbeFn = origProbe }()
+	gitIdentityProbeFn = func(string) (string, string, bool) {
+		return "Jito Kim", "pigberger70@gmail.com", true
+	}
+	origLoad := loadAccountsFn
+	defer func() { loadAccountsFn = origLoad }()
+	loadAccountsFn = func() (accounts.Config, error) {
+		return accounts.Config{AliasGitEmails: map[string]string{"company": "jito@company.com"}}, nil
+	}
+
+	l := domain.Loop{SessionID: "s1", Cwd: repo, CwdVerified: true,
+		Account: domain.Account{ConfigDir: "/x/.claude-work", Alias: "company"}}
+	msg := gitStatsCmd(l)().(gitStatsMsg)
+	if !msg.identity.mismatch || msg.identity.expected != "jito@company.com" {
+		t.Errorf("msg.identity = %+v, want mismatch=true expected=jito@company.com", msg.identity)
+	}
+}
+
+// TestGitStatsCmd_NoAlias_SkipsMismatchCheck: a loop with no managed alias (the
+// common zero-config case) must not even consult the config — no alias, no
+// check, no cost. The seam fatals if it's called.
+func TestGitStatsCmd_NoAlias_SkipsMismatchCheck(t *testing.T) {
+	repo := initTestGitRepo(t)
+
+	origProbe := gitIdentityProbeFn
+	defer func() { gitIdentityProbeFn = origProbe }()
+	gitIdentityProbeFn = func(string) (string, string, bool) { return "N", "e@x.com", true }
+	origLoad := loadAccountsFn
+	defer func() { loadAccountsFn = origLoad }()
+	loadAccountsFn = func() (accounts.Config, error) {
+		t.Fatal("loadAccountsFn must not be called for a loop with no alias")
+		return accounts.Config{}, nil
+	}
+
+	l := domain.Loop{SessionID: "s1", Cwd: repo, CwdVerified: true} // no Account.Alias
+	msg := gitStatsCmd(l)().(gitStatsMsg)
+	if msg.identity.mismatch {
+		t.Errorf("no alias must yield no mismatch, got %+v", msg.identity)
+	}
+}
+
+// TestRenderDetail_GitIdentityNotOK_NoGitRow: the not-a-repo / unset path
+// (ok=false) shows NO GIT row — same presence/absence discipline as ACCOUNT,
+// never a fabricated or blank identity. Failure-first: this is the guard the
+// "omit when there's no identity" requirement rides on.
+func TestRenderDetail_GitIdentityNotOK_NoGitRow(t *testing.T) {
+	l := domain.Loop{Project: "myproject", SessionID: "s1", State: domain.StateIdle}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now(), gitIdentity: gitIdentityResult{ok: false}})
+	// "GIT" as a standalone detail KEY must not appear. (Guard against a
+	// substring false-positive: there is no other "GIT" token in a goal-less
+	// idle loop's detail.)
+	if strings.Contains(out, "GIT") {
+		t.Errorf("did not expect a GIT row for an unresolved identity:\n%s", out)
+	}
+}
+
+// TestRenderDetail_GitIdentityEmailOnly_ShowsBareEmail: unset user.name but a
+// set user.email (a common CI/box config) shows the bare email, no empty
+// angle brackets.
+func TestRenderDetail_GitIdentityEmailOnly_ShowsBareEmail(t *testing.T) {
+	l := domain.Loop{Project: "p", SessionID: "s1", State: domain.StateIdle}
+	data := detailData{now: time.Now(), gitIdentity: gitIdentityResult{email: "box@ci.local", ok: true}}
+	out := renderDetail(l, 100, 40, data)
+	if !strings.Contains(out, "box@ci.local") {
+		t.Fatalf("expected the bare email in the GIT row:\n%s", out)
+	}
+	if strings.Contains(out, "<box@ci.local>") {
+		t.Errorf("expected NO angle brackets when user.name is unset:\n%s", out)
+	}
+}
+
+// TestRenderDetail_GitIdentity_NarrowWidth_NoOverflow: a long identity at a
+// narrow panel width must be truncated by trunc() like every other value row,
+// never overflow — the same width discipline TestView_NoLineExceedsTerminalWidth
+// enforces globally, pinned here at the row level so a regression is caught
+// close to the change.
+func TestRenderDetail_GitIdentity_NarrowWidth_NoOverflow(t *testing.T) {
+	width := 40
+	l := domain.Loop{Project: "p", SessionID: "s1", State: domain.StateIdle}
+	longEmail := strings.Repeat("a", 80) + "@example.com"
+	data := detailData{now: time.Now(), gitIdentity: gitIdentityResult{name: strings.Repeat("N", 40), email: longEmail, ok: true}}
+	out := renderDetail(l, width, 40, data)
+	for i, line := range strings.Split(out, "\n") {
+		if got := lipgloss.Width(line); got > width {
+			t.Errorf("line %d is %d cols wide, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+// TestGitStatsCmd_FoldsIdentity_OnRealRepo: the identity read rides the SAME
+// gitStatsCmd pass (no second dispatch). Against a real repo with a set local
+// identity, the message carries it. Uses the gitIdentityProbeFn seam so the
+// assertion is deterministic rather than depending on the host's git config.
+// Mutation: remove the `if ok { ... gitIdentityProbeFn ... }` fold → identity
+// stays zero-value and this fails.
+func TestGitStatsCmd_FoldsIdentity_OnRealRepo(t *testing.T) {
+	repo := initTestGitRepo(t)
+
+	orig := gitIdentityProbeFn
+	defer func() { gitIdentityProbeFn = orig }()
+	called := false
+	gitIdentityProbeFn = func(cwd string) (string, string, bool) {
+		called = true
+		if cwd != repo {
+			t.Errorf("probe called with cwd %q, want %q", cwd, repo)
+		}
+		return "Seam Name", "seam@example.com", true
+	}
+
+	l := domain.Loop{SessionID: "s1", Cwd: repo, CwdVerified: true}
+	msg, ok := gitStatsCmd(l)().(gitStatsMsg)
+	if !ok {
+		t.Fatal("gitStatsCmd did not return a gitStatsMsg")
+	}
+	if !called {
+		t.Fatal("expected the identity probe to be called on a real repo (the fold)")
+	}
+	if !msg.identity.ok || msg.identity.name != "Seam Name" || msg.identity.email != "seam@example.com" {
+		t.Errorf("msg.identity = %+v, want the seam's values", msg.identity)
+	}
+}
+
+// TestGitStatsCmd_NonRepo_SkipsIdentityProbe: a cwd that is NOT a git repo
+// makes computeGitStats return ok=false — and the identity probe must NOT run
+// (a non-repo dir's GLOBAL git identity must never surface as this "repo's").
+// This is the free repo-ness gate the fold gets from gitStats.ok. Mutation:
+// call the probe unconditionally → `called` flips true and this fails.
+func TestGitStatsCmd_NonRepo_SkipsIdentityProbe(t *testing.T) {
+	nonRepo := t.TempDir() // a plain dir, never `git init`ed
+
+	orig := gitIdentityProbeFn
+	defer func() { gitIdentityProbeFn = orig }()
+	called := false
+	gitIdentityProbeFn = func(cwd string) (string, string, bool) {
+		called = true
+		return "should", "not@run.com", true
+	}
+
+	l := domain.Loop{SessionID: "s1", Cwd: nonRepo, CwdVerified: true}
+	msg := gitStatsCmd(l)().(gitStatsMsg)
+	if called {
+		t.Error("identity probe ran on a non-repo cwd — it must be gated on gitStats.ok")
+	}
+	if msg.identity.ok {
+		t.Errorf("msg.identity.ok = true for a non-repo, want false:\n%+v", msg.identity)
+	}
+}
+
+// TestGitStatsCmd_UnverifiedCwd_NoIdentity: an unverified Cwd (lossy decode)
+// is never run against git at all — neither stats nor identity — and the probe
+// must not fire.
+func TestGitStatsCmd_UnverifiedCwd_NoIdentity(t *testing.T) {
+	orig := gitIdentityProbeFn
+	defer func() { gitIdentityProbeFn = orig }()
+	gitIdentityProbeFn = func(cwd string) (string, string, bool) {
+		t.Fatal("identity probe must not run for an unverified cwd")
+		return "", "", false
+	}
+	l := domain.Loop{SessionID: "s1", Cwd: "/x/lossy", CwdVerified: false}
+	msg := gitStatsCmd(l)().(gitStatsMsg)
+	if msg.identity.ok || msg.stats.ok {
+		t.Errorf("unverified cwd must yield empty stats+identity, got %+v / %+v", msg.stats, msg.identity)
+	}
+}
+
+// TestComputeGitIdentity_RealRepo_ReadsLocalIdentity exercises the REAL probe
+// (no seam) end-to-end against a temp repo with a local user.name/user.email —
+// proving computeGitIdentity reads the effective committer identity, not a
+// fabricated value.
+func TestComputeGitIdentity_RealRepo_ReadsLocalIdentity(t *testing.T) {
+	repo := initTestGitRepo(t)
+	runGit(t, repo, "config", "user.name", "Local Person")
+	runGit(t, repo, "config", "user.email", "local@example.com")
+
+	name, email, ok := computeGitIdentity(repo)
+	if !ok {
+		t.Fatal("expected ok=true for a repo with a set local identity")
+	}
+	if name != "Local Person" || email != "local@example.com" {
+		t.Errorf("computeGitIdentity = (%q, %q), want the local values", name, email)
+	}
+}
+
+// TestUpdate_GitStatsMsg_PopulatesIdentityCache: the handler stores the folded
+// identity into m.gitIdentity keyed by sessionID (lockstep with m.gitStats).
+func TestUpdate_GitStatsMsg_PopulatesIdentityCache(t *testing.T) {
+	m := New()
+	id := gitIdentityResult{name: "Jito Kim", email: "jito@company.com", ok: true}
+	updated, _ := m.Update(gitStatsMsg{sessionID: "s1", stats: gitStatsResult{ok: true}, identity: id})
+	got := updated.(Model).gitIdentity["s1"]
+	if got != id {
+		t.Errorf("m.gitIdentity[s1] = %+v, want %+v", got, id)
+	}
+}
+
+// TestDemoFleet_GitIdentity_SurfacesMismatch pins the demo's high-value shape:
+// the migrate-db loop carries the "work" Claude alias but a PERSONAL git email
+// — the captain's own lbox mismatch — so a --demo viewer sees ACCOUNT and GIT
+// disagree at a glance. Without this, the row (and the feature's whole point)
+// would be invisible in demo QA.
+func TestDemoFleet_GitIdentity_SurfacesMismatch(t *testing.T) {
+	loops, _, _, gitIdentity := demoFleet()
+
+	var migrateDB domain.Loop
+	for _, l := range loops {
+		if l.Project == "migrate-db" {
+			migrateDB = l
+		}
+	}
+	if migrateDB.SessionID == "" {
+		t.Fatal("expected a migrate-db loop in the demo fleet")
+	}
+	if migrateDB.Account.Alias != "work" {
+		t.Fatalf("migrate-db account alias = %q, want the company-ish 'work'", migrateDB.Account.Alias)
+	}
+	id, ok := gitIdentity[migrateDB.SessionID]
+	if !ok || !id.ok {
+		t.Fatalf("expected a seeded git identity for migrate-db, got %+v (present=%v)", id, ok)
+	}
+	if !strings.Contains(id.email, "gmail.com") {
+		t.Errorf("migrate-db git email = %q, want a personal (gmail) address so the mismatch is visible against the 'work' alias", id.email)
+	}
+
+	// And it must actually RENDER as adjacent ACCOUNT + GIT rows in the demo.
+	m := NewDemo()
+	for i, l := range m.visibleLoops() {
+		if l.Project == "migrate-db" {
+			m.cursor = i
+		}
+	}
+	// migrate-db is seeded as the OPT-IN configured mismatch (declared expectation
+	// jito@company.com, actual personal email) — the ⚠ marker must be visible in
+	// demo QA, with the expected email shown so it's actionable.
+	if !id.mismatch || id.expected == "" {
+		t.Fatalf("migrate-db demo identity must be the configured-mismatch case (⚠), got %+v", id)
+	}
+	out := strings.Join(m.detailPanelLines(100, 60), "\n")
+	if !strings.Contains(out, "ACCOUNT") || !strings.Contains(out, "GIT") {
+		t.Errorf("demo DETAIL for migrate-db must show BOTH ACCOUNT and GIT rows:\n%s", out)
+	}
+	if !strings.Contains(out, "work") || !strings.Contains(out, id.email) {
+		t.Errorf("demo DETAIL for migrate-db must juxtapose the 'work' alias with the personal git email:\n%s", out)
+	}
+	if !strings.Contains(out, "⚠") || !strings.Contains(out, id.expected) {
+		t.Errorf("demo DETAIL for migrate-db must show the ⚠ marker AND the expected email %q:\n%s", id.expected, out)
+	}
+}
+
+// TestDemoFleet_GitIdentity_NoExpectation_NoWarning is the other half: the
+// refactor-core loop commits under a personal email with NO declared
+// expectation — its GIT row must be plain (no ⚠), proving a bare
+// account/identity difference is never itself flagged (the captain's clarified
+// rule: mixing is often intentional).
+func TestDemoFleet_GitIdentity_NoExpectation_NoWarning(t *testing.T) {
+	_, _, _, gitIdentity := demoFleet()
+	m := NewDemo()
+	var idx int
+	for i, l := range m.visibleLoops() {
+		if l.Project == "refactor-core" {
+			idx = i
+		}
+	}
+	m.cursor = idx
+	sel, _ := m.selected()
+	if id := gitIdentity[sel.SessionID]; id.mismatch {
+		t.Fatalf("refactor-core must NOT be a mismatch case, got %+v", id)
+	}
+	out := strings.Join(m.detailPanelLines(100, 60), "\n")
+	if !strings.Contains(out, "GIT") {
+		t.Fatalf("expected a GIT row for refactor-core:\n%s", out)
+	}
+	if strings.Contains(out, "⚠") {
+		t.Errorf("refactor-core has no declared expectation — its GIT row must show NO ⚠:\n%s", out)
+	}
+}
+
+// initTestGitRepo makes a fresh temp git repo (no identity set yet) and returns
+// its path. Callers set config as needed.
+func initTestGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	return dir
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	full := append([]string{"-C", dir}, args...)
+	if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
 // ── feat/fleet-account-tag: FLEET panel's ACCOUNT tag column ─────────────────
 
 // multiAccountFleet gates the whole feature: the column shows ONLY when the
@@ -9048,7 +9464,7 @@ func TestUpdate_EnterKey_ObservedLoop_StillDispatchesAttach(t *testing.T) {
 // ── fleetops --demo: synthetic fleet, no real data, no disk writes ─────
 
 func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
-	loops, detailCache, oracleCounts := demoFleet()
+	loops, detailCache, oracleCounts, _ := demoFleet()
 
 	if len(loops) != 7 {
 		t.Fatalf("got %d loops, want 7", len(loops))
