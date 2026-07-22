@@ -24,10 +24,11 @@ _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_
 > processes; see "How it works").
 
 You run several `claude` sessions across projects — some grinding on a task, some
-waiting on a permission prompt, some silently dead. fleetops watches
-`~/.claude/projects/`'s own session logs, works out what's *actually* happening
-in each one, and lets you act on it with one key — without switching terminals
-to find out.
+waiting on a permission prompt, some silently dead, and maybe some on a different
+account than the others. fleetops watches Claude Code's own session logs, works
+out what's *actually* happening in each one, and lets you act on it with one
+key — across every project and every account, without switching terminals to
+find out.
 
 ## What it does
 
@@ -43,6 +44,11 @@ to find out.
   session (orca, tmux, cmux), plus **iTerm2 directly, with no multiplexer at
   all**. Anywhere else, it still degrades to a copy-pasteable manual command
   instead of doing nothing.
+- **Runs a fleet across multiple Claude accounts** — a work login and a personal
+  one, say. Bind a directory to an account and every loop you start there runs on
+  it, fixed; each loop shows which account it's on; a resume can't switch a live
+  session onto the wrong one. No more `logout`/`login` juggling, no more finding
+  out from the billing. Single-account users see none of it. ([details](#multiple-claude-accounts))
 
 ## Install
 
