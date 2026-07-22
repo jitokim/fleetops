@@ -5459,6 +5459,134 @@ func TestRenderDetail_EventsBlockPresentWithEnoughHeight(t *testing.T) {
 	}
 }
 
+// ── action-first DETAIL order (feat/detail-action-first) ──────────────────
+
+// requireCalloutBeforeState asserts that a human-action callout (marker) is
+// rendered ABOVE the STATE metadata row — the whole point of action-first:
+// the first thing the eye hits is what the operator must do.
+func requireCalloutBeforeState(t *testing.T, out, marker string) {
+	t.Helper()
+	plain := stripANSI(out)
+	calloutAt := strings.Index(plain, marker)
+	stateAt := strings.Index(plain, "STATE")
+	if calloutAt < 0 {
+		t.Fatalf("expected callout %q in DETAIL output:\n%s", marker, plain)
+	}
+	if stateAt < 0 {
+		t.Fatalf("expected a STATE row in DETAIL output:\n%s", plain)
+	}
+	if calloutAt >= stateAt {
+		t.Errorf("callout %q must render BEFORE the STATE row (action-first): callout@%d, STATE@%d\n%s",
+			marker, calloutAt, stateAt, plain)
+	}
+}
+
+func TestRenderDetail_GateLoop_CalloutRendersBeforeStateRow(t *testing.T) {
+	l := domain.Loop{
+		Project: "myproject", SessionID: "s1", State: domain.StateGate,
+		GatePrompt: "Bash: git push --force", GateOptions: []string{"approve", "deny"},
+	}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	requireCalloutBeforeState(t, out, "GATE ▸")
+}
+
+func TestRenderDetail_DriftLoop_CalloutRendersBeforeStateRow(t *testing.T) {
+	l := domain.Loop{
+		Project: "myproject", SessionID: "s1", State: domain.StateDrift,
+		Goal: domain.Goal{Text: "ship the feature"},
+		Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "tests still failing"},
+	}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	requireCalloutBeforeState(t, out, "DRIFT ▸")
+}
+
+func TestRenderDetail_StalledLoop_ResumeCalloutRendersBeforeStateRow(t *testing.T) {
+	l := domain.Loop{
+		Project: "myproject", SessionID: "s1", State: domain.StateStalled,
+		Stall: domain.StallNoOutput,
+	}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	requireCalloutBeforeState(t, out, "RESUME ▸")
+}
+
+// TestRenderDetail_NoActionLoop_NoTopCalloutAndPriorOrder pins the "needs
+// nothing" case: a running/idle loop shows NO action callout, and its rows
+// stay in the prior order (session id first, then STATE) — action-first must
+// not perturb a loop that needs no action.
+func TestRenderDetail_NoActionLoop_NoTopCalloutAndPriorOrder(t *testing.T) {
+	l := domain.Loop{Project: "myproject", SessionID: "sess-noaction", State: domain.StateRunning}
+	out := stripANSI(renderDetail(l, 100, 40, detailData{now: time.Now()}))
+
+	for _, marker := range []string{"GATE ▸", "DRIFT ▸", "RESUME ▸", "RESTART ▸"} {
+		if strings.Contains(out, marker) {
+			t.Errorf("a no-action (running) loop must show no %q callout:\n%s", marker, out)
+		}
+	}
+	sidAt := strings.Index(out, "sess-noaction")
+	stateAt := strings.Index(out, "STATE")
+	if sidAt < 0 || stateAt < 0 || sidAt >= stateAt {
+		t.Errorf("prior order must hold: session id before STATE (sid@%d, STATE@%d)\n%s", sidAt, stateAt, out)
+	}
+}
+
+// TestRenderDetail_EventsCappedAtDetailRows pins the EVENTS cap: even with
+// far more events than the cap and a generous height, DETAIL renders at most
+// eventsDetailRows event lines (the full history lives in the `o` pager).
+func TestRenderDetail_EventsCappedAtDetailRows(t *testing.T) {
+	l := domain.Loop{Project: "myproject", SessionID: "s1", State: domain.StateIdle}
+	var evs []events.Event
+	for i := 0; i < 12; i++ {
+		evs = append(evs, events.Event{
+			TS: int64(i + 1), Trigger: events.TriggerScan,
+			FromState: "running", ToState: "idle", Detail: fmt.Sprintf("evt-%02d", i),
+		})
+	}
+	out := stripANSI(renderDetail(l, 80, 60, detailData{now: time.Now(), events: evs}))
+
+	shown := 0
+	for i := 0; i < 12; i++ {
+		if strings.Contains(out, fmt.Sprintf("evt-%02d", i)) {
+			shown++
+		}
+	}
+	if shown > eventsDetailRows {
+		t.Errorf("EVENTS must be capped at %d lines in DETAIL, but %d event lines rendered:\n%s",
+			eventsDetailRows, shown, out)
+	}
+	if shown == 0 {
+		t.Errorf("expected some (newest) events shown, got none:\n%s", out)
+	}
+}
+
+// TestDetailPanelLines_ActionLoop_NeverExceedsInnerHeight is the height-
+// accounting check at the level that actually owns the bound: detailPanelLines
+// clips its content to innerHeight (renderDetail's metadata top block is
+// intentionally unbounded — it's the clip here that guarantees fit). With the
+// action callout now on TOP and EVENTS capped to a short tail, the clipped
+// output must never exceed the rows it's given, across a small→large sweep and
+// every action state (the callout must never push the panel past its box).
+func TestDetailPanelLines_ActionLoop_NeverExceedsInnerHeight(t *testing.T) {
+	base := domain.Loop{Project: "myproject", SessionID: "s1", Goal: domain.Goal{Text: "do the thing"}, LastText: "still working"}
+	states := map[string]domain.Loop{
+		"gate":    {Project: base.Project, SessionID: base.SessionID, State: domain.StateGate, GatePrompt: "Bash: git push", GateOptions: []string{"approve", "deny"}, LastText: base.LastText},
+		"drift":   {Project: base.Project, SessionID: base.SessionID, State: domain.StateDrift, Goal: base.Goal, Last: &domain.Verdict{Outcome: domain.OutcomeRejected, Reason: "tests failing"}, LastText: base.LastText},
+		"stalled": {Project: base.Project, SessionID: base.SessionID, State: domain.StateStalled, Stall: domain.StallNoOutput, LastText: base.LastText},
+		"running": {Project: base.Project, SessionID: base.SessionID, State: domain.StateRunning, Goal: base.Goal, LastText: base.LastText},
+	}
+	for name, l := range states {
+		m := New()
+		m.loops = []domain.Loop{l}
+		m.cursor = 0
+		for _, innerHeight := range []int{3, 6, 10, 18, 24, 40} {
+			lines := m.detailPanelLines(80, innerHeight)
+			if len(lines) > innerHeight {
+				t.Errorf("%s/innerHeight=%d: detailPanelLines returned %d lines, want <= %d",
+					name, innerHeight, len(lines), innerHeight)
+			}
+		}
+	}
+}
+
 // ── flap counter ─────────────────────────────────────────────────────────
 
 func TestOrdinal(t *testing.T) {
