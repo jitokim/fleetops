@@ -943,6 +943,17 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 				Detail: fmt.Sprintf("%s at cycle %d: %s", domain.OutcomeProgress, refactorCore.Cycle, refactorCoreReason),
 				Actor:  events.ActorAuto},
 		}},
+		// feat/detail-tail-readable: the two resume-eligible demo loops (a
+		// StateDrift and a StateStalled) carry a seeded resumePrompt so the R
+		// preview — "R ▸ <what pressing r re-sends>" — is visible in demo QA
+		// without a real session JSONL (NewDemo never runs detailCacheCmd, so
+		// LastUserPrompt is never read). depUpgrade (drift) also exercises the
+		// "(r appends your optional hint)" note branch; coverage (stalled) the
+		// plain branch.
+		depUpgrade.SessionID: {resumePrompt: resumePromptResult{
+			text: "upgrade deps to latest and keep CI green — bump go.mod, run go test ./...", ok: true}},
+		coverage.SessionID: {resumePrompt: resumePromptResult{
+			text: "raise package coverage to 80% by adding table-driven tests for the untested branches", ok: true}},
 	}
 
 	oracleCounts = map[string]int{
@@ -5508,11 +5519,12 @@ func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
 	}
 	cached := m.detailCache[sel.SessionID] // zero value (empty events, lastError.ok=false) when not yet cached — see detailCache's doc
 	data := detailData{
-		now:         time.Now(),
-		events:      cached.events,
-		git:         m.gitStats[sel.SessionID],
-		gitIdentity: m.gitIdentity[sel.SessionID],
-		lastError:   cached.lastError,
+		now:          time.Now(),
+		events:       cached.events,
+		git:          m.gitStats[sel.SessionID],
+		gitIdentity:  m.gitIdentity[sel.SessionID],
+		lastError:    cached.lastError,
+		resumePrompt: cached.resumePrompt,
 	}
 	lines := strings.Split(renderDetail(sel, innerWidth, innerHeight, data), "\n")
 	if len(lines) > innerHeight {
@@ -5881,14 +5893,26 @@ type lastErrorResult struct {
 	ok   bool
 }
 
+// resumePromptResult is the last user prompt claude.LastUserPrompt would
+// re-send if the operator pressed "r" — the DETAIL panel's R preview
+// (feat/detail-tail-readable). ok=false means the session log carries no
+// prior user message (LastUserPrompt's !ok), in which case "r" sends Enter
+// only — so the preview says exactly that rather than showing a blank.
+type resumePromptResult struct {
+	text string
+	ok   bool
+}
+
 // detailCacheEntry is one loop's cached event history + LAST ERROR
-// extraction. The zero value (nil events, lastError.ok=false) means "not
-// computed yet" — renderDetail already tolerates both being empty/absent
-// (see detailData's doc), so there is no separate loading state to thread
+// extraction + resume-prompt preview. The zero value (nil events,
+// lastError.ok=false, resumePrompt.ok=false) means "not computed yet" —
+// renderDetail already tolerates all three being empty/absent (see
+// detailData's doc), so there is no separate loading state to thread
 // through.
 type detailCacheEntry struct {
-	events    []events.Event
-	lastError lastErrorResult
+	events       []events.Event
+	lastError    lastErrorResult
+	resumePrompt resumePromptResult
 }
 
 // detailCacheMsg reports detailCacheCmd's result for sessionID.
@@ -5897,19 +5921,25 @@ type detailCacheMsg struct {
 	entry     detailCacheEntry
 }
 
-// detailCacheCmd gathers l's event history and transcript LAST ERROR off
-// the event loop. Both are best-effort (events.Read tolerates a
-// missing/empty history; claude.LastError's ok=false just means "no error
-// entry found") — never an error surfaced to the human, same as gitStatsCmd.
+// detailCacheCmd gathers l's event history, transcript LAST ERROR, and the
+// resume-prompt preview off the event loop. All three are best-effort
+// (events.Read tolerates a missing/empty history; claude.LastError's ok=false
+// just means "no error entry found"; claude.LastUserPrompt's ok=false means
+// "no prior user message") — never an error surfaced to the human, same as
+// gitStatsCmd. The LastUserPrompt read rides HERE, in the existing selected-
+// loop off-loop cache, precisely so View() never reads/parses the session
+// JSONL synchronously and no NEW per-scan read is added.
 func detailCacheCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		evs, _ := events.Read(historyDirFn(), l.SessionID)
 		text, ts, ok := claude.LastError(l.Path)
+		prompt, promptOK := claude.LastUserPrompt(l.Path)
 		return detailCacheMsg{
 			sessionID: l.SessionID,
 			entry: detailCacheEntry{
-				events:    evs,
-				lastError: lastErrorResult{text: text, ts: ts, ok: ok},
+				events:       evs,
+				lastError:    lastErrorResult{text: text, ts: ts, ok: ok},
+				resumePrompt: resumePromptResult{text: prompt, ok: promptOK},
 			},
 		}
 	}
@@ -5950,11 +5980,12 @@ const detailKeyWidth = 8
 // data — directly testable without a real event-log dir, transcript file,
 // or git repo.
 type detailData struct {
-	now         time.Time
-	events      []events.Event // this session's history, oldest-first (events.Read's contract)
-	git         gitStatsResult
-	gitIdentity gitIdentityResult // the selected loop's git committer identity (GIT row), cached async — see gitStatsCmd
-	lastError   lastErrorResult   // the selected loop's transcript LAST ERROR (claude.LastError), cached async — see detailCacheCmd
+	now          time.Time
+	events       []events.Event // this session's history, oldest-first (events.Read's contract)
+	git          gitStatsResult
+	gitIdentity  gitIdentityResult  // the selected loop's git committer identity (GIT row), cached async — see gitStatsCmd
+	lastError    lastErrorResult    // the selected loop's transcript LAST ERROR (claude.LastError), cached async — see detailCacheCmd
+	resumePrompt resumePromptResult // what "r" would re-send (claude.LastUserPrompt) — the R preview, cached async — see detailCacheCmd
 }
 
 // eventsMinRows is the EVENTS block's floor: below this many rows available
@@ -6011,6 +6042,15 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	if callout := detailActionCallout(l, width, data); callout != "" {
 		d.WriteString(strings.TrimPrefix(callout, "\n"))
 		d.WriteString("\n")
+		// feat/detail-tail-readable (real user "Mike": "when it's stalled I
+		// want to READ whether pressing R is the right move"): for a resume-
+		// eligible loop (Stalled/Drift — the exact states the "r" key guard
+		// allows), show WHAT "r" would re-send directly under its callout, so
+		// "it's stalled → R will resend THIS" reads as one thought. Non-resume
+		// callouts (GATE) get no preview — renderResumePreview returns "".
+		if preview := renderResumePreview(l, data.resumePrompt, valueWidth); preview != "" {
+			d.WriteString(preview)
+		}
 	}
 	// fix/exit-gate-ux (UX judge item 4): this used to lead with
 	// "▸ <project>  <sid>" — but the panel's own title (see detailTitle)
@@ -6706,6 +6746,47 @@ func renderDriftCallout(l domain.Loop, width int) string {
 		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive with hint") +
 		"   " + stKeyChipRed.Render("k") + stDim.Render(" kill")
 	return "\n" + stCalloutRed.Width(contentWidth).Render(line)
+}
+
+// resumePreviewMaxLines caps the R preview's wrapped prompt lines. Kept small
+// (3) on purpose: it sits directly under the action callout at the TOP of the
+// panel, so it must convey "R will re-send THIS" without pushing the session
+// id and metadata rows down the panel. It's a glance to judge whether R is the
+// right move, not the full prompt — the whole transcript stays the `o` pager's
+// job, same discipline as TAIL and EVENTS.
+const resumePreviewMaxLines = 3
+
+// renderResumePreview shows, for a resume-eligible loop, the exact last user
+// prompt pressing "r" would re-send (claude.LastUserPrompt, cached off-loop in
+// data.resumePrompt) — the answer to real user "Mike"'s "I want to READ
+// whether pressing R is the right move" before he commits to it. It renders
+// ONLY for StateStalled / StateDrift — the two states the "r" key guard allows
+// (see Update) and the two the callout region already owns — returning "" for
+// every other state (running / idle / gate / done / failed) so a loop that
+// can't be resumed shows no preview and no clutter.
+//
+// When LastUserPrompt found no prior prompt (rp.ok=false) it says so honestly,
+// matching resumeCmd/driftRedriveCmd's own "sent Enter only" note rather than
+// showing a blank. For a DRIFT loop the preview shows the BASE last prompt
+// only — "r" composes it with the operator's optional corrective hint at the
+// redrive step (composeDriftPrompt), which is NOT part of this text — so a
+// trailing note says the hint is appended, rather than implying it's already
+// shown here.
+func renderResumePreview(l domain.Loop, rp resumePromptResult, valueWidth int) string {
+	if l.State != domain.StateStalled && l.State != domain.StateDrift {
+		return ""
+	}
+	if !rp.ok {
+		return detailRow("R ▸", stDim.Render("(no prior prompt — R sends Enter only)"))
+	}
+	wrapped := wrapTailText(rp.text, valueWidth, resumePreviewMaxLines)
+	for i := range wrapped {
+		wrapped[i] = stDim.Render(wrapped[i])
+	}
+	if l.State == domain.StateDrift {
+		wrapped = append(wrapped, stDim.Render("(r appends your optional hint to this)"))
+	}
+	return detailRowMultiline("R ▸", wrapped)
 }
 
 // ── status line / keybar ─────────────────────────────────────

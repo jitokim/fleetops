@@ -696,10 +696,14 @@ func detailPanelV2RegressionLoop(t *testing.T, historyDir string) domain.Loop {
 
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	longToken := strings.Repeat("x", 220) // one unbroken 220-char token — no spaces at all
+	// A REAL user prompt line so LastUserPrompt returns ok — the R preview
+	// (feat/detail-tail-readable) then populates in the height sweep too, not
+	// just render empty. Long enough to wrap past resumePreviewMaxLines.
+	userLine := `{"type":"user","message":{"content":"fix the flaky auth test — it fails intermittently under parallel load, so stabilize the shared fixture and rerun the suite a few times to confirm it is green"}}`
 	errLine := fmt.Sprintf(
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"API Error: 429 Too Many Requests — request id %s retry after 30s"}]},"timestamp":%q}`,
 		longToken, now.Format(time.RFC3339))
-	if err := os.WriteFile(transcriptPath, []byte(errLine+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(transcriptPath, []byte(userLine+"\n"+errLine+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -728,8 +732,11 @@ func detailPanelV2RegressionLoop(t *testing.T, historyDir string) domain.Loop {
 		TokensSpent:  1_200_000,
 		Last:         &domain.Verdict{Outcome: domain.OutcomeProgress, Reason: "made partial progress, one test still failing intermittently under load"},
 		LastActivity: now,
-		LastText:     "still working on stabilizing the flaky test",
-		BoundAt:      now.Add(-50 * time.Minute),
+		// Long enough to wrap past the bumped tailMaxLines (8) at every sweep
+		// width, so the height accounting is exercised against the fuller TAIL,
+		// not just a one-liner.
+		LastText: strings.Repeat("still working on stabilizing the flaky test under parallel load ", 12),
+		BoundAt:  now.Add(-50 * time.Minute),
 	}
 }
 
@@ -803,13 +810,18 @@ func TestView_NoLineExceedsTerminalWidth_DetailPanelV2Blocks_ActuallyRendered(t 
 	l := detailPanelV2RegressionLoop(t, historyDir)
 
 	m := New()
-	m.w, m.h = 120, 45
+	// h bumped 45 → 72: feat/detail-tail-readable added the R preview and a
+	// fuller 8-line TAIL to this fixture, which (correctly) crowd EVENTS out at
+	// 45 — EVENTS yields to the taller top/tail, exactly the height accounting
+	// the sweep above pins. This sanity check just needs enough room to show
+	// ALL blocks at once so it proves each one still renders.
+	m.w, m.h = 120, 72
 	m.loops = []domain.Loop{l}
 	m.cursor = 0
 	m.detailCache = primeDetailCache(t, l) // fix/exit-gate-ux: events+LAST ERROR are now async-cached, not read synchronously by View()
 	out := m.View()
 
-	for _, want := range []string{"LAST ERROR", "VERDICTS", "EVENTS", "stall in"} {
+	for _, want := range []string{"LAST ERROR", "VERDICTS", "EVENTS", "stall in", "R ▸", "TAIL"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected the rendered frame to contain %q (the block this regression test exists to exercise), got:\n%s", want, out)
 		}
@@ -4687,6 +4699,97 @@ func TestRenderDetail_LongLastText_ShowsWrappedTruncatedTailRow(t *testing.T) {
 	}
 	if !strings.Contains(out, "…") {
 		t.Errorf("an overflowing TAIL should carry a truncation marker:\n%s", out)
+	}
+}
+
+// ── feat/detail-tail-readable: R preview (renderResumePreview) ────────────
+//
+// Real user "Mike": "when it's stalled I want to READ whether pressing R is
+// the right move." The preview shows WHAT "r" re-sends, for exactly the two
+// states the "r" guard allows (Stalled/Drift), and nothing for the rest.
+
+func TestRenderResumePreview_StalledLoop_ShowsLastPrompt(t *testing.T) {
+	l := domain.Loop{State: domain.StateStalled, Stall: domain.StallRateLimit}
+	got := renderResumePreview(l, resumePromptResult{text: "resume the failing migration", ok: true}, 60)
+	if !strings.Contains(got, "R ▸") {
+		t.Errorf("stalled preview should carry the R ▸ label:\n%q", got)
+	}
+	if !strings.Contains(got, "resume the failing migration") {
+		t.Errorf("stalled preview should show the last prompt r would re-send:\n%q", got)
+	}
+}
+
+func TestRenderResumePreview_DriftLoop_ShowsBasePromptAndHintNote(t *testing.T) {
+	l := domain.Loop{State: domain.StateDrift}
+	got := renderResumePreview(l, resumePromptResult{text: "upgrade deps, keep CI green", ok: true}, 60)
+	if !strings.Contains(got, "upgrade deps, keep CI green") {
+		t.Errorf("drift preview should show the BASE last prompt:\n%q", got)
+	}
+	// drift's "r" composes the base prompt with an optional operator hint
+	// (composeDriftPrompt) — the preview must say the hint is appended, not
+	// imply it's already part of the shown text.
+	if !strings.Contains(got, "hint") {
+		t.Errorf("drift preview must note that r appends the operator's hint:\n%q", got)
+	}
+}
+
+func TestRenderResumePreview_NoPriorPrompt_ShowsEnterOnlyNote(t *testing.T) {
+	l := domain.Loop{State: domain.StateStalled}
+	got := renderResumePreview(l, resumePromptResult{ok: false}, 60)
+	if !strings.Contains(got, "no prior prompt") || !strings.Contains(got, "Enter only") {
+		t.Errorf("with LastUserPrompt !ok the preview must honestly say r sends Enter only:\n%q", got)
+	}
+}
+
+func TestRenderResumePreview_NonResumeStates_ShowNothing(t *testing.T) {
+	// Every state the "r" guard does NOT allow must render no preview — a
+	// running/idle/gate/done/failed loop can't be resumed, so no clutter.
+	for _, st := range []domain.LoopState{
+		domain.StateRunning, domain.StateIdle, domain.StateGate,
+		domain.StateDone, domain.StateFailed,
+	} {
+		l := domain.Loop{State: st}
+		if got := renderResumePreview(l, resumePromptResult{text: "anything", ok: true}, 60); got != "" {
+			t.Errorf("state %v is not resume-eligible; preview must be empty, got:\n%q", st, got)
+		}
+	}
+}
+
+func TestRenderDetail_StalledLoop_RPreviewAppearsAboveSessionID(t *testing.T) {
+	// The preview belongs WITH the callout at the top — so "it's stalled → R
+	// will resend THIS" reads as one thought, ahead of the metadata rows.
+	l := domain.Loop{
+		Project: "p", SessionID: "sess-1234", State: domain.StateStalled,
+		Stall: domain.StallRateLimit, Cwd: "/x", Path: "/x/s.jsonl",
+	}
+	out := renderDetail(l, 80, 40, detailData{
+		now:          time.Now(),
+		resumePrompt: resumePromptResult{text: "please finish the refactor", ok: true},
+	})
+	rIdx := strings.Index(out, "R ▸")
+	calloutIdx := strings.Index(out, "RESUME ▸")
+	stateIdx := strings.Index(out, "STATE") // the first metadata row
+	if rIdx == -1 {
+		t.Fatalf("a stalled loop's DETAIL must show the R preview:\n%s", out)
+	}
+	// The preview sits WITH the action callout at the top: after the RESUME
+	// callout, but ahead of the metadata rows (STATE, CYCLE, …).
+	if calloutIdx == -1 || rIdx < calloutIdx {
+		t.Errorf("R preview (idx %d) must render after the RESUME callout (idx %d):\n%s", rIdx, calloutIdx, out)
+	}
+	if stateIdx == -1 || rIdx > stateIdx {
+		t.Errorf("R preview (idx %d) must render above the metadata rows / STATE (idx %d):\n%s", rIdx, stateIdx, out)
+	}
+}
+
+func TestRenderDetail_IdleLoop_NoRPreview(t *testing.T) {
+	l := domain.Loop{Project: "p", SessionID: "s1", State: domain.StateIdle, Cwd: "/x", Path: "/x/s.jsonl"}
+	out := renderDetail(l, 80, 40, detailData{
+		now:          time.Now(),
+		resumePrompt: resumePromptResult{text: "should not appear", ok: true},
+	})
+	if strings.Contains(out, "R ▸") || strings.Contains(out, "should not appear") {
+		t.Errorf("an idle (non-resume-eligible) loop must show NO R preview:\n%s", out)
 	}
 }
 
@@ -8770,6 +8873,35 @@ func TestDemoFleet_GitIdentity_SurfacesMismatch(t *testing.T) {
 	}
 	if !strings.Contains(out, "⚠") || !strings.Contains(out, id.expected) {
 		t.Errorf("demo DETAIL for migrate-db must show the ⚠ marker AND the expected email %q:\n%s", id.expected, out)
+	}
+}
+
+// TestDemoFleet_ResumeEligibleLoop_ShowsRPreview pins that at least one
+// resume-eligible demo loop (a Stalled or Drift one) carries a seeded
+// resumePrompt so the R preview — the answer to Mike's "read before pressing
+// R" — is actually visible in `--demo` QA, where NewDemo never runs
+// detailCacheCmd (so LastUserPrompt is never read from a real JSONL).
+func TestDemoFleet_ResumeEligibleLoop_ShowsRPreview(t *testing.T) {
+	_, detailCache, _, _ := demoFleet()
+	m := NewDemo()
+
+	found := false
+	for i, l := range m.visibleLoops() {
+		if l.State != domain.StateStalled && l.State != domain.StateDrift {
+			continue
+		}
+		if entry, ok := detailCache[l.SessionID]; !ok || !entry.resumePrompt.ok {
+			continue
+		}
+		m.cursor = i
+		out := strings.Join(m.detailPanelLines(100, 60), "\n")
+		if !strings.Contains(out, "R ▸") {
+			t.Errorf("resume-eligible demo loop %q must render the R preview in DETAIL:\n%s", l.Project, out)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("no resume-eligible (Stalled/Drift) demo loop carries a seeded resumePrompt — the R preview is invisible in demo QA")
 	}
 }
 
