@@ -17,7 +17,7 @@
 
 _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_
 
-> **Status: experimental / 0.8.0-alpha.** This is a young, actively-changing
+> **Status: experimental / 0.8.1-alpha.** This is a young, actively-changing
 > project — expect rough edges, and read the "Known rough edges" and
 > "Limitations" sections below before trusting it with anything you can't
 > afford to have go wrong (it does send real keystrokes and can kill real
@@ -259,8 +259,8 @@ the CLI just means you never have to.
   shown; when it isn't, the wizard offers a one-key picker across your aliases
   (plus the default account). Each choice shows its login state, and `l` launches
   `claude login` for an account that isn't signed in yet.
-- **Observe**: every loop's `DETAIL` panel carries an `ACCOUNT` row with the
-  alias (and email, when available), and a `GIT` row with the identity that
+- **Observe**: every loop's `DETAIL` panel carries a `CLAUDE` row with the
+  account alias and login email, and a `GIT` row with the identity that
   directory actually commits as (`user.name <user.email>`) — so you can see the
   Claude account and the git author side by side. A different Claude account and
   git email is **not** flagged on its own (mixing them is often deliberate — a

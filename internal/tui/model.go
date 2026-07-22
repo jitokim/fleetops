@@ -6117,8 +6117,8 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	// zero-config case) renders no row at all here, matching the DRIVE
 	// row's own presence/absence pattern just above rather than adding a
 	// third "not applicable" state to parse.
-	if label := l.Account.Label(); label != "" {
-		d.WriteString(detailRow("ACCOUNT", stDim.Render(trunc(label, valueWidth))))
+	if v := l.Account.DetailValue(); v != "" {
+		d.WriteString(detailRow("CLAUDE", stDim.Render(trunc(v, valueWidth))))
 	}
 	// feat/detail-git-identity: the git committer identity this repo actually
 	// commits AS, placed directly under ACCOUNT so the Claude account and the
