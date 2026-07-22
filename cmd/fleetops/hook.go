@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/sessions"
 )
@@ -197,6 +199,8 @@ func sessionStartHook() {
 	}
 	pid, tty := sessions.ResolveClaudeTTY(os.Getppid())
 	hostApp, windowID := resolveHostWindow()
+	configDir := os.Getenv(claudeConfigDirEnvVar)
+	email, plan := resolveAccountLabel(configDir)
 	_ = sessions.WriteSession(sessions.SessionsDir(), payload.SessionID, sessions.SessionEntry{
 		PID:            pid,
 		TTY:            tty,
@@ -206,7 +210,58 @@ func sessionStartHook() {
 		StartedAt:      time.Now(),
 		HostApp:        hostApp,
 		WindowID:       windowID,
+		ConfigDir:      configDir,
+		AccountEmail:   email,
+		AccountPlan:    plan,
 	})
+}
+
+// claudeConfigDirEnvVar is the environment variable that fixes which Claude
+// account a session runs as (see internal/accounts' package doc) — read here,
+// once, at SessionStart, since that is the ONLY point in a session's life this
+// hook fires with the launching environment still in scope. "" means the
+// default account.
+const claudeConfigDirEnvVar = "CLAUDE_CONFIG_DIR"
+
+// accountStatusTimeout bounds the `claude auth status --json` probe below.
+// The hook must never delay SessionStart unacceptably — a wedged or slow
+// `claude` binary must not hold up the user's actual session starting.
+const accountStatusTimeout = 2 * time.Second
+
+// accountStatusFn is the injectable seam for the `claude auth status --json`
+// probe, so tests never spawn a real `claude` binary. Production default is
+// accountstatus.Query — the single definition of that subprocess and its JSON
+// shape, shared with the TUI's account picker (see internal/accountstatus).
+var accountStatusFn = accountstatus.Query
+
+// resolveAccountLabel best-effort resolves the display email/plan for the
+// account scoped by configDir, for the SessionStart hook to persist onto the
+// session registry.
+//
+// configDir=="" (the default account — the overwhelmingly common,
+// zero-config case) SKIPS the probe entirely rather than merely being one
+// more input to it: a single-account user never displays this pair (see
+// domain.Account.Label's unconditional default-account guard), so spawning
+// `claude auth status` for every one of their sessions would cost a
+// subprocess for information nothing ever shows — exactly the "no behavior
+// change" this feature promises the common case.
+//
+// Any other failure — timeout, non-zero exit, malformed JSON, or a genuine
+// loggedIn:false for a configured-but-not-logged-in account — degrades to
+// ("", "") just as silently: this is display metadata, never load-bearing
+// (ConfigDir alone is what a resume needs), so there is nothing here worth
+// failing loudly over.
+func resolveAccountLabel(configDir string) (email, plan string) {
+	if configDir == "" {
+		return "", ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), accountStatusTimeout)
+	defer cancel()
+	st, ok := accountStatusFn(ctx, configDir)
+	if !ok || !st.LoggedIn {
+		return "", ""
+	}
+	return st.Email, st.Plan
 }
 
 // Host terminal markers this hook recognizes: the $TERM_PROGRAM value each one

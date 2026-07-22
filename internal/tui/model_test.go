@@ -14,6 +14,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/jitokim/fleetops/internal/accounts"
+	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/claude"
 	"github.com/jitokim/fleetops/internal/control"
 	"github.com/jitokim/fleetops/internal/domain"
@@ -51,6 +53,19 @@ func TestMain(m *testing.M) {
 	// banner line if it were half-installed). Default to a healthy report; the
 	// banner/H/esc tests override hookHealthFn themselves (save-then-restore).
 	hookHealthFn = func() hooks.Report { return hooks.Report{OK: true} }
+	// Hermeticity net for the multi-account picker: proceedFromWhere calls
+	// loadAccountsFn the instant wizardWhere commits, and its production default
+	// reads the real ~/.fleetops/accounts.json — on a machine that actually has
+	// aliases configured (e.g. the captain's QA box) that would divert EVERY
+	// existing wizard test into the new account step. Default to the empty
+	// config (zero-config: no account step, submit straight through); the
+	// account-picker tests override loadAccountsFn/gitMainRepoDirFn/
+	// accountStatusProbeFn themselves. The latter two also never shell out here.
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil }
+	gitMainRepoDirFn = func(string) (string, bool) { return "", false }
+	accountStatusProbeFn = func(context.Context, string) (accountstatus.Status, bool) {
+		return accountstatus.Status{}, false
+	}
 	os.Exit(m.Run())
 }
 
@@ -1746,7 +1761,7 @@ func TestSendPromptCmd_KilledLoop_RefusesWithoutDispatching(t *testing.T) {
 	// — this is the one shared choke point that matters, since Tier 2's
 	// headless redrive is fully capable of reviving a killed session.
 	redriveCalled := false
-	withFakeActuationSeams(t, nil, func(cwd, sessionID, prompt string) error {
+	withFakeActuationSeams(t, nil, func(cwd, sessionID, prompt, configDir string) error {
 		redriveCalled = true
 		return nil
 	})
@@ -2623,7 +2638,7 @@ func TestUpdate_IKey_AmbiguousSharedDir_RunningLoop_StillRefuses(t *testing.T) {
 	// if some future change accidentally wires a path to it anyway.
 	origRedrive := redriveFn
 	t.Cleanup(func() { redriveFn = origRedrive })
-	redriveFn = func(cwd, sessionID, prompt string) error {
+	redriveFn = func(cwd, sessionID, prompt, configDir string) error {
 		t.Fatal("redriveFn must not be called — a running loop must never get the headless fallback")
 		return nil
 	}
@@ -2659,7 +2674,7 @@ func TestUpdate_IKey_StalledAmbiguous_FullRoundTrip_RoutesToExactSessionIDHeadle
 			tier1Called = true
 			return nil, true, false // backend resolves but can't disambiguate — the orca/cwd-chain outcome
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			redriveCwd, redriveSessionID, redrivePrompt = cwd, sessionID, prompt
 			return nil
 		},
@@ -2723,7 +2738,7 @@ func TestUpdate_IKey_ResolvableInPlace_FullRoundTrip_UsesTierOneNotHeadless(t *t
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return ctrl, true, true
 		},
-		func(cwd, sessionID, prompt string) error { redriveCalled = true; return nil },
+		func(cwd, sessionID, prompt, configDir string) error { redriveCalled = true; return nil },
 	)
 
 	m, cmd := updateModel(t, m, runeKey('i'))
@@ -2770,7 +2785,7 @@ func TestUpdate_InjectSubmit_TargetWentRunningWhileTyping_Refuses(t *testing.T) 
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, true, false
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			redriveCalled = true
 			return nil
 		},
@@ -2814,7 +2829,7 @@ func TestUpdate_InjectSubmit_AmbiguousEligible_InterimStatusSaysHeadless(t *test
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, true, false
 		},
-		func(cwd, sessionID, prompt string) error { return nil },
+		func(cwd, sessionID, prompt, configDir string) error { return nil },
 	)
 
 	m, _ = updateModel(t, m, runeKey('i'))
@@ -2857,7 +2872,7 @@ func TestUpdate_IKey_OrcaThreeSessionsOneWorktree_IdleSelected_RoutesHeadlessly(
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, true, false // orca resolves as a backend, but the 3-way cwd match can't disambiguate (LocateClaude's own >1 refusal)
 		},
-		func(cwd, sessionID, prompt string) error { redriveSessionID = sessionID; return nil },
+		func(cwd, sessionID, prompt, configDir string) error { redriveSessionID = sessionID; return nil },
 	)
 
 	m, cmd := updateModel(t, m, runeKey('i'))
@@ -2993,7 +3008,7 @@ func TestSendPromptCmd_StateFailed_RefusesWithGovernorMessage(t *testing.T) {
 // test that reaches a real tier dispatch (success or failure) now also
 // triggers logActuationEvent's events.Append call, which must never touch
 // the real ~/.fleetops/history during `go test`.
-func withFakeActuationSeams(t *testing.T, resolve func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool), redrive func(cwd, sessionID, prompt string) error) {
+func withFakeActuationSeams(t *testing.T, resolve func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool), redrive func(cwd, sessionID, prompt, configDir string) error) {
 	t.Helper()
 	origResolve, origRedrive, origHistoryDir := resolveActuationTargetFn, redriveFn, historyDirFn
 	t.Cleanup(func() { resolveActuationTargetFn, redriveFn, historyDirFn = origResolve, origRedrive, origHistoryDir })
@@ -3015,7 +3030,7 @@ func TestSendPromptCmd_StallGone_SkipsTierOne_GoesStraightToTierTwo(t *testing.T
 			tier1Called = true
 			return nil, true, true // would succeed if tried — must NOT be tried
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			gotSessionID, gotPrompt = sessionID, prompt
 			return nil
 		},
@@ -3049,7 +3064,7 @@ func TestSendPromptCmd_TierOneFound_UsesTierOneNotRedrive(t *testing.T) {
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return fakeCtrl, true, true
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			redriveCalled = true
 			return nil
 		},
@@ -3079,7 +3094,7 @@ func TestSendPromptCmd_TierOneNotFound_FallsToTierTwoRedrive(t *testing.T) {
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, true, false // backend resolved, but no surface located
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			redriveCalled = true
 			return nil
 		},
@@ -3123,7 +3138,7 @@ func TestSendPromptCmd_TierOneHSendFails_FallsToTierTwoRedrive(t *testing.T) {
 				func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 					return act, true, true
 				},
-				func(cwd, sessionID, prompt string) error { redriveCalled = true; return nil },
+				func(cwd, sessionID, prompt, configDir string) error { redriveCalled = true; return nil },
 			)
 			l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
 
@@ -3163,7 +3178,7 @@ func TestSendPromptCmd_TierOneHTimeout_DoesNotRedrive(t *testing.T) {
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: timedOut}, true, true
 		},
-		func(cwd, sessionID, prompt string) error { redriveCalled = true; return nil },
+		func(cwd, sessionID, prompt, configDir string) error { redriveCalled = true; return nil },
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
 
@@ -3198,7 +3213,7 @@ func TestSendPromptCmd_TierOneMultiplexerSendFails_IsTerminal(t *testing.T) {
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return act, true, true
 		},
-		func(cwd, sessionID, prompt string) error { redriveCalled = true; return nil },
+		func(cwd, sessionID, prompt, configDir string) error { redriveCalled = true; return nil },
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "myproject"}
 
@@ -3225,7 +3240,7 @@ func TestSendPromptCmd_TierOneNotFound_DowngradeMessage_ExplainsWhy(t *testing.T
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, true, false // backend resolved, but no surface located
 		},
-		func(cwd, sessionID, prompt string) error { return nil },
+		func(cwd, sessionID, prompt, configDir string) error { return nil },
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "myproject"} // Stall is zero-value, i.e. NOT StallGone
 
@@ -3265,7 +3280,7 @@ func TestSendPromptCmd_StallGone_TierTwoMessage_UnchangedPlainText(t *testing.T)
 			t.Fatal("resolveActuationTargetFn must not be called for a StallGone loop")
 			return nil, false, false
 		},
-		func(cwd, sessionID, prompt string) error { return nil },
+		func(cwd, sessionID, prompt, configDir string) error { return nil },
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "myproject", Stall: domain.StallGone}
 
@@ -3288,7 +3303,7 @@ func TestSendPromptCmd_TierTwoRedriveFails_ReportsError(t *testing.T) {
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, false, false
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			return errTestJudgeFailed
 		},
 	)
@@ -3333,7 +3348,7 @@ func TestSendPromptCmd_TTYPlausibleButBindingFails_FallsToTierTwoNotMisrouted(t 
 			// refused internally because >1 loop matched that directory.
 			return nil, true, false
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			redriveCalled = true
 			return nil
 		},
@@ -3543,7 +3558,7 @@ func TestUpdate_RKey_SecondPressWhileActuating_RefusesWithoutSecondRedrive(t *te
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return nil, false, false // Tier 1 never resolves — every dispatch would reach Tier 2
 		},
-		func(cwd, sessionID, prompt string) error {
+		func(cwd, sessionID, prompt, configDir string) error {
 			redriveCalls++
 			return nil
 		},
@@ -4870,7 +4885,7 @@ func TestOrDash(t *testing.T) {
 // within detailKeyWidth runes, checked here so a future row addition
 // can't reintroduce the same class of bug silently.
 func TestDetailRow_KeyWidth_NoKeyExceedsDetailKeyWidth(t *testing.T) {
-	keys := []string{"STATE", "NOTE", "CYCLE", "GOAL", "ORACLE", "RUBRIC", "CHALL", "STAGE", "BUDGET", "N/I", "LAST", "CWD", "LOG", "TAIL", "EVENTS"}
+	keys := []string{"STATE", "NOTE", "CYCLE", "GOAL", "ORACLE", "RUBRIC", "CHALL", "STAGE", "BUDGET", "N/I", "LAST", "CWD", "ACCOUNT", "LOG", "TAIL", "EVENTS"}
 	for _, k := range keys {
 		if len(k) > detailKeyWidth {
 			t.Errorf("key %q is %d runes, want <= detailKeyWidth (%d) — lipgloss wraps rather than overflowing", k, len(k), detailKeyWidth)
@@ -6194,9 +6209,14 @@ func TestWizard_EngineEnabled_ReachesEngineDriveStep(t *testing.T) {
 func TestUpdate_WizardEngineDrive_EKey_SubmitsBootstrap(t *testing.T) {
 	origBootstrap := bootstrapClaudeFn
 	defer func() { bootstrapClaudeFn = origBootstrap }()
-	bootstrapClaudeFn = func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	bootstrapClaudeFn = func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return []byte(`{"session_id":"s-new"}`), nil
 	}
+	// Keep account resolution hermetic (no dependence on the dev's real
+	// ~/.fleetops/accounts.json, no git subprocess): unbound → default account.
+	origLoadAccounts := loadAccountsFn
+	defer func() { loadAccountsFn = origLoadAccounts }()
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil }
 	registryDirFn = func() string { return t.TempDir() }
 	historyDirFn = func() string { return t.TempDir() }
 
@@ -6934,7 +6954,7 @@ func TestSendPromptCmd_TierOneHFailureThenTierTwo_RecordsBoth(t *testing.T) {
 		func(sessionsDir, sessionID, projectDir string) (control.Actuator, bool, bool) {
 			return &fakeActuator{backend: "iterm2", tier: "tier1h", resumeErr: control.ErrSendTTYMismatch}, true, true
 		},
-		func(cwd, sessionID, prompt string) error { return nil },
+		func(cwd, sessionID, prompt, configDir string) error { return nil },
 	)
 	l := domain.Loop{SessionID: "sess-1", Project: "myproject", State: domain.StateStalled}
 
@@ -7203,7 +7223,7 @@ func TestDetectTransitions_AlreadyRateLimited_NotANewEdge_NoSchedule(t *testing.
 // ── autoRedriveScheduledMsg: re-check at fire time ────────────────────────
 
 func TestUpdate_AutoRedriveScheduledMsg_StillRateLimited_FiresRedrive(t *testing.T) {
-	withFakeActuationSeams(t, nil, func(cwd, sessionID, prompt string) error { return nil })
+	withFakeActuationSeams(t, nil, func(cwd, sessionID, prompt, configDir string) error { return nil })
 	m := New()
 	m.loops = []domain.Loop{{SessionID: "s1", Project: "myproject", State: domain.StateStalled, Stall: domain.StallRateLimit}}
 
@@ -7269,7 +7289,7 @@ func TestUpdate_AutoRedriveScheduledMsg_ManualRedriveInFlight_Skips(t *testing.T
 }
 
 func TestUpdate_AutoRedriveScheduledMsg_Fires_SetsActuating(t *testing.T) {
-	withFakeActuationSeams(t, nil, func(cwd, sessionID, prompt string) error { return nil })
+	withFakeActuationSeams(t, nil, func(cwd, sessionID, prompt, configDir string) error { return nil })
 	m := New()
 	m.loops = []domain.Loop{{SessionID: "s1", Project: "myproject", State: domain.StateStalled, Stall: domain.StallRateLimit}}
 
@@ -7324,7 +7344,7 @@ func TestAutoRedrive429Cmd_RecordsEventWithActorAuto(t *testing.T) {
 	historyDirFn = func() string { return historyDir }
 	origRedrive := redriveFn
 	defer func() { redriveFn = origRedrive }()
-	redriveFn = func(cwd, sessionID, prompt string) error { return nil }
+	redriveFn = func(cwd, sessionID, prompt, configDir string) error { return nil }
 
 	l := domain.Loop{SessionID: "s1", Project: "myproject", State: domain.StateStalled, Stall: domain.StallRateLimit}
 	autoRedrive429Cmd(l, 1)()
@@ -7366,7 +7386,7 @@ func TestAutoRedrive429Cmd_NeverSendsNotificationDirectly(t *testing.T) {
 
 	l := domain.Loop{SessionID: "s1", Project: "myproject", State: domain.StateStalled, Stall: domain.StallRateLimit}
 	for _, outcome := range []error{nil, errTestJudgeFailed} {
-		redriveFn = func(cwd, sessionID, prompt string) error { return outcome }
+		redriveFn = func(cwd, sessionID, prompt, configDir string) error { return outcome }
 		for attempt := 1; attempt <= autoRedriveMaxAttempts; attempt++ {
 			autoRedrive429Cmd(l, attempt)()
 		}
@@ -7579,11 +7599,16 @@ func TestParseBootstrapSessionID_ControlCharInResult_FallsBackToRegex(t *testing
 
 // withFakeBootstrapClaude overrides bootstrapClaudeFn for the duration of
 // one test, restoring the original on cleanup.
-func withFakeBootstrapClaude(t *testing.T, fn func(ctx context.Context, cwd, prompt string) ([]byte, error)) {
+func withFakeBootstrapClaude(t *testing.T, fn func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error)) {
 	t.Helper()
 	orig := bootstrapClaudeFn
 	t.Cleanup(func() { bootstrapClaudeFn = orig })
 	bootstrapClaudeFn = fn
+	// Default the account resolution to "unbound" so bootstrap tests that don't
+	// care about accounts stay hermetic (no real accounts.json, no git).
+	origLoad := loadAccountsFn
+	t.Cleanup(func() { loadAccountsFn = origLoad })
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil }
 }
 
 func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T) {
@@ -7594,7 +7619,7 @@ func TestBootstrapEngineCmd_Success_BindsWithDrivenTrue_EmitsEvent(t *testing.T)
 	historyDirFn = func() string { return historyDir }
 
 	var gotCwd, gotPrompt string
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		gotCwd, gotPrompt = cwd, prompt
 		return []byte(`{"session_id":"sess-boot-1","result":"cycle 1 done","is_error":false}`), nil
 	})
@@ -7659,7 +7684,7 @@ func TestBootstrapEngineCmd_CallerDrivenFalse_StillBindsDrivenTrue(t *testing.T)
 	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
 	registryDirFn = func() string { return loopsDir }
 	historyDirFn = func() string { return t.TempDir() }
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return []byte(`{"session_id":"sess-boot-2"}`), nil
 	})
 
@@ -7681,7 +7706,7 @@ func TestBootstrapEngineCmd_ExecError_NoRecordCreated(t *testing.T) {
 	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
 	registryDirFn = func() string { return loopsDir }
 	historyDirFn = func() string { return t.TempDir() }
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return nil, errTestJudgeFailed // any non-nil error — the sentinel already used elsewhere in this file for exactly this purpose
 	})
 
@@ -7714,7 +7739,7 @@ func TestBootstrapEngineCmd_NoSessionIDInResponse_NoRecordCreated(t *testing.T) 
 	defer func() { registryDirFn, historyDirFn = origRegistryDir, origHistoryDir }()
 	registryDirFn = func() string { return loopsDir }
 	historyDirFn = func() string { return t.TempDir() }
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		return []byte(`{"result":"something went sideways","is_error":true}`), nil // no session_id at all
 	})
 
@@ -7749,7 +7774,7 @@ func TestBootstrapEngineCmd_ReusesBuildSpawnPromptVerbatim(t *testing.T) {
 	historyDirFn = func() string { return t.TempDir() }
 
 	var gotPrompt string
-	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+	withFakeBootstrapClaude(t, func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
 		gotPrompt = prompt
 		return []byte(`{"session_id":"s1"}`), nil
 	})
@@ -7979,7 +8004,7 @@ func TestDriveCmd_Success_EmitsEventAndReturnsResumeResultMsg(t *testing.T) {
 	}
 
 	var gotCwd, gotSessionID, gotPrompt string
-	redriveFn = func(cwd, sessionID, prompt string) error {
+	redriveFn = func(cwd, sessionID, prompt, configDir string) error {
 		gotCwd, gotSessionID, gotPrompt = cwd, sessionID, prompt
 		return nil
 	}
@@ -8041,7 +8066,7 @@ func TestDriveCmd_NoRegistryRecord_GracefulFailure(t *testing.T) {
 	registryDirFn = func() string { return registryDir }
 	historyDirFn = func() string { return historyDir }
 	redriveCalled := false
-	redriveFn = func(cwd, sessionID, prompt string) error { redriveCalled = true; return nil }
+	redriveFn = func(cwd, sessionID, prompt, configDir string) error { redriveCalled = true; return nil }
 
 	l := engineDriveReadyLoop() // no matching registry.Bind for sess-1
 
@@ -8070,7 +8095,7 @@ func TestDriveCmd_RedriveError_ReturnsFailureResult(t *testing.T) {
 	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	redriveFn = func(cwd, sessionID, prompt string) error { return errTestJudgeFailed }
+	redriveFn = func(cwd, sessionID, prompt, configDir string) error { return errTestJudgeFailed }
 
 	msg := driveCmd(engineDriveReadyLoop())()
 
@@ -8102,7 +8127,7 @@ func TestDriveCmd_ResumeResultMsg_ClearsActuating(t *testing.T) {
 	if err := registry.Bind(registryDir, "sess-1", registry.BindSpec{Goal: "ship it", Driven: true}); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	redriveFn = func(cwd, sessionID, prompt string) error { return nil }
+	redriveFn = func(cwd, sessionID, prompt, configDir string) error { return nil }
 
 	m := New()
 	m.actuating = map[string]bool{"sess-1": true}
@@ -8188,6 +8213,36 @@ func TestRenderDetail_ObservedLoop_NoDriveRow(t *testing.T) {
 	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
 	if strings.Contains(out, "DRIVE") {
 		t.Errorf("did not expect a DRIVE row for an observed loop:\n%s", out)
+	}
+}
+
+// ── multi-account Phase B: DETAIL panel's ACCOUNT row ───────────────────────
+
+// TestRenderDetail_AccountLabelSet_ShowsAccountRow mirrors
+// TestRenderDetail_DrivenLoop_ShowsDriveRow's presence/absence pattern: a
+// loop whose Account.Label() resolves to something non-empty gets an
+// ACCOUNT row showing exactly that label.
+func TestRenderDetail_AccountLabelSet_ShowsAccountRow(t *testing.T) {
+	l := domain.Loop{Project: "myproject", SessionID: "s1", State: domain.StateIdle,
+		Account: domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "company"}}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "ACCOUNT") {
+		t.Errorf("expected an ACCOUNT row when Account.Label() is non-empty:\n%s", out)
+	}
+	if !strings.Contains(out, "company") {
+		t.Errorf("expected the ACCOUNT row to show the resolved alias:\n%s", out)
+	}
+}
+
+// TestRenderDetail_ZeroValueAccount_NoAccountRow is the zero-noise guarantee
+// at the render layer: a loop with no account info at all (the default,
+// single-account-user case — Account's zero value) must show NO ACCOUNT row,
+// not an empty one.
+func TestRenderDetail_ZeroValueAccount_NoAccountRow(t *testing.T) {
+	l := domain.Loop{Project: "myproject", SessionID: "s1", State: domain.StateIdle}
+	out := renderDetail(l, 100, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "ACCOUNT") {
+		t.Errorf("did not expect an ACCOUNT row for a loop with no account info:\n%s", out)
 	}
 }
 
@@ -8638,6 +8693,11 @@ func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	}
 	if len(migrateDB.GateOptions) != 3 {
 		t.Errorf("migrate-db.GateOptions = %q, want three choices", migrateDB.GateOptions)
+	}
+	// multi-account Phase B: the one demo loop carrying an account label, so
+	// the DETAIL panel's ACCOUNT row has something real to show in demo QA.
+	if got := migrateDB.Account.Label(); got != "work" {
+		t.Errorf("migrate-db.Account.Label() = %q, want %q", got, "work")
 	}
 
 	flakyTests, ok := byProject["flaky-tests"]

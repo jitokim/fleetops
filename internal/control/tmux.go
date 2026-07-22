@@ -254,8 +254,22 @@ const tmuxSpawnCreateTimeout = 5 * time.Second
 // not get. So a wedged tmux now fails fast and honestly (an error, never a
 // false success) instead of hanging forever, exactly like every other
 // backend's Spawn already fails on a genuine problem.
-func (tmuxController) Spawn(cwd, goal string) error {
-	argv := tmuxNewWindowCmd(cwd, spawnCommandFn())
+func (c tmuxController) Spawn(cwd, goal string) error {
+	return c.spawnArgv(cwd, goal, spawnArgvForCwd(cwd))
+}
+
+// SpawnWithConfigDir implements control.AccountSpawner: Spawn under an
+// EXPLICIT account (the "n"-wizard picker's choice for an unbound dir) instead
+// of the cwd-resolved one — see spawnArgvWithConfigDir and AccountSpawner's doc.
+func (c tmuxController) SpawnWithConfigDir(cwd, goal, configDir string) error {
+	return c.spawnArgv(cwd, goal, spawnArgvWithConfigDir(configDir))
+}
+
+// spawnArgv is the shared new-window+boot-wait+send body behind both Spawn
+// (cwd-resolved account) and SpawnWithConfigDir (explicit account); spawnArgv,
+// the claude command line, is the only thing that varies between them.
+func (tmuxController) spawnArgv(cwd, goal string, spawnCommand []string) error {
+	argv := tmuxNewWindowCmd(cwd, spawnCommand)
 	out, err := outputBounded(tmuxSpawnCreateTimeout, argv)
 	if err != nil {
 		return fmt.Errorf("tmux new-window: %w", err)

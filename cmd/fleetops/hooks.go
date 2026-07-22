@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jitokim/fleetops/internal/accounts"
 	"github.com/jitokim/fleetops/internal/hooks"
 )
 
@@ -173,6 +174,21 @@ func settingsPath() (string, error) {
 	return hooks.DefaultSettingsPath()
 }
 
+// hookLocations enumerates EVERY config dir fleetops manages hooks in — the
+// default ~/.claude plus each alias config dir in ~/.fleetops/accounts.json —
+// so install/uninstall/status operate on all of them, not just the default.
+// This is what stops a loop spawned under a non-default account from firing NO
+// fleetops hooks (recording nothing) because its settings.json was never
+// touched. Zero-config (no accounts.json) yields just the default location, so
+// nothing changes for single-account users.
+func hookLocations() ([]hooks.ConfigDirLocation, error) {
+	path, err := settingsPath()
+	if err != nil {
+		return nil, err
+	}
+	return hooks.SettingsLocations(path, accounts.DefaultPath()), nil
+}
+
 // loadSettings decodes into map[string]any (not a struct) so unknown fields
 // round-trip untouched — we only ever want to touch the specific
 // hooks.<event> arrays in fleetopsHookSpecs.
@@ -215,26 +231,16 @@ func writeSettings(path string, settings map[string]any) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-func installHooks() {
-	exe, err := os.Executable()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks install:", err)
-		os.Exit(1)
-	}
-
-	path, err := settingsPath()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks install:", err)
-		os.Exit(1)
-	}
+// installHooksAt installs the fleetops hook entries into ONE settings.json,
+// creating the file (and its config dir) if needed — the same backup+merge+
+// idempotent logic install has always used for ~/.claude/settings.json, now
+// reused per config dir rather than duplicated. Returns the events it newly
+// added (empty ⇒ already installed, nothing written).
+func installHooksAt(path, exe string) ([]string, error) {
 	settings, err := loadSettings(path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks install:", err)
-		os.Exit(1)
+		return nil, err
 	}
-
-	// Idempotent per entry: install each event that isn't already present,
-	// skip the ones that are. Nothing new means nothing to write.
 	var installed []string
 	for _, spec := range fleetopsHookSpecs() {
 		cmd := exe + " " + spec.subcommandSuffix
@@ -243,35 +249,88 @@ func installHooks() {
 		}
 	}
 	if len(installed) == 0 {
-		fmt.Println("already installed")
-		return
+		return nil, nil // already installed — nothing to back up or write
 	}
-
 	if err := backupSettings(path); err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks install: backup failed:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("backup failed: %w", err)
 	}
 	if err := writeSettings(path, settings); err != nil {
+		return nil, err
+	}
+	return installed, nil
+}
+
+// hookDirResult is one config dir's install/uninstall outcome. Collected across
+// ALL dirs so a per-dir failure (e.g. a hand-broken settings.json in one alias)
+// is reported without aborting the rest — the "each dir independent" contract
+// installHooks/uninstallHooks document. err != "" ⇒ that dir failed; the driver
+// exits non-zero at the end if any did.
+type hookDirResult struct {
+	loc       hooks.ConfigDirLocation
+	installed []string // events newly installed (install path); empty ⇒ already installed
+	changed   bool     // whether uninstall removed anything (uninstall path)
+	err       error    // per-dir failure — collected, never aborts the others
+}
+
+// installHooksAllAt installs into every location, CONTINUING past a per-dir
+// error rather than aborting: a broken settings.json in one alias must not leave
+// every subsequent alias without hooks. Pure (no os.Exit / process state) so a
+// test can prove one bad dir doesn't stop the others. The driver (installHooks)
+// prints and decides the exit code from the returned results.
+func installHooksAllAt(locations []hooks.ConfigDirLocation, exe string) []hookDirResult {
+	results := make([]hookDirResult, 0, len(locations))
+	for _, loc := range locations {
+		installed, err := installHooksAt(loc.Path, exe)
+		results = append(results, hookDirResult{loc: loc, installed: installed, err: err})
+	}
+	return results
+}
+
+func installHooks() {
+	exe, err := os.Executable()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "fleetops hooks install:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("installed hooks: %s\n(backup: %s.bak-fleetops)\n", strings.Join(installed, ", "), path)
+	locations, err := hookLocations()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fleetops hooks install:", err)
+		os.Exit(1)
+	}
+
+	// Install into every account's config dir (default + each alias), so a loop
+	// spawned under a non-default account fires our hooks too. Each dir is
+	// independent; a failure in one is reported but does not abort the rest.
+	anyInstalled, anyFailed := false, false
+	for _, r := range installHooksAllAt(locations, exe) {
+		if r.err != nil {
+			anyFailed = true
+			fmt.Fprintf(os.Stderr, "fleetops hooks install [%s]: %v\n", r.loc.Label, r.err)
+			continue
+		}
+		if len(r.installed) == 0 {
+			fmt.Printf("[%s] already installed (%s)\n", r.loc.Label, r.loc.Path)
+			continue
+		}
+		anyInstalled = true
+		fmt.Printf("[%s] installed hooks: %s (%s)\n(backup: %s.bak-fleetops)\n",
+			r.loc.Label, strings.Join(r.installed, ", "), r.loc.Path, r.loc.Path)
+	}
+	if !anyInstalled && !anyFailed {
+		fmt.Println("all config dirs already installed")
+	}
+	if anyFailed {
+		os.Exit(1)
+	}
 }
 
-func uninstallHooks() {
-	path, err := settingsPath()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks uninstall:", err)
-		os.Exit(1)
-	}
+// uninstallHooksAt removes the fleetops hook entries from ONE settings.json,
+// returning whether anything changed (false ⇒ nothing of ours was present).
+func uninstallHooksAt(path string) (bool, error) {
 	settings, err := loadSettings(path)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks uninstall:", err)
-		os.Exit(1)
+		return false, err
 	}
-
-	// Remove each event we recognizably installed; leave everything else
-	// (other tools' hooks, unrelated settings) untouched.
 	changed := false
 	for _, spec := range fleetopsHookSpecs() {
 		if uninstallHookEntry(settings, spec.eventName, spec.subcommandSuffix) {
@@ -279,34 +338,92 @@ func uninstallHooks() {
 		}
 	}
 	if !changed {
-		fmt.Println("not installed")
-		return
+		return false, nil
 	}
-
 	if err := backupSettings(path); err != nil {
-		fmt.Fprintln(os.Stderr, "fleetops hooks uninstall: backup failed:", err)
-		os.Exit(1)
+		return false, fmt.Errorf("backup failed: %w", err)
 	}
 	if err := writeSettings(path, settings); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// uninstallHooksAllAt removes from every location, CONTINUING past a per-dir
+// error (same "each dir independent" contract as installHooksAllAt): a broken
+// settings.json in one alias must not leave stale hooks in every other alias.
+// Note (#5/#7): uninstall only reverses config dirs STILL listed in
+// accounts.json — an alias removed from accounts.json AFTER install keeps its
+// hooks, since hookLocations no longer enumerates it. `hooks status` on the
+// still-listed dirs won't reveal that orphan either. Documented, not fixed here.
+func uninstallHooksAllAt(locations []hooks.ConfigDirLocation) []hookDirResult {
+	results := make([]hookDirResult, 0, len(locations))
+	for _, loc := range locations {
+		changed, err := uninstallHooksAt(loc.Path)
+		results = append(results, hookDirResult{loc: loc, changed: changed, err: err})
+	}
+	return results
+}
+
+func uninstallHooks() {
+	locations, err := hookLocations()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "fleetops hooks uninstall:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("uninstalled fleetops's hooks\n(backup: %s.bak-fleetops)\n", path)
+
+	// Remove from every account's config dir, so `uninstall` fully reverses
+	// `install` and never leaves a stale hook behind in an alias dir.
+	anyChanged, anyFailed := false, false
+	for _, r := range uninstallHooksAllAt(locations) {
+		if r.err != nil {
+			anyFailed = true
+			fmt.Fprintf(os.Stderr, "fleetops hooks uninstall [%s]: %v\n", r.loc.Label, r.err)
+			continue
+		}
+		if !r.changed {
+			fmt.Printf("[%s] not installed (%s)\n", r.loc.Label, r.loc.Path)
+			continue
+		}
+		anyChanged = true
+		fmt.Printf("[%s] uninstalled fleetops's hooks (%s)\n(backup: %s.bak-fleetops)\n", r.loc.Label, r.loc.Path, r.loc.Path)
+	}
+	if !anyChanged && !anyFailed {
+		fmt.Println("not installed in any config dir")
+	}
+	if anyFailed {
+		os.Exit(1)
+	}
 }
 
-// statusHooks prints the current hook health without touching settings.json —
-// the read-only counterpart to install/uninstall. It exists so the
-// uninstall→reinstall acceptance path is observable from the CLI (and so a
-// stale-path breakage is legible) without launching the TUI: `fleetops hooks
-// status` after an uninstall reports Missing, after a reinstall reports OK.
+// statusHooks prints the current hook health PER config dir without touching
+// settings.json — the read-only counterpart to install/uninstall. Reporting per
+// dir is what makes a "not installed in company" state VISIBLE rather than
+// silent: after an uninstall each dir reports Missing, after a reinstall each
+// reports OK, and a dir with no hooks stands out from the healthy ones.
 func statusHooks() {
 	path, err := settingsPath()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "fleetops hooks status:", err)
 		os.Exit(1)
 	}
-	report := hooks.HealthAt(path, hooks.BinaryExists)
-	fmt.Print(formatHookStatus(report))
+	healths := hooks.HealthAllAt(path, accounts.DefaultPath(), hooks.BinaryExists)
+	fmt.Print(formatMultiHookStatus(healths))
+}
+
+// formatMultiHookStatus renders one labeled section per config dir, so a
+// per-alias gap ("company: missing") is legible at a glance. Pure (no I/O) so
+// it is unit-testable — statusHooks only resolves paths and prints this.
+func formatMultiHookStatus(healths []hooks.ConfigDirHealth) string {
+	var b strings.Builder
+	for i, h := range healths {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "── %s (%s) ──\n", h.Location.Label, h.Location.Path)
+		b.WriteString(formatHookStatus(h.Report))
+	}
+	return b.String()
 }
 
 // formatHookStatus renders a Report as human-readable status lines plus a

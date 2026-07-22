@@ -72,7 +72,10 @@ func testBindSpec() registry.BindSpec {
 // runSpawn dispatches spawnCmd and returns its message as a spawnResultMsg.
 func runSpawn(t *testing.T, cwd string, useWorktree bool) spawnResultMsg {
 	t.Helper()
-	msg := spawnCmd(cwd, testBindSpec(), useWorktree)()
+	// "" configDir = the default account (no explicit override) — the
+	// zero-config path these worktree tests exercise (multi-account Phase C
+	// added the parameter; account-specific spawn is covered separately).
+	msg := spawnCmd(cwd, testBindSpec(), useWorktree, "")()
 	result, ok := msg.(spawnResultMsg)
 	if !ok {
 		t.Fatalf("spawnCmd returned %T, want spawnResultMsg", msg)

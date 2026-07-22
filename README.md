@@ -161,6 +161,108 @@ Two things this setting does **not** touch:
   loops you started yourself, elsewhere — and your spawn preferences have no
   business rewriting how those are driven.
 
+## Multiple Claude accounts
+
+If you run more than one Claude account — a work login and a personal one, say —
+fleetops can spawn each loop under the right account, show you which account
+every loop is on, and keep a resume on the same account it started with.
+
+The mechanism is Claude Code's own `CLAUDE_CONFIG_DIR`. Point it at a directory
+and that directory holds the whole account: its credentials, its settings, and
+its session transcripts. Two directories, two accounts, side by side. (Claude's
+docs describe macOS credentials as a single global keychain item; on the CLI
+versions this was built against, `CLAUDE_CONFIG_DIR` does scope the account —
+`CLAUDE_CONFIG_DIR=/some/empty/dir claude auth status` reports logged-out while
+the default reports your account. If a future version changes that, the
+`hooks status` / account display below will show it, rather than fleetops
+guessing.)
+
+### 1. Add each account
+
+```bash
+fleetops accounts add work        # registers "work" and launches its browser login
+fleetops accounts add personal    # same for "personal"
+```
+
+`accounts add <alias>` does the whole setup in one step: it creates a config dir
+for the account (`~/.fleetops/accounts/<alias>` by default, `0700`), records the
+alias in `~/.fleetops/accounts.json`, and then launches `claude login` for it —
+the normal browser flow, with the credentials landing in that dir. Pass
+`--no-login` to register without logging in (finish later with
+`fleetops accounts login <alias>`), or `--dir <absolute path>` to point an alias
+at an existing config dir. No token is ever read, printed, or stored — only the
+alias, the config-dir path, and (for display) your email and plan.
+
+### 2. Bind directories to an account
+
+```bash
+fleetops accounts bind work ~/src/acme
+fleetops accounts bind personal ~/side-projects
+```
+
+A **binding** attaches a directory (or repo) to an alias: a loop spawned
+anywhere under a bound path — including a git worktree derived from it — runs on
+that account, fixed. Paths are made absolute (a leading `~` is expanded), and a
+bind to an unknown alias is rejected, so a mistyped binding can't silently fall
+back to the wrong account. The longest matching binding wins, so a specific repo
+can override a broader parent. Reverse either edit with
+`fleetops accounts unbind <path>` or `fleetops accounts remove <alias>`
+(`remove` only un-names the account — it never deletes the config dir or logs it
+out, and refuses while bindings still point at it unless you pass `--force`).
+
+`~/.fleetops/accounts.json` is written for you; it looks like this, and you can
+still hand-edit it if you prefer:
+
+```json
+{
+  "aliases": {
+    "work":     "/Users/you/.fleetops/accounts/work",
+    "personal": "/Users/you/.fleetops/accounts/personal"
+  },
+  "bindings": [
+    { "path": "/Users/you/src/acme",      "alias": "work" },
+    { "path": "/Users/you/side-projects", "alias": "personal" }
+  ]
+}
+```
+
+### 3. Install the hooks, then check it all worked
+
+```bash
+fleetops hooks install     # installs into ~/.claude AND every alias config dir
+fleetops accounts          # one view: each account's login state, hooks, bindings
+```
+
+The hooks matter: a session's transcript lives under *its* `CLAUDE_CONFIG_DIR`,
+so without the hooks installed there, a loop on the `work` account would run but
+be invisible to the cockpit. `fleetops accounts` (bare, or `accounts list`) is
+the "did it work" surface — for every alias it shows the config dir, whether it
+is logged in (and the email/plan), whether the hooks are installed there, and
+the paths bound to it, so a "not logged in" or "hooks not installed" gap on any
+account is visible, not silent. (`fleetops hooks status` reports the hook half
+per account too.)
+
+Under the hood every step is still just `CLAUDE_CONFIG_DIR` — `accounts add`
+runs `CLAUDE_CONFIG_DIR=<dir> claude login`, and a spawn prefixes the bound
+account's `CLAUDE_CONFIG_DIR` — so if you would rather drive it by hand, you can;
+the CLI just means you never have to.
+
+### What you get
+
+- **Spawn** (`n`): when the target directory is bound, the account is fixed and
+  shown; when it isn't, the wizard offers a one-key picker across your aliases
+  (plus the default account). Each choice shows its login state, and `l` launches
+  `claude login` for an account that isn't signed in yet.
+- **Observe**: every loop's `DETAIL` panel carries an `ACCOUNT` row with the
+  alias (and email, when available). Loops across different accounts share one
+  cockpit.
+- **Resume**: `r`/`i` re-drive a session under the account it was *recorded*
+  with, never whatever the current directory happens to be bound to — a live
+  session can't be switched onto the wrong account under you.
+
+If you never create `~/.fleetops/accounts.json`, none of this activates: one
+account, one config dir, no account row, no extra work — exactly as before.
+
 ## How it works
 
 **Observation.** `internal/claude` globs `~/.claude/projects/*/*.jsonl`, uses each

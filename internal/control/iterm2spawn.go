@@ -155,8 +155,22 @@ type iterm2Session struct {
 //
 // So liveness alone is never enough: nothing here claims a loop started until
 // claude is provably running on the tty we created.
-func (iterm2Spawner) Spawn(cwd, goal string) error {
-	session, err := iterm2CreateSession(cwd, spawnCommandFn())
+func (s iterm2Spawner) Spawn(cwd, goal string) error {
+	return s.spawnArgv(cwd, goal, spawnArgvForCwd(cwd))
+}
+
+// SpawnWithConfigDir implements control.AccountSpawner: Spawn under an
+// EXPLICIT account (the "n"-wizard picker's choice for an unbound dir) instead
+// of the cwd-resolved one — see spawnArgvWithConfigDir and AccountSpawner's doc.
+func (s iterm2Spawner) SpawnWithConfigDir(cwd, goal, configDir string) error {
+	return s.spawnArgv(cwd, goal, spawnArgvWithConfigDir(configDir))
+}
+
+// spawnArgv is the shared create+boot-wait+verify-claude+send body behind both
+// Spawn (cwd-resolved account) and SpawnWithConfigDir (explicit account);
+// spawnArgv, the claude command line, is the only thing that varies.
+func (iterm2Spawner) spawnArgv(cwd, goal string, spawnArgv []string) error {
+	session, err := iterm2CreateSession(cwd, spawnArgv)
 	if err != nil {
 		return err
 	}

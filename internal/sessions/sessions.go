@@ -74,6 +74,29 @@ type SessionEntry struct {
 	// channel at ~/.fleetops/sessions/<id>.sock. Declared now for forward
 	// compatibility only — this slice never populates or reads it.
 	SocketPath string `json:"socket_path,omitempty"`
+
+	// ConfigDir, AccountEmail, AccountPlan are multi-account Phase B's
+	// additions — same additive, omitempty, back-compatible shape as
+	// HostApp/WindowID/SocketPath above (a record from an older binary
+	// simply decodes with these at their zero value).
+	//
+	// ConfigDir is the LOAD-BEARING one: os.Getenv("CLAUDE_CONFIG_DIR") read
+	// at SessionStart, "" meaning the default account. It is what a later
+	// resume (control.Redrive) must honor — the session's account was fixed
+	// at launch and a resume must never re-derive it from whatever
+	// ~/.fleetops/accounts.json currently binds the cwd to (see Redrive's
+	// own doc). Always captured, instantly, with no I/O — unlike the two
+	// fields below, its capture can never be skipped or fail.
+	ConfigDir string `json:"config_dir,omitempty"`
+	// AccountEmail and AccountPlan are best-effort display metadata read from
+	// `claude auth status --json` run WITH this ConfigDir (see
+	// cmd/fleetops's sessionStartHook) — NEVER a token, only the identity
+	// `claude auth status` itself already prints. Both stay "" whenever that
+	// probe was skipped (ConfigDir=="" — see the hook's doc for why),
+	// timed out, errored, or reported loggedIn:false; a missing value here
+	// is never itself an error, just "nothing to show".
+	AccountEmail string `json:"account_email,omitempty"`
+	AccountPlan  string `json:"account_plan,omitempty"`
 }
 
 // validSessionID rejects anything that isn't a plain, single-component

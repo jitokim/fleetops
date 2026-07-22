@@ -55,6 +55,28 @@ func TestWriteReadSession_HostFields_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestWriteReadSession_AccountFields_RoundTrip confirms the additive
+// ConfigDir/AccountEmail/AccountPlan fields (multi-account Phase B) round-trip
+// through Write→Read, same as the host fields above.
+func TestWriteReadSession_AccountFields_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	in := sampleEntry()
+	in.ConfigDir = "/home/user/.claude-work"
+	in.AccountEmail = "jito@company.com"
+	in.AccountPlan = "team"
+
+	if err := WriteSession(dir, "sess-acct", in); err != nil {
+		t.Fatalf("WriteSession: %v", err)
+	}
+	got, err := ReadSession(dir, "sess-acct")
+	if err != nil {
+		t.Fatalf("ReadSession: %v", err)
+	}
+	if got != in {
+		t.Errorf("round-trip mismatch:\n got %+v\nwant %+v", got, in)
+	}
+}
+
 // TestReadSession_BackCompat_LegacyTtyOnlyRecordLoads is the key back-compat
 // guarantee — every ~/.fleetops/sessions record on an upgrading machine predates
 // the schema extension, so a strict read would break attach for every existing
@@ -82,6 +104,13 @@ func TestReadSession_BackCompat_LegacyTtyOnlyRecordLoads(t *testing.T) {
 	if got.HostApp != "" || got.WindowID != "" || got.SocketPath != "" {
 		t.Errorf("absent new fields must be zero-valued, got HostApp=%q WindowID=%q SocketPath=%q",
 			got.HostApp, got.WindowID, got.SocketPath)
+	}
+	// multi-account Phase B added a SECOND round of new fields onto the SAME
+	// struct — a record from before Phase B (or before the host-field
+	// extension) must decode this batch as zero-valued too, not error.
+	if got.ConfigDir != "" || got.AccountEmail != "" || got.AccountPlan != "" {
+		t.Errorf("absent account fields must be zero-valued, got ConfigDir=%q AccountEmail=%q AccountPlan=%q",
+			got.ConfigDir, got.AccountEmail, got.AccountPlan)
 	}
 }
 

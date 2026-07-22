@@ -16,6 +16,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -273,13 +274,30 @@ const redriveTimeout = 10 * time.Minute
 // re-drop cmd.Dir — see buildRedriveCmd. An empty cwd is refused up front
 // rather than allowed to fall back to the process dir (cmd.Dir=""), which is
 // the exact broken behavior this fixes.
-func Redrive(cwd, sessionID, prompt string) error {
+//
+// # Multi-account (Phase B): honors the session's RECORDED config dir
+//
+// Redrive RESUMES an existing session; its account was fixed when the session
+// was first started. Prefixing it with the accounts binding's config dir would
+// let a re-drive SWITCH accounts out from under a live session, which is never
+// what a resume should do — so the account injection that spawncmd.go layers
+// onto SPAWN (spawnArgvForCwd) has no equivalent CWD-BASED lookup here.
+//
+// Instead configDir is the value RECORDED for this exact session at
+// SessionStart (internal/sessions.SessionEntry.ConfigDir, threaded in by the
+// caller from the loop's registry entry — see domain.Loop.Account.ConfigDir)
+// — never re-derived from whatever the directory is currently bound to in
+// ~/.fleetops/accounts.json, which can disagree with what this session
+// actually started under. configDir=="" (the default account, or a session
+// recorded before this field existed) sets no environment override at all —
+// byte-identical to Redrive's pre-Phase-B behavior.
+func Redrive(cwd, sessionID, prompt, configDir string) error {
 	if cwd == "" {
 		return fmt.Errorf("claude --resume: refusing to re-drive %s with no cwd — sessions are cwd/project-scoped, so resuming from the wrong directory silently fails", sessionID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), redriveTimeout)
 	defer cancel()
-	if err := buildRedriveCmd(ctx, cwd, sessionID, prompt).Run(); err != nil {
+	if err := buildRedriveCmd(ctx, cwd, sessionID, prompt, configDir).Run(); err != nil {
 		return fmt.Errorf("claude --resume: %w", err)
 	}
 	return nil
@@ -290,10 +308,23 @@ func Redrive(cwd, sessionID, prompt string) error {
 // same shape bootstrap uses) so a unit test can assert cmd.Dir == cwd and the
 // argv is redriveArgv's fixed invocation WITHOUT spawning a real claude — the
 // cwd wiring was invisible precisely because nothing exercised it in isolation.
-func buildRedriveCmd(ctx context.Context, cwd, sessionID, prompt string) *exec.Cmd {
+//
+// configDir != "" sets CLAUDE_CONFIG_DIR in the child's environment, ON TOP OF
+// the inherited os.Environ() (never REPLACING it — cmd.Env=nil would otherwise
+// starve claude of PATH/HOME/etc). Unlike spawnArgvForCwd's "env VAR=val cmd"
+// argv-prefix trick (needed because several spawn backends take a shell string
+// or a bare argv with no Env field of their own), Redrive already builds its
+// own exec.Cmd directly, so setting cmd.Env is the direct mechanism — no argv
+// juggling needed. configDir=="" leaves cmd.Env at its zero value (nil), which
+// exec.Cmd documents as "use the calling process's environment" — today's
+// behavior, unchanged.
+func buildRedriveCmd(ctx context.Context, cwd, sessionID, prompt, configDir string) *exec.Cmd {
 	argv := redriveArgv(sessionID, prompt)
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
+	if configDir != "" {
+		cmd.Env = append(os.Environ(), claudeConfigDirEnv+"="+configDir)
+	}
 	return cmd
 }
 

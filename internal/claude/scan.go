@@ -16,11 +16,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jitokim/fleetops/internal/accounts"
 	"github.com/jitokim/fleetops/internal/domain"
 	"github.com/jitokim/fleetops/internal/engine"
 	"github.com/jitokim/fleetops/internal/events"
 	"github.com/jitokim/fleetops/internal/gate"
 	"github.com/jitokim/fleetops/internal/registry"
+	"github.com/jitokim/fleetops/internal/sessions"
 )
 
 // IdleThreshold: no log write for this long ⇒ the loop is considered stuck.
@@ -28,13 +30,71 @@ var IdleThreshold = 4 * time.Minute
 
 const tailBytes = 24 * 1024
 
-// ProjectsDir is ~/.claude/projects (override for tests).
+// ProjectsDir is ~/.claude/projects — the DEFAULT account's transcript root
+// (override for tests).
 func ProjectsDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
 	return filepath.Join(home, ".claude", "projects")
+}
+
+// ProjectsRoots is the full set of transcript roots the scanner reads: the
+// default ~/.claude/projects, plus "<configDir>/projects" for every alias in
+// ~/.fleetops/accounts.json. A loop spawned under a non-default account
+// (CLAUDE_CONFIG_DIR=~/.claude-work) writes its transcript under
+// ~/.claude-work/projects, which the single default root never saw — so
+// without every alias root here, half the accounts feature (observation) is
+// unreachable: such a loop never enters the fleet, gets no governor/budget/
+// actuation, shows no ACCOUNT badge.
+//
+// Zero-config is byte-identical: no (or unreadable/malformed) accounts.json ⇒
+// exactly one root, ~/.claude/projects, exactly as before this feature.
+func ProjectsRoots() []string {
+	return projectsRootsFrom(ProjectsDir(), accounts.DefaultPath())
+}
+
+// projectsRootsFrom is ProjectsRoots' pure, injectable core: the default root
+// first, then one "<configDir>/projects" per alias loaded from accountsPath,
+// deduped by cleaned path (so an alias that names the default dir — e.g.
+// "main" → ~/.claude — does not double it) and ordered by alias name for a
+// stable scan order. A Load ERROR is tolerated (returns just the default root),
+// never fatal: a typo in accounts.json must not blind the scanner to the
+// default account's loops. A missing/unreadable alias projects dir needs no
+// handling here — filepath.Glob simply yields no matches for it (see
+// DiscoverLoops), so it is skipped, not an error.
+func projectsRootsFrom(defaultRoot, accountsPath string) []string {
+	roots := make([]string, 0, 1)
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" {
+			return
+		}
+		clean := filepath.Clean(dir)
+		if seen[clean] {
+			return
+		}
+		seen[clean] = true
+		roots = append(roots, clean)
+	}
+	add(defaultRoot)
+
+	cfg, err := accounts.Load(accountsPath)
+	if err != nil {
+		return roots // a malformed config must not hide the default account's loops
+	}
+	names := make([]string, 0, len(cfg.Aliases))
+	for name := range cfg.Aliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if dir := cfg.Aliases[name]; dir != "" {
+			add(filepath.Join(dir, "projects"))
+		}
+	}
+	return roots
 }
 
 // ActiveWindow: only sessions written within this window are part of "the fleet".
@@ -54,10 +114,23 @@ var IncludeHidden = false
 // sessions active within `within` (0 = keep all). Seed spec AC-1 + filter decision:
 // "recent activity + not cleanly ended" — the window drops days-old noise.
 func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
-	root := ProjectsDir()
-	matches, err := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
-	if err != nil {
-		return nil, err
+	// Glob transcripts across EVERY account's root (default + each alias config
+	// dir), not just ~/.claude/projects — otherwise a loop spawned under a
+	// non-default account is invisible to the whole fleet (see ProjectsRoots).
+	// A transcript's absolute path still uniquely identifies its loop, so
+	// merging matches across roots introduces no collision. A missing/unreadable
+	// alias root yields no matches (glob returns nil) and is silently skipped —
+	// never fatal.
+	var matches []string
+	for _, root := range ProjectsRoots() {
+		m, err := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
+		if err != nil {
+			// The only error filepath.Glob returns is ErrBadPattern; our pattern
+			// is a fixed shape, so this is unreachable in practice. Skip the root
+			// rather than abort the whole scan on one bad root.
+			continue
+		}
+		matches = append(matches, m...)
 	}
 	gatesDir := gate.GatesDir()
 	pending := gate.Pending(gatesDir)
@@ -78,11 +151,17 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	sort.Slice(loops, func(i, j int) bool {
 		return loops[i].LastActivity.After(loops[j].LastActivity)
 	})
+	// Collapse the same session appearing under two roots (an alias config dir
+	// that is a copy/symlink of ~/.claude) BEFORE any per-loop enrichment or
+	// display — otherwise one session becomes two rows and kill/resume go
+	// ambiguous. See dedupBySessionID.
+	loops = dedupBySessionID(loops)
 
 	historyDir := events.HistoryDir()
 	loopsDir := registry.LoopsDir()
 	registry.BindPending(loopsDir, registry.PendingDir(), loops, now, historyDir)
 	loops = enrichFromRegistry(loops, loopsDir, historyDir)
+	loops = enrichAccounts(loops, sessions.SessionsDir(), accounts.DefaultPath())
 
 	live, liveOK := LiveClaudeCwds()
 	loops = applyLiveness(loops, live, liveOK, historyDir, now, within)
@@ -97,6 +176,33 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	pruneMetricsCache(keep)
 
 	return loops, nil
+}
+
+// dedupBySessionID collapses loops that share a SessionID but live under
+// different transcript roots — the case where an alias config dir is a COPY (or
+// symlink) of ~/.claude, e.g. `cp -R ~/.claude ~/.claude-work`: the identical
+// session file then exists under both roots, so the cross-root glob in
+// DiscoverLoops lists it twice. Left unmerged the same session renders as two
+// rows and a kill/resume can't tell which is "the" one. Keeps the newest
+// transcript per SessionID (latest LastActivity — the copy still being written,
+// if either is), preserving the caller's existing order. A pure path-string
+// root dedup (projectsRootsFrom) cannot catch this: a copy is a genuinely
+// different path, not a symlink EvalSymlinks would fold — deduping on the
+// SessionID the transcripts actually share is the robust cut.
+func dedupBySessionID(loops []domain.Loop) []domain.Loop {
+	slotFor := make(map[string]int, len(loops)) // SessionID → index in out
+	out := make([]domain.Loop, 0, len(loops))
+	for _, l := range loops {
+		if idx, seen := slotFor[l.SessionID]; seen {
+			if l.LastActivity.After(out[idx].LastActivity) {
+				out[idx] = l // a newer copy of the same session wins its slot
+			}
+			continue
+		}
+		slotFor[l.SessionID] = len(out)
+		out = append(out, l)
+	}
+	return out
 }
 
 // enrichFromRegistry attaches goal-bound metadata (Name, Goal.Text/MaxCycles/
@@ -139,6 +245,14 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		// (false) — exactly right, since it was never handed to the engine.
 		loops[i].Driven = rec.Driven
 
+		// Seed the DURABLE account config dir from the record (enrichAccounts,
+		// which runs next, prefers this over the transient session entry — the
+		// entry is a live-only signal that vanishes when the headless process
+		// ends, wedging cycle 2+ / dead-loop resume otherwise). "" for a record
+		// predating this field or a default-account loop; enrichAccounts then
+		// falls back to the entry, preserving pre-ConfigDir loops' behavior.
+		loops[i].Account.ConfigDir = rec.ConfigDir
+
 		// A live gate always wins over a stale verdict: the loop is blocked
 		// on a human decision RIGHT NOW, which is more urgent and more
 		// current than a judgment rendered against an earlier cycle's
@@ -157,6 +271,74 @@ func enrichFromRegistry(loops []domain.Loop, loopsDir, historyDir string) []doma
 		}
 
 		applyGovernor(&loops[i], historyDir)
+	}
+	return loops
+}
+
+// enrichAccounts attaches multi-account Phase B's account metadata
+// (domain.Loop.Account) onto each loop, from TWO sources with a deliberate
+// precedence:
+//
+//   - ConfigDir (the load-bearing field a redrive acts on) comes from the
+//     DURABLE registry record when present — seeded onto loops[i].Account.
+//     ConfigDir by enrichFromRegistry, which runs first. This is what survives
+//     after a loop's transient session-registry entry is gone (deleted on
+//     SessionEnd / pruned when the headless `claude -p` process ends), so an
+//     engine cycle 2+ or a Tier-2 resume of a dead alias-account loop still
+//     redrives on the RIGHT account instead of wedging under no config dir.
+//     Only when the record has none (a loop predating registry.Record.ConfigDir,
+//     or one never spawned via fleetops) does it fall back to the live session
+//     entry's ConfigDir.
+//   - Alias/Email/Plan are DISPLAY-only. Alias is resolved from the effective
+//     ConfigDir; Email/Plan are live-only, taken from the session entry when it
+//     still exists (best-effort, "" otherwise).
+//
+// A loop with neither a record ConfigDir nor a session entry is left with the
+// zero Account — Account.Label() renders that as "", indistinguishable from
+// "no account feature at all", the zero-config posture.
+//
+// Both the session registry and the accounts config are read ONCE per scan,
+// not once per loop: sessions.ListSessions reads its whole directory in one
+// pass, and accounts.Load parses one small JSON file — neither changes
+// mid-scan.
+//
+// A malformed accounts.json (Load's error case) is treated as INACTIVE here,
+// exactly like control.defaultAccountConfigDir's own precedent for the same
+// file: this is a DISPLAY enrichment, not the fail-closed control-path
+// guarantee internal/accounts.Load itself upholds, and blocking every loop's
+// alias label on one JSON typo would be a worse failure mode than simply
+// showing no alias (the loop's raw ConfigDir/Email still render via
+// Account.Label's fallback chain).
+func enrichAccounts(loops []domain.Loop, sessionsDir, accountsPath string) []domain.Loop {
+	entries := sessions.ListSessions(sessionsDir)
+	cfg, err := accounts.Load(accountsPath)
+	if err != nil {
+		cfg = accounts.Config{}
+	}
+	for i := range loops {
+		entry, hasEntry := entries[loops[i].SessionID]
+
+		// Durable record ConfigDir (seeded by enrichFromRegistry) wins over the
+		// transient session entry — see this function's doc.
+		configDir := loops[i].Account.ConfigDir
+		if configDir == "" && hasEntry {
+			configDir = entry.ConfigDir
+		}
+
+		var alias string
+		if configDir != "" {
+			// Guarded on a non-empty ConfigDir: an empty one is the default
+			// account by definition (domain.Account.IsDefault), and
+			// Account.Label() refuses to show an alias for it defensively —
+			// resolving one here would be wasted work on a never-displayed value.
+			alias, _ = cfg.AliasForConfigDir(configDir)
+		}
+		acct := domain.Account{ConfigDir: configDir, Alias: alias}
+		if hasEntry {
+			acct.Email = entry.AccountEmail
+			acct.Plan = entry.AccountPlan
+		}
+		loops[i].Account = acct
 	}
 	return loops
 }

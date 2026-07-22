@@ -118,7 +118,23 @@ const (
 // deliberately never passes --focus, so it's already the orca analog of
 // tmux's Spawn `-d` fix (see tmux.go's tmuxNewWindowCmd) — spawning a loop
 // here does not steal the cockpit's focus by orca's own documented default.
-func (orcaController) Spawn(cwd, goal string) error {
+func (c orcaController) Spawn(cwd, goal string) error {
+	return c.spawnArgv(cwd, goal, spawnArgvForCwd(cwd))
+}
+
+// SpawnWithConfigDir implements control.AccountSpawner: Spawn under an
+// EXPLICIT account (the "n"-wizard picker's choice for an unbound dir) instead
+// of the cwd-resolved one. Identical to Spawn but for the argv's account
+// prefix — see spawnArgvWithConfigDir and AccountSpawner's doc.
+func (c orcaController) SpawnWithConfigDir(cwd, goal, configDir string) error {
+	return c.spawnArgv(cwd, goal, spawnArgvWithConfigDir(configDir))
+}
+
+// spawnArgv is the shared create+wait+re-locate+send body behind both Spawn
+// (cwd-resolved account) and SpawnWithConfigDir (explicit account) — the only
+// thing that varies between them is spawnArgv, the claude command line orca's
+// `--command` runs, so it is passed in rather than re-resolved here.
+func (orcaController) spawnArgv(cwd, goal string, spawnArgv []string) error {
 	ctxCreate, cancelCreate := context.WithTimeout(context.Background(), spawnCreateTimeout)
 	defer cancelCreate()
 	// --command takes a command STRING, not an argv, so the configured spawn
@@ -129,7 +145,7 @@ func (orcaController) Spawn(cwd, goal string) error {
 	// this renders to exactly "claude" — byte-identical to the literal that
 	// was here before.
 	createOut, err := exec.CommandContext(ctxCreate, "orca", "terminal", "create",
-		"--worktree", "path:"+cwd, "--command", shellQuoteJoin(spawnCommandFn()), "--title", spawnTitle, "--json").Output()
+		"--worktree", "path:"+cwd, "--command", shellQuoteJoin(spawnArgv), "--title", spawnTitle, "--json").Output()
 	if err != nil {
 		return fmt.Errorf("orca terminal create: %w", err)
 	}
@@ -251,6 +267,14 @@ func (orcaController) SpawnWorktree(repoCwd, name, prompt string) (string, error
 	// orca flags are verified live before they are relied on. A user's
 	// configured flags therefore do not reach an orca worktree spawn; that is
 	// a known, accepted gap rather than an oversight.
+	//
+	// The multi-account CLAUDE_CONFIG_DIR prefix does not reach this path
+	// either, for the same reason: --agent names an agent KIND, not a command
+	// we can front with `env CLAUDE_CONFIG_DIR=…`. An orca-managed worktree
+	// spawn thus runs under the default account. The backend-agnostic git
+	// worktree path (spawnIntoGitWorktree → Controller.Spawn) DOES inherit the
+	// origin's account; only orca's own one-shot worktree launch is exempt.
+	// Accepted Phase A gap, flagged for Phase B.
 	out, err := exec.CommandContext(ctx, "orca", "worktree", "create",
 		"--repo", "path:"+repoCwd, "--name", name, "--agent", "claude", "--prompt", prompt, "--json").Output()
 	if err != nil {

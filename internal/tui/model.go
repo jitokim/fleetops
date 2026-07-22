@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/jitokim/fleetops/internal/accounts"
+	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/claude"
 	"github.com/jitokim/fleetops/internal/control"
 	"github.com/jitokim/fleetops/internal/domain"
@@ -94,6 +97,26 @@ var (
 	// against a REAL git and a real temp repo; this seam is about testing what
 	// the TUI does with each outcome.
 	worktreeCreateFn = worktree.Create
+	// loadAccountsFn loads ~/.fleetops/accounts.json for the "n"-wizard account
+	// picker (multi-account Phase C). A seam so the picker's three branches
+	// (no aliases → skip, malformed → warn+skip, aliases present → pick) are
+	// testable without writing a real config to the developer's home. It is the
+	// FIRST thing proceedFromWhere consults: for a zero-config machine the file
+	// is absent, Load returns the empty Config, and the wizard submits with no
+	// account step at all — the byte-identical zero-config path.
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Load(accounts.DefaultPath()) }
+	// gitMainRepoDirFn is control.GitMainRepoDir by default — the SAME git
+	// worktree→origin resolver the spawn path uses (see control's doc), fed to
+	// accounts.Config.ResolveForCwd so the picker binds a worktree to its origin
+	// repo exactly as a spawn would. A seam because it shells out to git.
+	gitMainRepoDirFn = control.GitMainRepoDir
+	// accountStatusProbeFn is accountstatus.Query by default — the `claude auth
+	// status --json` login-state probe (D1), run per alias config dir when the
+	// picker is entered. A seam so the picker never spawns a real `claude` in
+	// tests (and so `--demo` cannot shell out — though the demo keymap already
+	// blocks "n" outright, this is defence in depth, matching
+	// control.UseDefaultSpawnCommand's reasoning).
+	accountStatusProbeFn = accountstatus.Query
 	// controlResolveForLocateFn is control.ResolveForLocate by default —
 	// attachCmd's ATTACH resolver seam. Split from controlResolveFn on purpose:
 	// attach must follow whichever backend can actually Locate the loop's
@@ -221,6 +244,35 @@ type bootstrapResultMsg struct {
 // now creates worktrees itself with plain git (spawnIntoGitWorktree), so every
 // backend that can spawn can spawn into a worktree.
 type worktreeEligibilityMsg bool
+
+// accountStatusResult is one alias config dir's probed login state (D1): ok is
+// whether the `claude auth status --json` probe itself succeeded, st its parsed
+// result. The two are distinct on purpose — a failed probe (ok=false) renders
+// "unknown", whereas a successful probe of a logged-OUT dir (ok=true,
+// st.LoggedIn=false) renders the prominent "not logged in" warning.
+type accountStatusResult struct {
+	ok bool
+	st accountstatus.Status
+}
+
+// accountDecisionMsg carries the "n"-wizard account picker's off-loop
+// resolution (resolveAccountCmd) back to the event loop: whether the final
+// spawn cwd is bound (fixed==true, account not changeable) or unbound (a genuine
+// pick among aliasNames), plus every relevant config dir's cached login status.
+// Computed off-loop because resolving the binding shells out to git and probing
+// each alias shells out to `claude`.
+type accountDecisionMsg struct {
+	// generation echoes the spawnGeneration that dispatched this resolution, so
+	// a decision from a cancelled/re-entered wizard is discarded instead of
+	// applying a stale account (see Model.spawnGeneration).
+	generation uint64
+	fixed      bool
+	alias      string            // fixed: the bound alias name
+	configDir  string            // fixed: the bound config dir
+	aliasNames []string          // unbound: sorted alias names (stable digit order)
+	configDirs map[string]string // unbound: alias name → config dir
+	statuses   map[string]accountStatusResult
+}
 
 // killResultMsg reports the outcome of a kill (k key, double-press confirm)
 // attempt, computed off the event loop by killCmd, mirroring resumeResultMsg.
@@ -369,6 +421,15 @@ const (
 	// happened to sit on).
 	wizardWhere
 	wizardDir // free-text absolute/~ path, entered via [c] from wizardWhere or wizardEngineDrive; returns to spawnDirReturn
+	// wizardAccount: single-key account picker (multi-account Phase C), reached
+	// ONLY after wizardWhere has committed the FINAL spawn dir and ONLY when
+	// aliases are configured (accounts.json non-empty). Placed last, and
+	// resolved from the final spawn cwd, precisely because the cwd can still
+	// change at wizardWhere ([c]/[s]) — computing the account any earlier could
+	// show (and inject) a stale binding. A machine with no accounts.json never
+	// reaches this step at all, so zero-config spawns are byte-identical (see
+	// proceedFromWhere and TestProceedFromWhere_ZeroConfig_NoAccountStep).
+	wizardAccount
 )
 
 type Model struct {
@@ -443,6 +504,56 @@ type Model struct {
 	spawnWorktreeEligible bool
 	spawnHostsClaudeRepo  bool
 	spawnCwdIsRepo        bool
+
+	// Multi-account Phase C — the "n"-wizard account picker (wizardAccount).
+	//
+	// spawnConfigDir is the account the wizard resolved for THIS spawn, threaded
+	// verbatim into spawnCmd (control.SpawnWithAccount). "" is the load-bearing
+	// zero-config value: it means "no explicit override — spawn resolves the
+	// account from cwd exactly as Phase A did", so a machine with no aliases
+	// (spawnConfigDir never set to anything else) spawns byte-identically. A
+	// non-empty value is the picker's explicit choice for an UNBOUND dir, or a
+	// bound dir's fixed binding — either way it OVERRIDES cwd re-resolution.
+	spawnConfigDir string
+	// spawnUseWorktree carries wizardWhere's resolved worktree-vs-dir choice
+	// across the account step to submit — the account step sits BETWEEN the
+	// where choice and the spawn, so the choice has to survive it.
+	spawnUseWorktree bool
+
+	// spawnGeneration is a monotonically-increasing token stamped on every
+	// resolveAccountCmd dispatch and carried back on its accountDecisionMsg. The
+	// handler DISCARDS any decision whose generation != the current one, so a
+	// LATE message from a cancelled or re-entered wizard cannot apply a STALE
+	// (wrong) account to this spawn. Necessary because resolveAccountCmd is slow
+	// — it runs git plus a serial 2s probe per alias — so a human who esc's and
+	// restarts the wizard can easily have an old probe still in flight.
+	spawnGeneration uint64
+
+	// accountResolving is true while the off-loop account probe
+	// (resolveAccountCmd) is in flight — the picker renders "resolving…" and
+	// swallows every key but esc, so a keystroke can't act on a not-yet-known
+	// account.
+	accountResolving bool
+	// accountFixed marks the FIXED (cwd-bound) case: the account is shown but
+	// cannot be changed (the "#1 고정" requirement). accountFixedAlias/Dir name
+	// it; the picker fields below are unused.
+	accountFixed      bool
+	accountFixedAlias string
+	accountFixedDir   string
+	// accountAliasNames (sorted) and accountConfigDirs (name→config dir) are the
+	// UNBOUND picker's choices — a stable, deterministic key order so digit N
+	// always maps to the same alias within one wizard.
+	accountAliasNames []string
+	accountConfigDirs map[string]string
+	// accountStatuses caches each probed config dir's login state (config dir →
+	// result), populated ONCE by resolveAccountCmd when the step is entered —
+	// never re-run per keystroke (D1's caching requirement).
+	accountStatuses map[string]accountStatusResult
+	// accountLoginPrompt is the picker's transient "which alias to log into?"
+	// sub-state: [l] sets it, the next digit launches `claude login` for that
+	// alias (D2), esc clears it. Kept off the alias-select keys so a login and a
+	// select never race on the same digit.
+	accountLoginPrompt bool
 
 	filterQuery string // the APPLIED "/" filter (post-enter); "" means no filter
 
@@ -732,17 +843,22 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 	// exists for: with only one, "attach and look" costs about the same, and
 	// the demo would not show why any of this was built.
 	migrateDB := domain.Loop{
-		Project:      "migrate-db",
-		SessionID:    "demo-migrate-db",
-		ProjectDir:   "-home-user-billing",
-		Cwd:          "/home/user/billing",
-		Path:         "/home/user/.claude/projects/-home-user-billing/demo-migrate-db.jsonl",
-		State:        domain.StateGate,
-		GatePrompt:   "The migration will drop the legacy invoices table. How should I proceed?",
-		GateOptions:  []string{"Drop it", "Keep and rename", "Stop and let me look"},
-		Cycle:        2,
-		Goal:         domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
-		TokensSpent:  180000,
+		Project:     "migrate-db",
+		SessionID:   "demo-migrate-db",
+		ProjectDir:  "-home-user-billing",
+		Cwd:         "/home/user/billing",
+		Path:        "/home/user/.claude/projects/-home-user-billing/demo-migrate-db.jsonl",
+		State:       domain.StateGate,
+		GatePrompt:  "The migration will drop the legacy invoices table. How should I proceed?",
+		GateOptions: []string{"Drop it", "Keep and rename", "Stop and let me look"},
+		Cycle:       2,
+		Goal:        domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
+		TokensSpent: 180000,
+		// multi-account Phase B: the one demo loop carrying an account label,
+		// so the DETAIL panel's ACCOUNT row is visible in demo QA without
+		// needing a real ~/.fleetops/accounts.json — see
+		// TestDemoFleet_MigrateDB_CarriesAccountLabel.
+		Account:      domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "work"},
 		LastActivity: now.Add(-2 * time.Minute),
 	}
 	refactorCoreReason := "payment handlers moved into internal/payment, existing tests still pass — ledger reconciliation not yet covered"
@@ -975,7 +1091,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						// worth of input.
 						return m, nil
 					}
-					return m.submitSpawnWizard(true)
+					return m.proceedFromWhere(true)
 				case "c":
 					return m.enterWizardDir(wizardWhere)
 				case "s":
@@ -990,11 +1106,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil // stay on wizardWhere — the label re-renders with the new target
 				case "enter":
-					return m.submitSpawnWizard(m.worktreeOffered() && m.spawnHostsClaudeRepo) // default
+					return m.proceedFromWhere(m.worktreeOffered() && m.spawnHostsClaudeRepo) // default
 				case "d":
-					return m.submitSpawnWizard(false)
+					return m.proceedFromWhere(false)
 				}
 				return m, nil // ignore any other key at this single-key step
+			}
+			if m.spawnStep == wizardAccount {
+				return m.handleAccountStepKey(key)
 			}
 			switch key {
 			case "esc":
@@ -1396,6 +1515,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spawnWorktreeEligible = false // set once checkWorktreeEligibilityCmd's result arrives
 			m.spawnHostsClaudeRepo = m.dirHostsClaudeRepo(cwd)
 			m.spawnCwdIsRepo = worktree.IsRepo(cwd)
+			// Multi-account Phase C: clear any prior wizard's account state so a
+			// stale pick can never leak into this spawn. spawnConfigDir="" keeps
+			// the zero-config path byte-identical until the picker sets it.
+			m.spawnConfigDir = ""
+			m.spawnUseWorktree = false
+			m.accountResolving = false
+			m.accountFixed = false
+			m.accountFixedAlias = ""
+			m.accountFixedDir = ""
+			m.accountAliasNames = nil
+			m.accountConfigDirs = nil
+			m.accountStatuses = nil
+			m.accountLoginPrompt = false
 			m.mode = modePrompting
 			m.input = newWizardInput()
 			return m, tea.Batch(textinput.Blink, checkWorktreeEligibilityCmd())
@@ -1556,6 +1688,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case worktreeEligibilityMsg:
 		m.spawnWorktreeEligible = bool(msg)
+	case accountDecisionMsg:
+		// Discard a STALE decision: one from a cancelled/re-entered wizard (its
+		// generation no longer matches) or one that landed after the account
+		// step was already left. Applying it would stamp the wrong account onto
+		// whatever the model is doing now. Only a decision for the CURRENT
+		// wizardAccount step and the CURRENT generation is honored.
+		if m.spawnStep != wizardAccount || msg.generation != m.spawnGeneration {
+			return m, nil
+		}
+		return m.applyAccountDecision(msg)
 	case killResultMsg:
 		m.status = msg.text
 		if msg.ok {
@@ -1711,7 +1853,7 @@ func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.
 		// Tier 2: vendor-independent headless re-drive. Works on every
 		// host (including a StallGone bare shell, or no backend/ambiguous
 		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
-		if err := redriveFn(l.Cwd, l.SessionID, prompt); err != nil {
+		if err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir); err != nil {
 			logActuationEvent(l, action, "tier2", err)
 			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
 		}
@@ -2188,6 +2330,235 @@ func (m Model) advanceSpawnWizard() (tea.Model, tea.Cmd) {
 	}
 }
 
+// proceedFromWhere is the fork between wizardWhere and the actual spawn: with
+// aliases configured it inserts the account picker (wizardAccount), otherwise
+// it submits directly. It runs the MOMENT the final spawn cwd is committed
+// (wizardWhere's w/d/enter), which is exactly why the account is resolved here
+// and not earlier — an earlier resolution could bind a cwd the human then
+// changed at wizardWhere.
+//
+// The zero-config guarantee lives in the very first branch: loadAccountsFn on a
+// machine with no ~/.fleetops/accounts.json returns the empty Config, len==0,
+// and the spawn goes straight to submitSpawnWizard with spawnConfigDir=="" —
+// no new step, no probe, no behaviour change whatsoever. A malformed config
+// (Load error) degrades the SAME way (submit as default) plus a one-line
+// warning: a typo must not wedge the wizard, and Phase A's spawn path already
+// treats a malformed config as "no account" identically.
+func (m Model) proceedFromWhere(useWorktree bool) (tea.Model, tea.Cmd) {
+	cfg, err := loadAccountsFn()
+	if err != nil {
+		// A typo must not wedge the wizard: spawn under the default account
+		// exactly as Phase A's spawn path does with a malformed config, but
+		// SAY so — the warning is set AFTER submit because submitSpawnWizard
+		// overwrites the status with its own "spawning…" line.
+		m.spawnConfigDir = ""
+		model, cmd := m.submitSpawnWizard(useWorktree)
+		mm := model.(Model)
+		mm.status, mm.statusKind = "accounts.json invalid — spawning under the default account: "+err.Error(), statusNeutral
+		return mm, cmd
+	}
+	if len(cfg.Aliases) == 0 {
+		// Zero-config: no aliases → no account step, byte-identical spawn.
+		m.spawnConfigDir = ""
+		return m.submitSpawnWizard(useWorktree)
+	}
+	// Aliases exist — enter the account step and resolve the decision off the
+	// event loop (binding resolution shells out to git; each probe shells out
+	// to `claude`). The picker renders "resolving…" until accountDecisionMsg.
+	m.spawnUseWorktree = useWorktree
+	m.spawnStep = wizardAccount
+	m.accountResolving = true
+	m.accountFixed = false
+	m.accountLoginPrompt = false
+	m.accountStatuses = nil
+	m.input.Blur()
+	// Advance the generation so any decision still in flight from a PRIOR
+	// dispatch (a wizard the human cancelled and restarted) is discarded when
+	// it lands — only the resolution stamped with THIS value is applied.
+	m.spawnGeneration++
+	return m, resolveAccountCmd(m.spawnCwd, cfg, m.spawnGeneration)
+}
+
+// resolveAccountCmd resolves the account decision for the FINAL spawn cwd off
+// the event loop: it binds cwd (git-aware, via the same origin resolver the
+// spawn path uses) and probes login status for every config dir it will show.
+// A bound cwd yields a FIXED decision (one probe); an unbound one yields the
+// picker over all aliases (one probe each). D1's cache is exactly this message:
+// the probes run ONCE here, never per keystroke.
+func resolveAccountCmd(cwd string, cfg accounts.Config, generation uint64) tea.Cmd {
+	return func() tea.Msg {
+		statuses := map[string]accountStatusResult{}
+		probe := func(dir string) {
+			if dir == "" {
+				return
+			}
+			if _, done := statuses[dir]; done {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), accountStatusProbeTimeout)
+			defer cancel()
+			st, ok := accountStatusProbeFn(ctx, dir)
+			statuses[dir] = accountStatusResult{ok: ok, st: st}
+		}
+
+		if alias, configDir, bound := cfg.ResolveForCwd(cwd, gitMainRepoDirFn); bound {
+			probe(configDir)
+			return accountDecisionMsg{generation: generation, fixed: true, alias: alias, configDir: configDir, statuses: statuses}
+		}
+
+		names := make([]string, 0, len(cfg.Aliases))
+		for name := range cfg.Aliases {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		configDirs := make(map[string]string, len(cfg.Aliases))
+		for _, name := range names {
+			configDirs[name] = cfg.Aliases[name]
+			probe(cfg.Aliases[name])
+		}
+		return accountDecisionMsg{generation: generation, fixed: false, aliasNames: names, configDirs: configDirs, statuses: statuses}
+	}
+}
+
+// accountStatusProbeTimeout bounds each `claude auth status --json` probe, the
+// same 2s budget the SessionStart hook uses (cmd/fleetops) — a wedged `claude`
+// must never hang the wizard.
+const accountStatusProbeTimeout = 2 * time.Second
+
+// applyAccountDecision stores resolveAccountCmd's result and renders the step:
+// a fixed account waits for [enter]/[l]/[esc]; the picker waits for a digit,
+// [enter] (default), [l] (login), or [esc]. It NEVER auto-submits — even the
+// fixed case pauses, so a not-logged-in bound account's warning is seen before
+// an unauthenticated session is spawned.
+func (m Model) applyAccountDecision(msg accountDecisionMsg) (tea.Model, tea.Cmd) {
+	m.accountResolving = false
+	m.accountStatuses = msg.statuses
+	if msg.fixed {
+		m.accountFixed = true
+		m.accountFixedAlias = msg.alias
+		m.accountFixedDir = msg.configDir
+		return m, nil
+	}
+	m.accountFixed = false
+	m.accountAliasNames = msg.aliasNames
+	m.accountConfigDirs = msg.configDirs
+	return m, nil
+}
+
+// handleAccountStepKey routes a keypress at wizardAccount. While the decision
+// is still resolving only [esc] (cancel) is honoured. Fixed vs. picker then
+// diverge; the login sub-prompt ([l]) is handled first because it reinterprets
+// the digit keys as "which account to log into" rather than "which to pick".
+func (m Model) handleAccountStepKey(key string) (tea.Model, tea.Cmd) {
+	if key == "esc" {
+		m.mode = modeNormal
+		m.input.Blur()
+		m.accountLoginPrompt = false
+		// Bump the generation so an account decision STILL IN FLIGHT (the git +
+		// per-alias probes are slow) can't land after this cancel and mutate the
+		// picker fields (accountFixed/accountConfigDirs/…) post-esc — the
+		// accountDecisionMsg guard discards any generation != current. Benign
+		// today (mode is normal so nothing acts on those fields), but keeps the
+		// race guard airtight against a future reader.
+		m.spawnGeneration++
+		m.status, m.statusKind = "cancelled", statusNeutral
+		return m, nil
+	}
+	if m.accountResolving {
+		return m, nil // ignore every key but esc until the account is known
+	}
+	if m.accountFixed {
+		return m.handleFixedAccountKey(key)
+	}
+	return m.handlePickerKey(key)
+}
+
+// handleFixedAccountKey: the account cannot be changed (cwd binding), so the
+// only actions are proceed ([enter]), log the bound account in ([l]), or cancel
+// (esc, handled above).
+func (m Model) handleFixedAccountKey(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "enter":
+		m.spawnConfigDir = m.accountFixedDir
+		return m.submitSpawnWizard(m.spawnUseWorktree)
+	case "l":
+		return m, loginLaunchCmd(m.spawnCwd, m.accountFixedDir, m.accountFixedAlias)
+	}
+	return m, nil
+}
+
+// handlePickerKey: an UNBOUND dir's genuine choice — digit N selects alias N,
+// [enter] takes the default account (no CLAUDE_CONFIG_DIR), [l] then a digit
+// launches `claude login` for that alias.
+func (m Model) handlePickerKey(key string) (tea.Model, tea.Cmd) {
+	if m.accountLoginPrompt {
+		if key == "l" {
+			m.accountLoginPrompt = false // toggle off
+			return m, nil
+		}
+		if name, ok := m.aliasForDigit(key); ok {
+			m.accountLoginPrompt = false
+			return m, loginLaunchCmd(m.spawnCwd, m.accountConfigDirs[name], name)
+		}
+		return m, nil // ignore non-digit while awaiting a login target
+	}
+	switch key {
+	case "enter":
+		// Default account — the pre-highlighted choice. No override.
+		m.spawnConfigDir = ""
+		return m.submitSpawnWizard(m.spawnUseWorktree)
+	case "l":
+		m.accountLoginPrompt = true
+		return m, nil
+	}
+	if name, ok := m.aliasForDigit(key); ok {
+		m.spawnConfigDir = m.accountConfigDirs[name]
+		return m.submitSpawnWizard(m.spawnUseWorktree)
+	}
+	return m, nil // ignore any other key at this single-key step
+}
+
+// aliasForDigit maps a "1".."9" keypress to the aliasNames entry it selects
+// (1-indexed, matching the rendered "[1] name" labels). ok=false for any
+// non-digit or an out-of-range index, so a stray key is simply ignored.
+func (m Model) aliasForDigit(key string) (string, bool) {
+	if len(key) != 1 || key[0] < '1' || key[0] > '9' {
+		return "", false
+	}
+	idx := int(key[0] - '1')
+	if idx >= len(m.accountAliasNames) {
+		return "", false
+	}
+	return m.accountAliasNames[idx], true
+}
+
+// loginLaunchCmd opens a terminal running `env CLAUDE_CONFIG_DIR=<configDir>
+// claude login` (D2) via whichever backend implements control.TerminalOpener —
+// the SAME seam take-over (takeOverCmd) uses. fleetops only launches the flow;
+// the browser OAuth and the credential write are the human's and claude's. On
+// no backend / an opener-less backend it reports the manual command instead of
+// failing silently.
+func loginLaunchCmd(cwd, configDir, alias string) tea.Cmd {
+	return func() tea.Msg {
+		// attachResultMsg (not spawnResultMsg) on purpose: it only sets the
+		// status line, whereas a spawnResultMsg failure would reopenSpawnWizard
+		// and eject the human from the account picker they are standing in.
+		command := control.LoginTerminalCommand(configDir)
+		ctrl, ok := controlResolveFn()
+		if !ok {
+			return attachResultMsg{false, "no orca/tmux — log in manually: " + command}
+		}
+		opener, supports := ctrl.(control.TerminalOpener)
+		if !supports {
+			return attachResultMsg{false, "no orca/tmux terminal opener — log in manually: " + command}
+		}
+		if err := opener.OpenTerminal(cwd, command); err != nil {
+			return attachResultMsg{false, fmt.Sprintf("login launch for %s failed: %v", alias, err)}
+		}
+		return attachResultMsg{true, fmt.Sprintf("launched claude login for %s — complete it in the new terminal, then pick the account", alias)}
+	}
+}
+
 // submitSpawnWizard finishes the wizard (from either wizardMaxCycles, when
 // worktree spawn isn't eligible at all, or wizardWhere's w/d/enter) and
 // dispatches spawnCmd. useWorktree is the wizard's resolved choice — spawnCmd
@@ -2222,6 +2593,12 @@ func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 	if m.spawnDoneWhen == "" {
 		note += " (no done condition — oracle judges against the goal only)"
 	}
+	// The chosen account is part of the spawn's identity, so it goes in the
+	// status the human reads back — "" (default account) stays silent, exactly
+	// as it did before this feature, keeping the zero-config line unchanged.
+	if m.spawnConfigDir != "" {
+		note += " under account " + m.spawnConfigDir
+	}
 	if useWorktree {
 		m.status, m.statusKind = fmt.Sprintf("spawning loop in a new worktree of %s...%s", m.spawnCwd, note), statusNeutral
 	} else {
@@ -2235,7 +2612,7 @@ func (m Model) submitSpawnWizard(useWorktree bool) (tea.Model, tea.Cmd) {
 		Challenger:    m.spawnChallenger,
 		MaxCycles:     m.spawnMaxCycles,
 	}
-	return m, spawnCmd(m.spawnCwd, spec, useWorktree)
+	return m, spawnCmd(m.spawnCwd, spec, useWorktree, m.spawnConfigDir)
 }
 
 // submitSpawnWizardEngineDrive finishes the wizard via the 'e' (engine-
@@ -2316,8 +2693,13 @@ func checkWorktreeEligibilityCmd() tea.Cmd {
 // works, so this is detected here (comparing the two paths) purely to tell
 // the human the truth in the status line, not treated as any kind of
 // failure.
-func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
+func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool, configDir string) tea.Cmd {
 	return func() tea.Msg {
+		// Persist the chosen account onto the DURABLE record (via the pending
+		// round trip): without this, a redrive after the loop's transient
+		// session-registry entry is gone would fire on the wrong account. "" =
+		// default, byte-identical to before. See registry.BindSpec.ConfigDir.
+		spec.ConfigDir = configDir
 		// resolveSpawnerFn, not controlResolveFn: spawn is the one operation
 		// a host terminal can perform without being a multiplexer, so it
 		// resolves over the wider Spawner seam (multiplexers first, then
@@ -2332,9 +2714,26 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		}
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
 
-		if spawner, supports := ctrl.(control.WorktreeSpawner); useWorktree && supports {
+		// orca (the only WorktreeSpawner) worktree requests split on the account:
+		//
+		//   - DEFAULT account (configDir == ""): orca's native `worktree create
+		//     --agent`, which carries no env prefix but needs none. Unchanged.
+		//   - NON-default account (configDir != ""): all three of orca + a chosen
+		//     account + an isolated worktree cannot coexist. orca's `terminal
+		//     create --worktree path:<p>` only accepts a worktree ORCA itself
+		//     registered — handing it a fleetops-created checkout returns
+		//     selector_not_found (verified live). Creating one and routing it
+		//     through SpawnWithAccount would strand an orphaned checkout orca
+		//     rejects. So we spawn in the bound repo dir orca DOES know, with the
+		//     account preserved via the env prefix, and tell the human isolation
+		//     was forfeited (spawnOrcaAccountNoWorktree). The account — the whole
+		//     point of the feature — is kept; the worktree is honestly dropped.
+		if wtSpawner, supports := ctrl.(control.WorktreeSpawner); useWorktree && supports {
+			if configDir != "" {
+				return spawnOrcaAccountNoWorktree(ctrl, cwd, spec, prompt, configDir)
+			}
 			name := worktreeNameFromGoal(spec.Goal)
-			worktreePath, err := spawner.SpawnWorktree(cwd, name, prompt)
+			worktreePath, err := wtSpawner.SpawnWorktree(cwd, name, prompt)
 			if err != nil {
 				// The backend's own worktree spawn. Its error may or may not
 				// mean a window was created, so it is classified rather than
@@ -2366,10 +2765,10 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 		}
 
 		if useWorktree {
-			return spawnIntoGitWorktree(ctrl, cwd, spec, prompt)
+			return spawnIntoGitWorktree(ctrl, cwd, spec, prompt, configDir)
 		}
 
-		if err := ctrl.Spawn(cwd, prompt); err != nil {
+		if err := control.SpawnWithAccount(ctrl, cwd, prompt, configDir); err != nil {
 			return spawnResultMsg{ok: false, text: spawnFailureText(err), mayHaveSpawned: spawnMayHaveLandedWindow(err)}
 		}
 		if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
@@ -2381,18 +2780,45 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 	}
 }
 
+// spawnOrcaAccountNoWorktree handles the one combination orca cannot serve:
+// orca + a non-default account + a worktree request. orca's `terminal create
+// --worktree path:<p>` only accepts a worktree orca itself registered, so a
+// fleetops-created checkout comes back selector_not_found (verified live) — and
+// creating one anyway would strand an orphaned checkout. Instead it spawns in
+// the bound repo dir (cwd), which orca DOES know, with the account preserved via
+// SpawnWithAccount's env prefix, and reports plainly that no isolated checkout
+// was made. Account kept (the feature's point); isolation honestly forfeited.
+//
+// spec.ConfigDir is already set (spawnCmd's closure head), so the pending record
+// this writes carries the account onto the durable record like every other path.
+func spawnOrcaAccountNoWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt, configDir string) tea.Msg {
+	if err := control.SpawnWithAccount(ctrl, cwd, prompt, configDir); err != nil {
+		return spawnResultMsg{ok: false, text: spawnFailureText(err), mayHaveSpawned: spawnMayHaveLandedWindow(err)}
+	}
+	forfeit := fmt.Sprintf("spawned in %s under account %s via %s — orca can't isolate a worktree under a non-default account, so no separate checkout",
+		cwd, configDir, ctrl.Name())
+	if err := registry.WritePending(registry.PendingDir(), cwd, spec); err != nil {
+		// best-effort, same posture as the plain-spawn path: the loop really did
+		// start, it just won't get ORACLE/N-I tracking.
+		return spawnResultMsg{ok: true, text: fmt.Sprintf("%s (goal not recorded: %v)", forfeit, err)}
+	}
+	return spawnResultMsg{ok: true, text: forfeit}
+}
+
 // spawnIntoGitWorktree is spawnCmd's BACKEND-AGNOSTIC worktree branch: it
 // creates a real git worktree itself (internal/worktree — plain `git worktree
 // add`, branched from an explicit origin/<default-branch>) and then runs the
 // ordinary Controller.Spawn INTO that fresh directory.
 //
 // This is what makes worktree isolation available on every backend rather than
-// only on orca. It is reached only when the resolved controller does NOT
-// implement control.WorktreeSpawner — orca still takes its own one-shot
-// `worktree create --agent` path above, unchanged. Keeping orca's route intact
-// is deliberate: its worktrees are Orca-managed and show up in Orca's own UI,
-// which is a real advantage for an orca user, and demoting that path is a
-// separate decision nobody has made.
+// only on orca. It is reached only for backends that do NOT implement
+// control.WorktreeSpawner (tmux/cmux/iTerm2) — which honor the env prefix on a
+// fresh checkout — for EITHER account. orca never reaches here: its default-
+// account worktree takes orca's own `worktree create --agent` path, and its
+// non-default-account worktree is redirected to spawnOrcaAccountNoWorktree
+// (orca rejects a fleetops-created worktree — see there). Keeping orca's native
+// route intact for the default account is deliberate: its worktrees are Orca-
+// managed and show up in Orca's own UI, a real advantage for an orca user.
 //
 // Failure is REPORTED, never silently downgraded to a plain current-dir spawn.
 // The human explicitly asked for isolation; quietly spawning into the repo they
@@ -2400,13 +2826,21 @@ func spawnCmd(cwd string, spec registry.BindSpec, useWorktree bool) tea.Cmd {
 // defect. The status line names the branch AND the base it was cut from, since
 // the explicit base is the whole guarantee and a guarantee nobody can see is
 // one nobody can trust.
-func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt string) tea.Msg {
+func spawnIntoGitWorktree(ctrl control.Spawner, cwd string, spec registry.BindSpec, prompt, configDir string) tea.Msg {
 	wt, err := worktreeCreateFn(cwd)
 	if err != nil {
 		// The git worktree itself failed, before any terminal was driven.
 		return spawnResultMsg{ok: false, text: fmt.Sprintf("worktree spawn failed: %v", err)}
 	}
-	if err := ctrl.Spawn(wt.Path, prompt); err != nil {
+	// Account (multi-account Phase C): the wizard resolved configDir from the
+	// ORIGIN cwd, so threading it here pins the picker's choice explicitly. When
+	// configDir=="" this is SpawnWithAccount's pass-through to plain Spawn, which
+	// re-resolves CLAUDE_CONFIG_DIR from wt.Path — and control's GitMainRepoDir
+	// maps that fresh worktree back to cwd's ORIGIN repo, so an unbound-but-
+	// defaulted spawn still inherits the origin's binding exactly as Phase A
+	// intended. Either way the account follows the origin, never the bare
+	// worktree path.
+	if err := control.SpawnWithAccount(ctrl, wt.Path, prompt, configDir); err != nil {
 		// The checkout exists but nothing is running in it. Say exactly that,
 		// and name the path — it is the human's to reuse or remove, and a
 		// message that omitted it would leave an orphan directory they never
@@ -2453,6 +2887,34 @@ func staleBaseNote(wt worktree.Result) string {
 // transcript exactly like any other loop (the scanner stays the SOLE owner
 // of State — this function never classifies anything itself).
 
+// bootstrapConfigDirForCwd resolves the CLAUDE_CONFIG_DIR the engine-drive
+// bootstrap in cwd should run under — the SAME resolution the manual spawn path
+// uses (loadAccountsFn + gitMainRepoDirFn, the worktree→origin git seam), so a
+// bound cwd's account is honored identically whether the human picked [manual]
+// or [e]. Returns "" (default account) whenever accounts.json is absent/
+// malformed or cwd is unbound: a Load error must never wedge the engine-drive
+// spawn, just fall back to the default account as Phase A's spawn path does.
+//
+// KNOWN GAP (#5/#7): on an UNBOUND cwd that nonetheless has aliases configured,
+// this silently defaults to the default account — the engine-drive path has no
+// interactive account picker, unlike the manual spawn wizard (proceedFromWhere →
+// wizardAccount) which would prompt. So [e] engine-drive on an unbound dir can
+// only ever run the default account today; pick the account by binding the dir
+// (or spawn manually) if a non-default one is wanted. Deliberate for now, not a
+// silent wrong-account bug: a bound cwd — the case that matters for accounts —
+// is always honored.
+func bootstrapConfigDirForCwd(cwd string) string {
+	cfg, err := loadAccountsFn()
+	if err != nil {
+		return ""
+	}
+	_, configDir, ok := cfg.ResolveForCwd(cwd, gitMainRepoDirFn)
+	if !ok {
+		return ""
+	}
+	return configDir
+}
+
 // bootstrapTimeout bounds the headless claude -p bootstrap call.
 // Deliberately generous compared to judgeTimeout's 2 minutes (internal/
 // oracle) — cycle 1 does REAL WORK, not a cheap haiku judgment.
@@ -2495,16 +2957,43 @@ func parseBootstrapSessionID(raw []byte) (string, bool) {
 	return "", false
 }
 
-// bootstrapClaudeFn runs `claude -p <prompt> --output-format json` in cwd
-// and returns its raw stdout — the ONE real exec call bootstrapEngineCmd
-// makes, isolated behind a func var (same seam shape as judgeFn/redriveFn:
-// an entire side-effecting call, swappable, not just a directory/session
-// lookup) so tests can verify Bind/event-emission/status-line behavior
-// without invoking a real claude CLI.
-var bootstrapClaudeFn = func(ctx context.Context, cwd, prompt string) ([]byte, error) {
+// bootstrapClaudeFn runs `claude -p <prompt> --output-format json` in cwd,
+// under the account scoped by configDir, and returns its raw stdout — the ONE
+// real exec call bootstrapEngineCmd makes, isolated behind a func var (same seam
+// shape as judgeFn/redriveFn: an entire side-effecting call, swappable, not just
+// a directory/session lookup) so tests can verify Bind/event-emission/status-
+// line behavior without invoking a real claude CLI.
+//
+// configDir threads the account the same way SPAWN and REDRIVE already do:
+// without it, a bound cwd handed to [e] engine-drive would run cycle 1 — and
+// every subsequent driven cycle — on the DEFAULT account, silently degrading
+// the exact wrong-account guarantee the accounts package exists to enforce.
+var bootstrapClaudeFn = func(ctx context.Context, cwd, prompt, configDir string) ([]byte, error) {
+	return buildBootstrapCmd(ctx, cwd, prompt, configDir).Output()
+}
+
+// buildBootstrapCmd assembles the headless cycle-1 exec.Cmd with cwd and the
+// account env, split out as a testable seam (same shape as control's
+// buildRedriveCmd) so a unit test can assert cmd.Env carries CLAUDE_CONFIG_DIR
+// for a bound cwd and is absent for an unbound one, WITHOUT spawning a real
+// claude. configDir != "" appends CLAUDE_CONFIG_DIR ON TOP OF os.Environ()
+// (never replacing it — a nil-but-nonempty Env would starve claude of PATH/
+// HOME); configDir == "" leaves cmd.Env nil, exec's "inherit the parent
+// environment" — byte-identical to the pre-account bootstrap.
+// claudeConfigDirEnv is the environment variable that scopes which Claude
+// account a process runs as — the same name control injects at spawn and
+// redrive (control.claudeConfigDirEnv). Duplicated as an unexported const here
+// rather than exported from control, to keep it a private detail of each
+// package that must set it; the STRING is the contract, shared with claude.
+const claudeConfigDirEnv = "CLAUDE_CONFIG_DIR"
+
+func buildBootstrapCmd(ctx context.Context, cwd, prompt, configDir string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json")
 	cmd.Dir = cwd
-	return cmd.Output()
+	if configDir != "" {
+		cmd.Env = append(os.Environ(), claudeConfigDirEnv+"="+configDir)
+	}
+	return cmd
 }
 
 // bootstrapEngineCmd runs cwd's contract as a headless cycle 1 and, only
@@ -2530,10 +3019,24 @@ func bootstrapEngineCmd(cwd string, spec registry.BindSpec) tea.Cmd {
 	return func() tea.Msg {
 		spec.Driven = true
 
+		// Honor the account bound to cwd, exactly as the manual spawn path does
+		// (proceedFromWhere → ResolveForCwd). The engine-drive path skips the
+		// wizardWhere/wizardAccount steps, so without resolving here a bound cwd
+		// would run cycle 1 AND every driven cycle on the default account —
+		// silently wrong. Resolved HERE (off the event loop) because the same
+		// git rev-parse the manual path runs off-loop must not block Update.
+		// An unbound cwd (or any resolve failure) yields "" — the default
+		// account, byte-identical to before.
+		configDir := bootstrapConfigDirForCwd(cwd)
+		// Persist it onto the DURABLE record too, so engine cycle 2+ (driveCmd)
+		// redrives on the SAME account — the session-registry entry it would
+		// otherwise source from is gone once cycle 1's headless process ends.
+		spec.ConfigDir = configDir
+
 		ctx, cancel := context.WithTimeout(context.Background(), bootstrapTimeout)
 		defer cancel()
 		prompt := buildSpawnPrompt(spec.Goal, spec.DoneCondition, spec.Rubric, spec.Challenger, spec.MaxCycles)
-		out, err := bootstrapClaudeFn(ctx, cwd, prompt)
+		out, err := bootstrapClaudeFn(ctx, cwd, prompt, configDir)
 		if err != nil {
 			return bootstrapResultMsg{false, fmt.Sprintf("engine bootstrap failed: %v", err), ""}
 		}
@@ -2853,7 +3356,7 @@ func driveCmd(l domain.Loop) tea.Cmd {
 			Detail:    fmt.Sprintf("cycle %d", l.Cycle),
 			Actor:     events.ActorAuto,
 		})
-		err := redriveFn(l.Cwd, l.SessionID, prompt)
+		err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir)
 		if err != nil {
 			return resumeResultMsg{sessionID: l.SessionID, ok: false,
 				text: fmt.Sprintf("engine: cycle %d failed — %v", l.Cycle, err)}
@@ -3135,7 +3638,7 @@ type autoRedriveResultMsg struct {
 func autoRedrive429Cmd(l domain.Loop, attempt int) tea.Cmd {
 	return func() tea.Msg {
 		prompt, _ := claude.LastUserPrompt(l.Path) // an empty/absent prior prompt still redrives — same tolerance as resumeCmd
-		err := redriveFn(l.Cwd, l.SessionID, prompt)
+		err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir)
 		_ = events.Append(historyDirFn(), events.Event{
 			TS:        time.Now().UnixNano(),
 			SessionID: l.SessionID,
@@ -5187,6 +5690,14 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	}
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
+	// multi-account Phase B: omitted ENTIRELY (not shown blank) when
+	// l.Account.Label() is "" — the default account (the common
+	// zero-config case) renders no row at all here, matching the DRIVE
+	// row's own presence/absence pattern just above rather than adding a
+	// third "not applicable" state to parse.
+	if label := l.Account.Label(); label != "" {
+		d.WriteString(detailRow("ACCOUNT", stDim.Render(trunc(label, valueWidth))))
+	}
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
 
 	switch l.State {
@@ -5830,6 +6341,8 @@ func renderNewLoopPrompt(m Model) string {
 		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.whereStepLabel())
 	case wizardEngineDrive:
 		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.engineDriveStepLabel())
+	case wizardAccount:
+		return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ " + m.accountStepLabel())
 	}
 	return lipgloss.NewStyle().Foreground(cAccent).Bold(true).Render("NEW LOOP ▸ "+wizardStepLabel(m.spawnStep)+" ") + m.input.View()
 }
@@ -5842,6 +6355,57 @@ func renderNewLoopPrompt(m Model) string {
 // engine path's only chance to see — and [c]hange — where the loop will run.
 func (m Model) engineDriveStepLabel() string {
 	return fmt.Sprintf("drive? [e] engine-drive · [m] manual (observe only) · [c] change dir — in %s:", displayDir(m.spawnCwd))
+}
+
+// accountStepLabel builds the wizardAccount single-key prompt (multi-account
+// Phase C / D1). Three shapes, in the order the step can be in:
+//   - resolving: the off-loop probe hasn't returned yet.
+//   - fixed: a cwd-bound account, shown but NOT changeable ("#1 고정"), with a
+//     prominent warning when it is not logged in (spawning there would be
+//     unauthenticated).
+//   - picker: an unbound dir's real choice — "[1] name ✓ · [2] name ⚠ · [enter]
+//     default", each alias tagged with its cached login state, plus the login
+//     sub-prompt when [l] is armed.
+func (m Model) accountStepLabel() string {
+	if m.accountResolving {
+		return "account: resolving… (esc cancels)"
+	}
+	if m.accountFixed {
+		return fmt.Sprintf("account: %s (fixed — from cwd binding) %s · [enter] spawn · [l] login · [esc] cancel",
+			m.accountFixedAlias, m.accountStatusTag(m.accountFixedDir))
+	}
+	if m.accountLoginPrompt {
+		return "login which account? " + m.aliasChoiceList() + " · [l]/[esc] cancel"
+	}
+	return "account: " + m.aliasChoiceList() + " · [enter] default · [l] login · [esc] cancel"
+}
+
+// aliasChoiceList renders the numbered alias choices with each one's cached
+// login tag — the shared body of the picker prompt and its login sub-prompt.
+func (m Model) aliasChoiceList() string {
+	parts := make([]string, 0, len(m.accountAliasNames))
+	for i, name := range m.accountAliasNames {
+		parts = append(parts, fmt.Sprintf("[%d] %s %s", i+1, name, m.accountStatusTag(m.accountConfigDirs[name])))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// accountStatusTag renders one config dir's cached login state (D1): a check
+// with the email when logged in, a prominent warning when a successful probe
+// found it logged OUT, and a quiet "?" when the probe itself failed (unknown,
+// not a claim of either state). Never shows a token — only email/plan/state.
+func (m Model) accountStatusTag(configDir string) string {
+	res, ok := m.accountStatuses[configDir]
+	if !ok || !res.ok {
+		return "(? login unknown)"
+	}
+	if !res.st.LoggedIn {
+		return "⚠ NOT LOGGED IN"
+	}
+	if res.st.Email != "" {
+		return "✓ " + res.st.Email
+	}
+	return "✓ logged in"
 }
 
 // wizardStepLabel is each free-text wizard step's prompt label —
