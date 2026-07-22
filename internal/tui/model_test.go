@@ -247,7 +247,7 @@ func TestLayoutModeFor(t *testing.T) {
 // cols" caveat for the old columnWidths).
 func TestListRowWidths_NeverOverflows(t *testing.T) {
 	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
-		wName, showCycle, showOracle, showLast := listRowWidths(innerWidth)
+		wName, _, showCycle, showOracle, showLast := listRowWidths(innerWidth, false)
 		sum := wMarker + wName + wState
 		if showCycle {
 			sum += wCycle
@@ -276,14 +276,14 @@ func TestListRowWidths_NeverOverflows(t *testing.T) {
 // readable label"; LAST alone keeps the physical threshold.
 func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	full := wMarker + wState + wCycle + wOracle + wLast + nameGoodWidth
-	_, showCycle, showOracle, showLast := listRowWidths(full)
+	_, _, showCycle, showOracle, showLast := listRowWidths(full, false)
 	if !showCycle || !showOracle || !showLast {
 		t.Fatalf("precondition failed: at full width want all three shown, got cycle=%v oracle=%v last=%v", showCycle, showOracle, showLast)
 	}
 
 	// one step narrower than "all three fit" — ORACLE (the least
 	// essential) must be the one to go, CYCLE and LAST both survive.
-	_, showCycle, showOracle, showLast = listRowWidths(full - 1)
+	_, _, showCycle, showOracle, showLast = listRowWidths(full-1, false)
 	if showOracle {
 		t.Error("showOracle = true with insufficient room, want false (ORACLE drops first)")
 	}
@@ -294,7 +294,7 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	// narrow enough that CYCLE can't keep the label readable either —
 	// CYCLE goes next, LAST still survives alone.
 	tight := wMarker + wState + wLast + listNameFloor
-	_, showCycle, showOracle, showLast = listRowWidths(tight)
+	_, _, showCycle, showOracle, showLast = listRowWidths(tight, false)
 	if showOracle || showCycle {
 		t.Errorf("got cycle=%v oracle=%v, want both dropped at this width", showCycle, showOracle)
 	}
@@ -303,7 +303,7 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	}
 
 	// narrower still — even LAST alone doesn't fit.
-	_, showCycle, showOracle, showLast = listRowWidths(wMarker + wState + listNameFloor - 1)
+	_, _, showCycle, showOracle, showLast = listRowWidths(wMarker+wState+listNameFloor-1, false)
 	if showCycle || showOracle || showLast {
 		t.Errorf("got cycle=%v oracle=%v last=%v, want all three dropped at this width", showCycle, showOracle, showLast)
 	}
@@ -315,7 +315,7 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 // NAME instead (the 100-col-terminal case: innerWidth 48 used to give
 // NAME 7).
 func TestListRowWidths_ReadabilityFloor_ProtectsLabelOverOracleCycle(t *testing.T) {
-	wName, showCycle, showOracle, showLast := listRowWidths(48)
+	wName, _, showCycle, showOracle, showLast := listRowWidths(48, false)
 	if showOracle || showCycle {
 		t.Errorf("got cycle=%v oracle=%v, want both dropped in favor of a readable label", showCycle, showOracle)
 	}
@@ -333,7 +333,7 @@ func TestListRowWidths_ReadabilityFloor_ProtectsLabelOverOracleCycle(t *testing.
 // doc on the structural floor this row format needs).
 func TestListRowWidths_NameWithinBounds(t *testing.T) {
 	for _, innerWidth := range []int{wMarker + wState + listNameFloor, 40, 100, 300} {
-		wName, _, _, _ := listRowWidths(innerWidth)
+		wName, _, _, _, _ := listRowWidths(innerWidth, false)
 		if wName < listNameFloor {
 			t.Errorf("innerWidth=%d: wName=%d, want >= listNameFloor (%d)", innerWidth, wName, listNameFloor)
 		}
@@ -8246,6 +8246,279 @@ func TestRenderDetail_ZeroValueAccount_NoAccountRow(t *testing.T) {
 	}
 }
 
+// ── feat/fleet-account-tag: FLEET panel's ACCOUNT tag column ─────────────────
+
+// multiAccountFleet gates the whole feature: the column shows ONLY when the
+// visible fleet spans >=2 DISTINCT non-empty account labels. These pin every
+// branch of that rule, failure cases first.
+
+func TestMultiAccountFleet_ZeroLabels_False(t *testing.T) {
+	// The common single-/zero-account user: no managed accounts at all.
+	loops := []domain.Loop{{SessionID: "a"}, {SessionID: "b"}}
+	if multiAccountFleet(loops) {
+		t.Error("multiAccountFleet = true, want false for a zero-config fleet")
+	}
+}
+
+func TestMultiAccountFleet_OneManagedAmongDefaults_False(t *testing.T) {
+	// The judgment call: a lone managed account among default-account loops is
+	// ONE distinct non-empty label — below the >=2 gate, so no column.
+	loops := []domain.Loop{
+		{SessionID: "a", Account: domain.Account{ConfigDir: "/d/work", Alias: "work"}},
+		{SessionID: "b"},
+		{SessionID: "c"},
+	}
+	if multiAccountFleet(loops) {
+		t.Error("multiAccountFleet = true, want false for one managed account among defaults")
+	}
+}
+
+func TestMultiAccountFleet_SameLabelTwice_False(t *testing.T) {
+	// Two loops on the SAME account = one DISTINCT label. Guards the distinct-
+	// set logic against a naive "count non-empty labels" mutation.
+	loops := []domain.Loop{
+		{SessionID: "a", Account: domain.Account{ConfigDir: "/d/work", Alias: "work"}},
+		{SessionID: "b", Account: domain.Account{ConfigDir: "/d/work-clone", Alias: "work"}},
+	}
+	if multiAccountFleet(loops) {
+		t.Error("multiAccountFleet = true, want false — same label twice is one distinct account")
+	}
+}
+
+func TestMultiAccountFleet_TwoDistinct_True(t *testing.T) {
+	// The captain's my+company case: two distinct managed accounts on screen.
+	loops := []domain.Loop{
+		{SessionID: "a", Account: domain.Account{ConfigDir: "/d/work", Alias: "work"}},
+		{SessionID: "b", Account: domain.Account{ConfigDir: "/d/personal", Alias: "personal"}},
+	}
+	if !multiAccountFleet(loops) {
+		t.Error("multiAccountFleet = false, want true for two distinct non-empty labels")
+	}
+}
+
+func TestMultiAccountFleet_TwoDistinctPlusDefaults_True(t *testing.T) {
+	// Two managed accounts AND some default loops — still >=2 distinct.
+	loops := []domain.Loop{
+		{SessionID: "a", Account: domain.Account{ConfigDir: "/d/work", Alias: "work"}},
+		{SessionID: "b"},
+		{SessionID: "c", Account: domain.Account{ConfigDir: "/d/personal", Alias: "personal"}},
+	}
+	if !multiAccountFleet(loops) {
+		t.Error("multiAccountFleet = false, want true — two distinct labels among defaults")
+	}
+}
+
+func TestAccountTag_NonEmpty_Bracketed(t *testing.T) {
+	if got := accountTag("work"); got != "[work]" {
+		t.Errorf("accountTag(work) = %q, want [work]", got)
+	}
+}
+
+func TestAccountTag_Empty_BlankNeverBrackets(t *testing.T) {
+	// A default-account loop's cell must be a blank (aligned by Width later),
+	// never "[]".
+	if got := accountTag(""); got != "" {
+		t.Errorf("accountTag(\"\") = %q, want \"\" (blank cell, never [])", got)
+	}
+}
+
+func TestAccountTag_LongLabel_TruncatesWithinBracket(t *testing.T) {
+	long := "verylongaccountemail@company-domain.example.com"
+	got := accountTag(long)
+	if w := narrowAmbiguous.StringWidth(got); w > wAccount {
+		t.Errorf("accountTag(%q) = %q (width %d), want <= wAccount (%d)", long, got, w, wAccount)
+	}
+	if !strings.HasPrefix(got, "[") || !strings.HasSuffix(got, "]") {
+		t.Errorf("accountTag(%q) = %q, want bracketed", long, got)
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("accountTag(%q) = %q, want a truncation ellipsis inside the brackets", long, got)
+	}
+}
+
+// listRowWidths' account branch: requested vs not, and its place in the drop
+// cascade.
+
+func TestListRowWidths_AccountNotRequested_NeverShown(t *testing.T) {
+	// wantAccount=false ⇒ showAccount=false at EVERY width — the zero-config
+	// path never even enters the account width math.
+	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
+		if _, showAccount, _, _, _ := listRowWidths(innerWidth, false); showAccount {
+			t.Fatalf("innerWidth=%d: showAccount=true with wantAccount=false", innerWidth)
+		}
+	}
+}
+
+func TestListRowWidths_AccountRequested_ShowsAtGenerousWidth(t *testing.T) {
+	full := wMarker + wState + wAccount + wCycle + wOracle + wLast + nameGoodWidth
+	_, showAccount, showCycle, showOracle, showLast := listRowWidths(full, true)
+	if !showAccount || !showCycle || !showOracle || !showLast {
+		t.Fatalf("at full width want every column incl account, got account=%v cycle=%v oracle=%v last=%v",
+			showAccount, showCycle, showOracle, showLast)
+	}
+}
+
+func TestListRowWidths_Account_OutlivesOracleAndCycle(t *testing.T) {
+	// Mid-width band: room for a readable NAME + account + LAST, but not for
+	// oracle/cycle on top. Oracle and cycle drop FIRST; account (more worth
+	// protecting when two accounts are on screen) survives.
+	w := wMarker + wState + wAccount + wLast + nameGoodWidth
+	_, showAccount, showCycle, showOracle, showLast := listRowWidths(w, true)
+	if !showAccount {
+		t.Errorf("showAccount=false at innerWidth=%d, want true (account outlives oracle/cycle)", w)
+	}
+	if showOracle || showCycle {
+		t.Errorf("got oracle=%v cycle=%v, want both dropped before account", showOracle, showCycle)
+	}
+	if !showLast {
+		t.Error("showLast=false, want true")
+	}
+}
+
+func TestListRowWidths_Account_DropsBeforeLast(t *testing.T) {
+	// Tight band: only NAME + LAST fit at the physical floor — oracle, cycle
+	// AND account are all shed, LAST alone survives (account yields to LAST,
+	// the most established column).
+	tight := wMarker + wState + wLast + listNameFloor
+	_, showAccount, showCycle, showOracle, showLast := listRowWidths(tight, true)
+	if showAccount || showCycle || showOracle {
+		t.Errorf("got account=%v cycle=%v oracle=%v, want all three dropped at tight width",
+			showAccount, showCycle, showOracle)
+	}
+	if !showLast {
+		t.Error("showLast=false, want true — LAST outlives the account tag")
+	}
+}
+
+func TestListRowWidths_AccountRequested_NeverOverflows(t *testing.T) {
+	// The account column must obey the same "never return a layout that
+	// doesn't fit" invariant as the rest of the cascade.
+	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
+		wName, showAccount, showCycle, showOracle, showLast := listRowWidths(innerWidth, true)
+		sum := wMarker + wName + wState
+		if showAccount {
+			sum += wAccount
+		}
+		if showCycle {
+			sum += wCycle
+		}
+		if showOracle {
+			sum += wOracle
+		}
+		if showLast {
+			sum += wLast
+		}
+		if sum > innerWidth {
+			t.Errorf("innerWidth=%d: sum=%d (wName=%d account=%v cycle=%v oracle=%v last=%v), want <= %d",
+				innerWidth, sum, wName, showAccount, showCycle, showOracle, showLast, innerWidth)
+		}
+	}
+}
+
+// End-to-end through fleetPanelLines: tags render when shown, and the row is
+// byte-identical to today when not.
+
+func TestFleetPanelLines_MultiAccount_RendersTags(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "alpha", SessionID: "s1", State: domain.StateRunning, Cycle: 2,
+			Goal:    domain.Goal{Text: "work loop goal", MaxCycles: 12},
+			Account: domain.Account{ConfigDir: "/d/work", Alias: "work"}},
+		{Project: "beta", SessionID: "s2", State: domain.StateIdle, Cycle: 1,
+			Goal:    domain.Goal{Text: "personal loop goal", MaxCycles: 12},
+			Account: domain.Account{ConfigDir: "/d/personal", Alias: "personal"}},
+	}
+	m.cursor = 0
+	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
+	if !strings.Contains(joined, "[work]") {
+		t.Errorf("expected [work] tag, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "[personal]") {
+		t.Errorf("expected [personal] tag, got:\n%s", joined)
+	}
+}
+
+// TestFleetPanelLines_SingleAccount_ByteIdenticalToZeroConfig is the hard
+// rule, proved directly: two fleets that differ ONLY in account fields — one
+// all-default, one with a single managed account among defaults (1 distinct
+// label, below the >=2 gate) — must produce byte-identical FLEET rows across
+// wide, mid and narrow panels. The account presence must not leak one byte.
+func TestFleetPanelLines_SingleAccount_ByteIdenticalToZeroConfig(t *testing.T) {
+	withAccount := []domain.Loop{
+		{Project: "alpha", SessionID: "s1", State: domain.StateRunning, Cycle: 2,
+			Goal:    domain.Goal{Text: "some goal here", MaxCycles: 12},
+			Account: domain.Account{ConfigDir: "/d/work", Alias: "work"}},
+		{Project: "beta", SessionID: "s2", State: domain.StateIdle, Cycle: 1,
+			Goal: domain.Goal{Text: "another goal here", MaxCycles: 12}},
+	}
+	zeroConfig := []domain.Loop{
+		{Project: "alpha", SessionID: "s1", State: domain.StateRunning, Cycle: 2,
+			Goal: domain.Goal{Text: "some goal here", MaxCycles: 12}},
+		{Project: "beta", SessionID: "s2", State: domain.StateIdle, Cycle: 1,
+			Goal: domain.Goal{Text: "another goal here", MaxCycles: 12}},
+	}
+	for _, wh := range [][2]int{{120, 10}, {80, 10}, {50, 8}, {36, 8}} {
+		mA := New()
+		mA.loops, mA.cursor = withAccount, 0
+		mZ := New()
+		mZ.loops, mZ.cursor = zeroConfig, 0
+		a := strings.Join(mA.fleetPanelLines(wh[0], wh[1]), "\n")
+		z := strings.Join(mZ.fleetPanelLines(wh[0], wh[1]), "\n")
+		if a != z {
+			t.Errorf("innerWidth=%d: single-account fleet not byte-identical to zero-config:\n got=%q\nwant=%q", wh[0], a, z)
+		}
+	}
+}
+
+// TestView_NoLineExceedsTerminalWidth_MultiAccountFleet re-runs the standing
+// overflow acceptance bar over a fleet that DOES trigger the account column,
+// including a long email-as-label to stress the trunc-inside-bracket path —
+// the tag must never blow a row past the terminal width.
+func TestView_NoLineExceedsTerminalWidth_MultiAccountFleet(t *testing.T) {
+	loops := []domain.Loop{
+		{Project: "alpha", SessionID: "s1", State: domain.StateRunning, Cycle: 2,
+			Goal:    domain.Goal{Text: "add pagination to the search endpoint", MaxCycles: 12},
+			Account: domain.Account{ConfigDir: "/d/work", Email: "verylongaccount@company-domain.example.com"}},
+		{Project: "beta", SessionID: "s2", State: domain.StateIdle, Cycle: 1,
+			Goal:    domain.Goal{Text: "another goal here", MaxCycles: 12},
+			Account: domain.Account{ConfigDir: "/d/personal", Alias: "personal"}},
+	}
+	for _, width := range []int{45, 65, 70, 90, 120, 175} {
+		for _, height := range []int{18, 24, 40, 60} {
+			t.Run(fmt.Sprintf("width=%d/height=%d", width, height), func(t *testing.T) {
+				m := New()
+				m.w, m.h = width, height
+				m.loops = loops
+				m.cursor = 0
+				out := m.View()
+				for i, line := range strings.Split(out, "\n") {
+					if got := lipgloss.Width(line); got > width {
+						t.Errorf("width=%d: line %d is %d cols, want <= %d: %q", width, i, got, width, line)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestDemoFleet_SpansTwoAccounts_ShowsFleetTag mirrors the existing demo
+// ACCOUNT assertion (TestDemoFleet's migrate-db check): the --demo fleet must
+// span >=2 distinct accounts so the FLEET tag column — not just DETAIL's
+// ACCOUNT row — is visible in demo QA.
+func TestDemoFleet_SpansTwoAccounts_ShowsFleetTag(t *testing.T) {
+	m := NewDemo()
+	if !multiAccountFleet(m.loops) {
+		t.Fatal("demo fleet must span >=2 distinct account labels so the FLEET tag column shows")
+	}
+	joined := strings.Join(m.fleetPanelLines(120, 30), "\n")
+	if !strings.Contains(joined, "[work]") {
+		t.Errorf("expected the [work] tag in the demo FLEET panel, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "[personal]") {
+		t.Errorf("expected the [personal] tag in the demo FLEET panel, got:\n%s", joined)
+	}
+}
+
 // ── kill adapter for Driven loops (design doc §4) ─────────────────────────
 
 func TestKillCmd_DrivenLoop_ClearsDrivenInsteadOfTierOneExit(t *testing.T) {
@@ -8694,10 +8967,20 @@ func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	if len(migrateDB.GateOptions) != 3 {
 		t.Errorf("migrate-db.GateOptions = %q, want three choices", migrateDB.GateOptions)
 	}
-	// multi-account Phase B: the one demo loop carrying an account label, so
-	// the DETAIL panel's ACCOUNT row has something real to show in demo QA.
+	// multi-account Phase B: a demo loop carrying an account label, so the
+	// DETAIL panel's ACCOUNT row has something real to show in demo QA.
 	if got := migrateDB.Account.Label(); got != "work" {
 		t.Errorf("migrate-db.Account.Label() = %q, want %q", got, "work")
+	}
+	// feat/fleet-account-tag: refactor-core carries a SECOND, DIFFERENT label
+	// ("personal"), so the demo fleet spans >=2 distinct accounts and the
+	// FLEET panel's ACCOUNT tag column also renders in demo QA — pinned so a
+	// future edit can't quietly collapse the demo back to a single account.
+	// (refactor-core's other fields are asserted further down.)
+	if rc, ok := byProject["refactor-core"]; !ok {
+		t.Fatal("expected a refactor-core loop — the Driven demo loop")
+	} else if got := rc.Account.Label(); got != "personal" {
+		t.Errorf("refactor-core.Account.Label() = %q, want %q", got, "personal")
 	}
 
 	flakyTests, ok := byProject["flaky-tests"]
