@@ -5751,6 +5751,36 @@ type detailData struct {
 // than rendering a cramped, barely-useful sliver.
 const eventsMinRows = 3
 
+// eventsDetailRows caps how many event lines the DETAIL panel's EVENTS tail
+// shows. DETAIL only needs a glance at the latest few — the FULL history
+// already lives in the `o` pager and `fleetops report`, so absorbing all the
+// leftover panel height with low-value log lines (the old behavior) buried
+// the one thing an operator actually needs to see: the action callout on top.
+// Kept just above eventsMinRows' 2-data-row floor so the tail is a real
+// glance, not a cramped sliver.
+const eventsDetailRows = 3
+
+// detailActionCallout returns the single action callout the human must act on
+// for this loop — GATE (a permission/AskUserQuestion prompt), DRIFT (the
+// oracle rejected the "done" claim), or RESUME/RESTART (stalled / 429 / gone)
+// — or "" when the loop needs nothing (running / idle / done / failed). The
+// three states are mutually exclusive (a loop is exactly one of them), so this
+// is a plain switch, not a priority merge — exactly the xor the mid-panel
+// switch used to encode, lifted out so renderDetail can lead with it.
+// Each callout returns a leading "\n" to separate itself from preceding
+// content; renderDetail strips that when placing the callout at the very top.
+func detailActionCallout(l domain.Loop, width int, data detailData) string {
+	switch l.State {
+	case domain.StateStalled:
+		return renderResumeCallout(l, width, data.events, data.now)
+	case domain.StateGate:
+		return renderGateCallout(l, width)
+	case domain.StateDrift:
+		return renderDriftCallout(l, width)
+	}
+	return ""
+}
+
 func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	// leave room for the ~8-col key + its gap before truncating long values
 	// (paths) so nothing overflows the terminal width.
@@ -5760,6 +5790,17 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	}
 
 	var d strings.Builder
+	// action-first: when the loop needs the human (GATE / DRIFT /
+	// stalled-resume), lead the panel with that callout — it's the first
+	// thing the eye must hit, ahead of the session id and every metadata row.
+	// A loop that needs nothing renders no top callout, so its rows stay in
+	// exactly the prior order. detailActionCallout owns the xor (exactly one
+	// callout applies); each callout emits a leading "\n" to fence itself off
+	// from preceding content, which we strip here since nothing precedes it.
+	if callout := detailActionCallout(l, width, data); callout != "" {
+		d.WriteString(strings.TrimPrefix(callout, "\n"))
+		d.WriteString("\n")
+	}
 	// fix/exit-gate-ux (UX judge item 4): this used to lead with
 	// "▸ <project>  <sid>" — but the panel's own title (see detailTitle)
 	// already reads "DETAIL ▸ <project>", so the project name printed a
@@ -5830,14 +5871,8 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	}
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
 
-	switch l.State {
-	case domain.StateStalled:
-		d.WriteString(renderResumeCallout(l, width, data.events, data.now))
-	case domain.StateGate:
-		d.WriteString(renderGateCallout(l, width))
-	case domain.StateDrift:
-		d.WriteString(renderDriftCallout(l, width))
-	}
+	// The action callout (GATE / DRIFT / resume) now renders at the TOP of
+	// the panel, before the session id — see detailActionCallout above.
 
 	if errText, errTS, ok := lastErrorForDetail(data); ok {
 		d.WriteString(renderLastErrorBlock(errText, errTS, valueWidth))
@@ -5860,18 +5895,25 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 		tail = strings.TrimRight(detailRowMultiline("TAIL", wrapped), "\n")
 	}
 
-	// EVENTS absorbs whatever height is left after everything else
-	// (including TAIL, capped at tailMaxLines, and the top block above) —
-	// see eventsMinRows' doc for the floor below which it's omitted
+	// EVENTS is a short tail — the latest eventsDetailRows events for a
+	// glance, NOT the whole leftover height (the full history lives in the
+	// `o` pager and `fleetops report`; see eventsDetailRows' doc). It's still
+	// clipped to whatever height is actually left after the top block and
+	// TAIL, so it can never overflow the panel box on a small height, and
+	// still honors eventsMinRows as the floor below which it's omitted
 	// entirely rather than rendered cramped.
 	used := strings.Count(top, "\n") + 1
 	if tail != "" {
 		used += strings.Count(tail, "\n") + 1
 	}
 	remaining := height - used
+	eventsRows := eventsDetailRows + 1 // +1 row for the "EVENTS" title line
+	if eventsRows > remaining {
+		eventsRows = remaining
+	}
 	eventsBlock := ""
-	if remaining >= eventsMinRows {
-		eventsBlock = renderEventsBlock(data.events, valueWidth, remaining)
+	if eventsRows >= eventsMinRows {
+		eventsBlock = renderEventsBlock(data.events, valueWidth, eventsRows)
 	}
 
 	var out strings.Builder
