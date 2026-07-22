@@ -861,10 +861,14 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		Cycle:       2,
 		Goal:        domain.Goal{Text: "migrate billing to the new schema", MaxCycles: 10, BudgetTokens: 1_000_000},
 		TokensSpent: 180000,
-		// multi-account Phase B: the one demo loop carrying an account label,
-		// so the DETAIL panel's ACCOUNT row is visible in demo QA without
-		// needing a real ~/.fleetops/accounts.json — see
-		// TestDemoFleet_MigrateDB_CarriesAccountLabel.
+		// multi-account Phase B: a demo loop carrying an account label, so the
+		// DETAIL panel's ACCOUNT row is visible in demo QA without needing a
+		// real ~/.fleetops/accounts.json — see
+		// TestDemoFleet_MigrateDB_CarriesAccountLabel. feat/fleet-account-tag:
+		// a SECOND distinct label (refactorCore's "personal", below) now joins
+		// it so the fleet spans >=2 accounts and the FLEET panel's ACCOUNT tag
+		// column also shows in demo QA — see
+		// TestDemoFleet_SpansTwoAccounts_ShowsFleetTag.
 		Account:      domain.Account{ConfigDir: "/home/user/.claude-work", Alias: "work"},
 		LastActivity: now.Add(-2 * time.Minute),
 	}
@@ -885,7 +889,13 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 			MaxCycles:    8,
 			BudgetTokens: 2_000_000,
 		},
-		TokensSpent:  410000,
+		TokensSpent: 410000,
+		// feat/fleet-account-tag: a SECOND, DIFFERENT account label from
+		// migrateDB's "work" — so the demo fleet spans >=2 distinct accounts
+		// and the FLEET panel's ACCOUNT tag column (not just DETAIL's ACCOUNT
+		// row) is exercised in demo QA. See
+		// TestDemoFleet_SpansTwoAccounts_ShowsFleetTag.
+		Account:      domain.Account{ConfigDir: "/home/user/.claude-personal", Alias: "personal"},
 		Last:         &domain.Verdict{Outcome: domain.OutcomeProgress, Reason: refactorCoreReason, AtCycle: 3},
 		LastActivity: now.Add(-90 * time.Second),
 	}
@@ -4889,6 +4899,16 @@ const (
 	// room. See listRowWidths for the drop-order these widths feed into.
 	wCycle  = 7
 	wOracle = 6
+	// wAccount (feat/fleet-account-tag): the FLEET row's optional account
+	// provenance column, shown ONLY when >=2 distinct non-empty account
+	// labels are visible in the fleet (see multiAccountFleet) — a single- or
+	// zero-account fleet never requests it, keeping those rows byte-identical
+	// to before this column existed. The tag renders as "[label]"; 12 fits
+	// "[company]" (9) with a column gap, and the label is truncated to
+	// wAccount-2 inside the brackets so a long email-as-label can't overflow
+	// the fixed-width panel. See listRowWidths for where it drops in the
+	// width cascade.
+	wAccount = 12
 )
 
 // nameFloorWidth/nameCapWidth bound the FLEET panel's NAME column: below the
@@ -5214,8 +5234,19 @@ func fleetOracleCountsCmd(loops []domain.Loop) tea.Cmd {
 // the narrowest panels renderWide ever produces this lands on the same
 // widths as before, so only mid-width panels trade ORACLE/CYCLE for a
 // readable label.
-func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast bool) {
-	showCycle, showOracle, showLast = true, true, true
+//
+// feat/fleet-account-tag: the ACCOUNT tag column is requested by the caller
+// (wantAccount — true only when >=2 distinct account labels are visible, see
+// multiAccountFleet), never by width alone. When requested it joins the
+// readability-floor cascade AFTER oracle and cycle but BEFORE last's physical
+// floor: it is more worth protecting than the two metadata glyphs (if two
+// accounts are on screen you want to know which loop is which) yet still
+// yields to a readable NAME and to LAST (recency, the most established
+// column). When wantAccount is false showAccount starts false and never
+// enters the width math, so a single-/zero-account fleet's widths — and the
+// three lines below — are byte-identical to before this column existed.
+func listRowWidths(innerWidth int, wantAccount bool) (wName int, showAccount, showCycle, showOracle, showLast bool) {
+	showAccount, showCycle, showOracle, showLast = wantAccount, true, true, true
 	name := func() int {
 		fixed := wMarker + wState
 		if showLast {
@@ -5227,15 +5258,22 @@ func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast b
 		if showOracle {
 			fixed += wOracle
 		}
+		if showAccount {
+			fixed += wAccount
+		}
 		return innerWidth - fixed
 	}
-	// drop right-to-priority: ORACLE first, then CYCLE, then LAST — see
-	// this function's own doc for why this specific order.
+	// drop right-to-priority: ORACLE first, then CYCLE, then ACCOUNT (all
+	// readability-floor gated), then LAST (physical floor) — see this
+	// function's own doc for why this specific order.
 	if name() < nameGoodWidth {
 		showOracle = false
 	}
 	if name() < nameGoodWidth {
 		showCycle = false
+	}
+	if name() < nameGoodWidth {
+		showAccount = false
 	}
 	if name() < listNameFloor {
 		showLast = false
@@ -5247,7 +5285,7 @@ func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast b
 	if wName > nameCapWidth {
 		wName = nameCapWidth
 	}
-	return wName, showCycle, showOracle, showLast
+	return wName, showAccount, showCycle, showOracle, showLast
 }
 
 // renderListRow renders one FLEET panel row: marker+NAME+STATE[+CYCLE]
@@ -5257,7 +5295,7 @@ func listRowWidths(innerWidth int) (wName int, showCycle, showOracle, showLast b
 // (Model.fleetOracleCounts, looked up by the caller — this function does
 // no I/O of its own, same discipline as everything else in this file's
 // render path).
-func renderListRow(l domain.Loop, sel, dup bool, wName int, showCycle, showOracle, showLast bool, oracleCount int, totalWidth int) string {
+func renderListRow(l domain.Loop, sel, dup bool, wName int, showAccount, showCycle, showOracle, showLast bool, oracleCount int, totalWidth int) string {
 	// feat/engine-provenance: wMarker is 2 cols wide, but the cursor glyph
 	// below only ever occupies 1 of them — the second was always blank
 	// padding. Rather than widen the row for a Driven marker, that
@@ -5284,6 +5322,14 @@ func renderListRow(l domain.Loop, sel, dup bool, wName int, showCycle, showOracl
 		marker,
 		stInk.Width(wName).Render(trunc(label, wName-1)),
 		stateStyle(l).Width(wState).Render(stateLabel(l)),
+	}
+	// feat/fleet-account-tag: provenance, placed right after STATE and styled
+	// dim like the other metadata columns — it answers "which account" for a
+	// fleet that spans several, not a status alert. A default-account loop
+	// (Label()=="") renders a blank cell of width wAccount, aligned, so the
+	// columns to its right stay lined up across rows.
+	if showAccount {
+		cells = append(cells, stDim.Width(wAccount).Render(accountTag(l.Account.Label())))
 	}
 	if showCycle {
 		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
@@ -5319,6 +5365,50 @@ func oracleCompactLabel(l domain.Loop, count int) string {
 	return fmt.Sprintf("%s×%d", glyph, count)
 }
 
+// accountTag is the FLEET panel's ACCOUNT column value: the loop's account
+// label wrapped in brackets ("[company]"), or "" for a default/unmanaged
+// account (Account.Label()==""), which renders as a blank cell of width
+// wAccount so the columns to its right stay aligned across rows — never "[]".
+// The label is truncated to wAccount-2 so it always fits inside the brackets
+// within the fixed column width, no matter how long an email-as-label gets.
+// Provenance only — the >=2-distinct-accounts gate that decides whether this
+// column shows at all lives in the caller (multiAccountFleet).
+func accountTag(label string) string {
+	if label == "" {
+		return ""
+	}
+	return "[" + trunc(label, wAccount-2) + "]"
+}
+
+// multiAccountFleet reports whether the given (visible) loops span at least
+// two DISTINCT non-empty account labels — the only condition under which the
+// FLEET panel shows its ACCOUNT column.
+//
+// The threshold is >=2 distinct NON-EMPTY labels, deliberately: the tag
+// answers "which of the several accounts is this loop on?", a question that
+// only exists once two managed accounts are actually on screen at the same
+// time (the captain's my+company case). A lone managed account among
+// default-account loops yields exactly one distinct non-empty label — there
+// the tag would just repeat itself on its one row while every default loop
+// renders a blank cell, adding a column for the whole fleet to disambiguate
+// nothing. And zero non-empty labels (the common single-/zero-account user)
+// must add nothing at all. Both fall below the threshold, so both keep
+// today's byte-identical rows.
+func multiAccountFleet(loops []domain.Loop) bool {
+	seen := make(map[string]struct{}, 2)
+	for _, l := range loops {
+		label := l.Account.Label()
+		if label == "" {
+			continue
+		}
+		seen[label] = struct{}{}
+		if len(seen) >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
 // fleetPanelLines builds the FLEET panel's content lines, scrolled (see
 // visibleWindow) so the cursor row stays visible within innerHeight rows.
 // Callers pad/clip the result to exactly innerHeight via padLines.
@@ -5338,13 +5428,13 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 	case len(visible) == 0:
 		return []string{stFaint.Render(fmt.Sprintf("no loops match filter %q.", m.filterQuery))}
 	}
-	wName, showCycle, showOracle, showLast := listRowWidths(innerWidth)
+	wName, showAccount, showCycle, showOracle, showLast := listRowWidths(innerWidth, multiAccountFleet(visible))
 	dupLabels := duplicateLabels(visible)
 	start, end := visibleWindow(len(visible), m.cursor, innerHeight)
 	rows := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
 		l := visible[i]
-		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.DisplayLabel()], wName, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
+		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.DisplayLabel()], wName, showAccount, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
 	}
 	return rows
 }
