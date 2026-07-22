@@ -5922,7 +5922,18 @@ func detailCacheCmd(l domain.Loop) tea.Cmd {
 // viewer — that's what ↵ attach is for) shrank this from 6 to 4 to make
 // room for the new LAST ERROR/VERDICTS/EVENTS blocks; the full report lives
 // in the pager / oracle / EVENTS block, not here.
-const tailMaxLines = 4
+//
+// feat/detail-tail-readable (real user "Mike": "TAIL is too short"): bumped
+// 4 → 8. Four wrapped lines of an idle loop's LastText is often too little
+// to judge WHAT it just did / produced without leaving fleetops for the
+// session — the exact onboarding-abandonment signal this addresses. Eight
+// lines is roughly a short paragraph: enough to judge, still a bounded tail,
+// NOT a transcript (that stays the `o` pager's job). It's safe on short
+// panels because TAIL renders LAST in renderDetail's output and the whole
+// panel is top-down clipped to the height (detailPanelLines), so a tall
+// TAIL yields to the clip before the callout/metadata rows above it ever do,
+// and EVENTS already yields to TAIL's line count in the height accounting.
+const tailMaxLines = 8
 
 // detailKeyWidth is the fixed column width of a detail row's KEY (see
 // detailRow). TAIL's wrapped continuation lines indent by exactly this much so

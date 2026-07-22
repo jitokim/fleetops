@@ -4606,6 +4606,34 @@ func TestWrapTailText_NonPositiveArgsReturnNil(t *testing.T) {
 	}
 }
 
+// ── feat/detail-tail-readable: TAIL cap bump (4 → 8) ──────────────────────
+//
+// Real user "Mike": "TAIL is too short" — 4 wrapped lines is often too little
+// to judge what an idle loop just did without leaving fleetops for the session.
+
+func TestWrapTailText_RendersUpToNewCap(t *testing.T) {
+	// A LastText that wraps well past the cap must be bounded to exactly
+	// tailMaxLines lines (with a truncation marker), never more — the bump to 8
+	// still yields a strictly bounded tail, not a transcript.
+	long := strings.Repeat("alpha bravo charlie delta echo foxtrot ", 40)
+	got := wrapTailText(long, 20, tailMaxLines)
+	if len(got) != tailMaxLines {
+		t.Errorf("wrapped tail is %d lines, want exactly tailMaxLines=%d", len(got), tailMaxLines)
+	}
+	if !strings.HasSuffix(got[len(got)-1], "…") {
+		t.Errorf("an overflowing tail's last line must carry the … marker: %q", got[len(got)-1])
+	}
+}
+
+func TestTailMaxLines_IsEight(t *testing.T) {
+	// Pin the deliberate value: 8 is the "enough to judge an idle loop" cap
+	// (real user Mike: 4 was too short). A silent regression back to 4/6 would
+	// re-introduce the pain this feature exists to fix.
+	if tailMaxLines != 8 {
+		t.Errorf("tailMaxLines = %d, want 8 (feat/detail-tail-readable)", tailMaxLines)
+	}
+}
+
 func TestDetailRowMultiline_KeyOnFirstLineContinuationIndented(t *testing.T) {
 	out := detailRowMultiline("TAIL", []string{"alpha", "beta", "gamma"})
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
