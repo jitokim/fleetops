@@ -295,6 +295,13 @@ func (f *fakeAccountWorktreeSpawner) SpawnWithConfigDir(cwd, goal, configDir str
 // know with the account preserved via the env prefix, and say so.
 func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_SpawnsInRepoNoWorktree(t *testing.T) {
 	isolateFleetopsHome(t)
+	// The forfeit message must show the ALIAS ("work"), never the raw
+	// config-dir path — that is exactly the bug this test now guards against.
+	oload := loadAccountsFn
+	t.Cleanup(func() { loadAccountsFn = oload })
+	loadAccountsFn = func() (accounts.Config, error) {
+		return accounts.Config{Aliases: map[string]string{"work": "/abs/.claude-work"}}, nil
+	}
 	orca := &fakeAccountWorktreeSpawner{
 		fakeController: &fakeController{name: "orca"},
 		worktreePath:   "/should-not-be-used",
@@ -325,8 +332,66 @@ func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_SpawnsInRepoNoWorktree(t *testi
 	if orca.gotConfigCwd != "/repo" {
 		t.Errorf("SpawnWithConfigDir cwd = %q, want the bound repo dir /repo (NOT a worktree)", orca.gotConfigCwd)
 	}
-	if !strings.Contains(result.text, "no separate checkout") || !strings.Contains(result.text, "/abs/.claude-work") {
-		t.Errorf("status %q must tell the human isolation was forfeited AND name the account", result.text)
+	if !strings.Contains(result.text, "no separate checkout") || !strings.Contains(result.text, "account work") {
+		t.Errorf("status %q must tell the human isolation was forfeited AND name the account by ALIAS (work)", result.text)
+	}
+	if strings.Contains(result.text, "/abs/.claude-work") {
+		t.Errorf("status %q leaks the raw config-dir path — must show the alias instead", result.text)
+	}
+}
+
+// When the config dir isn't mapped to any alias (a stale/edited
+// accounts.json — should not happen via the wizard, but must not crash or
+// blank out the account name), the forfeit message falls back to the
+// config-dir's base name rather than the full path.
+func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_UnmappedConfigDir_FallsBackToBaseName(t *testing.T) {
+	isolateFleetopsHome(t)
+	oload := loadAccountsFn
+	t.Cleanup(func() { loadAccountsFn = oload })
+	loadAccountsFn = func() (accounts.Config, error) { return accounts.Config{}, nil } // no aliases at all
+	orca := &fakeAccountWorktreeSpawner{
+		fakeController: &fakeController{name: "orca"},
+		worktreePath:   "/should-not-be-used",
+	}
+	stubSpawner(t, orca, true)
+	stubWorktreeCreate(t, worktree.Result{Path: "/repo-wt-should-not-exist", Branch: "b", Base: "origin/main"}, nil)
+
+	msg := spawnCmd("/repo", testBindSpec(), true, "/Users/imac/.fleetops/accounts/work")()
+	result, ok := msg.(spawnResultMsg)
+	if !ok || !result.ok {
+		t.Fatalf("spawn failed: %+v", msg)
+	}
+	if !strings.Contains(result.text, "account work") {
+		t.Errorf("status %q must fall back to the config-dir base name (work), got no such substring", result.text)
+	}
+	if strings.Contains(result.text, "/Users/imac/.fleetops/accounts/work") {
+		t.Errorf("status %q leaks the raw config-dir path even on the fallback path", result.text)
+	}
+}
+
+// A loadAccountsFn error (e.g. a malformed accounts.json read at forfeit
+// time) must not crash the forfeit path either — same base-name fallback.
+func TestSpawnCmd_OrcaWorktree_NonDefaultAccount_LoadError_FallsBackToBaseName(t *testing.T) {
+	isolateFleetopsHome(t)
+	oload := loadAccountsFn
+	t.Cleanup(func() { loadAccountsFn = oload })
+	loadAccountsFn = func() (accounts.Config, error) {
+		return accounts.Config{}, errContext("accounts: parsing …: bad json")
+	}
+	orca := &fakeAccountWorktreeSpawner{
+		fakeController: &fakeController{name: "orca"},
+		worktreePath:   "/should-not-be-used",
+	}
+	stubSpawner(t, orca, true)
+	stubWorktreeCreate(t, worktree.Result{Path: "/repo-wt-should-not-exist", Branch: "b", Base: "origin/main"}, nil)
+
+	msg := spawnCmd("/repo", testBindSpec(), true, "/Users/imac/.fleetops/accounts/work")()
+	result, ok := msg.(spawnResultMsg)
+	if !ok || !result.ok {
+		t.Fatalf("spawn failed: %+v", msg)
+	}
+	if !strings.Contains(result.text, "account work") {
+		t.Errorf("status %q must fall back to the config-dir base name (work) on a load error, got no such substring", result.text)
 	}
 }
 

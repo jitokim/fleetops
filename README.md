@@ -17,7 +17,7 @@
 
 _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_
 
-> **Status: experimental / 0.7.0-alpha.** This is a young, actively-changing
+> **Status: experimental / 0.7.1-alpha.** This is a young, actively-changing
 > project — expect rough edges, and read the "Known rough edges" and
 > "Limitations" sections below before trusting it with anything you can't
 > afford to have go wrong (it does send real keystrokes and can kill real
@@ -259,6 +259,15 @@ the CLI just means you never have to.
 - **Resume**: `r`/`i` re-drive a session under the account it was *recorded*
   with, never whatever the current directory happens to be bound to — a live
   session can't be switched onto the wrong account under you.
+
+**One backend limit — orca worktrees.** orca only spawns worktrees it registered
+itself, so it can't isolate a fresh worktree under a non-default account. When
+you ask for a worktree spawn on a bound (non-default) account under orca,
+fleetops keeps the *account* and forgoes the separate checkout — it spawns in the
+bound repo directory and tells you so, rather than stranding an orphaned
+checkout. tmux, iTerm2, and cmux do both — account and worktree — together. And
+engine-drive (`e`) on an *unbound* directory uses the default account (there is
+no picker at that step).
 
 If you never create `~/.fleetops/accounts.json`, none of this activates: one
 account, one config dir, no account row, no extra work — exactly as before.

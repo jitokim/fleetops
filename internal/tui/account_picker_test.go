@@ -393,3 +393,117 @@ func TestLoginLaunchCmd_NoOpener_ReportsManualCommand(t *testing.T) {
 		t.Errorf("text = %q, want it to include the manual login command", res.text)
 	}
 }
+
+// ── status shows the ALIAS, never the raw config-dir path ──────────────────
+//
+// Bug: submitSpawnWizard's status line used to read
+// "spawning loop in ... under account /Users/x/.fleetops/accounts/work" — the
+// raw CLAUDE_CONFIG_DIR path — instead of "under account work". These tests
+// pin the fix: spawnAlias is set alongside spawnConfigDir at every assignment
+// site and submitSpawnWizard prefers it over the path.
+
+// The bound (fixed) account path: [enter] confirms it and the status must say
+// "under account company", never the raw config-dir path.
+func TestSubmitSpawnWizard_BoundAccount_StatusShowsAliasNotPath(t *testing.T) {
+	pinAccounts(t, boundConfig(),
+		func(string) (string, bool) { return "/abs/work", true },
+		func(context.Context, string) (accountstatus.Status, bool) {
+			return accountstatus.Status{LoggedIn: true, Email: "jito@company.com"}, true
+		})
+
+	m := driveToWhere(t, New())
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = runCmd(t, m, cmd)
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // confirm the fixed account
+
+	if m.spawnAlias != "company" {
+		t.Errorf("spawnAlias = %q, want company", m.spawnAlias)
+	}
+	if !strings.Contains(m.status, "under account company") {
+		t.Errorf("status = %q, want it to say 'under account company'", m.status)
+	}
+	if strings.Contains(m.status, "/abs/.claude-work") {
+		t.Errorf("status = %q leaks the raw config-dir path", m.status)
+	}
+}
+
+// The picker's digit choice: same guarantee for an UNBOUND dir's explicit
+// alias selection.
+func TestSubmitSpawnWizard_PickerDigitChoice_StatusShowsAliasNotPath(t *testing.T) {
+	pinAccounts(t, twoAliasConfig(), func(string) (string, bool) { return "", false },
+		func(context.Context, string) (accountstatus.Status, bool) { return accountstatus.Status{}, false })
+
+	m := driveToWhere(t, New())
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = runCmd(t, m, cmd)
+	m, _ = updateModel(t, m, runeKey('1')) // company (sorted first)
+
+	if m.spawnAlias != "company" {
+		t.Errorf("spawnAlias = %q, want company", m.spawnAlias)
+	}
+	if !strings.Contains(m.status, "under account company") {
+		t.Errorf("status = %q, want it to say 'under account company'", m.status)
+	}
+	if strings.Contains(m.status, "/abs/.claude-work") {
+		t.Errorf("status = %q leaks the raw config-dir path", m.status)
+	}
+}
+
+// The picker's default (no override) choice adds NO account note at all —
+// same as the zero-config guarantee.
+func TestSubmitSpawnWizard_PickerDefaultChoice_NoAccountNote(t *testing.T) {
+	pinAccounts(t, twoAliasConfig(), func(string) (string, bool) { return "", false },
+		func(context.Context, string) (accountstatus.Status, bool) { return accountstatus.Status{}, false })
+
+	m := driveToWhere(t, New())
+	m, cmd := updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = runCmd(t, m, cmd)
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // default account
+
+	if m.spawnAlias != "" {
+		t.Errorf("spawnAlias = %q, want \"\" for the default account", m.spawnAlias)
+	}
+	if strings.Contains(m.status, "under account") {
+		t.Errorf("status = %q must have no account note for the default account", m.status)
+	}
+}
+
+// Zero-config: no aliases at all → the status must have no account note
+// (proves the existing zero-config guarantee is unchanged by this fix).
+func TestSubmitSpawnWizard_ZeroConfig_NoAccountNote(t *testing.T) {
+	pinAccounts(t, accounts.Config{}, func(string) (string, bool) { return "", false },
+		func(context.Context, string) (accountstatus.Status, bool) {
+			t.Error("the login probe must never run for a zero-config machine")
+			return accountstatus.Status{}, false
+		})
+
+	m := driveToWhere(t, New())
+	m, _ = updateModel(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if strings.Contains(m.status, "under account") {
+		t.Errorf("status = %q must have no account note for zero-config", m.status)
+	}
+}
+
+// Defensive fallback: if spawnAlias is somehow empty while spawnConfigDir is
+// set (should never happen via the wizard — every assignment site sets both
+// together — but this guards against a future regression reintroducing the
+// bug at just one call site), the status falls back to the config-dir's base
+// name, never the full path.
+func TestSubmitSpawnWizard_AliasEmptyButConfigDirSet_FallsBackToBaseName(t *testing.T) {
+	m := New()
+	m.spawnCwd = "/repo"
+	m.spawnGoal = "goal"
+	m.spawnConfigDir = "/Users/imac/.fleetops/accounts/work"
+	m.spawnAlias = "" // defensive case — should not happen via the wizard
+
+	model, _ := m.submitSpawnWizard(false)
+	mm := model.(Model)
+
+	if !strings.Contains(mm.status, "under account work") {
+		t.Errorf("status = %q, want the base-name fallback 'under account work'", mm.status)
+	}
+	if strings.Contains(mm.status, "/Users/imac/.fleetops/accounts/work") {
+		t.Errorf("status = %q leaks the raw config-dir path", mm.status)
+	}
+}
