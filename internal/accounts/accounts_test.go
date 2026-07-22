@@ -342,6 +342,61 @@ func TestAliasForConfigDir_EmptyConfig(t *testing.T) {
 	}
 }
 
+// ── GitEmailForAlias (opt-in git-identity expectation) ──────────────────────
+
+func TestGitEmailForAlias_Declared(t *testing.T) {
+	cfg := Config{AliasGitEmails: map[string]string{"company": "jito@company.com"}}
+	email, ok := cfg.GitEmailForAlias("company")
+	if !ok || email != "jito@company.com" {
+		t.Fatalf("GitEmailForAlias(company) = (%q, %v), want (jito@company.com, true)", email, ok)
+	}
+}
+
+func TestGitEmailForAlias_Absent_NoExpectation(t *testing.T) {
+	// The common case: no "alias_git_emails" at all → no expectation, no check.
+	cfg := Config{Aliases: map[string]string{"company": "/abs/.claude-work"}}
+	if _, ok := cfg.GitEmailForAlias("company"); ok {
+		t.Fatal("an alias with no declared git_email must return ok=false")
+	}
+}
+
+func TestGitEmailForAlias_EmptyAlias(t *testing.T) {
+	cfg := Config{AliasGitEmails: map[string]string{"company": "jito@company.com"}}
+	if _, ok := cfg.GitEmailForAlias(""); ok {
+		t.Fatal("the empty alias (a default-account loop) must return ok=false")
+	}
+}
+
+func TestGitEmailForAlias_EmptyDeclaredValue(t *testing.T) {
+	// A present-but-blank entry is not a real expectation.
+	cfg := Config{AliasGitEmails: map[string]string{"company": ""}}
+	if _, ok := cfg.GitEmailForAlias("company"); ok {
+		t.Fatal("a blank declared email must return ok=false, not an empty expectation")
+	}
+}
+
+// TestLoad_AliasGitEmails_ParsedAndRoundTripSafe: the opt-in field parses from
+// JSON, and a stale/unknown alias key does NOT fail the load (a cosmetic hint
+// must never block the config that gates spawning).
+func TestLoad_AliasGitEmails_Parsed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	body := `{
+		"aliases": {"company": "/abs/.claude-work"},
+		"alias_git_emails": {"company": "jito@company.com", "ghost": "stale@nowhere.com"}
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load must tolerate an alias_git_emails key with no matching alias (cosmetic hint): %v", err)
+	}
+	if email, ok := cfg.GitEmailForAlias("company"); !ok || email != "jito@company.com" {
+		t.Errorf("parsed expectation = (%q, %v), want (jito@company.com, true)", email, ok)
+	}
+}
+
 // ── DefaultPath ────────────────────────────────────────────────────────────
 
 func TestDefaultPath_LandsUnderDotFleetops(t *testing.T) {

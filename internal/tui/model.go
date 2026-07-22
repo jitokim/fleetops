@@ -169,6 +169,14 @@ var (
 		}
 		return exec.Command(exe, "hooks", "install").Run()
 	}
+	// gitIdentityProbeFn is computeGitIdentity by default — the `git -C <cwd>
+	// config user.name/user.email` reader behind the DETAIL panel's GIT row
+	// (feat/detail-git-identity). A seam so the row's states (both set / email
+	// only / name only / unset) are testable without a real git checkout, and
+	// so `--demo` can seed a synthetic identity without shelling out — the same
+	// func-var discipline accountStatusProbeFn holds. Pure observation: it reads
+	// email/name (never a token), never writes git config.
+	gitIdentityProbeFn = computeGitIdentity
 )
 
 type loopsMsg []domain.Loop
@@ -638,6 +646,15 @@ type Model struct {
 	// either way (see renderStageRow).
 	gitStats map[string]gitStatsResult
 
+	// gitIdentity caches the selected loop's git committer identity (user.name
+	// / user.email — feat/detail-git-identity's GIT row), keyed by SessionID.
+	// Populated in the SAME gitStatsMsg gitStats is (one off-loop refresh, one
+	// dispatch), same selected-loop-only scope for the same reason: no other
+	// loop's identity is ever rendered. A zero-value entry (ok=false) means
+	// "not computed yet", "not a git repo", or "unset identity" — the GIT row
+	// is omitted either way (see renderDetail), never a fabricated value.
+	gitIdentity map[string]gitIdentityResult
+
 	// fleetOracleCounts caches EVERY loop's total judged-verdict count
 	// (TriggerOracle event count), keyed by SessionID — backs the FLEET
 	// panel's new ORACLE×N column (feat/panel-info). UNLIKE gitStats/
@@ -737,10 +754,19 @@ func NewDemo() Model {
 	m.demo = true
 	m.hostname = "dev-box"
 	m.status = "demo mode — synthetic fleet, nothing real"
-	loops, detailCache, oracleCounts := demoFleet()
+	loops, detailCache, oracleCounts, gitIdentity := demoFleet()
 	m.loops = loops
 	m.detailCache = detailCache
 	m.fleetOracleCounts = oracleCounts
+	// feat/detail-git-identity: demo never runs gitStatsCmd (the fleet is
+	// static, nothing shells out), so the GIT row's identity — like the
+	// detailCache above — is seeded directly here. Two identities: migrateDB
+	// (Claude alias "work") committing under a PERSONAL git email is the
+	// captain's own lbox mismatch, visible in demo QA the moment ACCOUNT and
+	// GIT sit adjacent; refactorCore (alias "personal") committing under a
+	// matching personal email is the aligned case. See
+	// TestDemoFleet_GitIdentity_SurfacesMismatch.
+	m.gitIdentity = gitIdentity
 	// Demo is hermetic ("nothing real"): drop whatever New loaded from the
 	// real ~/.fleetops/hidden.json so a captain's actual tombstones can't
 	// filter the synthetic fleet, and so d/x (demo-blocked anyway) have
@@ -778,7 +804,7 @@ func NewDemo() Model {
 // should show VERDICTS (refactor-core) needs an actual TriggerOracle event
 // seeded here, in the exact Detail encoding judgeCmd itself writes
 // ("<outcome> at cycle <N>: <reason>", see events.ParseOracleDetail).
-func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, oracleCounts map[string]int) {
+func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, oracleCounts map[string]int, gitIdentity map[string]gitIdentityResult) {
 	now := time.Now()
 
 	authHarden := domain.Loop{
@@ -917,6 +943,17 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 				Detail: fmt.Sprintf("%s at cycle %d: %s", domain.OutcomeProgress, refactorCore.Cycle, refactorCoreReason),
 				Actor:  events.ActorAuto},
 		}},
+		// feat/detail-tail-readable: the two resume-eligible demo loops (a
+		// StateDrift and a StateStalled) carry a seeded resumePrompt so the R
+		// preview — "R ▸ <what pressing r re-sends>" — is visible in demo QA
+		// without a real session JSONL (NewDemo never runs detailCacheCmd, so
+		// LastUserPrompt is never read). depUpgrade (drift) also exercises the
+		// "(r appends your optional hint)" note branch; coverage (stalled) the
+		// plain branch.
+		depUpgrade.SessionID: {resumePrompt: resumePromptResult{
+			text: "upgrade deps to latest and keep CI green — bump go.mod, run go test ./...", ok: true}},
+		coverage.SessionID: {resumePrompt: resumePromptResult{
+			text: "raise package coverage to 80% by adding table-driven tests for the untested branches", ok: true}},
 	}
 
 	oracleCounts = map[string]int{
@@ -924,7 +961,24 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		refactorCore.SessionID: 1,
 	}
 
-	return loops, detailCache, oracleCounts
+	// feat/detail-git-identity: the GIT row's identities, seeded to show BOTH
+	// states in demo QA (NewDemo never runs gitStatsCmd, so no config is read —
+	// the mismatch flag is seeded directly, standing in for a user who declared
+	// an "alias_git_emails" expectation):
+	//   - migrate-db: the "work" Claude alias committing under a PERSONAL git
+	//     email while the user DECLARED it should be jito@company.com — the
+	//     OPT-IN ⚠ mismatch case, so the marker is visible in demo QA.
+	//   - refactor-core: the "personal" alias committing under a personal email
+	//     with NO declared expectation — the plain, warning-free row (the common
+	//     case), proving a mere account/identity difference is NOT flagged.
+	// The other loops carry no seeded identity, so their GIT row is omitted (the
+	// not-a-repo / unset path) — proving the row's presence/absence discipline.
+	gitIdentity = map[string]gitIdentityResult{
+		migrateDB.SessionID:    {name: "Jito Kim", email: "pigberger70@gmail.com", ok: true, mismatch: true, expected: "jito@company.com"},
+		refactorCore.SessionID: {name: "Jito Kim", email: "pigberger70@gmail.com", ok: true},
+	}
+
+	return loops, detailCache, oracleCounts, gitIdentity
 }
 
 // destructiveConfirmWindow: the confirming second press must land within this
@@ -989,6 +1043,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.gitStats = make(map[string]gitStatsResult)
 		}
 		m.gitStats[msg.sessionID] = msg.stats
+		// feat/detail-git-identity: the identity rides the same message (see
+		// gitStatsCmd) — cache it in lockstep so the GIT row refreshes on the
+		// exact cadence the STAGE row does.
+		if m.gitIdentity == nil {
+			m.gitIdentity = make(map[string]gitIdentityResult)
+		}
+		m.gitIdentity[msg.sessionID] = msg.identity
 		return m, nil
 	case fleetOracleCountsMsg:
 		m.fleetOracleCounts = map[string]int(msg)
@@ -5458,10 +5519,12 @@ func (m Model) detailPanelLines(innerWidth, innerHeight int) []string {
 	}
 	cached := m.detailCache[sel.SessionID] // zero value (empty events, lastError.ok=false) when not yet cached — see detailCache's doc
 	data := detailData{
-		now:       time.Now(),
-		events:    cached.events,
-		git:       m.gitStats[sel.SessionID],
-		lastError: cached.lastError,
+		now:          time.Now(),
+		events:       cached.events,
+		git:          m.gitStats[sel.SessionID],
+		gitIdentity:  m.gitIdentity[sel.SessionID],
+		lastError:    cached.lastError,
+		resumePrompt: cached.resumePrompt,
 	}
 	lines := strings.Split(renderDetail(sel, innerWidth, innerHeight, data), "\n")
 	if len(lines) > innerHeight {
@@ -5580,27 +5643,55 @@ type gitStatsResult struct {
 	ok                 bool
 }
 
-// gitStatsMsg reports gitStatsCmd's result for sessionID.
+// gitStatsMsg reports gitStatsCmd's result for sessionID — both the
+// working-tree diff snapshot (STAGE row) and the committer identity (GIT row),
+// gathered together in the one off-loop refresh so the GIT row adds no second
+// dispatch cadence of its own (feat/detail-git-identity).
 type gitStatsMsg struct {
 	sessionID string
 	stats     gitStatsResult
+	identity  gitIdentityResult
 }
 
 // gitStatsTimeout bounds each of the two git subprocess calls — a wedged
 // git (e.g. an NFS-mounted repo) must not hang the fleet loop.
 const gitStatsTimeout = 2 * time.Second
 
-// gitStatsCmd computes l's working-tree diff stats off the event loop.
-// CwdVerified is required (same "don't trust a lossy decoded path" guard
-// used elsewhere — see domain.Loop.CwdVerified's doc) — an unverified Cwd
-// isn't safe to run git commands against at all.
+// gitStatsCmd computes l's working-tree diff stats AND committer identity off
+// the event loop, in one pass (feat/detail-git-identity folds the GIT row's
+// identity read in here rather than dispatching a second cmd — same trigger,
+// same cache, no new per-scan subprocess cadence). CwdVerified is required
+// (same "don't trust a lossy decoded path" guard used elsewhere — see
+// domain.Loop.CwdVerified's doc) — an unverified Cwd isn't safe to run git
+// commands against at all.
 func gitStatsCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		if !l.CwdVerified {
-			return gitStatsMsg{l.SessionID, gitStatsResult{}}
+			return gitStatsMsg{sessionID: l.SessionID}
 		}
 		files, plus, minus, ok := computeGitStats(l.Cwd)
-		return gitStatsMsg{l.SessionID, gitStatsResult{files: files, plus: plus, minus: minus, ok: ok}}
+		stats := gitStatsResult{files: files, plus: plus, minus: minus, ok: ok}
+		// feat/detail-git-identity: read the committer identity in the SAME
+		// off-loop pass, gated on ok so a non-repo cwd never reaches the probe
+		// (its global git identity must not surface as this repo's — see
+		// computeGitIdentity's doc). An unverified cwd already returned above,
+		// so identity, like stats, is only ever read against a trusted path.
+		var identity gitIdentityResult
+		if ok {
+			name, email, idOK := gitIdentityProbeFn(l.Cwd)
+			identity = gitIdentityResult{name: name, email: email, ok: idOK}
+			// Opt-in mismatch (feat/detail-git-identity): flagged ONLY when this
+			// loop's Claude alias carries a DECLARED git_email expectation and the
+			// repo's actual email disagrees. Guarded on a non-empty alias AND a
+			// resolved email so the common zero-config loop pays nothing here — no
+			// alias, no config read, no check. The config load is off the event
+			// loop (this whole func is a tea.Cmd goroutine), like the git reads
+			// above, and reuses the existing loadAccountsFn seam.
+			if idOK && identity.email != "" && l.Account.Alias != "" {
+				identity.mismatch, identity.expected = gitEmailMismatch(l.Account.Alias, identity.email)
+			}
+		}
+		return gitStatsMsg{sessionID: l.SessionID, stats: stats, identity: identity}
 	}
 }
 
@@ -5662,6 +5753,126 @@ func countUntrackedFiles(porcelain string) int {
 	return n
 }
 
+// ── git commit identity (feat/detail-git-identity's GIT row) ────────────
+//
+// The real user pain (see .notes/feature-git-identity.md): fleetops already
+// pins and shows the CLAUDE account per repo (ACCOUNT row), but NOT the git
+// identity each repo actually commits AS — so a company repo silently
+// committing under a personal git email (the captain's own lbox case: company
+// Claude alias, personal git email, no local override) went unseen. The GIT
+// row surfaces `git -C <cwd> config user.name/user.email` right next to
+// ACCOUNT so the two read together and a human spots the mismatch at a glance.
+//
+// It rides the SAME off-loop selected-loop refresh gitStatsCmd already runs
+// (folded into it below), cached alongside gitStats keyed by SessionID — no
+// new per-scan subprocess dispatch, and the repo-ness gate comes for free from
+// gitStats.ok (a non-repo never reaches the identity read, so the row is
+// omitted rather than showing a global fallback identity for a non-repo dir).
+
+// gitIdentityResult is one loop's committer identity snapshot. ok=false means
+// "not a git repo, cwd unverified, git failed, OR neither name nor email is
+// set" — the GIT row is omitted entirely in that case (same optional-row
+// discipline as ACCOUNT/DRIVE), never a fabricated or blank identity.
+//
+// mismatch is the OPT-IN warning: true ONLY when the loop's Claude alias has a
+// declared git_email expectation (accounts.json "alias_git_emails") AND the
+// repo's actual email disagrees with it. It is NEVER inferred from a bare
+// Claude-account / git-identity difference — that difference is often
+// intentional (a company repo signed off under a personal email), so with no
+// declared expectation there is no check and mismatch stays false. expected
+// carries the declared email, shown beside the ⚠ so the human can act.
+type gitIdentityResult struct {
+	name, email string
+	ok          bool
+	mismatch    bool
+	expected    string
+}
+
+// computeGitIdentity reads the EFFECTIVE committer identity in cwd — the
+// values a commit made here would actually use, with git's own
+// system→global→local precedence resolved by `git config` itself (two plain
+// reads, not `--get-regexp`, precisely so the resolved value wins rather than
+// this code re-implementing scope precedence). This is what exposes the
+// captain's bug: a repo with no LOCAL user.email inherits the GLOBAL
+// (personal) one, and that inherited value is exactly what must show.
+//
+// ok=false whenever neither field resolves (unset identity) — a missing
+// value is reported as absence, never a fabricated placeholder. Callers only
+// invoke this once cwd is already confirmed a git repo (gitStats.ok), so a
+// non-repo dir never reaches here and can't surface its global-config
+// identity as if it were this repo's.
+func computeGitIdentity(cwd string) (name, email string, ok bool) {
+	name = gitConfigValue(cwd, "user.name")
+	email = gitConfigValue(cwd, "user.email")
+	return name, email, name != "" || email != ""
+}
+
+// gitConfigValue reads a single effective git config key in cwd, returning ""
+// for an unset key (`git config <key>` exits non-zero) or any other failure —
+// a best-effort annotation, never an error surfaced to the human (same posture
+// as computeGitStats). Bounded by gitStatsTimeout so a wedged git can't hang
+// the fleet.
+func gitConfigValue(cwd, key string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), gitStatsTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "config", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitEmailMismatch reports whether alias has a DECLARED git_email expectation
+// (accounts.json "alias_git_emails") that disagrees with actualEmail, and the
+// declared email when it does. This is the sole gate on the GIT row's ⚠: no
+// declared expectation ⇒ (false, "") ⇒ no warning, which is the common case
+// and the whole opt-in posture — a Claude-account / git-identity difference is
+// never itself treated as wrong. A config-load failure is swallowed to
+// (false, ""): a missing/broken accounts.json must never manufacture a
+// warning. Called off the event loop (from gitStatsCmd's goroutine).
+func gitEmailMismatch(alias, actualEmail string) (mismatch bool, expected string) {
+	cfg, err := loadAccountsFn()
+	if err != nil {
+		return false, ""
+	}
+	declared, ok := cfg.GitEmailForAlias(alias)
+	if !ok || declared == actualEmail {
+		return false, ""
+	}
+	return true, declared
+}
+
+// renderGitRow builds the DETAIL panel's GIT row. Default (no declared
+// expectation): the plain identity in stDim, exactly like CWD/ACCOUNT — no
+// warning. On an OPT-IN mismatch (id.mismatch): an amber "⚠ <identity>
+// (expected <declared>)", the ONLY case fleetops ever flags — the declared
+// email is shown so the human knows both the actual and the expected value.
+func renderGitRow(id gitIdentityResult, valueWidth int) string {
+	label := gitIdentityLabel(id)
+	if !id.mismatch {
+		return detailRow("GIT", stDim.Render(trunc(label, valueWidth)))
+	}
+	marked := "⚠ " + label
+	if id.expected != "" {
+		marked += "  (expected " + id.expected + ")"
+	}
+	return detailRow("GIT", lipgloss.NewStyle().Foreground(cAmber).Render(trunc(marked, valueWidth)))
+}
+
+// gitIdentityLabel is the GIT row's value: "name <email>" when both are set,
+// the bare email when only it is set, the bare name when only it is set. An
+// identity with neither is never passed here (ok=false omits the row).
+func gitIdentityLabel(id gitIdentityResult) string {
+	switch {
+	case id.name != "" && id.email != "":
+		return id.name + " <" + id.email + ">"
+	case id.email != "":
+		return id.email
+	default:
+		return id.name
+	}
+}
+
 // ── DETAIL panel's async event-log + LAST ERROR cache ───────────────────
 //
 // fix/exit-gate-ux (architecture judge, P1): reading the event log
@@ -5682,14 +5893,26 @@ type lastErrorResult struct {
 	ok   bool
 }
 
+// resumePromptResult is the last user prompt claude.LastUserPrompt would
+// re-send if the operator pressed "r" — the DETAIL panel's R preview
+// (feat/detail-tail-readable). ok=false means the session log carries no
+// prior user message (LastUserPrompt's !ok), in which case "r" sends Enter
+// only — so the preview says exactly that rather than showing a blank.
+type resumePromptResult struct {
+	text string
+	ok   bool
+}
+
 // detailCacheEntry is one loop's cached event history + LAST ERROR
-// extraction. The zero value (nil events, lastError.ok=false) means "not
-// computed yet" — renderDetail already tolerates both being empty/absent
-// (see detailData's doc), so there is no separate loading state to thread
+// extraction + resume-prompt preview. The zero value (nil events,
+// lastError.ok=false, resumePrompt.ok=false) means "not computed yet" —
+// renderDetail already tolerates all three being empty/absent (see
+// detailData's doc), so there is no separate loading state to thread
 // through.
 type detailCacheEntry struct {
-	events    []events.Event
-	lastError lastErrorResult
+	events       []events.Event
+	lastError    lastErrorResult
+	resumePrompt resumePromptResult
 }
 
 // detailCacheMsg reports detailCacheCmd's result for sessionID.
@@ -5698,19 +5921,25 @@ type detailCacheMsg struct {
 	entry     detailCacheEntry
 }
 
-// detailCacheCmd gathers l's event history and transcript LAST ERROR off
-// the event loop. Both are best-effort (events.Read tolerates a
-// missing/empty history; claude.LastError's ok=false just means "no error
-// entry found") — never an error surfaced to the human, same as gitStatsCmd.
+// detailCacheCmd gathers l's event history, transcript LAST ERROR, and the
+// resume-prompt preview off the event loop. All three are best-effort
+// (events.Read tolerates a missing/empty history; claude.LastError's ok=false
+// just means "no error entry found"; claude.LastUserPrompt's ok=false means
+// "no prior user message") — never an error surfaced to the human, same as
+// gitStatsCmd. The LastUserPrompt read rides HERE, in the existing selected-
+// loop off-loop cache, precisely so View() never reads/parses the session
+// JSONL synchronously and no NEW per-scan read is added.
 func detailCacheCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
 		evs, _ := events.Read(historyDirFn(), l.SessionID)
 		text, ts, ok := claude.LastError(l.Path)
+		prompt, promptOK := claude.LastUserPrompt(l.Path)
 		return detailCacheMsg{
 			sessionID: l.SessionID,
 			entry: detailCacheEntry{
-				events:    evs,
-				lastError: lastErrorResult{text: text, ts: ts, ok: ok},
+				events:       evs,
+				lastError:    lastErrorResult{text: text, ts: ts, ok: ok},
+				resumePrompt: resumePromptResult{text: prompt, ok: promptOK},
 			},
 		}
 	}
@@ -5723,7 +5952,18 @@ func detailCacheCmd(l domain.Loop) tea.Cmd {
 // viewer — that's what ↵ attach is for) shrank this from 6 to 4 to make
 // room for the new LAST ERROR/VERDICTS/EVENTS blocks; the full report lives
 // in the pager / oracle / EVENTS block, not here.
-const tailMaxLines = 4
+//
+// feat/detail-tail-readable (real user "Mike": "TAIL is too short"): bumped
+// 4 → 8. Four wrapped lines of an idle loop's LastText is often too little
+// to judge WHAT it just did / produced without leaving fleetops for the
+// session — the exact onboarding-abandonment signal this addresses. Eight
+// lines is roughly a short paragraph: enough to judge, still a bounded tail,
+// NOT a transcript (that stays the `o` pager's job). It's safe on short
+// panels because TAIL renders LAST in renderDetail's output and the whole
+// panel is top-down clipped to the height (detailPanelLines), so a tall
+// TAIL yields to the clip before the callout/metadata rows above it ever do,
+// and EVENTS already yields to TAIL's line count in the height accounting.
+const tailMaxLines = 8
 
 // detailKeyWidth is the fixed column width of a detail row's KEY (see
 // detailRow). TAIL's wrapped continuation lines indent by exactly this much so
@@ -5740,10 +5980,12 @@ const detailKeyWidth = 8
 // data — directly testable without a real event-log dir, transcript file,
 // or git repo.
 type detailData struct {
-	now       time.Time
-	events    []events.Event // this session's history, oldest-first (events.Read's contract)
-	git       gitStatsResult
-	lastError lastErrorResult // the selected loop's transcript LAST ERROR (claude.LastError), cached async — see detailCacheCmd
+	now          time.Time
+	events       []events.Event // this session's history, oldest-first (events.Read's contract)
+	git          gitStatsResult
+	gitIdentity  gitIdentityResult  // the selected loop's git committer identity (GIT row), cached async — see gitStatsCmd
+	lastError    lastErrorResult    // the selected loop's transcript LAST ERROR (claude.LastError), cached async — see detailCacheCmd
+	resumePrompt resumePromptResult // what "r" would re-send (claude.LastUserPrompt) — the R preview, cached async — see detailCacheCmd
 }
 
 // eventsMinRows is the EVENTS block's floor: below this many rows available
@@ -5800,6 +6042,15 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	if callout := detailActionCallout(l, width, data); callout != "" {
 		d.WriteString(strings.TrimPrefix(callout, "\n"))
 		d.WriteString("\n")
+		// feat/detail-tail-readable (real user "Mike": "when it's stalled I
+		// want to READ whether pressing R is the right move"): for a resume-
+		// eligible loop (Stalled/Drift — the exact states the "r" key guard
+		// allows), show WHAT "r" would re-send directly under its callout, so
+		// "it's stalled → R will resend THIS" reads as one thought. Non-resume
+		// callouts (GATE) get no preview — renderResumePreview returns "".
+		if preview := renderResumePreview(l, data.resumePrompt, valueWidth); preview != "" {
+			d.WriteString(preview)
+		}
 	}
 	// fix/exit-gate-ux (UX judge item 4): this used to lead with
 	// "▸ <project>  <sid>" — but the panel's own title (see detailTitle)
@@ -5868,6 +6119,22 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	// third "not applicable" state to parse.
 	if label := l.Account.Label(); label != "" {
 		d.WriteString(detailRow("ACCOUNT", stDim.Render(trunc(label, valueWidth))))
+	}
+	// feat/detail-git-identity: the git committer identity this repo actually
+	// commits AS, placed directly under ACCOUNT so the Claude account and the
+	// git identity read together — a company Claude account committing under a
+	// personal git email (the captain's own lbox case) is then visible at a
+	// glance. Omitted entirely when there's no identity at all (data.gitIdentity
+	// .ok is false: not a repo, or unset), same presence/absence discipline as
+	// the ACCOUNT/DRIVE rows above rather than a third "not applicable" state.
+	// The ⚠ mismatch marker (see renderGitRow) is OPT-IN: it fires only when the
+	// alias has a declared git_email expectation that disagrees — never inferred
+	// from a bare Claude-account / git-identity difference, which is often
+	// intentional (a company repo signed off under a personal email). With no
+	// declared expectation the row is a plain, warning-free fact: the two rows
+	// simply read together so the human can judge.
+	if data.gitIdentity.ok {
+		d.WriteString(renderGitRow(data.gitIdentity, valueWidth))
 	}
 	d.WriteString(detailRow("LOG", stDim.Render(trunc(l.Path, valueWidth))))
 
@@ -6479,6 +6746,47 @@ func renderDriftCallout(l domain.Loop, width int) string {
 		"   " + stKeyChipRed.Render("r") + stDim.Render(" re-drive with hint") +
 		"   " + stKeyChipRed.Render("k") + stDim.Render(" kill")
 	return "\n" + stCalloutRed.Width(contentWidth).Render(line)
+}
+
+// resumePreviewMaxLines caps the R preview's wrapped prompt lines. Kept small
+// (3) on purpose: it sits directly under the action callout at the TOP of the
+// panel, so it must convey "R will re-send THIS" without pushing the session
+// id and metadata rows down the panel. It's a glance to judge whether R is the
+// right move, not the full prompt — the whole transcript stays the `o` pager's
+// job, same discipline as TAIL and EVENTS.
+const resumePreviewMaxLines = 3
+
+// renderResumePreview shows, for a resume-eligible loop, the exact last user
+// prompt pressing "r" would re-send (claude.LastUserPrompt, cached off-loop in
+// data.resumePrompt) — the answer to real user "Mike"'s "I want to READ
+// whether pressing R is the right move" before he commits to it. It renders
+// ONLY for StateStalled / StateDrift — the two states the "r" key guard allows
+// (see Update) and the two the callout region already owns — returning "" for
+// every other state (running / idle / gate / done / failed) so a loop that
+// can't be resumed shows no preview and no clutter.
+//
+// When LastUserPrompt found no prior prompt (rp.ok=false) it says so honestly,
+// matching resumeCmd/driftRedriveCmd's own "sent Enter only" note rather than
+// showing a blank. For a DRIFT loop the preview shows the BASE last prompt
+// only — "r" composes it with the operator's optional corrective hint at the
+// redrive step (composeDriftPrompt), which is NOT part of this text — so a
+// trailing note says the hint is appended, rather than implying it's already
+// shown here.
+func renderResumePreview(l domain.Loop, rp resumePromptResult, valueWidth int) string {
+	if l.State != domain.StateStalled && l.State != domain.StateDrift {
+		return ""
+	}
+	if !rp.ok {
+		return detailRow("R ▸", stDim.Render("(no prior prompt — R sends Enter only)"))
+	}
+	wrapped := wrapTailText(rp.text, valueWidth, resumePreviewMaxLines)
+	for i := range wrapped {
+		wrapped[i] = stDim.Render(wrapped[i])
+	}
+	if l.State == domain.StateDrift {
+		wrapped = append(wrapped, stDim.Render("(r appends your optional hint to this)"))
+	}
+	return detailRowMultiline("R ▸", wrapped)
 }
 
 // ── status line / keybar ─────────────────────────────────────
