@@ -17,7 +17,7 @@
 
 _(the fleet above is `fleetops --demo` — a synthetic fleet, nothing real)_
 
-> **Status: experimental / 0.7.3-alpha.** This is a young, actively-changing
+> **Status: experimental / 0.8.0-alpha.** This is a young, actively-changing
 > project — expect rough edges, and read the "Known rough edges" and
 > "Limitations" sections below before trusting it with anything you can't
 > afford to have go wrong (it does send real keystrokes and can kill real
@@ -113,7 +113,7 @@ look at the UI, or for screenshotting it without leaking real paths/goals.
 | `/` | filter the fleet (live, by project/session/state/stall — `esc` clears, `enter` applies) |
 | `↵` | attach: bring the loop's terminal to the front |
 | `a` | approve a gate (bare Enter — accepts claude's default option) |
-| `r` | resume a stalled/drifted loop (re-sends its last prompt) |
+| `r` | resume a stalled/drifted loop — re-sends its last prompt (DETAIL shows that prompt first, so you read what `r` will send before pressing it) |
 | `i` | inject an arbitrary prompt into the selected loop (type it, `enter` sends, `esc` cancels) |
 | `p` | stop the current turn (Esc) without killing the process |
 | `k` | kill — press twice within 3s to confirm (sends `/exit`) |
@@ -260,8 +260,14 @@ the CLI just means you never have to.
   (plus the default account). Each choice shows its login state, and `l` launches
   `claude login` for an account that isn't signed in yet.
 - **Observe**: every loop's `DETAIL` panel carries an `ACCOUNT` row with the
-  alias (and email, when available). Loops across different accounts share one
-  cockpit.
+  alias (and email, when available), and a `GIT` row with the identity that
+  directory actually commits as (`user.name <user.email>`) — so you can see the
+  Claude account and the git author side by side. A different Claude account and
+  git email is **not** flagged on its own (mixing them is often deliberate — a
+  signed-off commit under a personal email, say); a `⚠` appears only if you
+  opt in by declaring the expected email for an alias (`alias_git_emails` in
+  `accounts.json`) and the repo disagrees. Loops across different accounts share
+  one cockpit.
 - **Resume**: `r`/`i` re-drive a session under the account it was *recorded*
   with, never whatever the current directory happens to be bound to — a live
   session can't be switched onto the wrong account under you.
