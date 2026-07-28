@@ -789,11 +789,14 @@ func NewDemo() Model {
 //
 // The fixture deliberately covers every renderable shape this file knows
 // about, in one small fleet: a GATE (permission prompt), a plain RUNNING
-// loop, a DRIFT (oracle-rejected) loop, two unbound/observed loops (no
-// goal at all — docs-gen idle, coverage stalled/429) proving the "no
-// goal, no oracle" case renders correctly, and one Driven (engine-owned)
-// loop so the ⚙ marker and the DRIVE/RUBRIC/CHALL contract rows have
-// something real to show.
+// loop, a RUNNING loop DELEGATING to a live subagent (v0.9.0 subagent
+// visibility — flock-audit, its TAIL row carrying the exact "delegating:
+// <type> — <child last line>" string applySubagentDelegation produces), a
+// DRIFT (oracle-rejected) loop, two unbound/observed loops (no goal at all
+// — docs-gen idle, coverage stalled/429) proving the "no goal, no oracle"
+// case renders correctly, and one Driven (engine-owned) loop so the ⚙
+// marker and the DRIVE/RUBRIC/CHALL contract rows have something real to
+// show.
 //
 // The two returned maps seed exactly what the normal loopsMsg pipeline
 // would otherwise populate via detailCacheCmd/fleetOracleCountsCmd (real
@@ -835,6 +838,27 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		Cycle:        4,
 		Goal:         domain.Goal{Text: "fix flaky tests", MaxCycles: 12},
 		LastActivity: now.Add(-3 * time.Second),
+	}
+	// v0.9.0 subagent visibility: a RUNNING loop delegating to a live child.
+	// LastText is EXACTLY the string applySubagentDelegation writes via
+	// formatDelegating ("delegating: <subagent_type> — <child last line>"),
+	// not a prettier paraphrase — the demo is what a new reader believes the
+	// product looks like, so any divergence from what the real feature renders
+	// is a false claim. Single live child, so no "(N live)" count; a code-review
+	// subagent's freshest line is the child text. Held at StateRunning exactly
+	// as the real hold does while a subagent is live. See
+	// TestDemoFleet_ReturnsExpectedLoops's delegation assertions.
+	flockAudit := domain.Loop{
+		Project:      "flock-audit",
+		SessionID:    "demo-flock-audit",
+		ProjectDir:   "-home-user-fleet",
+		Cwd:          "/home/user/fleet",
+		Path:         "/home/user/.claude/projects/-home-user-fleet/demo-flock-audit.jsonl",
+		State:        domain.StateRunning,
+		LastText:     "delegating: code-reviewer — checking the flock lock path in internal/registry",
+		Cycle:        5,
+		Goal:         domain.Goal{Text: "audit the registry flock and fix the stale-lock path", MaxCycles: 12},
+		LastActivity: now.Add(-4 * time.Second),
 	}
 	depUpgrade := domain.Loop{
 		Project:    "dep-upgrade",
@@ -927,7 +951,7 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		LastActivity: now.Add(-90 * time.Second),
 	}
 
-	loops = []domain.Loop{authHarden, migrateDB, flakyTests, depUpgrade, docsGen, coverage, refactorCore}
+	loops = []domain.Loop{authHarden, migrateDB, flakyTests, flockAudit, depUpgrade, docsGen, coverage, refactorCore}
 
 	detailCache = map[string]detailCacheEntry{
 		authHarden.SessionID: {events: []events.Event{
@@ -943,6 +967,18 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 				FromState: "idle", ToState: "idle", Trigger: events.TriggerOracle,
 				Detail: fmt.Sprintf("%s at cycle %d: %s", domain.OutcomeProgress, refactorCore.Cycle, refactorCoreReason),
 				Actor:  events.ActorAuto},
+		}},
+		// v0.9.0 subagent visibility: a spawn then the scan that keeps the loop
+		// RUNNING while its subagent works, so the delegating loop's DETAIL panel
+		// shows a non-empty EVENTS tail alongside the "delegating: …" TAIL row —
+		// the frame a v0.9.0 screenshot lands on.
+		flockAudit.SessionID: {events: []events.Event{
+			{TS: now.Add(-5 * time.Minute).UnixNano(), SessionID: flockAudit.SessionID,
+				FromState: "", ToState: "running", Trigger: events.TriggerActuation,
+				Detail: "spawn: audit the registry flock", Actor: events.ActorHuman},
+			{TS: now.Add(-4 * time.Second).UnixNano(), SessionID: flockAudit.SessionID,
+				FromState: "running", ToState: "running", Trigger: events.TriggerScan,
+				Detail: "delegating to code-reviewer", Actor: events.ActorSystem},
 		}},
 		// feat/detail-tail-readable: the two resume-eligible demo loops (a
 		// StateDrift and a StateStalled) carry a seeded resumePrompt so the R
