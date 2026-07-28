@@ -26,6 +26,7 @@ import (
 	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/claude"
 	"github.com/jitokim/fleetops/internal/control"
+	"github.com/jitokim/fleetops/internal/control/actuate"
 	"github.com/jitokim/fleetops/internal/domain"
 	"github.com/jitokim/fleetops/internal/engine"
 	"github.com/jitokim/fleetops/internal/events"
@@ -1859,105 +1860,70 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // share a mechanical stem worth deriving one from the other.
 func sendPromptCmd(l domain.Loop, prompt, action, successVerb, note string) tea.Cmd {
 	return func() tea.Msg {
-		// SAFETY: the governor stopped this loop (internal/engine.Check via
-		// applyGovernor, no-improve limit reached) — StateFailed is
-		// deliberately terminal (domain.LoopState.Terminal()). Resuming it
-		// would silently re-drive a loop the runtime already decided to
-		// fail closed on; the human must make a new decision (kill, or a
-		// fresh contract), not have "r"/"i" quietly override the governor.
-		// This is policy, not capability — unlike StallGone, it applies
-		// regardless of which tier could technically reach the session.
-		// No actuation event here — nothing was dispatched to any tier.
-		if l.State == domain.StateFailed {
-			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "governor stopped this loop (no improvement) — k kill or start a new contract"}
+		// Ambiguity is a caller precondition, adjudicated UPSTREAM at "r"/"i"
+		// keypress time by m.refuseIfAmbiguous — which also has two deliberate
+		// bypasses (ttyPathPlausible and injectHeadlessFallbackEligible) and a
+		// per-loop ambiguityRemedy string that live in the TUI. It is not part
+		// of this send/redrive policy. See
+		// docs/adr-actuation-policy-extraction.md §2.2 / §2.4 / §3.
+		res := actuationPolicy().Actuate(actuate.ActuationRequest{
+			Loop:   l,
+			Prompt: prompt,
+			Action: action,
+		})
+		ok, text := renderActuationResult(res, l, successVerb, action, note)
+		return resumeResultMsg{sessionID: l.SessionID, ok: ok, text: text}
+	}
+}
+
+// actuationPolicy binds the actuate.Policy to the TUI's overridable side-effect
+// seams (resolve/redrive/event-log), so tests keep swapping the same package
+// vars they always have.
+func actuationPolicy() actuate.Policy {
+	return actuate.Policy{
+		ResolveTarget: func(sessionID, projectDir string) (control.Actuator, bool, bool) {
+			return resolveActuationTargetFn(sessionsDirFn(), sessionID, projectDir)
+		},
+		Redrive:  redriveFn,
+		LogEvent: logActuationEvent,
+	}
+}
+
+// renderActuationResult maps a structured actuate.Verdict back to the exact
+// human-facing status line sendPromptCmd used to build inline. It is a pure
+// presentation function — it re-routes WHERE the string is chosen (from the
+// policy's verdict), never WHAT it says. The wording is the behavior-preserving
+// invariant (ADR §2.3).
+//
+// successVerb ("resumed"/"re-drove"/"injected into") and note are the caller's
+// display vocabulary, kept out of the policy on purpose. Where two verdicts
+// share one enum value but differ in wording, the choice turns on facts the
+// renderer already holds: RefusedTerminalState on l.State, DeliveredTier2 and
+// the Tier 2 failure on l.Stall / res.Tier — exactly the branches the old
+// inline code took.
+func renderActuationResult(res actuate.ActuationResult, l domain.Loop, successVerb, action, note string) (ok bool, text string) {
+	switch res.Verdict {
+	case actuate.Delivered:
+		return true, fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, res.Backend, note)
+	case actuate.DeliveredTier2:
+		if l.Stall != domain.StallGone {
+			return true, fmt.Sprintf("delivered to %s's session %s as a background turn (tier 2) — couldn't target the on-screen session unambiguously, won't appear in the open window", l.Project, shortID(l.SessionID))
 		}
-		// fix/killed-state: same policy-not-capability reasoning as
-		// StateFailed above — Tier 2's headless redrive
-		// (`claude --resume <id> -p <prompt>`) is fully capable of
-		// reviving a killed session (it doesn't care whether a human
-		// killed it), so this must be blocked at the policy layer, not
-		// left to accidentally succeed. Belt-and-suspenders: the "i" key's
-		// keypress-time guard (Update) already refuses before this is ever
-		// reached via the TUI, but resumeCmd's own "r" guard only checks
-		// Stalled/Drift (which already excludes Killed) — this is the one
-		// shared choke point both paths funnel through.
+		return true, fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)
+	case actuate.RefusedTerminalState:
 		if l.State == domain.StateKilled {
-			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: "this loop was killed — start a new contract, don't resume/inject"}
+			return false, "this loop was killed — start a new contract, don't resume/inject"
 		}
-
-		if l.Stall != domain.StallGone {
-			act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
-			if backendAvailable && found {
-				err := act.Resume(prompt)
-				if err == nil {
-					logActuationEvent(l, action, act.Tier(), nil)
-					return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("%s %s via %s%s", successVerb, l.Project, act.Backend(), note)}
-				}
-				logActuationEvent(l, action, act.Tier(), err)
-				// A failed Tier 1h send is a DEGRADE, not a dead end. Tier 1h
-				// resolves optimistically — the registry says the loop lives in
-				// an iTerm2 session, and only the send itself can discover that
-				// no session matches (closed, or a stale registry GUID after an
-				// iTerm2 restart — #62) or that it now hosts a different tty. Before
-				// Tier 1h existed such a loop fell to Tier 2 and the prompt
-				// landed; reporting the failure as terminal here would be a
-				// capability REGRESSION for exactly the sessions the tier was
-				// meant to help. Safe because 1h does not half-deliver on any
-				// failure that reaches the fall-through below
-				// (control.IsHostSendTier documents why), so the redrive cannot
-				// double-send. The one failure that CAN have delivered is
-				// carved out immediately after.
-				//
-				// Only r/i degrade: they have a Tier 2 (a headless redrive of
-				// the same session). k/p/a have none, so their call sites keep
-				// reporting a 1h failure as terminal rather than inventing a
-				// fallback that does not exist.
-				if !control.IsHostSendTier(act) {
-					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("resume %s failed: %v", l.Project, err)}
-				}
-				// ...with ONE exception: a deadline kill (see
-				// control.ErrSendDeliveryUnknown) is the single 1h failure that
-				// may have already delivered, because it interrupted a script
-				// that was running rather than one that never started. Falling
-				// through would risk re-sending the same prompt into a session
-				// that already got it. Stop here and say the honest thing —
-				// the outcome is UNKNOWN, so the human, not the runtime, makes
-				// the call about retrying.
-				if errors.Is(err, control.ErrSendDeliveryUnknown) {
-					return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("%s %s: delivery UNKNOWN — the host send timed out and may or may not have landed. Attach (↵) and check before retrying; NOT re-driven, to avoid sending it twice", action, l.Project)}
-				}
-			}
+		return false, "governor stopped this loop (no improvement) — k kill or start a new contract"
+	case actuate.DeliveryUnknown:
+		return false, fmt.Sprintf("%s %s: delivery UNKNOWN — the host send timed out and may or may not have landed. Attach (↵) and check before retrying; NOT re-driven, to avoid sending it twice", action, l.Project)
+	case actuate.RefusedNoSurface:
+		if res.Tier == "tier2" {
+			return false, fmt.Sprintf("re-drive %s failed: %v", l.Project, res.Err)
 		}
-
-		// Tier 2: vendor-independent headless re-drive. Works on every
-		// host (including a StallGone bare shell, or no backend/ambiguous
-		// cwd match) — see docs/adr-vendor-independent-actuation.md §2.2.
-		if err := redriveFn(l.Cwd, l.SessionID, prompt, l.Account.ConfigDir); err != nil {
-			logActuationEvent(l, action, "tier2", err)
-			return resumeResultMsg{sessionID: l.SessionID, ok: false, text: fmt.Sprintf("re-drive %s failed: %v", l.Project, err)}
-		}
-		logActuationEvent(l, action, "tier2", nil)
-		if l.Stall != domain.StallGone {
-			// Bug 2 (Option B honesty fix, refined by
-			// feat/inject-headless-exact-fallback): this branch is a
-			// DOWNGRADE, not StallGone's normal Tier-2 path — Tier 1 either
-			// found no backend, or a resolved Tier 1h
-			// host send refused (no session matched — closed or a stale
-			// registry GUID, #62 — or its tty moved), or (most commonly, with
-			// N>1 sessions
-			// sharing a cwd on a backend with no per-session tty dispatch,
-			// e.g. cmux/orca — see docs/adr-vendor-independent-actuation.md
-			// §4 and ResolveActuationTarget's doc) couldn't disambiguate
-			// which on-screen session was meant, so it fell through to the
-			// SAME session's exact SessionID via the headless re-drive
-			// instead of silently claiming success in the open window (or,
-			// pre-feat/inject-headless-exact-fallback, refusing outright —
-			// see injectHeadlessFallbackEligible). Name the exact session
-			// the human's prompt actually reached (shortID) — the human is
-			// watching a terminal window that will NOT visibly update.
-			return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("delivered to %s's session %s as a background turn (tier 2) — couldn't target the on-screen session unambiguously, won't appear in the open window", l.Project, shortID(l.SessionID))}
-		}
-		return resumeResultMsg{sessionID: l.SessionID, ok: true, text: fmt.Sprintf("re-drove %s headlessly (tier 2) — output lands in the transcript", l.Project)}
+		return false, fmt.Sprintf("resume %s failed: %v", l.Project, res.Err)
+	default:
+		return false, fmt.Sprintf("resume %s failed", l.Project)
 	}
 }
 
