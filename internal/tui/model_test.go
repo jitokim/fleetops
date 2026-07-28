@@ -19,6 +19,7 @@ import (
 	"github.com/jitokim/fleetops/internal/accountstatus"
 	"github.com/jitokim/fleetops/internal/claude"
 	"github.com/jitokim/fleetops/internal/control"
+	"github.com/jitokim/fleetops/internal/control/actuate"
 	"github.com/jitokim/fleetops/internal/domain"
 	"github.com/jitokim/fleetops/internal/engine"
 	"github.com/jitokim/fleetops/internal/events"
@@ -3519,6 +3520,68 @@ func TestKPA_OrdinaryTierOneFailure_StillSaysFailed(t *testing.T) {
 	}
 	if strings.Contains(km.text, "UNKNOWN") {
 		t.Errorf("text = %q, must not hedge a failure we actually know about", km.text)
+	}
+}
+
+// TestRenderDispatchResult_ByteExactPerCell makes "the human strings are the
+// invariant" (ADR §2.3 / §7.4) a tested property rather than an asserted one: it
+// pins the byte-exact (ok, text) renderDispatchResult produces for every
+// (action ∈ {approve,kill,interrupt}) × (verdict) cell — including the new
+// DispatchRefusedTerminalState cells the design-review WARNING added, and the
+// kill destructive path §7.5 demanded a byte-diff for. The literal/fmt arms are
+// asserted as full literals; the noSurfaceText / unknownDeliveryText arms are
+// built from the same helpers with the ADR §7.4-documented arguments, pinning
+// that renderDispatchResult delegates to the right helper with the right args.
+func TestRenderDispatchResult_ByteExactPerCell(t *testing.T) {
+	// A fixed loop makes the helper-based arms deterministic: StallNone + zero
+	// BoundAt selects ambiguityRemedy's "attach (↵) or run `fleetops hooks
+	// install`" branch. renderDispatchResult reads only l.Project (not l.State),
+	// so one loop covers every cell.
+	l := domain.Loop{Project: "myproj", SessionID: "sess-abc", Stall: domain.StallNone}
+	boom := errors.New("boom")
+
+	cases := []struct {
+		action   string
+		verdict  actuate.DispatchVerdict
+		backend  string
+		err      error
+		wantOk   bool
+		wantText string
+	}{
+		// approve
+		{"approve", actuate.DispatchDelivered, "orca", nil, true, "approved myproj via orca"},
+		{"approve", actuate.DispatchRefusedTerminalState, "", nil, false, "this loop was killed — nothing to approve"},
+		{"approve", actuate.RefusedBackendUnavailable, "", nil, false, noSurfaceText(l, "approve manually: attach and press Enter")},
+		{"approve", actuate.RefusedNotFound, "", nil, false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"},
+		{"approve", actuate.DispatchDeliveryUnknown, "", nil, false, unknownDeliveryText("approve", l.Project, "the Enter", "a")},
+		{"approve", actuate.DispatchFailed, "", boom, false, "approve myproj failed: boom"},
+		// kill
+		{"kill", actuate.DispatchDelivered, "orca", nil, true, "killed myproj — state updates on next scan"},
+		{"kill", actuate.DispatchRefusedTerminalState, "", nil, true, "myproj already killed/gone — it will age out of the window"},
+		{"kill", actuate.RefusedBackendUnavailable, "", nil, false, noSurfaceText(l, "kill manually: type /exit in "+l.Project)},
+		{"kill", actuate.RefusedNotFound, "", nil, false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"},
+		{"kill", actuate.DispatchDeliveryUnknown, "", nil, false, unknownDeliveryText("kill", l.Project, `the "/exit"`, "k")},
+		{"kill", actuate.DispatchFailed, "", boom, false, "kill myproj failed: boom"},
+		// interrupt
+		{"interrupt", actuate.DispatchDelivered, "orca", nil, true, "interrupted myproj — resume with r"},
+		{"interrupt", actuate.DispatchRefusedTerminalState, "", nil, false, "this loop was killed — nothing to stop"},
+		{"interrupt", actuate.RefusedBackendUnavailable, "", nil, false, noSurfaceText(l, "stop manually: press Esc in "+l.Project)},
+		{"interrupt", actuate.RefusedNotFound, "", nil, false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"},
+		{"interrupt", actuate.DispatchDeliveryUnknown, "", nil, false, unknownDeliveryText("stop", l.Project, "the Esc", "p")},
+		{"interrupt", actuate.DispatchFailed, "", boom, false, "stop myproj failed: boom"},
+	}
+
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/%s", tc.action, tc.verdict), func(t *testing.T) {
+			res := actuate.DispatchResult{Verdict: tc.verdict, Backend: tc.backend, Err: tc.err, SessionID: l.SessionID}
+			ok, text := renderDispatchResult(res, l, tc.action)
+			if ok != tc.wantOk {
+				t.Errorf("ok = %v, want %v", ok, tc.wantOk)
+			}
+			if text != tc.wantText {
+				t.Errorf("text = %q, want %q", text, tc.wantText)
+			}
+		})
 	}
 }
 

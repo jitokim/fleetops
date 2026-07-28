@@ -245,3 +245,232 @@ for a verb with no Tier 2).
   a type — is exactly what makes the verdict enum machine-readable for free (roadmap
   §2.2): a distinction built to be honest to a human turns out to be the distinction
   an agent must branch on.
+
+## 7. Follow-up design: the tier1-only `Dispatch` seam
+
+This section discharges §3's "honest follow-up" and §4's not-line-verified item.
+The four sibling paths were line-verified on branch `jitokim/sibling-dispatch-policy`
+(cited `file:line` below). It is a design, not an implementation: no Go was written.
+Scope discipline is the same as the rest of this ADR — consolidate the inline
+skeleton the three tier1-only verbs already share, add no capability, preserve every
+human-visible string.
+
+### 7.1 Confirmed caller topology (line-verified)
+
+| path | actuator call | tier1-only? | resolve-failure branches | DeliveryUnknown | logs event | pre-resolve preconditions |
+|------|---------------|-------------|--------------------------|-----------------|------------|---------------------------|
+| `approveCmd` (`model.go:2143`) | `act.Approve()` (`:2164`) | yes (`:2154`) | `!backendAvailable`→`noSurfaceText` (`:2159`); `!found`→"no unambiguous claude surface … press Enter" (`:2162`) | yes (`:2167`→`unknownDeliveryText`) | `logActuationEvent` (`:2165/:2177`) | `StateKilled`→"nothing to approve" (`:2151`); **success side-effect**: `gate.DeleteMarkerIfTS` (`:2176`) |
+| `killCmd` (`model.go:3226`) | `act.Resume("/exit")` (`:3268`) | yes (`:3258`) | `!backendAvailable`→`noSurfaceText` (`:3263`); `!found`→"… type /exit" (`:3266`) | yes (`:3274`→`unknownDeliveryText`) | `logActuationEvent` (`:3269/:3288`) | `StateKilled\|\|StallGone`→ok=true no-op (`:3235`); `Driven`→engine-kill via `registry.MarkDriven`, bypasses actuation (`:3251`) |
+| `interruptCmd` (`model.go:3295`) | `act.Interrupt()` (`:3314`) | yes (`:3304`) | `!backendAvailable`→`noSurfaceText` (`:3309`); `!found`→"… press Esc" (`:3312`) | yes (`:3317`→`unknownDeliveryText`) | `logActuationEvent` (`:3315/:3322`) | `StateKilled`→"nothing to stop" (`:3301`) |
+| `autoRedrive429Cmd` (`model.go:3715`) | `redriveFn(...)` **Tier-2 direct** (`:3718`) | **no** | none — never resolves a Tier-1 surface | n/a (no host send) | inline `events.Append`, **`ActorAuto`** + attempt-numbered detail (`:3719`) | none (scheduled by 429 ceiling) |
+
+Every assumption in the task held. Two corrections/clarifications:
+
+- **The `!backendAvailable` vs `!found` split is real and load-bearing** across all
+  three tier1-only verbs, and Actuate's `RefusedNoSurface` genuinely cannot express
+  it: Actuate collapses both into "fall through to Tier 2" (`actuate.go:141-161`),
+  which is exactly the wrong move for a verb with no Tier 2. Confirmed.
+- **429 does NOT belong on `Actuate` as §3 claimed — it stays a separate caller.**
+  Verified `autoRedrive429Cmd` calls `redriveFn` directly (Tier-2), never resolving a
+  Tier-1 surface. Routing it through `Actuate` would (a) make it try **Tier 1 first**
+  (`Actuate` only skips Tier 1 for `StallGone`, and a rate-limited loop is not
+  necessarily `StallGone`) — i.e. start typing into a possibly-attended session, a
+  behavior change; (b) log `ActorHuman` via `LogEventFunc` where today it logs
+  `ActorAuto` with attempt-numbered detail; (c) gain nothing, because it has **no
+  policy branching to drift** — it is one `redriveFn` call plus ok/fail. It already
+  shares the `Redrive` primitive. §3's "the 429 path … does belong on `Actuate`"
+  should be softened to: *shares the `Redrive` primitive, but is Tier-2-direct +
+  `ActorAuto`, so it remains a separate caller.* (Note: `driveCmd` at `:3419` is a
+  second Tier-2-direct `ActorAuto` redrive with the same shape — neither is in scope
+  for the tier1-only seam.)
+
+So the tier1-only `Dispatch` seam covers **approve / kill / interrupt only**. 429 is
+out of scope on both counts (not tier1-only, and no inline policy to consolidate).
+
+### 7.2 What is shared vs. what stays with the caller
+
+The three tier1-only verbs share one skeleton, verbatim:
+
+```
+resolve → { !backendAvailable | !found } split → act.<method>() →
+          { ErrSendDeliveryUnknown | other err | ok } → logActuationEvent
+```
+
+That skeleton is the drift surface, and it is what `Dispatch` owns. What legitimately
+differs stays with the caller, exactly as ambiguity stays a caller precondition for
+`Actuate` (§2.2):
+
+- **Pre-resolve preconditions** — kill's `StallGone` no-op (`ok=true`) and its `Driven`
+  engine-kill. These emit verb-specific strings and even different ok-values, so they
+  are *not* a shared verdict — they are preconditions decided before the seam is
+  entered, mirroring §2.2. (`StateKilled` was originally listed here too, but the design
+  review promoted it into `Dispatch` as `DispatchRefusedTerminalState` — see §7.3 — so
+  it is now a shared verdict, not a caller precondition. Its verb-specific string is
+  reproduced by the renderer's terminal-state arm, so nothing human-visible changed.)
+- **approve's success side-effect** (`gate.DeleteMarkerIfTS`). Runs in the caller on a
+  `Delivered` verdict.
+- **All human strings** — stay in the TUI renderer (§2.3 invariant).
+
+### 7.3 The `Dispatch` method, request/result, and a method-specific verdict enum
+
+**Reuse the existing `Policy` struct.** `Dispatch` needs only `ResolveTarget` and
+`LogEvent`, both already on `Policy`; `Redrive` stays unused for this method. So the
+TUI's existing `actuationPolicy()` wiring covers `Dispatch` with no new seams.
+
+**Request/result — dedicated, minimal types (do not reuse `ActuationRequest`).**
+`ActuationRequest` carries `Prompt`, which no tier1-only verb sends (kill's `"/exit"`
+is a fixed internal payload of the kill verb). Carrying an always-empty `Prompt` is a
+latent trap. Prefer:
+
+```
+DispatchRequest{ Loop domain.Loop; Action string }   // Action ∈ {"approve","kill","interrupt"}
+DispatchResult{ Verdict DispatchVerdict; Tier, Backend string; Err error; SessionID string }
+```
+
+`Action` selects **both** the actuator method **and** the event label — putting the
+verb→method mapping in one place is itself anti-drift.
+
+**Introduce a method-specific `DispatchVerdict` enum — do NOT extend the `Verdict`
+enum.** The justification is *not* that the two outcome spaces are disjoint — they
+overlap (both carry a "delivered" and a "delivery-unknown" case, and both refuse a
+terminal-state loop). It is two concrete properties a merged enum would lose:
+1. **Switch totality.** A single merged enum would hold ~8 distinct values
+   (`Delivered` / `DeliveredTier2` / `RefusedTerminalState` / `RefusedNoSurface` /
+   `DeliveryUnknown` plus Dispatch's `RefusedBackendUnavailable` / `RefusedNotFound` /
+   `DispatchFailed`), forcing *each* renderer `switch` to handle values that can never
+   occur for its method — Actuate's degrade verdicts in the Dispatch renderer, the
+   resolve-split in the Actuate renderer. Two focused enums keep each `switch` total,
+   so a missed case is a bug in the enum's own method, not noise from the other's.
+2. **The resolve-failure refinement.** `Dispatch` must split a resolve failure into
+   `RefusedBackendUnavailable` vs `RefusedNotFound`; Actuate's `RefusedNoSurface`
+   structurally cannot carry that distinction (it collapses both into a Tier 2
+   fall-through), which is exactly the wrong move for a verb that must never
+   headlessly re-drive (a kill must not re-send `/exit`).
+The shared PRIMITIVES (the six sentinels, `LogEventFunc`, `ResolveTargetFunc`) and the
+terminal-state guard are reused; only the verdict TAXONOMY is method-specific.
+
+```
+DispatchVerdict:
+  DispatchDelivered             // act.<method>() returned nil
+  DispatchRefusedTerminalState  // l.State == StateKilled; refused BEFORE resolve, nothing logged
+  RefusedBackendUnavailable     // resolve: !backendAvailable  → noSurfaceText(...)
+  RefusedNotFound               // resolve: found == false      → "no unambiguous claude surface …"
+  DispatchDeliveryUnknown       // act.<method>() → ErrSendDeliveryUnknown; Err set; NOT retried
+  DispatchFailed                // act.<method>() → any other error; Err carries the cause
+```
+
+Six values, one per honesty outcome. `DispatchRefusedTerminalState` is the design
+review's WARNING resolution (2026-07-29): the terminal-state guard moved *into*
+`Dispatch` (mirroring `Actuate`), so the destructive kill verb is not structurally
+weaker than the send path — a headless `Dispatch{Action:"kill"}` on a `StateKilled`
+loop is refused inside the seam, not silently re-dispatched. **Only `StateKilled` is
+guarded, not `StateFailed`**: killing a governor-stopped (`StateFailed`) loop is a
+supported, reachable path (the inject key-guard directs the operator to do exactly
+that), so guarding it would change behavior. The prefix (`DispatchDelivered`,
+`DispatchDeliveryUnknown`, `DispatchRefusedTerminalState`) disambiguates the values
+that collide with `Verdict`'s constants; the identifiers must differ because the two
+enums live in one package. No `DeliveredTier2` / degrade (these verbs have no Tier 2 —
+the invariant that a kill must never headlessly re-drive `/exit`). `Err` is a `control`
+sentinel or nil, same discipline as `ActuationResult`.
+
+**One shared `Dispatch(verb)`, not per-action wrappers.** Signature:
+
+```
+func (p Policy) Dispatch(req DispatchRequest) DispatchResult
+```
+
+Internally an `Action`→`func(control.Actuator) error` selector: `"approve"`→`Approve`,
+`"kill"`→`Resume("/exit")`, `"interrupt"`→`Interrupt`, with a defensive default. Per-
+action wrappers would either re-duplicate the skeleton or each be a one-liner delegating
+here anyway; the single method matches `Actuate`'s shape and keeps the verb→method map
+in one spot.
+
+### 7.4 How the four paths map, and how each verdict renders to today's exact string
+
+Add one pure formatter `renderDispatchResult(res, l, action)` mirroring
+`renderActuationResult` (`model.go:1904`). It keeps `noSurfaceText`,
+`unknownDeliveryText`, and `ambiguityRemedy` in the TUI (they must not move — §2.3;
+`noSurfaceText` calls the TUI-resident `ambiguityRemedy`). It switches on the verdict and,
+per verb, reproduces the current line:
+
+| verdict | approve | kill | interrupt |
+|---------|---------|------|-----------|
+| `DispatchDelivered` | `"approved %s via %s"` | `"killed %s — state updates on next scan"` | `"interrupted %s — resume with r"` |
+| `DispatchRefusedTerminalState` (ok) | `false, "this loop was killed — nothing to approve"` | `true, "%s already killed/gone — it will age out of the window"` | `false, "this loop was killed — nothing to stop"` |
+| `RefusedBackendUnavailable` | `noSurfaceText(l,"approve manually: attach and press Enter")` | `noSurfaceText(l,"kill manually: type /exit in "+Project)` | `noSurfaceText(l,"stop manually: press Esc in "+Project)` |
+| `RefusedNotFound` | "…press Enter" | "…type /exit" | "…press Esc" |
+| `DispatchDeliveryUnknown` | `unknownDeliveryText("approve",…,"the Enter","a")` | `unknownDeliveryText("kill",…,'the "/exit"',"k")` | `unknownDeliveryText("stop",…,"the Esc","p")` |
+| `DispatchFailed` | `"approve %s failed: %v"` | `"kill %s failed: %v"` | `"stop %s failed: %v"` |
+
+The `DispatchRefusedTerminalState` row reproduces the exact `StateKilled` strings and
+ok-values the three callers used to emit inline — note kill's is the `ok=true`
+"already killed/gone" no-op it shares with the caller-side `StallGone` branch (§7.2).
+
+Per-path mapping:
+
+- **`interruptCmd`** → drop the caller-side `StateKilled` guard (now inside `Dispatch`);
+  replace resolve→split→`Interrupt`→log with `Dispatch{Action:"interrupt"}`; render.
+- **`approveCmd`** → drop the caller-side `StateKilled` guard (now inside `Dispatch`);
+  on `DispatchDelivered`, run `gate.DeleteMarkerIfTS` then render; else render. (See §7.6
+  for the one ordering nuance.)
+- **`killCmd`** → keep the `StallGone` no-op and the `Driven` engine-kill branch as
+  caller preconditions; the `StateKilled` half of the former `StateKilled||StallGone`
+  guard moves into `Dispatch`. For a non-`Driven` live loop, replace the Tier-1 block
+  with `Dispatch{Action:"kill"}`; render. **Ordering nuance (unreachable):** with
+  `StateKilled` now refused inside `Dispatch` (after the caller's `Driven` check rather
+  than before it, as the old combined guard was), a `StateKilled` + `Driven` loop would
+  take the `Driven` engine-kill branch instead of the "already killed/gone" no-op. This
+  is unreachable in practice — the `k` keypress guard blocks `StateKilled` entirely, and
+  the in-`killCmd` guard was always documented as defense-in-depth against a stale
+  dispatch — so no reachable behavior changes; it is recorded here for honesty.
+- **`autoRedrive429Cmd`** → **no change** (§7.1).
+
+The three `*ResultMsg` types, the preconditions, and all prose helpers stay put. Only
+the resolve→dispatch→log skeleton moves — the same "re-route where the string is chosen,
+never what it says" move §2.3 made for the send path.
+
+### 7.5 Migration order & risk
+
+1. **`interrupt` first (safest).** Non-destructive (Esc leaves the process alive),
+   fewest preconditions (`StateKilled` only), no success side-effect. Proves the seam.
+2. **`approve` next.** Adds the `gate.DeleteMarkerIfTS` success side-effect — the one
+   ordering nuance to verify (§7.6). Still non-destructive.
+3. **`kill` last (riskiest — destructive).** `/exit` is destructive; it has the most
+   preconditions (`StateKilled`/`StallGone` no-op + `Driven` engine branch); and its
+   `DeliveryUnknown` case is the site that *motivated* the whole carve-out (`:3271-3273`)
+   — a wrong "failed" invites a second `/exit`, the double-send `ErrSendDeliveryUnknown`
+   exists to prevent. Migrate it only after the seam is proven on the other two, and
+   diff the rendered strings byte-for-byte.
+
+The `k`/`x` two-press destructive-confirm gate stays in `Model` (§2.4, roadmap §2.4).
+`Dispatch` is only the **post-confirm** actuation; the gate is decided upstream and
+`Dispatch` never sees it — exactly as ambiguity is decided upstream of `Actuate`.
+
+### 7.6 Honesty ledger (§7)
+
+**Verified live (read-only, branch `jitokim/sibling-dispatch-policy`):**
+- All four paths and their `file:line` in §7.1's table, including the `!backendAvailable`
+  vs `!found` split, the `ErrSendDeliveryUnknown` branch, and `logActuationEvent` calls
+  in each of the three tier1-only verbs.
+- `autoRedrive429Cmd` is Tier-2-direct (`redriveFn`, `:3718`), logs `ActorAuto` inline
+  (`:3719`), never resolves a Tier-1 surface — the basis for excluding it from the seam
+  and for the §3 correction. `driveCmd` (`:3419`) is a second such caller.
+- `Actuate` collapses both resolve-failure kinds into Tier-2 fall-through
+  (`actuate.go:141-161`), confirming `RefusedNoSurface` cannot carry the split.
+- `Policy` exposes `ResolveTarget`/`LogEvent`/`Redrive` (`actuate.go:114-119`);
+  `actuationPolicy()` already binds them (`model.go:1882`).
+- `Actuator` has `Approve()`/`Interrupt()`/`Resume()`/`Tier()`/`Backend()`
+  (`control/actuator.go:24-38`), so the verb→method selector is expressible.
+
+**Assumed / not verified (verify at implementation start):**
+- That `renderDispatchResult` can reproduce every string byte-for-byte — asserted from
+  reading the call sites, not proven by a running diff.
+- **One real behavior nuance in approve:** today the order is `Approve()` →
+  `DeleteMarkerIfTS` → `logActuationEvent(nil)` (`:2164-2177`). With `Dispatch` logging
+  the success event internally, the caller's `DeleteMarkerIfTS` runs *after* the log,
+  reversing marker-vs-event order. This is believed immaterial (the event is best-effort;
+  the marker CAS is keyed on `GateTS`, and nothing reads the event to decide the marker),
+  but it is the single non-string-identical change and must be confirmed, or preserved by
+  having `approveCmd` delete the marker before calling a non-logging `Dispatch` variant.
+- Whether any test double relies on the exact call order of resolve/dispatch/log within
+  these three cmds (the send-path migration did not, but these are separate tests).
