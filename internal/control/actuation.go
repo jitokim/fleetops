@@ -127,10 +127,8 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
 		// Tier 1a — session-unique tty. Probe every available TTYLocator
 		// backend; first hit wins (no ambiguity guard needed).
-		for _, c := range avail {
-			if t, ok := tierOneA(c, entry.TTY); ok {
-				return boundController{ctrl: c, target: t}, true, true
-			}
+		if c, t, ok := tierOneAAcross(avail, entry.TTY); ok {
+			return boundController{ctrl: c, target: t}, true, true
 		}
 		// Tier 1h — the host terminal writes to the session in place, keyed by
 		// the registry's host_app + window_id.
@@ -183,6 +181,36 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 	// Tier 1b — cwd is many-to-one, so probe ALL available backends and count
 	// matches; >=2 distinct backends matching is cross-backend ambiguity and
 	// must refuse, never silently pick one.
+	if c, t, ok := tierOneBAcross(avail, projectDir); ok {
+		return boundController{ctrl: c, target: t}, true, true
+	}
+	return nil, true, false
+}
+
+// tierOneAAcross runs Tier 1a (the session-unique tty locate) across the
+// available backends: the first TTYLocator hit wins, with NO ambiguity guard
+// because a tty is session-unique by construction (see ResolveActuationTarget's
+// Tier 1a doc). Extracted so the tab-title resolver reuses the EXACT same
+// locate discipline as typed actuation rather than re-spelling it (DRY: if the
+// tty rule changes, both move together).
+func tierOneAAcross(avail []Controller, tty string) (Controller, Target, bool) {
+	for _, c := range avail {
+		if t, ok := tierOneA(c, tty); ok {
+			return c, t, true
+		}
+	}
+	return nil, Target{}, false
+}
+
+// tierOneBAcross runs Tier 1b (the cwd LocateClaude probe) across the available
+// backends, REFUSING on cross-backend ambiguity: because cwd is many-to-one it
+// counts matches and returns not-found when >=2 DISTINCT backends each locate a
+// claude surface for the same projectDir — the cross-backend analogue of
+// LocateClaude's own ">1 match" refusal. Exactly one match → use it; zero or
+// >=2 → not found. Extracted alongside tierOneAAcross for the same DRY reason
+// (see its doc) — this is the single home of the fail-closed ambiguity rule
+// both actuation and tab-titling depend on.
+func tierOneBAcross(avail []Controller, projectDir string) (Controller, Target, bool) {
 	var matchedCtrl Controller
 	var matchedTarget Target
 	matches := 0
@@ -193,9 +221,59 @@ func ResolveActuationTarget(sessionsDir, sessionID, projectDir string) (act Actu
 		}
 	}
 	if matches == 1 {
-		return boundController{ctrl: matchedCtrl, target: matchedTarget}, true, true
+		return matchedCtrl, matchedTarget, true
 	}
-	return nil, true, false
+	return nil, Target{}, false
+}
+
+// ResolveTabTitler resolves the terminal surface a loop's tab-title write
+// should land on, reusing ResolveActuationTarget's SAME fail-closed locate
+// discipline — Tier 1a (session-unique tty) then Tier 1b (cwd LocateClaude
+// across every backend, REFUSING on cross-backend ambiguity) — but returning a
+// TabTitler + its Target instead of an Actuator. A tab rename writes terminal
+// CHROME, not the session, so it must not travel the send/keystroke Actuator
+// seam (pivot §5.1: borrow the discipline, not the types).
+//
+// Tier 1h (host-send) is deliberately OMITTED: a bare host window has no cmux
+// tab to rename, and cmux is the only TabTitler today — so there is nothing for
+// a host-send tier to resolve to here.
+//
+// ok=false — and the caller MUST skip, never rename a guessed tab — when: no
+// backend is available, the cwd mapping is ambiguous (>=2 backends match), or
+// the resolved backend does not implement TabTitler (tmux/orca ⇒ no-op). Same
+// fail-closed posture as ResolveActuationTarget.
+func ResolveTabTitler(sessionsDir, sessionID, projectDir string) (TabTitler, Target, bool) {
+	ctrl, target, ok := resolveClaudeSurface(sessionsDir, sessionID, projectDir)
+	if !ok {
+		return nil, Target{}, false
+	}
+	titler, ok := ctrl.(TabTitler)
+	if !ok {
+		return nil, Target{}, false // resolved backend can't title tabs (tmux/orca) — no-op
+	}
+	return titler, target, true
+}
+
+// resolveClaudeSurface is the (Controller, Target) resolution core behind
+// tab-titling: Tier 1a (tty) then Tier 1b (cwd, ambiguity-refusing) from
+// ResolveActuationTarget, WITHOUT Tier 1h (host-send has no Controller/Target)
+// and WITHOUT wrapping the result in an Actuator. It shares the exact tier
+// helpers ResolveActuationTarget uses (tierOneAAcross/tierOneBAcross), so the
+// fail-closed locate rules cannot drift between the two paths; it stays a
+// SEPARATE function rather than being folded into ResolveActuationTarget
+// because that function's Actuator return and interleaved Tier 1h branch are
+// load-bearing for typed actuation and must not change shape.
+func resolveClaudeSurface(sessionsDir, sessionID, projectDir string) (Controller, Target, bool) {
+	avail := availableBackends()
+	if entry, err := sessions.ReadSession(sessionsDir, sessionID); err == nil && entry.TTY != "" && pidTTYFn(entry.PID) == normalizeTTY(entry.TTY) {
+		if c, t, ok := tierOneAAcross(avail, entry.TTY); ok {
+			return c, t, true
+		}
+	}
+	if len(avail) == 0 {
+		return nil, Target{}, false
+	}
+	return tierOneBAcross(avail, projectDir)
 }
 
 // availableBackends returns the backends usable right now, in the shared

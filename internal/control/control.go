@@ -210,6 +210,30 @@ type TTYLocator interface {
 	LocateByTTY(tty string) (Target, bool)
 }
 
+// TabTitler is another OPTIONAL capability (same narrow-interface idiom as
+// WorktreeSpawner/TerminalOpener/TTYLocator — don't widen Controller with a
+// method every backend must stub): write a loop's presentation state onto the
+// TAB STRIP of the multiplexer hosting it, so a human watching the tab bar
+// (not the fleetops TUI) still sees state + goal. The tab itself becomes an
+// output surface for what fleetops already knows.
+//
+// This is terminal CHROME — a write SIDE-EFFECT on a surface fleetops did NOT
+// create — so it is the SAME wrong-pane hazard class as typed actuation, and
+// callers MUST treat it that way: gate it behind an opt-in flag and resolve the
+// target through the SAME fail-closed locate/ambiguity refusal (see
+// ResolveTabTitler), never a guessed tab. It deliberately does NOT route through
+// the Actuator seam (send/keystroke verbs): a rename touches the window chrome,
+// not the session, so it borrows actuation's discipline but not its types.
+//
+// cmux implements it (`cmux rename-tab`); tmux/iTerm2/orca are interface-
+// sufficient follow-ups and deliberately do NOT implement it today, so
+// ResolveTabTitler's type-assert simply yields a no-op for them (absent ⇒ skip).
+// Callers type-assert (ctrl.(TabTitler)), exactly like the other optional
+// capabilities.
+type TabTitler interface {
+	SetTabTitle(t Target, title string) error
+}
+
 // backends is the ordered, install-preference backend list every resolver in
 // this package shares — orca preferred (the user's own environment), cmux then
 // tmux as fallbacks. Extracted to a single package var (rather than a literal
