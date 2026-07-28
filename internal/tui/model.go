@@ -1927,6 +1927,82 @@ func renderActuationResult(res actuate.ActuationResult, l domain.Loop, successVe
 	}
 }
 
+// renderDispatchResult maps a structured actuate.DispatchVerdict back to the
+// exact human-facing status line the tier1-only verbs (approve/kill/interrupt)
+// used to build inline. Like renderActuationResult it re-routes WHERE the
+// string is chosen (from the verdict), never WHAT it says — the wording is the
+// behavior-preserving invariant (ADR §2.3 / §7.4). The TUI-resident prose
+// helpers noSurfaceText and unknownDeliveryText stay here; they must not move.
+//
+// action is the verb ("approve"/"kill"/"interrupt"), which selects the display
+// vocabulary — every row differs per verb (e.g. Delivered says "approved" but
+// DeliveryUnknown/Failed use the "approve"/"stop" event stems), so the switch
+// keys on action first, verdict second, keeping each verb's render contract
+// total and readable. The DispatchRefusedTerminalState arm reproduces the exact
+// StateKilled strings (and ok-values) the three callers used to emit inline
+// before the terminal-state guard moved into Dispatch — kill's is the ok=true
+// "already killed/gone" no-op it shares with the caller-side StallGone branch.
+// Each verdict switch is exhaustive on DispatchVerdict: a future verdict added
+// to the enum but not to a verb here panics loudly (in tests) instead of
+// silently rendering as "failed".
+func renderDispatchResult(res actuate.DispatchResult, l domain.Loop, action string) (ok bool, text string) {
+	switch action {
+	case "approve":
+		switch res.Verdict {
+		case actuate.DispatchDelivered:
+			return true, fmt.Sprintf("approved %s via %s", l.Project, res.Backend)
+		case actuate.DispatchRefusedTerminalState:
+			return false, "this loop was killed — nothing to approve"
+		case actuate.RefusedBackendUnavailable:
+			return false, noSurfaceText(l, "approve manually: attach and press Enter")
+		case actuate.RefusedNotFound:
+			return false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"
+		case actuate.DispatchDeliveryUnknown:
+			return false, unknownDeliveryText("approve", l.Project, "the Enter", "a")
+		case actuate.DispatchFailed:
+			return false, fmt.Sprintf("approve %s failed: %v", l.Project, res.Err)
+		default:
+			panic(fmt.Sprintf("renderDispatchResult: unhandled verdict %s for action %q", res.Verdict, action))
+		}
+	case "kill":
+		switch res.Verdict {
+		case actuate.DispatchDelivered:
+			return true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)
+		case actuate.DispatchRefusedTerminalState:
+			return true, fmt.Sprintf("%s already killed/gone — it will age out of the window", l.Project)
+		case actuate.RefusedBackendUnavailable:
+			return false, noSurfaceText(l, "kill manually: type /exit in "+l.Project)
+		case actuate.RefusedNotFound:
+			return false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"
+		case actuate.DispatchDeliveryUnknown:
+			return false, unknownDeliveryText("kill", l.Project, `the "/exit"`, "k")
+		case actuate.DispatchFailed:
+			return false, fmt.Sprintf("kill %s failed: %v", l.Project, res.Err)
+		default:
+			panic(fmt.Sprintf("renderDispatchResult: unhandled verdict %s for action %q", res.Verdict, action))
+		}
+	case "interrupt":
+		switch res.Verdict {
+		case actuate.DispatchDelivered:
+			return true, fmt.Sprintf("interrupted %s — resume with r", l.Project)
+		case actuate.DispatchRefusedTerminalState:
+			return false, "this loop was killed — nothing to stop"
+		case actuate.RefusedBackendUnavailable:
+			return false, noSurfaceText(l, "stop manually: press Esc in "+l.Project)
+		case actuate.RefusedNotFound:
+			return false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"
+		case actuate.DispatchDeliveryUnknown:
+			return false, unknownDeliveryText("stop", l.Project, "the Esc", "p")
+		case actuate.DispatchFailed:
+			return false, fmt.Sprintf("stop %s failed: %v", l.Project, res.Err)
+		default:
+			panic(fmt.Sprintf("renderDispatchResult: unhandled verdict %s for action %q", res.Verdict, action))
+		}
+	default:
+		return false, fmt.Sprintf("%s %s failed: %v", action, l.Project, res.Err)
+	}
+}
+
 // resumeCmd re-sends a stalled loop's LAST USER PROMPT to the terminal surface
 // hosting it, via whichever multiplexer backend (orca/cmux/tmux) is available.
 // It's a thin wrapper over sendPromptCmd: its only prompt-specific work is
@@ -2142,40 +2218,30 @@ func takeOverCmd(l domain.Loop) tea.Cmd {
 // pattern as resumeCmd/attachCmd.
 func approveCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
-		// fix/killed-state: defense in depth — the "a" keypress guard
-		// (Update) already requires StateGate, which a killed loop can
-		// never be, so this is currently unreachable via the TUI; kept
-		// here anyway so a future change to that guard can't accidentally
-		// let a killed loop reach a real actuation attempt without an
-		// explicit, sensible refusal.
-		if l.State == domain.StateKilled {
-			return approveResultMsg{false, "this loop was killed — nothing to approve"}
+		// fix/killed-state: the StateKilled terminal-state refusal now lives
+		// inside actuate.Dispatch (defense in depth against a stale dispatch —
+		// the "a" keypress guard already requires StateGate, which a killed loop
+		// can never be). The renderer's DispatchRefusedTerminalState arm
+		// reproduces the exact "nothing to approve" refusal.
+		// Tier 1 only (tty → host send → cwd) — approving a gate has no headless
+		// Tier-2 equivalent (there's no "press Enter" over `claude --resume -p`;
+		// that starts a brand new turn, not an in-place keypress). The resolve →
+		// split → act → log skeleton lives in actuate.Dispatch (ADR §7); it never
+		// falls through to a re-drive.
+		res := actuationPolicy().Dispatch(actuate.DispatchRequest{Loop: l, Action: "approve"})
+		if res.Verdict == actuate.DispatchDelivered {
+			// Compare-and-swap delete: only remove the marker THIS decision was
+			// based on (l.GateTS) — a plain delete-by-name could destroy a BRAND
+			// NEW marker that landed between this loop's scan snapshot and this
+			// approve call (see gate.DeleteMarkerIfTS). Runs on delivery as a
+			// caller-owned success side-effect (ADR §7.2). Dispatch already
+			// logged the success event; this CAS delete is keyed on GateTS and
+			// nothing reads the event to decide the marker, so the now-after-log
+			// order is immaterial (ADR §7.6).
+			gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
 		}
-		// Tier 1 only (tty → host send → cwd) — approving a gate has no headless Tier-2
-		// equivalent (there's no "press Enter" over `claude --resume -p`;
-		// that starts a brand new turn, not an in-place keypress).
-		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
-		if !backendAvailable {
-			return approveResultMsg{false, noSurfaceText(l, "approve manually: attach and press Enter")}
-		}
-		if !found {
-			return approveResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Enter"}
-		}
-		if err := act.Approve(); err != nil {
-			logActuationEvent(l, "approve", act.Tier(), err)
-			// Unknown delivery is not a failure — see unknownDeliveryText.
-			if errors.Is(err, control.ErrSendDeliveryUnknown) {
-				return approveResultMsg{false, unknownDeliveryText("approve", l.Project, "the Enter", "a")}
-			}
-			return approveResultMsg{false, fmt.Sprintf("approve %s failed: %v", l.Project, err)}
-		}
-		// Compare-and-swap delete: only remove the marker THIS decision was
-		// based on (l.GateTS) — a plain delete-by-name could destroy a BRAND
-		// NEW marker that landed between this loop's scan snapshot and this
-		// approve call (see gate.DeleteMarkerIfTS).
-		gate.DeleteMarkerIfTS(gate.GatesDir(), l.SessionID, l.GateTS)
-		logActuationEvent(l, "approve", act.Tier(), nil)
-		return approveResultMsg{true, fmt.Sprintf("approved %s via %s", l.Project, act.Backend())}
+		ok, text := renderDispatchResult(res, l, "approve")
+		return approveResultMsg{ok, text}
 	}
 }
 
@@ -3228,11 +3294,15 @@ func killCmd(l domain.Loop) tea.Cmd {
 		// SAFETY: same reasoning as resumeCmd's StallGone guard — if the
 		// process is already gone, there's nothing to send "/exit" into
 		// (and doing so anyway risks typing it into a bare shell instead).
-		// fix/killed-state: belt-and-suspenders mirror of the "k" keypress
-		// guard (Update) — StateKilled reaching here at all would only
-		// happen via a stale dispatch, but the discipline in this file is
-		// every guard gets re-checked at the actual dispatch site too.
-		if l.State == domain.StateKilled || l.Stall == domain.StallGone {
+		// This StallGone no-op (ok=true) stays a caller precondition; it is NOT
+		// a terminal-state refusal and so cannot be a shared Dispatch verdict.
+		// The sibling StateKilled refusal (which used to share this branch and
+		// its exact string) now lives inside actuate.Dispatch's terminal-state
+		// guard — reproduced byte-for-byte by the renderer's
+		// DispatchRefusedTerminalState arm. Both are unreachable via the "k"
+		// keypress guard (Update), which already blocks StateKilled and
+		// StallGone; they remain here/in-Dispatch as defense in depth.
+		if l.Stall == domain.StallGone {
 			return killResultMsg{true, fmt.Sprintf("%s already killed/gone — it will age out of the window", l.Project)}
 		}
 		// feat/engine-provenance (design doc §4's kill adapter): a Driven
@@ -3256,37 +3326,24 @@ func killCmd(l domain.Loop) tea.Cmd {
 			return killResultMsg{true, fmt.Sprintf("killed %s — Driven cleared, state updates on next scan", l.Project)}
 		}
 		// Tier 1 only (tty → host send → cwd) — killing has no headless Tier-2
-		// equivalent (there's no live conversation left to type "/exit"
-		// into via a fresh --resume -p turn).
-		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
-		if !backendAvailable {
-			return killResultMsg{false, noSurfaceText(l, "kill manually: type /exit in "+l.Project)}
-		}
-		if !found {
-			return killResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: type /exit"}
-		}
-		if err := act.Resume("/exit"); err != nil {
-			logActuationEvent(l, "kill", act.Tier(), err)
-			// Unknown delivery is not a failure — see unknownDeliveryText.
-			// This is the site that motivated the distinction: "kill failed"
-			// reads as "press k again," and a second "/exit" into a session
-			// that already got one is the double-send this guards.
-			if errors.Is(err, control.ErrSendDeliveryUnknown) {
-				return killResultMsg{false, unknownDeliveryText("kill", l.Project, `the "/exit"`, "k")}
-			}
-			return killResultMsg{false, fmt.Sprintf("kill %s failed: %v", l.Project, err)}
-		}
-		// fix/killed-state: the event is written HERE, immediately once
-		// the "/exit" keystroke is confirmed sent — not once the process
-		// has actually exited (which happens asynchronously, outside this
-		// call's control). That's exactly what lets the NEXT scan's
-		// mostRecentActuationIsKill see a kill on record and derive
-		// StateKilled as soon as the process is confirmed gone — the
-		// status line deliberately does NOT optimistically set local model
-		// state itself (that would be a fake, unverified state the next
-		// scan could immediately contradict).
-		logActuationEvent(l, "kill", act.Tier(), nil)
-		return killResultMsg{true, fmt.Sprintf("killed %s — state updates on next scan", l.Project)}
+		// equivalent (there's no live conversation left to type "/exit" into via
+		// a fresh --resume -p turn), so a resolve miss must NEVER fall through to
+		// a re-drive: actuate.Dispatch has no Tier 2 at all (ADR §7). The kill
+		// event is written by Dispatch on a confirmed send (via the injected
+		// logActuationEvent) — immediately once the "/exit" keystroke is sent,
+		// not once the process has actually exited (which happens asynchronously,
+		// outside this call's control). That's exactly what lets the NEXT scan's
+		// mostRecentActuationIsKill see a kill on record and derive StateKilled
+		// as soon as the process is confirmed gone — the status line deliberately
+		// does NOT optimistically set local model state itself (that would be a
+		// fake, unverified state the next scan could immediately contradict).
+		//
+		// DispatchDeliveryUnknown is the case that motivated the whole carve-out
+		// here: "kill failed" reads as "press k again," and a second "/exit" into
+		// a session that already got one is the double-send it guards.
+		res := actuationPolicy().Dispatch(actuate.DispatchRequest{Loop: l, Action: "kill"})
+		ok, text := renderDispatchResult(res, l, "kill")
+		return killResultMsg{ok, text}
 	}
 }
 
@@ -3294,33 +3351,20 @@ func killCmd(l domain.Loop) tea.Cmd {
 // process — the loop stays alive, resumable with r.
 func interruptCmd(l domain.Loop) tea.Cmd {
 	return func() tea.Msg {
-		// fix/killed-state: defense in depth — the "p" keypress guard
-		// (Update) already requires Running/Gate, which a killed loop can
-		// never be, so this is currently unreachable via the TUI; kept
-		// here anyway, same reasoning as approveCmd's mirror check.
-		if l.State == domain.StateKilled {
-			return interruptResultMsg{false, "this loop was killed — nothing to stop"}
-		}
-		// Tier 1 only (tty → host send → cwd) — interrupting has no headless Tier-2
-		// equivalent (there's no in-flight turn to interrupt via a fresh
-		// --resume -p call; that would start a brand new turn instead).
-		act, backendAvailable, found := resolveActuationTargetFn(sessionsDirFn(), l.SessionID, l.ProjectDir)
-		if !backendAvailable {
-			return interruptResultMsg{false, noSurfaceText(l, "stop manually: press Esc in "+l.Project)}
-		}
-		if !found {
-			return interruptResultMsg{false, "no unambiguous claude surface — attach (↵) and act manually: press Esc"}
-		}
-		if err := act.Interrupt(); err != nil {
-			logActuationEvent(l, "interrupt", act.Tier(), err)
-			// Unknown delivery is not a failure — see unknownDeliveryText.
-			if errors.Is(err, control.ErrSendDeliveryUnknown) {
-				return interruptResultMsg{false, unknownDeliveryText("stop", l.Project, "the Esc", "p")}
-			}
-			return interruptResultMsg{false, fmt.Sprintf("stop %s failed: %v", l.Project, err)}
-		}
-		logActuationEvent(l, "interrupt", act.Tier(), nil)
-		return interruptResultMsg{true, fmt.Sprintf("interrupted %s — resume with r", l.Project)}
+		// fix/killed-state: the StateKilled terminal-state refusal now lives
+		// inside actuate.Dispatch (defense in depth against a stale dispatch —
+		// the "p" keypress guard already requires Running/Gate, which a killed
+		// loop can never be). The renderer's DispatchRefusedTerminalState arm
+		// reproduces the exact "nothing to stop" refusal.
+		// Tier 1 only (tty → host send → cwd) — interrupting has no headless
+		// Tier-2 equivalent (there's no in-flight turn to interrupt via a fresh
+		// --resume -p call; that would start a brand new turn instead). The
+		// resolve → split → act → log skeleton lives in actuate.Dispatch, which
+		// never falls through to a re-drive; the renderer maps its verdict back
+		// to this verb's exact strings. See ADR §7.
+		res := actuationPolicy().Dispatch(actuate.DispatchRequest{Loop: l, Action: "interrupt"})
+		ok, text := renderDispatchResult(res, l, "interrupt")
+		return interruptResultMsg{ok, text}
 	}
 }
 
