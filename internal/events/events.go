@@ -135,9 +135,17 @@ var maxFileSize int64 = 5 * 1024 * 1024
 // for the SAME session into rotating at once, clobbering the ".1" backup
 // (silent audit-data loss, the exact failure mode a history log must not
 // have). appendMu serializes the whole rotate-then-write span per process.
+//
 // Cross-PROCESS writers (e.g. two fleetops cockpits pointed at the same
-// ~/.fleetops/history) remain unserialized — out of scope for this fix
-// (would need a real file lock, e.g. flock, not just an in-process mutex).
+// ~/.fleetops/history) were the documented gap here: appendMu is in-process
+// only, and two cockpits could race the same stat-then-rename and clobber the
+// ".1" backup just as two goroutines once could. That gap is now closed by a
+// real advisory file lock (flock(2)) on a per-session lockfile, held across
+// the rotate-then-write span — see acquireHistoryLock (flock_unix.go, with a
+// documented no-op fallback in flock_other.go for platforms without flock).
+// appendMu is kept as the in-process fast path: it means only one goroutine
+// per process ever contends for the flock, so the flock only ever arbitrates
+// between DISTINCT processes.
 var appendMu sync.Mutex
 
 func Append(dir string, ev Event) error {
@@ -151,6 +159,19 @@ func Append(dir string, ev Event) error {
 		return err
 	}
 	path := filepath.Join(dir, ev.SessionID+".jsonl")
+
+	// Cross-process guard: hold an flock on the session's dedicated lockfile
+	// across BOTH the rotation and the write, so a second process cannot
+	// rotate/write the same session's history concurrently. Best-effort like
+	// the rest of Append — a lock error is returned, never panicked. See
+	// acquireHistoryLock for why the lock is on ".lock", not the history file
+	// (rotation renames the history file; flock follows the inode, not path).
+	releaseLock, err := acquireHistoryLock(path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
 	if err := rotateIfOversize(path); err != nil {
 		return err
 	}
