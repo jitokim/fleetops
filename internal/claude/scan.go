@@ -722,6 +722,11 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 	// "wrote recently" (see classifyLoop) — a loop that finished its turn a
 	// second ago is idle, not running.
 	buf, haveTail := readTail(path, tailBytes)
+	// outstanding is parsed ONCE here (when there's a tail) and shared by both
+	// the classify path and applySubagentDelegation below, so the ~24KB tail is
+	// walked for Agent launches once per scan, not twice. Nil when !haveTail —
+	// applySubagentDelegation then no-ops.
+	var outstanding []agentLaunch
 	if haveTail {
 		if text, ok := lastAssistantTextFromTail(buf); ok {
 			l.LastText = text
@@ -737,7 +742,8 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 				l.LastText = text
 			}
 		}
-		l.State, l.Stall = classifyLoop(buf, idleFor)
+		outstanding = outstandingAgentLaunches(buf)
+		l.State, l.Stall = classifyLoopWith(buf, idleFor, outstanding)
 	} else if idleFor >= IdleThreshold {
 		l.State, l.Stall = domain.StateStalled, domain.StallNoOutput
 	}
@@ -788,6 +794,16 @@ func loopFromLog(path string, fi os.FileInfo, now time.Time, gatesDir string, pe
 			l.GateOptions = options
 		}
 	}
+
+	// Subagent visibility: a loop delegating to a child (foreground or
+	// background Agent launch) is doing work the main tail can't see — hold it
+	// Running while a child is live and name what the child is doing in
+	// LastText. Runs AFTER the gate checks above so the enrichment sees the
+	// FULLY RESOLVED state: a loop that turned out to be a Gate or is rate-
+	// limited must not carry a stale "delegating" LastText (see
+	// applySubagentDelegation). No-op unless the tail showed an outstanding
+	// launch, so the common (non-delegating) loop pays nothing.
+	applySubagentDelegation(&l, path, now, outstanding)
 	return l
 }
 
@@ -845,49 +861,58 @@ const backgroundLaunchToolName = "Agent"
 // done" the moment the totals happened to line up.
 var toolUseIDPattern = regexp.MustCompile(`<tool-use-id>(toolu_[A-Za-z0-9]+)</tool-use-id>`)
 
-// outstandingBackgroundWork reports whether the tail shows background work
-// that was launched and has not reported back.
+// agentLaunch is one Agent tool_use seen in a session's tail, with the
+// metadata subagent visibility needs (subagent type + description) plus
+// whether it was launched in the background — which decides how its completion
+// is detected (see outstandingAgentLaunches).
+type agentLaunch struct {
+	id           string
+	subagentType string
+	description  string
+	background   bool
+}
+
+// scanAgentLaunches walks the tail ONCE and returns every Agent tool_use it
+// holds, plus the two id-sets that say a launch reported back: foregroundDone
+// (a user tool_result carrying the launch's tool_use id — a FOREGROUND Agent
+// completes inline, its result IS that tool_result) and backgroundNotified (a
+// later <tool-use-id> completion notification — a BACKGROUND Agent's inline
+// tool_result only acknowledges the launch, so #67 pairs it by this separate
+// notification instead).
 //
-// A background launch is an assistant tool_use for backgroundLaunchToolName
-// whose input sets run_in_background; its completion arrives later as a
-// notification carrying the SAME tool-use id. Unmatched launch ⇒ the session
-// is waiting on itself, not on a human.
+// Shared by outstandingBackgroundWork (#67's background-only reading) and the
+// foreground-inclusive outstandingAgentLaunches so the two cannot drift on how
+// a launch is parsed.
 //
 // # Tail truncation, and which way it fails
 //
 // This sees only the tail readTail kept, so a launch older than that window is
-// invisible and the session reads as idle — exactly today's behaviour, so the
-// degradation is graceful rather than a new wrong answer. The opposite error
-// (a launch visible but its completion scrolled past) would report work that
-// is actually finished, but it is close to impossible by construction: the
-// completion is always LATER in the file than its launch, so any window
-// holding the launch holds the completion too.
+// invisible and the session reads as before — graceful degradation, not a new
+// wrong answer. The opposite error (a launch visible but its completion
+// scrolled past) would report work that is actually finished, but is close to
+// impossible by construction: a completion is always LATER in the file than
+// its launch, so any window holding the launch holds the completion too.
 //
 // Deliberately tolerant of shape: unparseable lines are skipped rather than
 // failing the whole scan, matching lastTurnEnded's posture on a tail whose
 // first line is usually cut mid-record.
-func outstandingBackgroundWork(buf []byte) bool {
-	launched := map[string]bool{}
-	notified := map[string]bool{}
-
+func scanAgentLaunches(buf []byte) (launches []agentLaunch, foregroundDone, backgroundNotified map[string]bool) {
+	foregroundDone = map[string]bool{}
+	backgroundNotified = map[string]bool{}
 	for _, line := range strings.Split(string(buf), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// The completion notification is matched against the RAW line: it
-		// arrives as injected prose whose exact envelope is not ours to
-		// depend on, so pattern-matching the id is more durable than
-		// decoding a structure that may change shape.
+		// The background completion notification is matched against the RAW
+		// line: it arrives as injected prose whose exact envelope is not ours
+		// to depend on, so pattern-matching the id is more durable than
+		// decoding a structure that may change shape (#67).
 		for _, m := range toolUseIDPattern.FindAllStringSubmatch(line, -1) {
-			notified[m[1]] = true
+			backgroundNotified[m[1]] = true
 		}
-
 		var entry map[string]any
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-		if t, _ := entry["type"].(string); t != "assistant" {
 			continue
 		}
 		msg, ok := entry["message"].(map[string]any)
@@ -898,32 +923,97 @@ func outstandingBackgroundWork(buf []byte) bool {
 		if !ok {
 			continue
 		}
-		for _, b := range blocks {
-			block, ok := b.(map[string]any)
-			if !ok {
-				continue
+		switch entry["type"] {
+		case "assistant":
+			for _, b := range blocks {
+				if l, ok := agentLaunchFromBlock(b); ok {
+					launches = append(launches, l)
+				}
 			}
-			if bt, _ := block["type"].(string); bt != "tool_use" {
-				continue
-			}
-			if name, _ := block["name"].(string); name != backgroundLaunchToolName {
-				continue
-			}
-			input, ok := block["input"].(map[string]any)
-			if !ok {
-				continue
-			}
-			if bg, _ := input["run_in_background"].(bool); !bg {
-				continue
-			}
-			if id, _ := block["id"].(string); id != "" {
-				launched[id] = true
+		case "user":
+			for _, b := range blocks {
+				if id, ok := toolResultID(b); ok {
+					foregroundDone[id] = true
+				}
 			}
 		}
 	}
+	return launches, foregroundDone, backgroundNotified
+}
 
-	for id := range launched {
-		if !notified[id] {
+// agentLaunchFromBlock extracts an Agent tool_use block's launch metadata,
+// returning ok=false for any other block or a malformed shape (indexing a nil
+// input map is safe in Go — a missing field just reads as its zero value).
+func agentLaunchFromBlock(b any) (agentLaunch, bool) {
+	block, ok := b.(map[string]any)
+	if !ok {
+		return agentLaunch{}, false
+	}
+	if block["type"] != "tool_use" || block["name"] != backgroundLaunchToolName {
+		return agentLaunch{}, false
+	}
+	id, _ := block["id"].(string)
+	if id == "" {
+		return agentLaunch{}, false
+	}
+	input, _ := block["input"].(map[string]any)
+	bg, _ := input["run_in_background"].(bool)
+	st, _ := input["subagent_type"].(string)
+	desc, _ := input["description"].(string)
+	return agentLaunch{id: id, subagentType: st, description: desc, background: bg}, true
+}
+
+// toolResultID pulls the tool_use id a user tool_result block reports back
+// against — how a FOREGROUND launch's inline completion is paired.
+func toolResultID(b any) (string, bool) {
+	block, ok := b.(map[string]any)
+	if !ok || block["type"] != "tool_result" {
+		return "", false
+	}
+	id, _ := block["tool_use_id"].(string)
+	return id, id != ""
+}
+
+// outstandingAgentLaunches returns the Agent launches in the tail that have
+// not reported back — a FOREGROUND launch with no matching tool_result, OR a
+// BACKGROUND launch with no completion notification (#67). This GENERALIZES
+// #67's background-only outstandingBackgroundWork to foreground subagents,
+// which are the majority and were entirely uncovered: a foreground Agent
+// call's turn shows stop_reason "tool_use" and then the parent's own tail goes
+// quiet while the child works.
+func outstandingAgentLaunches(buf []byte) []agentLaunch {
+	launches, foregroundDone, backgroundNotified := scanAgentLaunches(buf)
+	var out []agentLaunch
+	for _, l := range launches {
+		done := foregroundDone[l.id]
+		if l.background {
+			done = backgroundNotified[l.id]
+		}
+		if !done {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// outstandingBackgroundWork reports whether the tail shows a BACKGROUND Agent
+// launch that has not reported back — the exact #67 reading classifyLoop
+// depends on (a finished turn with outstanding background work is not idle).
+// Now expressed on the shared scanAgentLaunches core (via
+// outstandingAgentLaunches) so foreground delegation and this background check
+// parse launches identically; the semantics here are unchanged — only
+// background launches, paired by completion notification, count.
+func outstandingBackgroundWork(buf []byte) bool {
+	return hasOutstandingBackground(outstandingAgentLaunches(buf))
+}
+
+// hasOutstandingBackground reports whether any of the ALREADY-PARSED launches
+// is a background launch still outstanding — the exact #67 reading, split out
+// so classifyLoopWith can consume launches the caller parsed once instead of
+// re-walking the tail.
+func hasOutstandingBackground(outstanding []agentLaunch) bool {
+	for _, l := range outstanding {
+		if l.background {
 			return true
 		}
 	}
@@ -959,8 +1049,20 @@ func outstandingBackgroundWork(buf []byte) bool {
 // silence reads as StalledNoOutput (also true, and the more useful reading,
 // because a background agent that dies leaves its launcher waiting forever —
 // which happened twice in the same session that reported this).
+//
+// classifyLoop is the (buf, idleFor) entry point kept for tailState and the
+// tests: it parses the tail's Agent launches and defers to classifyLoopWith.
+// Production (loopFromLog) parses those launches ONCE per scan and calls
+// classifyLoopWith directly, so the tail is not walked for launches twice.
 func classifyLoop(buf []byte, idleFor time.Duration) (domain.LoopState, domain.StallKind) {
-	if lastTurnEnded(buf) && !outstandingBackgroundWork(buf) {
+	return classifyLoopWith(buf, idleFor, outstandingAgentLaunches(buf))
+}
+
+// classifyLoopWith is classifyLoop's core, taking the tail's already-parsed
+// Agent launches so one parse can be shared between classification and
+// subagent-delegation enrichment (see loopFromLog).
+func classifyLoopWith(buf []byte, idleFor time.Duration, outstanding []agentLaunch) (domain.LoopState, domain.StallKind) {
+	if lastTurnEnded(buf) && !hasOutstandingBackground(outstanding) {
 		return domain.StateIdle, domain.StallNone
 	}
 	if idleFor < IdleThreshold {
@@ -970,6 +1072,159 @@ func classifyLoop(buf []byte, idleFor time.Duration) (domain.LoopState, domain.S
 		return domain.StateStalled, domain.StallRateLimit
 	}
 	return domain.StateStalled, domain.StallNoOutput
+}
+
+// subagentsDirFor locates a session's direct child (subagent) transcripts:
+// alongside <sessionID>.jsonl, Claude Code writes a directory
+// <sessionID>/subagents/ holding one agent-*.jsonl per DIRECT subagent (depth
+// 1 — a nested subagent lives under its own child's subagents/ subtree, which
+// this single-level path deliberately does not reach).
+func subagentsDirFor(mainPath string) string {
+	session := strings.TrimSuffix(filepath.Base(mainPath), ".jsonl")
+	return filepath.Join(filepath.Dir(mainPath), session, "subagents")
+}
+
+// childScan summarizes a delegating session's direct subagents.
+type childScan struct {
+	newestPath string // most-recently-modified non-empty child — its last line is the freshest "what the subagent is doing"
+	liveCount  int    // non-empty children written within drivenDormantStale of now — the honest "still working" set
+	ok         bool   // at least one non-empty child transcript exists (else the honesty fallback applies)
+}
+
+// scanChildren globs a session's DIRECT subagent transcripts and summarizes
+// their live activity. Called ONLY for a loop already shown to hold an
+// outstanding Agent launch (see applySubagentDelegation) — never for every
+// loop every scan — so the filesystem glob stays off the common path.
+//
+// Honesty: a child's mtime is a real write, so it may be claimed; an empty
+// (zero-byte) child is skipped, and ok stays false when the subagents dir is
+// unreachable or holds no non-empty child — the caller then keeps today's
+// classification rather than fabricate progress from a subagent that is not
+// actually writing. Liveness uses the drivenDormantStale ceiling for the
+// subagent-liveness reason applySubagentDelegation documents (the longest a
+// live child can plausibly stay quiet between writes) so a subagent long dead
+// is not counted live.
+func scanChildren(mainPath string, now time.Time) childScan {
+	matches, err := filepath.Glob(filepath.Join(subagentsDirFor(mainPath), "agent-*.jsonl"))
+	if err != nil {
+		return childScan{}
+	}
+	var res childScan
+	var newestMod time.Time
+	for _, p := range matches {
+		fi, err := os.Stat(p)
+		if err != nil || fi.Size() == 0 {
+			continue
+		}
+		res.ok = true
+		if now.Sub(fi.ModTime()) <= drivenDormantStale {
+			res.liveCount++
+		}
+		if fi.ModTime().After(newestMod) {
+			newestMod = fi.ModTime()
+			res.newestPath = p
+		}
+	}
+	return res
+}
+
+// applySubagentDelegation is subagent visibility's Half A+B: when the main
+// tail shows an outstanding Agent launch (foreground OR background), the loop
+// is DELEGATING — the human has nothing to do and the real work is in a child
+// transcript the main tail never shows, so classifyLoop (watching only the
+// main tail) misreads that quiet as StalledNoOutput. It receives the launches
+// loopFromLog already parsed (one tail walk per scan, shared with classify).
+//
+// It runs only for states where a "delegating" summary is honest and useful —
+// Running, Idle, and StalledNoOutput (see delegationRelevant). It deliberately
+// does NOT enrich a StateGate loop (a resolved gate is blocked on a human, not
+// delegating — a "delegating" LastText under a Gate row would be stale) nor a
+// StalledRateLimit loop (State would say rate-limit while LastText said
+// delegating — internally inconsistent). loopFromLog calls this AFTER the gate
+// checks so the state it sees is fully resolved.
+//
+// With at least one non-empty child reachable it (B) rewrites LastText to name
+// what the subagent is doing — its type plus the freshest child line — ALWAYS
+// while delegating, not only past the stall threshold; and (A) holds the
+// parent at StateRunning while a child is still live, generalizing #67's
+// background-only hold to foreground subagents too.
+//
+// The hold is bounded at drivenDormantStale (~15 min). That ceiling is chosen
+// on its OWN merits here: it's the longest a LIVE subagent can plausibly leave
+// its transcript quiet between writes — a long test run or a big grep can
+// legitimately silence a child for several minutes, so a tighter ceiling would
+// false-stall children that are genuinely working. It happens to REUSE the
+// drivenDormantStale constant applyLiveness uses for engine dormancy, but the
+// rationale is subagent liveness, not engine dormancy: if engine dormancy is
+// ever retuned, revisit this hold on its own terms rather than assuming they
+// move together. Once every child has been silent past the ceiling the
+// subagent is presumed dead, the hold releases, and the loop honestly surfaces
+// as the StalledNoOutput incident classifyLoop already called — a dead
+// subagent must not pin its launcher at Running forever (#67's hazard, now
+// generalized).
+//
+// Honesty fallback: with no reachable/non-empty child, nothing is claimed and
+// today's classification stands.
+func applySubagentDelegation(l *domain.Loop, mainPath string, now time.Time, outstanding []agentLaunch) {
+	if len(outstanding) == 0 {
+		return // not delegating — today's behavior
+	}
+	if !delegationRelevant(l.State, l.Stall) {
+		return // Gate / rate-limit: a delegating summary would be stale or inconsistent
+	}
+	children := scanChildren(mainPath, now)
+	if !children.ok {
+		return // honesty: no observed child writes to claim from
+	}
+	childLine, _ := LastAssistantText(children.newestPath)
+	l.LastText = formatDelegating(primarySubagentType(outstanding), children.liveCount, childLine)
+
+	if l.State == domain.StateStalled && l.Stall == domain.StallNoOutput && children.liveCount > 0 {
+		l.State, l.Stall = domain.StateRunning, domain.StallNone
+	}
+}
+
+// delegationRelevant reports whether a delegating "delegating: …" summary is
+// honest for this resolved state: only Running, Idle, and StalledNoOutput —
+// the states a quiet-but-delegating main tail actually lands on. A StateGate
+// loop is blocked on a human (not delegating), and a StalledRateLimit loop
+// would contradict its own State, so both are excluded (as is StallGone — a
+// loop already presumed dead).
+func delegationRelevant(state domain.LoopState, stall domain.StallKind) bool {
+	switch state {
+	case domain.StateRunning, domain.StateIdle:
+		return true
+	case domain.StateStalled:
+		return stall == domain.StallNoOutput
+	default:
+		return false
+	}
+}
+
+// primarySubagentType names the delegation for the DETAIL row: the most recent
+// outstanding launch's subagent_type (the freshest thing the parent handed
+// off). "" when the launch carried none — formatDelegating then omits the type
+// rather than invent one.
+func primarySubagentType(outstanding []agentLaunch) string {
+	return outstanding[len(outstanding)-1].subagentType
+}
+
+// formatDelegating renders the DETAIL TAIL row for a delegating loop:
+// "delegating: <subagent_type> — <child last line>", omitting the type when
+// unknown and adding a "(N live)" count when more than one child is still
+// writing.
+func formatDelegating(subagentType string, liveCount int, childLine string) string {
+	head := "delegating"
+	if subagentType != "" {
+		head += ": " + subagentType
+	}
+	if liveCount > 1 {
+		head += fmt.Sprintf(" (%d live)", liveCount)
+	}
+	if childLine != "" {
+		return head + " — " + childLine
+	}
+	return head
 }
 
 // readTail reads the last n bytes of path (or the whole file if smaller).

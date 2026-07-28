@@ -115,7 +115,7 @@ type Loop struct {
 	Path         string    // path to the session JSONL
 	LastActivity time.Time // last log write
 	Stall        StallKind // why it went silent, if it did
-	LastText     string    // last assistant text (tail), for the detail pane's TAIL row
+	LastText     string    // last assistant text (tail), for the detail pane's TAIL row; for a delegating loop the scanner replaces it with a synthesized "delegating: <subagent_type> — <child last line>" summary (see claude.applySubagentDelegation)
 	GateTS       int64     // unix NANOSECONDS of the gate marker this loop's StateGate was derived from, if any — lets approveCmd compare-and-swap delete only the marker it actually decided on (see gate.DeleteMarkerIfTS; nanosecond precision is what lets the CAS distinguish two markers landing in the same second)
 	Note         string    // governor-set annotation (internal/engine.Check via the scanner's applyGovernor) — the tui's NOTE column prefers this over stall/drift text when set; "" leaves NOTE's existing stall/drift behavior untouched
 	BoundAt      time.Time // when this loop was bound (internal/registry.Record.BoundAt, copied in by enrichFromRegistry) — zero value for an unbound loop; feat/detail-panel-v2's STAGE row prefers this for "elapsed", falling back to the event log's first entry when zero

@@ -2609,3 +2609,307 @@ func TestLoopFromLog_PermissionRequestOnlyMarker_IsAGate(t *testing.T) {
 		t.Error("GateTS not set — approve's compare-and-swap has no token to delete this marker with")
 	}
 }
+
+// ── Subagent visibility: delegating loops (jitokim/subagent-visibility) ──────
+//
+// The blocker these cover: fleetops watches only a session's MAIN tail, so
+// while it delegates to a subagent and WAITS, the main tail goes quiet and
+// classifyLoop misreads it as StalledNoOutput. #67 covered ONLY background
+// launches (and even those degraded after 4 min); FOREGROUND subagents — the
+// majority — were entirely uncovered. These assert the loop is held Running
+// while a child is live, surfaces honestly once the child is dead, and never
+// fabricates progress from a child that is not writing.
+
+type childFixture struct {
+	name  string
+	lines []string
+	age   time.Duration // how long ago its last write was, relative to `now`
+}
+
+// buildDelegationFixture writes a ~/.claude/projects-shaped tree — a main
+// session jsonl plus (when children != nil) its <sessionID>/subagents/
+// children — with controlled mtimes, and returns the main path + FileInfo for
+// loopFromLog. A nil children slice creates NO subagents dir at all (the
+// "unreachable" honesty case); an empty slice creates the dir but no child.
+func buildDelegationFixture(t *testing.T, mainLines []string, mainAge time.Duration, now time.Time, children []childFixture) (string, os.FileInfo) {
+	t.Helper()
+	proj := filepath.Join(t.TempDir(), "-x-myproject")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatalf("mkdir proj: %v", err)
+	}
+	mainPath := filepath.Join(proj, "sess-1.jsonl")
+	writeFixtureLines(t, mainPath, mainLines)
+	touch(t, mainPath, now.Add(-mainAge))
+
+	if children != nil {
+		subDir := filepath.Join(proj, "sess-1", "subagents")
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatalf("mkdir subagents: %v", err)
+		}
+		for _, c := range children {
+			cp := filepath.Join(subDir, c.name)
+			writeFixtureLines(t, cp, c.lines)
+			touch(t, cp, now.Add(-c.age))
+		}
+	}
+	fi, err := os.Stat(mainPath)
+	if err != nil {
+		t.Fatalf("stat main: %v", err)
+	}
+	return mainPath, fi
+}
+
+func writeFixtureLines(t *testing.T, path string, lines []string) {
+	t.Helper()
+	content := ""
+	for _, l := range lines {
+		content += l + "\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func touch(t *testing.T, path string, mod time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, mod, mod); err != nil {
+		t.Fatalf("chtimes %s: %v", path, err)
+	}
+}
+
+func fgAgentLaunch(id, subagentType string) string {
+	return `{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"` + id +
+		`","name":"Agent","input":{"subagent_type":"` + subagentType + `","description":"do the thing","run_in_background":false}}]}}`
+}
+
+func childAssistantLine(text string) string {
+	return `{"type":"assistant","message":{"content":[{"type":"text","text":"` + text + `"}]}}`
+}
+
+// loopFromDelegationFixture runs the real loopFromLog against a fixture, with
+// an empty gates dir and no pending markers — isolating the delegation path.
+func loopFromDelegationFixture(t *testing.T, path string, fi os.FileInfo, now time.Time) domain.Loop {
+	t.Helper()
+	return loopFromLog(path, fi, now, t.TempDir(), map[string]gate.Info{})
+}
+
+// The core fix #67 never covered: a FOREGROUND Agent launch with a live child
+// must read Running, not the Stalled the quiet main tail would otherwise get.
+func TestLoopFromLog_ForegroundDelegating_LiveChild_HeldRunning(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_fg1", "doc-writer")},
+		10*time.Minute, now,
+		[]childFixture{{name: "agent-aaa.jsonl", lines: []string{childAssistantLine("reading the config files")}, age: 30 * time.Second}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateRunning || l.Stall != domain.StallNone {
+		t.Fatalf("state=%v stall=%v, want running/none — a foreground subagent is live; classifyLoop's Stalled is the #67 gap this fixes", l.State, l.Stall)
+	}
+	if want := "delegating: doc-writer — reading the config files"; l.LastText != want {
+		t.Errorf("LastText=%q, want %q", l.LastText, want)
+	}
+}
+
+// The generalization must also hold #67's original background case on the SAME
+// child-liveness path.
+func TestLoopFromLog_BackgroundDelegating_LiveChild_HeldRunning(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{`{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_bg1","name":"Agent","input":{"subagent_type":"backend-eng","run_in_background":true,"prompt":"go"}}]}}`, turnEnded},
+		10*time.Minute, now,
+		[]childFixture{{name: "agent-bbb.jsonl", lines: []string{childAssistantLine("running the migration")}, age: 20 * time.Second}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateRunning || l.Stall != domain.StallNone {
+		t.Fatalf("state=%v stall=%v, want running/none — background subagent is live", l.State, l.Stall)
+	}
+	if want := "delegating: backend-eng — running the migration"; l.LastText != want {
+		t.Errorf("LastText=%q, want %q", l.LastText, want)
+	}
+}
+
+// Honesty cap: a child silent past the dead-subagent ceiling (drivenDormantStale)
+// must NOT pin the launcher at Running forever — the incident surfaces.
+func TestLoopFromLog_Delegating_ChildSilentPastCeiling_SurfacesStalled(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_fg2", "sre")},
+		20*time.Minute, now,
+		[]childFixture{{name: "agent-ccc.jsonl", lines: []string{childAssistantLine("was investigating")}, age: drivenDormantStale + 5*time.Minute}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateStalled || l.Stall != domain.StallNoOutput {
+		t.Fatalf("state=%v stall=%v, want stalled/no-output — the subagent is presumed dead past the ceiling, the launcher must not stay Running", l.State, l.Stall)
+	}
+	// DETAIL is still enriched with the last OBSERVED (real) child line, even
+	// though the state honestly reads the incident — enrich always, fabricate never.
+	if want := "delegating: sre — was investigating"; l.LastText != want {
+		t.Errorf("LastText=%q, want %q — the last real child line must still surface", l.LastText, want)
+	}
+}
+
+// Honesty fallback: an outstanding launch but NO reachable child (subagents
+// dir absent) must fall back to today's Stalled — never fabricate progress.
+func TestLoopFromLog_Delegating_NoChildrenReachable_FallsBackToStalled(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_fg3", "architect")},
+		10*time.Minute, now,
+		nil, // no subagents dir at all
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateStalled || l.Stall != domain.StallNoOutput {
+		t.Fatalf("state=%v stall=%v, want stalled/no-output — no child writes to claim from", l.State, l.Stall)
+	}
+	if strings.Contains(l.LastText, "delegating") {
+		t.Errorf("LastText=%q must NOT claim delegation when no child is observed", l.LastText)
+	}
+}
+
+// An empty (zero-byte) child is not an observed write: same honesty fallback.
+func TestLoopFromLog_Delegating_EmptyChild_FallsBackToStalled(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_fg4", "architect")},
+		10*time.Minute, now,
+		[]childFixture{{name: "agent-ddd.jsonl", lines: nil, age: 10 * time.Second}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateStalled || l.Stall != domain.StallNoOutput {
+		t.Fatalf("state=%v stall=%v, want stalled/no-output — a zero-byte child is not a real write", l.State, l.Stall)
+	}
+}
+
+// Multiple live children => the count is shown.
+func TestLoopFromLog_Delegating_MultipleLiveChildren_CountShown(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_fg5", "doc-writer")},
+		10*time.Minute, now,
+		[]childFixture{
+			{name: "agent-e1.jsonl", lines: []string{childAssistantLine("older child line")}, age: 90 * time.Second},
+			{name: "agent-e2.jsonl", lines: []string{childAssistantLine("freshest child line")}, age: 5 * time.Second},
+			{name: "agent-e3.jsonl", lines: []string{childAssistantLine("middle child line")}, age: 40 * time.Second},
+		},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateRunning {
+		t.Fatalf("state=%v, want running with 3 live children", l.State)
+	}
+	// count shown, and the newest child (e2) supplies the line.
+	if want := "delegating: doc-writer (3 live) — freshest child line"; l.LastText != want {
+		t.Errorf("LastText=%q, want %q", l.LastText, want)
+	}
+}
+
+// A recent foreground delegation (main not yet past the stall threshold)
+// already classifies Running — but DETAIL must STILL be enriched (enrich
+// always, not only past 4 min).
+func TestLoopFromLog_Delegating_RecentMain_EnrichesDetailAnyway(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_fg6", "ai-eng")},
+		30*time.Second, now, // well within IdleThreshold
+		[]childFixture{{name: "agent-fff.jsonl", lines: []string{childAssistantLine("embedding the corpus")}, age: 5 * time.Second}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateRunning {
+		t.Fatalf("state=%v, want running", l.State)
+	}
+	if want := "delegating: ai-eng — embedding the corpus"; l.LastText != want {
+		t.Errorf("LastText=%q, want %q — DETAIL must be enriched even before the stall threshold", l.LastText, want)
+	}
+}
+
+// Gate wins: an outstanding launch WITH a live child, but the tail also holds
+// a pending AskUserQuestion, resolves to StateGate — the loop is blocked on a
+// human, not delegating, so LastText must NOT be rewritten to "delegating".
+func TestLoopFromLog_Delegating_GateWins_NoDelegatingLastText(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{fgAgentLaunch("toolu_g1", "doc-writer"), askUserQuestionLine},
+		10*time.Minute, now,
+		[]childFixture{{name: "agent-g1.jsonl", lines: []string{childAssistantLine("reading the config files")}, age: 20 * time.Second}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateGate {
+		t.Fatalf("state=%v, want gate — a pending AskUserQuestion is a human decision, it wins over the delegation hold", l.State)
+	}
+	if strings.Contains(l.LastText, "delegating") {
+		t.Errorf("LastText=%q must NOT carry a delegating summary under a Gate row", l.LastText)
+	}
+}
+
+// Rate-limit wins: an outstanding launch WITH a live child, but the tail also
+// holds a rate-limit marker, resolves to StalledRateLimit. State says
+// rate-limit, so LastText must NOT say "delegating" — that would be internally
+// inconsistent (and the hold only ever applied to StallNoOutput anyway).
+func TestLoopFromLog_Delegating_RateLimited_NoDelegatingLastText(t *testing.T) {
+	now := time.Now()
+	path, fi := buildDelegationFixture(t,
+		[]string{
+			fgAgentLaunch("toolu_r1", "backend-eng"),
+			`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`,
+		},
+		10*time.Minute, now,
+		[]childFixture{{name: "agent-r1.jsonl", lines: []string{childAssistantLine("running the migration")}, age: 20 * time.Second}},
+	)
+
+	l := loopFromDelegationFixture(t, path, fi, now)
+
+	if l.State != domain.StateStalled || l.Stall != domain.StallRateLimit {
+		t.Fatalf("state=%v stall=%v, want stalled/rate-limit", l.State, l.Stall)
+	}
+	if strings.Contains(l.LastText, "delegating") {
+		t.Errorf("LastText=%q must NOT carry a delegating summary while the loop reads rate-limited", l.LastText)
+	}
+}
+
+// ── Pure helper: the foreground generalization of #67 ────────────────────────
+
+// A foreground Agent launch with NO matching tool_result is outstanding — the
+// exact case #67's background-only reading missed.
+func TestOutstandingAgentLaunches_ForegroundNoResult_Outstanding(t *testing.T) {
+	buf := []byte(fgAgentLaunch("toolu_x1", "doc-writer"))
+
+	out := outstandingAgentLaunches(buf)
+
+	if len(out) != 1 || out[0].id != "toolu_x1" || out[0].background {
+		t.Fatalf("got %+v, want one outstanding foreground launch toolu_x1", out)
+	}
+}
+
+// Once the foreground launch's tool_result lands, it is no longer outstanding.
+func TestOutstandingAgentLaunches_ForegroundWithResult_NotOutstanding(t *testing.T) {
+	buf := []byte(fgAgentLaunch("toolu_x2", "doc-writer") + "\n" +
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_x2","content":"done"}]}}`)
+
+	if out := outstandingAgentLaunches(buf); len(out) != 0 {
+		t.Fatalf("got %+v, want none — the foreground launch reported back inline", out)
+	}
+}
+
+// The refactor must NOT change outstandingBackgroundWork: a foreground launch
+// (even outstanding) is still not "background work".
+func TestOutstandingBackgroundWork_ForegroundOutstanding_StillFalse(t *testing.T) {
+	if outstandingBackgroundWork([]byte(fgAgentLaunch("toolu_x3", "doc-writer"))) {
+		t.Error("a foreground launch must not count as outstanding BACKGROUND work")
+	}
+}
