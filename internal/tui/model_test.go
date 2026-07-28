@@ -9692,8 +9692,8 @@ func TestUpdate_EnterKey_ObservedLoop_StillDispatchesAttach(t *testing.T) {
 func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 	loops, detailCache, oracleCounts, _ := demoFleet()
 
-	if len(loops) != 7 {
-		t.Fatalf("got %d loops, want 7", len(loops))
+	if len(loops) != 8 {
+		t.Fatalf("got %d loops, want 8", len(loops))
 	}
 	byProject := make(map[string]domain.Loop, len(loops))
 	for _, l := range loops {
@@ -9758,6 +9758,25 @@ func TestDemoFleet_ReturnsExpectedLoops(t *testing.T) {
 		t.Errorf("flaky-tests = %+v, want StateRunning cycle 4", flakyTests)
 	}
 
+	// v0.9.0 subagent visibility: a RUNNING loop delegating to a live child.
+	// LastText is pinned to the EXACT string applySubagentDelegation +
+	// formatDelegating produce ("delegating: <subagent_type> — <child last
+	// line>", single live child so no "(N live)" count). If the demo drifts
+	// from what the real feature renders, the demo becomes a claim nothing
+	// verifies — and the demo is what a new reader believes fleetops looks like.
+	flockAudit, ok := byProject["flock-audit"]
+	if !ok || flockAudit.State != domain.StateRunning {
+		t.Fatalf("flock-audit = %+v, want a StateRunning delegating loop", flockAudit)
+	}
+	if want := "delegating: code-reviewer — checking the flock lock path in internal/registry"; flockAudit.LastText != want {
+		t.Errorf("flock-audit.LastText = %q, want the exact formatDelegating shape %q", flockAudit.LastText, want)
+	}
+	// The seeded EVENTS tail keeps the delegating loop's DETAIL panel non-empty
+	// under the "delegating: …" TAIL row — the frame a v0.9.0 screenshot lands on.
+	if evs := detailCache[flockAudit.SessionID].events; len(evs) != 2 {
+		t.Errorf("flock-audit seeded events = %d, want 2 (spawn + delegating scan)", len(evs))
+	}
+
 	depUpgrade, ok := byProject["dep-upgrade"]
 	if !ok || depUpgrade.State != domain.StateDrift || depUpgrade.Cycle != 9 || depUpgrade.NoImprove != 2 {
 		t.Errorf("dep-upgrade = %+v, want StateDrift cycle 9 NoImprove 2", depUpgrade)
@@ -9806,8 +9825,8 @@ func TestNewDemo_SeedsFleetCursorOnGateAndSetsDemoFlag(t *testing.T) {
 	if !m.demo {
 		t.Error("expected m.demo = true")
 	}
-	if len(m.loops) != 7 {
-		t.Fatalf("got %d loops, want 7", len(m.loops))
+	if len(m.loops) != 8 {
+		t.Fatalf("got %d loops, want 8", len(m.loops))
 	}
 	if m.cursor != 0 || m.loops[0].Project != "auth-harden" || m.loops[0].State != domain.StateGate {
 		t.Errorf("cursor = %d on %+v, want cursor 0 on the auth-harden GATE (the hero frame)", m.cursor, m.loops[m.cursor])
