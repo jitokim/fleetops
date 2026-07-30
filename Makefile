@@ -1,4 +1,4 @@
-.PHONY: build install test fmt vet test-tools test-all
+.PHONY: build install test fmt fmt-check vet test-tools test-all local
 
 # build produces a local ./fleetops binary (gitignored) — run it with
 # ./fleetops, or `make install` to put fleetops on your PATH instead.
@@ -17,6 +17,12 @@ test:
 
 fmt:
 	gofmt -l .
+
+# fmt-check FAILS if any file is unformatted, unlike `fmt` (a lister that exits
+# 0). This is the same gate root-test.yml runs (`test -z "$(gofmt -l .)"`);
+# `local` uses it so a quick pre-push check catches what CI would reject.
+fmt-check:
+	@test -z "$$(gofmt -l .)" || { echo "gofmt: files need formatting:"; gofmt -l .; exit 1; }
 
 vet:
 	go vet ./...
@@ -45,3 +51,9 @@ test-tools:
 # test-all is what to run before pushing: the root module and every tools/
 # module, the same set CI covers across its two workflows.
 test-all: test test-tools
+
+# local runs the root-module CI checks in one command — the quick pre-push
+# loop, mirroring oh-my-graph's `make local`. Checks only; it does NOT run the
+# app (keeping fleetops's no-runner-creep identity). Use `make test-all` before
+# pushing to also cover the standalone tools/ modules.
+local: fmt-check vet build test
