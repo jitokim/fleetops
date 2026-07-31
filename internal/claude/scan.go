@@ -166,6 +166,16 @@ func DiscoverLoops(now time.Time, within time.Duration) ([]domain.Loop, error) {
 	live, liveOK := LiveClaudeCwds()
 	loops = applyLiveness(loops, live, liveOK, historyDir, now, within)
 
+	// PORTS surfacing (pivot §11): attach observed listening TCP ports to
+	// loops whose cwd applyLiveness just verified live. Gated — the probe
+	// (2 more lsof calls) only runs when at least one loop is CwdVerified,
+	// since applyPorts can attach to no one else anyway; a fleet with no
+	// live process pays nothing new.
+	if anyCwdVerified(loops) {
+		ports, portsOK := ListeningPortsByCwd()
+		loops = applyPorts(loops, ports, portsOK)
+	}
+
 	// Keep metricsCache bounded to sessions actually present in this scan —
 	// otherwise it grows forever as old sessions age out of the window or
 	// get deleted, over a long-running fleetops process.
@@ -610,6 +620,57 @@ func applyLiveness(loops []domain.Loop, live map[string]int, ok bool, historyDir
 		}
 	}
 	return out
+}
+
+// anyCwdVerified reports whether at least one loop has a live-process-
+// verified cwd — the gate for the ports probe in DiscoverLoops: applyPorts
+// attaches to CwdVerified loops only, so with none the 2 extra lsof calls
+// would be pure cost for a guaranteed no-op.
+func anyCwdVerified(loops []domain.Loop) bool {
+	for _, l := range loops {
+		if l.CwdVerified {
+			return true
+		}
+	}
+	return false
+}
+
+// applyPorts attaches observed listening TCP ports (ListeningPortsByCwd) to
+// each loop whose cwd hosts a listener — the PORTS surfacing enrichment
+// (pivot §11), run right after applyLiveness because it needs the healed
+// real cwd. Display-only metadata: State/Stall are never touched here, and
+// a port's disappearance is never a StallKind.
+//
+// Honesty rules, mirroring applyLiveness's own discipline:
+//   - ok=false (a probe failed) attaches nothing — a racing lsof is not
+//     evidence about any server, and Ports stays nil ("nothing observed"),
+//     which renders as nothing rather than as a claim.
+//   - only CwdVerified loops can match, and the match is EXACT string
+//     equality between the listener's real lsof cwd and the loop's healed
+//     real Cwd (both come from the same lsof -d cwd probe shape, so equal
+//     directories yield equal strings). Deliberately NOT the encodeCwd
+//     round-trip applyLiveness uses for its own matching: encodeCwd is
+//     many-to-one ("/x/foo-bar" vs "/x/foo.bar"), and matching through it
+//     could attach one dir's server to the other dir's loop — exactly the
+//     ambiguity CwdVerified's collision guard exists to refuse. Verified
+//     loops have the real path, so the lossless comparison is available and
+//     exact-only (a server in a SUBdirectory of a loop's cwd attaches
+//     nowhere — v1, per §11: `make local` runs at the worktree root).
+//   - a collided ProjectDir needs no second guard here: applyLiveness
+//     already leaves its loops CwdVerified=false.
+func applyPorts(loops []domain.Loop, portsByCwd map[string][]int, ok bool) []domain.Loop {
+	if !ok {
+		return loops
+	}
+	for i := range loops {
+		if !loops[i].CwdVerified {
+			continue
+		}
+		if ports := portsByCwd[loops[i].Cwd]; len(ports) > 0 {
+			loops[i].Ports = ports
+		}
+	}
+	return loops
 }
 
 // mostRecentActuationIsKill reports whether sessionID's most recent

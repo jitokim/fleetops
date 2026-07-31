@@ -249,7 +249,7 @@ func TestLayoutModeFor(t *testing.T) {
 // cols" caveat for the old columnWidths).
 func TestListRowWidths_NeverOverflows(t *testing.T) {
 	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
-		wName, _, showCycle, showOracle, showLast := listRowWidths(innerWidth, false)
+		wName, _, _, showCycle, showOracle, showLast := listRowWidths(innerWidth, false, false)
 		sum := wMarker + wName + wState
 		if showCycle {
 			sum += wCycle
@@ -278,14 +278,14 @@ func TestListRowWidths_NeverOverflows(t *testing.T) {
 // readable label"; LAST alone keeps the physical threshold.
 func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	full := wMarker + wState + wCycle + wOracle + wLast + nameGoodWidth
-	_, _, showCycle, showOracle, showLast := listRowWidths(full, false)
+	_, _, _, showCycle, showOracle, showLast := listRowWidths(full, false, false)
 	if !showCycle || !showOracle || !showLast {
 		t.Fatalf("precondition failed: at full width want all three shown, got cycle=%v oracle=%v last=%v", showCycle, showOracle, showLast)
 	}
 
 	// one step narrower than "all three fit" — ORACLE (the least
 	// essential) must be the one to go, CYCLE and LAST both survive.
-	_, _, showCycle, showOracle, showLast = listRowWidths(full-1, false)
+	_, _, _, showCycle, showOracle, showLast = listRowWidths(full-1, false, false)
 	if showOracle {
 		t.Error("showOracle = true with insufficient room, want false (ORACLE drops first)")
 	}
@@ -296,7 +296,7 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	// narrow enough that CYCLE can't keep the label readable either —
 	// CYCLE goes next, LAST still survives alone.
 	tight := wMarker + wState + wLast + listNameFloor
-	_, _, showCycle, showOracle, showLast = listRowWidths(tight, false)
+	_, _, _, showCycle, showOracle, showLast = listRowWidths(tight, false, false)
 	if showOracle || showCycle {
 		t.Errorf("got cycle=%v oracle=%v, want both dropped at this width", showCycle, showOracle)
 	}
@@ -305,7 +305,7 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 	}
 
 	// narrower still — even LAST alone doesn't fit.
-	_, _, showCycle, showOracle, showLast = listRowWidths(wMarker+wState+listNameFloor-1, false)
+	_, _, _, showCycle, showOracle, showLast = listRowWidths(wMarker+wState+listNameFloor-1, false, false)
 	if showCycle || showOracle || showLast {
 		t.Errorf("got cycle=%v oracle=%v last=%v, want all three dropped at this width", showCycle, showOracle, showLast)
 	}
@@ -317,7 +317,7 @@ func TestListRowWidths_DropOrder_OracleThenCycleThenLast(t *testing.T) {
 // NAME instead (the 100-col-terminal case: innerWidth 48 used to give
 // NAME 7).
 func TestListRowWidths_ReadabilityFloor_ProtectsLabelOverOracleCycle(t *testing.T) {
-	wName, _, showCycle, showOracle, showLast := listRowWidths(48, false)
+	wName, _, _, showCycle, showOracle, showLast := listRowWidths(48, false, false)
 	if showOracle || showCycle {
 		t.Errorf("got cycle=%v oracle=%v, want both dropped in favor of a readable label", showCycle, showOracle)
 	}
@@ -335,7 +335,7 @@ func TestListRowWidths_ReadabilityFloor_ProtectsLabelOverOracleCycle(t *testing.
 // doc on the structural floor this row format needs).
 func TestListRowWidths_NameWithinBounds(t *testing.T) {
 	for _, innerWidth := range []int{wMarker + wState + listNameFloor, 40, 100, 300} {
-		wName, _, _, _, _ := listRowWidths(innerWidth, false)
+		wName, _, _, _, _, _ := listRowWidths(innerWidth, false, false)
 		if wName < listNameFloor {
 			t.Errorf("innerWidth=%d: wName=%d, want >= listNameFloor (%d)", innerWidth, wName, listNameFloor)
 		}
@@ -9113,7 +9113,7 @@ func TestListRowWidths_AccountNotRequested_NeverShown(t *testing.T) {
 	// wantAccount=false ⇒ showAccount=false at EVERY width — the zero-config
 	// path never even enters the account width math.
 	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
-		if _, showAccount, _, _, _ := listRowWidths(innerWidth, false); showAccount {
+		if _, showAccount, _, _, _, _ := listRowWidths(innerWidth, false, false); showAccount {
 			t.Fatalf("innerWidth=%d: showAccount=true with wantAccount=false", innerWidth)
 		}
 	}
@@ -9121,7 +9121,7 @@ func TestListRowWidths_AccountNotRequested_NeverShown(t *testing.T) {
 
 func TestListRowWidths_AccountRequested_ShowsAtGenerousWidth(t *testing.T) {
 	full := wMarker + wState + wAccount + wCycle + wOracle + wLast + nameGoodWidth
-	_, showAccount, showCycle, showOracle, showLast := listRowWidths(full, true)
+	_, showAccount, _, showCycle, showOracle, showLast := listRowWidths(full, true, false)
 	if !showAccount || !showCycle || !showOracle || !showLast {
 		t.Fatalf("at full width want every column incl account, got account=%v cycle=%v oracle=%v last=%v",
 			showAccount, showCycle, showOracle, showLast)
@@ -9133,7 +9133,7 @@ func TestListRowWidths_Account_OutlivesOracleAndCycle(t *testing.T) {
 	// oracle/cycle on top. Oracle and cycle drop FIRST; account (more worth
 	// protecting when two accounts are on screen) survives.
 	w := wMarker + wState + wAccount + wLast + nameGoodWidth
-	_, showAccount, showCycle, showOracle, showLast := listRowWidths(w, true)
+	_, showAccount, _, showCycle, showOracle, showLast := listRowWidths(w, true, false)
 	if !showAccount {
 		t.Errorf("showAccount=false at innerWidth=%d, want true (account outlives oracle/cycle)", w)
 	}
@@ -9150,7 +9150,7 @@ func TestListRowWidths_Account_DropsBeforeLast(t *testing.T) {
 	// AND account are all shed, LAST alone survives (account yields to LAST,
 	// the most established column).
 	tight := wMarker + wState + wLast + listNameFloor
-	_, showAccount, showCycle, showOracle, showLast := listRowWidths(tight, true)
+	_, showAccount, _, showCycle, showOracle, showLast := listRowWidths(tight, true, false)
 	if showAccount || showCycle || showOracle {
 		t.Errorf("got account=%v cycle=%v oracle=%v, want all three dropped at tight width",
 			showAccount, showCycle, showOracle)
@@ -9164,7 +9164,7 @@ func TestListRowWidths_AccountRequested_NeverOverflows(t *testing.T) {
 	// The account column must obey the same "never return a layout that
 	// doesn't fit" invariant as the rest of the cascade.
 	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
-		wName, showAccount, showCycle, showOracle, showLast := listRowWidths(innerWidth, true)
+		wName, showAccount, _, showCycle, showOracle, showLast := listRowWidths(innerWidth, true, false)
 		sum := wMarker + wName + wState
 		if showAccount {
 			sum += wAccount
@@ -10936,4 +10936,206 @@ func TestUpdate_Esc_FilterTakesPrecedenceOverBannerDismiss(t *testing.T) {
 	if m.hookDismissed {
 		t.Error("esc cleared the filter but must NOT also dismiss the banner in the same press")
 	}
+}
+
+// ── feat/ports-surfacing: the FLEET PORT column and DETAIL PORTS row ─────
+
+func TestPortTag(t *testing.T) {
+	if got := portTag(nil); got != "" {
+		t.Errorf("portTag(nil) = %q, want \"\" — no observed ports renders a blank cell, never a claim", got)
+	}
+	if got := portTag([]int{3000}); got != "🌐:3000" {
+		t.Errorf("portTag([3000]) = %q, want 🌐:3000", got)
+	}
+	if got := portTag([]int{3000, 8080, 5173}); got != "🌐:3000+2" {
+		t.Errorf("portTag([3000 8080 5173]) = %q, want 🌐:3000+2 — extras summarized, full list is DETAIL's", got)
+	}
+}
+
+func TestPortTag_NeverExceedsColumnWidth_DropsSuffixNotDigits(t *testing.T) {
+	// the tag must fit inside wPort with the column gap — same
+	// fit-inside-the-fixed-column contract accountTag pins. But unlike a
+	// label, a port number may never be sheared mid-digits (an ellipsis'd
+	// port is a port that doesn't exist): when "+N" would overflow, the
+	// SUFFIX goes, the port stays whole.
+	wide := portTag([]int{65535, 1, 2, 3, 4, 5, 6, 7, 8, 9})
+	if w := narrowAmbiguous.StringWidth(wide); w > wPort-1 {
+		t.Errorf("portTag width = %d (%q), want <= wPort-1 (%d)", w, wide, wPort-1)
+	}
+	if wide != "🌐:65535" {
+		t.Errorf("portTag = %q, want 🌐:65535 — the +N suffix drops, the digits never do", wide)
+	}
+}
+
+func TestPortsDetailValue(t *testing.T) {
+	if got := portsDetailValue([]int{3000}); got != ":3000" {
+		t.Errorf("portsDetailValue([3000]) = %q, want :3000", got)
+	}
+	if got := portsDetailValue([]int{3000, 8080}); got != ":3000 :8080" {
+		t.Errorf("portsDetailValue([3000 8080]) = %q, want ':3000 :8080'", got)
+	}
+}
+
+func TestFleetHasPorts(t *testing.T) {
+	if fleetHasPorts([]domain.Loop{{}, {}}) {
+		t.Error("got true, want false — no loop has observed ports")
+	}
+	if !fleetHasPorts([]domain.Loop{{}, {Ports: []int{3000}}}) {
+		t.Error("got false, want true — one loop with ports is enough")
+	}
+	if fleetHasPorts(nil) {
+		t.Error("got true, want false for an empty fleet")
+	}
+}
+
+// listRowWidths' port branch: requested vs not, and its place in the drop
+// cascade (drops after ORACLE/CYCLE but BEFORE ACCOUNT — see its doc).
+
+func TestListRowWidths_PortNotRequested_NeverShown(t *testing.T) {
+	// wantPort=false ⇒ showPort=false at EVERY width — the no-server fleet
+	// never even enters the port width math.
+	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
+		if _, _, showPort, _, _, _ := listRowWidths(innerWidth, false, false); showPort {
+			t.Fatalf("innerWidth=%d: showPort=true with wantPort=false", innerWidth)
+		}
+	}
+}
+
+func TestListRowWidths_PortRequested_ShowsAtGenerousWidth(t *testing.T) {
+	full := wMarker + wState + wPort + wCycle + wOracle + wLast + nameGoodWidth
+	_, _, showPort, showCycle, showOracle, showLast := listRowWidths(full, false, true)
+	if !showPort || !showCycle || !showOracle || !showLast {
+		t.Fatalf("at full width want every column incl port, got port=%v cycle=%v oracle=%v last=%v",
+			showPort, showCycle, showOracle, showLast)
+	}
+}
+
+func TestListRowWidths_Port_OutlivesOracleAndCycle(t *testing.T) {
+	// Mid-width band: room for a readable NAME + port + LAST, but not for
+	// oracle/cycle on top. Oracle and cycle drop FIRST; port survives.
+	w := wMarker + wState + wPort + wLast + nameGoodWidth
+	_, _, showPort, showCycle, showOracle, showLast := listRowWidths(w, false, true)
+	if !showPort {
+		t.Errorf("showPort=false at innerWidth=%d, want true (port outlives oracle/cycle)", w)
+	}
+	if showOracle || showCycle {
+		t.Errorf("got oracle=%v cycle=%v, want both dropped before port", showOracle, showCycle)
+	}
+	if !showLast {
+		t.Error("showLast=false, want true")
+	}
+}
+
+func TestListRowWidths_Port_DropsBeforeAccount(t *testing.T) {
+	// Both requested, room for only one of them beside a readable NAME (the
+	// band fits either column alone, PORT even more easily at its narrower
+	// width — so surviving is purely about ORDER: the cascade must shed
+	// PORT and keep ACCOUNT, identity beats convenience).
+	w := wMarker + wState + wAccount + wLast + nameGoodWidth
+	_, showAccount, showPort, _, _, _ := listRowWidths(w, true, true)
+	if showPort {
+		t.Error("showPort=true, want false — PORT yields before ACCOUNT")
+	}
+	if !showAccount {
+		t.Error("showAccount=false, want true — ACCOUNT survives PORT")
+	}
+}
+
+func TestListRowWidths_PortRequested_NeverOverflows(t *testing.T) {
+	// The port column must obey the same "never return a layout that
+	// doesn't fit" invariant as the rest of the cascade.
+	for innerWidth := wMarker + wState; innerWidth <= 200; innerWidth++ {
+		wName, showAccount, showPort, showCycle, showOracle, showLast := listRowWidths(innerWidth, true, true)
+		sum := wMarker + wName + wState
+		if showAccount {
+			sum += wAccount
+		}
+		if showPort {
+			sum += wPort
+		}
+		if showCycle {
+			sum += wCycle
+		}
+		if showOracle {
+			sum += wOracle
+		}
+		if showLast {
+			sum += wLast
+		}
+		if sum > innerWidth {
+			t.Errorf("innerWidth=%d: sum=%d (wName=%d account=%v port=%v cycle=%v oracle=%v last=%v), want <= %d",
+				innerWidth, sum, wName, showAccount, showPort, showCycle, showOracle, showLast, innerWidth)
+		}
+	}
+}
+
+func TestFleetPanelLines_LoopWithPorts_RendersTag(t *testing.T) {
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "web", SessionID: "s1", State: domain.StateRunning, Cycle: 2,
+			Goal:  domain.Goal{Text: "run the e2e suite", MaxCycles: 12},
+			Ports: []int{3000}},
+		{Project: "api", SessionID: "s2", State: domain.StateIdle, Cycle: 1,
+			Goal: domain.Goal{Text: "idle loop", MaxCycles: 12}},
+	}
+	m.cursor = 0
+	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
+	if !strings.Contains(joined, "🌐:3000") {
+		t.Errorf("expected the 🌐:3000 tag, got:\n%s", joined)
+	}
+}
+
+func TestFleetPanelLines_NoPorts_NoTagColumn(t *testing.T) {
+	// the common no-e2e-server fleet must not gain a blank column — no 🌐
+	// anywhere in the panel.
+	m := New()
+	m.loops = []domain.Loop{
+		{Project: "web", SessionID: "s1", State: domain.StateRunning, Cycle: 2,
+			Goal: domain.Goal{Text: "some goal", MaxCycles: 12}},
+	}
+	m.cursor = 0
+	joined := strings.Join(m.fleetPanelLines(120, 10), "\n")
+	if strings.Contains(joined, "🌐") {
+		t.Errorf("expected no port glyph in a fleet with no observed ports, got:\n%s", joined)
+	}
+}
+
+func TestRenderDetail_WithPorts_ShowsPortsRow(t *testing.T) {
+	l := domain.Loop{Project: "web", SessionID: "s1", State: domain.StateRunning,
+		Cwd: "/x/web", CwdVerified: true, Path: "/x/s1.jsonl", Ports: []int{3000, 8080}}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if !strings.Contains(out, "PORTS") || !strings.Contains(out, ":3000 :8080") {
+		t.Errorf("detail pane should show a PORTS row with every observed port:\n%s", out)
+	}
+}
+
+func TestRenderDetail_NoPorts_OmitsPortsRow(t *testing.T) {
+	// presence/absence like the DRIVE row: nothing observed renders NO row
+	// — never a "no server" claim.
+	l := domain.Loop{Project: "web", SessionID: "s1", State: domain.StateIdle,
+		Cwd: "/x/web", Path: "/x/s1.jsonl"}
+	out := renderDetail(l, 80, 40, detailData{now: time.Now()})
+	if strings.Contains(out, "PORTS") {
+		t.Errorf("detail pane should have NO PORTS row when no port was observed:\n%s", out)
+	}
+}
+
+func TestDemoFleet_FlakyTests_CarriesObservedPort(t *testing.T) {
+	// the demo is what a new reader believes the product looks like — one
+	// loop must exercise the PORT column/PORTS row, in the only shape the
+	// real pipeline can produce: ports on a VERIFIED cwd (see applyPorts).
+	loops, _, _, _ := demoFleet()
+	for _, l := range loops {
+		if l.Project != "flaky-tests" {
+			continue
+		}
+		if len(l.Ports) != 1 || l.Ports[0] != 3000 {
+			t.Errorf("flaky-tests.Ports = %v, want [3000]", l.Ports)
+		}
+		if !l.CwdVerified {
+			t.Error("flaky-tests.CwdVerified = false — demo ports must ride a verified cwd, the only state the product produces")
+		}
+		return
+	}
+	t.Fatal("expected a flaky-tests loop in the demo fleet")
 }
