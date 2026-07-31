@@ -106,11 +106,20 @@ type Loop struct {
 	// prompt, deliberately: its choices are always some form of yes/no, so the
 	// information a human (or an agent) actually needs there is WHAT is being
 	// asked, which GatePrompt carries. Display-only; nothing selects from this.
-	GateOptions  []string
-	Project      string    // decoded project label (e.g. "myproject")
-	ProjectDir   string    // raw encoded project dir name, e.g. "-home-user-myproject"
-	Cwd          string    // best-effort decoded absolute cwd, for display only — see CwdVerified
-	CwdVerified  bool      // true once Cwd was confirmed against a live process's real lsof path (not a lossy decode); gates the spawn wizard's explicit [s] use-this-loop's-dir choice (see tui's wizardWhere)
+	GateOptions []string
+	Project     string // decoded project label (e.g. "myproject")
+	ProjectDir  string // raw encoded project dir name, e.g. "-home-user-myproject"
+	Cwd         string // best-effort decoded absolute cwd, for display only — see CwdVerified
+	CwdVerified bool   // true once Cwd was confirmed against a live process's real lsof path (not a lossy decode); gates the spawn wizard's explicit [s] use-this-loop's-dir choice (see tui's wizardWhere)
+	// Ports are the listening TCP ports observed (one bounded lsof pass, see
+	// claude.ListeningPortsByCwd/applyPorts) for processes whose cwd is this
+	// loop's VERIFIED Cwd — the captain's `make local PORT=xxxx` e2e server
+	// running as a sibling shell in the same worktree. Display-only metadata,
+	// only ever attached when CwdVerified is true. nil means "no port
+	// OBSERVED" (probe skipped/failed, or genuinely nothing listening) —
+	// never "the server is down"; and a present port claims exactly "a
+	// listening socket was observed there", never "healthy"/"e2e ready".
+	Ports        []int
 	SessionID    string    // Claude Code session id
 	Path         string    // path to the session JSONL
 	LastActivity time.Time // last log write

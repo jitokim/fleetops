@@ -789,7 +789,9 @@ func NewDemo() Model {
 //
 // The fixture deliberately covers every renderable shape this file knows
 // about, in one small fleet: a GATE (permission prompt), a plain RUNNING
-// loop, a RUNNING loop DELEGATING to a live subagent (v0.9.0 subagent
+// loop (flaky-tests — also the loop with an observed listening port, so the
+// FLEET PORT column and DETAIL PORTS row render, feat/ports-surfacing), a
+// RUNNING loop DELEGATING to a live subagent (v0.9.0 subagent
 // visibility — flock-audit, its TAIL row carrying the exact "delegating:
 // <type> — <child last line>" string applySubagentDelegation produces), a
 // DRIFT (oracle-rejected) loop, two unbound/observed loops (no goal at all
@@ -828,15 +830,23 @@ func demoFleet() (loops []domain.Loop, detailCache map[string]detailCacheEntry, 
 		TokensSpent:  640000,
 		LastActivity: now.Add(-40 * time.Second),
 	}
+	// feat/ports-surfacing: the one loop with an observed listening port —
+	// a dev server running in its worktree — so the FLEET PORT column and
+	// the DETAIL PORTS row have something real to show. CwdVerified
+	// accompanies it because the real pipeline only ever attaches ports to
+	// a verified cwd (see claude.applyPorts) — a demo loop with ports but
+	// an unverified cwd would be a state the product cannot produce.
 	flakyTests := domain.Loop{
 		Project:      "flaky-tests",
 		SessionID:    "demo-flaky-tests",
 		ProjectDir:   "-home-user-web",
 		Cwd:          "/home/user/web",
+		CwdVerified:  true,
 		Path:         "/home/user/.claude/projects/-home-user-web/demo-flaky-tests.jsonl",
 		State:        domain.StateRunning,
 		Cycle:        4,
 		Goal:         domain.Goal{Text: "fix flaky tests", MaxCycles: 12},
+		Ports:        []int{3000},
 		LastActivity: now.Add(-3 * time.Second),
 	}
 	// v0.9.0 subagent visibility: a RUNNING loop delegating to a live child.
@@ -5016,6 +5026,18 @@ const (
 	// the fixed-width panel. See listRowWidths for where it drops in the
 	// width cascade.
 	wAccount = 12
+	// wPort (feat/ports-surfacing): the FLEET row's optional listening-port
+	// column, shown ONLY when >=1 visible loop has observed ports (see
+	// fleetHasPorts) — a fleet with no live e2e server never requests it,
+	// keeping those rows byte-identical to before this column existed. The
+	// tag renders as "🌐:3000" ("+N" appended for extra ports when it fits
+	// — see portTag); 10 fits the widest single port "🌐:65535" (8 cols, 🌐
+	// is 2) with a column gap, and is deliberately this lean so the column
+	// SURVIVES renderWide's capped FLEET panel (wideLeftCap 72 → inner 70)
+	// next to the ACCOUNT tag: at wPort 12 the readability cascade had to
+	// shed it there, making the feature invisible in exactly the layout the
+	// captain runs. See listRowWidths for where it drops in the cascade.
+	wPort = 10
 )
 
 // nameFloorWidth/nameCapWidth bound the FLEET panel's NAME column: below the
@@ -5352,8 +5374,17 @@ func fleetOracleCountsCmd(loops []domain.Loop) tea.Cmd {
 // column). When wantAccount is false showAccount starts false and never
 // enters the width math, so a single-/zero-account fleet's widths — and the
 // three lines below — are byte-identical to before this column existed.
-func listRowWidths(innerWidth int, wantAccount bool) (wName int, showAccount, showCycle, showOracle, showLast bool) {
-	showAccount, showCycle, showOracle, showLast = wantAccount, true, true, true
+//
+// feat/ports-surfacing: the PORT tag column follows the ACCOUNT pattern
+// exactly — requested by the caller (wantPort — true only when >=1 visible
+// loop has observed ports, see fleetHasPorts), never by width alone, and
+// showPort never enters the width math when unrequested (a no-server fleet
+// keeps byte-identical rows). In the cascade it drops BEFORE ACCOUNT:
+// port is a convenience glance ("which port is this worktree's server on"),
+// while the account tag disambiguates whose loop a row even is — identity
+// beats convenience when width runs out.
+func listRowWidths(innerWidth int, wantAccount, wantPort bool) (wName int, showAccount, showPort, showCycle, showOracle, showLast bool) {
+	showAccount, showPort, showCycle, showOracle, showLast = wantAccount, wantPort, true, true, true
 	name := func() int {
 		fixed := wMarker + wState
 		if showLast {
@@ -5368,16 +5399,22 @@ func listRowWidths(innerWidth int, wantAccount bool) (wName int, showAccount, sh
 		if showAccount {
 			fixed += wAccount
 		}
+		if showPort {
+			fixed += wPort
+		}
 		return innerWidth - fixed
 	}
-	// drop right-to-priority: ORACLE first, then CYCLE, then ACCOUNT (all
-	// readability-floor gated), then LAST (physical floor) — see this
-	// function's own doc for why this specific order.
+	// drop right-to-priority: ORACLE first, then CYCLE, then PORT, then
+	// ACCOUNT (all readability-floor gated), then LAST (physical floor) —
+	// see this function's own doc for why this specific order.
 	if name() < nameGoodWidth {
 		showOracle = false
 	}
 	if name() < nameGoodWidth {
 		showCycle = false
+	}
+	if name() < nameGoodWidth {
+		showPort = false
 	}
 	if name() < nameGoodWidth {
 		showAccount = false
@@ -5392,7 +5429,7 @@ func listRowWidths(innerWidth int, wantAccount bool) (wName int, showAccount, sh
 	if wName > nameCapWidth {
 		wName = nameCapWidth
 	}
-	return wName, showAccount, showCycle, showOracle, showLast
+	return wName, showAccount, showPort, showCycle, showOracle, showLast
 }
 
 // renderListRow renders one FLEET panel row: marker+NAME+STATE[+CYCLE]
@@ -5402,7 +5439,7 @@ func listRowWidths(innerWidth int, wantAccount bool) (wName int, showAccount, sh
 // (Model.fleetOracleCounts, looked up by the caller — this function does
 // no I/O of its own, same discipline as everything else in this file's
 // render path).
-func renderListRow(l domain.Loop, sel, dup bool, wName int, showAccount, showCycle, showOracle, showLast bool, oracleCount int, totalWidth int) string {
+func renderListRow(l domain.Loop, sel, dup bool, wName int, showAccount, showPort, showCycle, showOracle, showLast bool, oracleCount int, totalWidth int) string {
 	// feat/engine-provenance: wMarker is 2 cols wide, but the cursor glyph
 	// below only ever occupies 1 of them — the second was always blank
 	// padding. Rather than widen the row for a Driven marker, that
@@ -5437,6 +5474,14 @@ func renderListRow(l domain.Loop, sel, dup bool, wName int, showAccount, showCyc
 	// columns to its right stay lined up across rows.
 	if showAccount {
 		cells = append(cells, stDim.Width(wAccount).Render(accountTag(l.Account.Label())))
+	}
+	// feat/ports-surfacing: observed listening ports, dim like the other
+	// metadata columns — a pure observation ("a listening socket exists in
+	// this loop's verified cwd"), not a health claim. A loop with no
+	// observed ports renders a blank cell of width wPort, aligned, so the
+	// columns to its right stay lined up across rows.
+	if showPort {
+		cells = append(cells, stDim.Width(wPort).Render(portTag(l.Ports)))
 	}
 	if showCycle {
 		cells = append(cells, stDim.Width(wCycle).Render(cycleLabel(l)))
@@ -5516,6 +5561,59 @@ func multiAccountFleet(loops []domain.Loop) bool {
 	return false
 }
 
+// portTag is the FLEET panel's PORT column value: the loop's first observed
+// listening port as "🌐:3000", with a "+N" suffix when more ports were
+// observed in the same cwd (the full list lives in the DETAIL panel's PORTS
+// row), or "" for a loop with no observed ports, which renders as a blank
+// cell of width wPort so the columns to its right stay aligned across rows.
+// When "+N" would overflow wPort-1 (a 5-digit port with extras) the SUFFIX
+// is dropped, never trunc'd: an ellipsis mid-number would display a port
+// that doesn't exist, and a wrong port is worse than an omitted "more"
+// hint. The bare port always fits by construction (🌐 2 + ":65535" 6 =
+// 8 <= wPort-1). Pure observation — a listening socket seen in the loop's
+// verified cwd, no health/readiness claim (see domain.Loop.Ports). The
+// >=1-loop-has-ports gate that decides whether this column shows at all
+// lives in the caller (fleetHasPorts).
+func portTag(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	tag := "🌐:" + strconv.Itoa(ports[0])
+	if len(ports) > 1 {
+		if withMore := tag + "+" + strconv.Itoa(len(ports)-1); narrowAmbiguous.StringWidth(withMore) <= wPort-1 {
+			tag = withMore
+		}
+	}
+	return tag
+}
+
+// portsDetailValue is the DETAIL panel's PORTS row value: every observed
+// listening port, ":3000 :8080" — the full list portTag's "+N" summarizes.
+// Callers only render the row when ports exist (presence/absence, like the
+// DRIVE row), so this never needs an empty placeholder.
+func portsDetailValue(ports []int) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = ":" + strconv.Itoa(p)
+	}
+	return strings.Join(parts, " ")
+}
+
+// fleetHasPorts reports whether at least one (visible) loop has observed
+// listening ports — the only condition under which the FLEET panel shows
+// its PORT column. Below it (the common no-e2e-server fleet) the column
+// would be a blank cell on every row, so it must add nothing at all,
+// keeping today's byte-identical rows — the same presence gate
+// multiAccountFleet applies to the ACCOUNT column.
+func fleetHasPorts(loops []domain.Loop) bool {
+	for _, l := range loops {
+		if len(l.Ports) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // fleetPanelLines builds the FLEET panel's content lines, scrolled (see
 // visibleWindow) so the cursor row stays visible within innerHeight rows.
 // Callers pad/clip the result to exactly innerHeight via padLines.
@@ -5535,13 +5633,13 @@ func (m Model) fleetPanelLines(innerWidth, innerHeight int) []string {
 	case len(visible) == 0:
 		return []string{stFaint.Render(fmt.Sprintf("no loops match filter %q.", m.filterQuery))}
 	}
-	wName, showAccount, showCycle, showOracle, showLast := listRowWidths(innerWidth, multiAccountFleet(visible))
+	wName, showAccount, showPort, showCycle, showOracle, showLast := listRowWidths(innerWidth, multiAccountFleet(visible), fleetHasPorts(visible))
 	dupLabels := duplicateLabels(visible)
 	start, end := visibleWindow(len(visible), m.cursor, innerHeight)
 	rows := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
 		l := visible[i]
-		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.DisplayLabel()], wName, showAccount, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
+		rows = append(rows, renderListRow(l, i == m.cursor, dupLabels[l.DisplayLabel()], wName, showAccount, showPort, showCycle, showOracle, showLast, m.fleetOracleCounts[l.SessionID], innerWidth))
 	}
 	return rows
 }
@@ -6158,6 +6256,14 @@ func renderDetail(l domain.Loop, width, height int, data detailData) string {
 	}
 	d.WriteString(detailRow("LAST", stInk.Render(rel(time.Since(l.LastActivity))+"  ("+l.LastActivity.Format("15:04:05")+")")))
 	d.WriteString(detailRow("CWD", stDim.Render(trunc(l.Cwd, valueWidth))))
+	// feat/ports-surfacing: every observed listening port in this loop's
+	// verified cwd, directly under CWD so the directory and its e2e server
+	// read together ("which port is THIS worktree's `make local` on"). Same
+	// presence/absence discipline as the DRIVE/CLAUDE rows — omitted
+	// entirely when nothing was observed, never a claim the server is down.
+	if len(l.Ports) > 0 {
+		d.WriteString(detailRow("PORTS", stDim.Render(trunc(portsDetailValue(l.Ports), valueWidth))))
+	}
 	// multi-account Phase B: omitted ENTIRELY (not shown blank) when
 	// l.Account.Label() is "" — the default account (the common
 	// zero-config case) renders no row at all here, matching the DRIVE

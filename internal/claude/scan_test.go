@@ -2913,3 +2913,89 @@ func TestOutstandingBackgroundWork_ForegroundOutstanding_StillFalse(t *testing.T
 		t.Error("a foreground launch must not count as outstanding BACKGROUND work")
 	}
 }
+
+// ── PORTS surfacing (pivot §11): applyPorts / anyCwdVerified ─────────────
+
+func TestApplyPorts_VerifiedExactMatch_Attaches(t *testing.T) {
+	loops := []domain.Loop{
+		{SessionID: "s1", ProjectDir: "-x-web", Cwd: "/x/web", CwdVerified: true, State: domain.StateRunning},
+	}
+
+	out := applyPorts(loops, map[string][]int{"/x/web": {3000, 8080}}, true)
+
+	if len(out[0].Ports) != 2 || out[0].Ports[0] != 3000 || out[0].Ports[1] != 8080 {
+		t.Errorf("Ports = %v, want [3000 8080]", out[0].Ports)
+	}
+}
+
+func TestApplyPorts_ProbeFailed_AttachesNothing(t *testing.T) {
+	// honesty rule 1: a failed probe is not evidence — nothing may be
+	// attached (or claimed) on no data, even for a loop that WOULD match.
+	loops := []domain.Loop{
+		{SessionID: "s1", Cwd: "/x/web", CwdVerified: true, State: domain.StateRunning},
+	}
+
+	out := applyPorts(loops, map[string][]int{"/x/web": {3000}}, false)
+
+	if out[0].Ports != nil {
+		t.Errorf("Ports = %v, want nil — probe failure must attach nothing", out[0].Ports)
+	}
+}
+
+func TestApplyPorts_UnverifiedCwd_NeverAttaches(t *testing.T) {
+	// honesty rule 4: only a live-process-verified cwd may match — an
+	// unverified Cwd is a LOSSY decode, and attaching on it could pin
+	// another directory's server to this loop.
+	loops := []domain.Loop{
+		{SessionID: "s1", Cwd: "/x/web", CwdVerified: false, State: domain.StateIdle},
+	}
+
+	out := applyPorts(loops, map[string][]int{"/x/web": {3000}}, true)
+
+	if out[0].Ports != nil {
+		t.Errorf("Ports = %v, want nil — unverified cwd must never attach", out[0].Ports)
+	}
+}
+
+func TestApplyPorts_SubdirectoryListener_DoesNotAttach(t *testing.T) {
+	// exact match only (v1): a server in a SUBdirectory of the loop's cwd
+	// attaches nowhere — prefix matching is deliberately not done.
+	loops := []domain.Loop{
+		{SessionID: "s1", Cwd: "/x/web", CwdVerified: true, State: domain.StateRunning},
+	}
+
+	out := applyPorts(loops, map[string][]int{"/x/web/e2e": {4000}}, true)
+
+	if out[0].Ports != nil {
+		t.Errorf("Ports = %v, want nil — subdirectory listener must not attach to the parent", out[0].Ports)
+	}
+}
+
+func TestApplyPorts_StateNeverTouched(t *testing.T) {
+	// display-only metadata: ports enrichment must never reclassify a loop
+	// — a port's presence (or disappearance) is not a StallKind.
+	loops := []domain.Loop{
+		{SessionID: "s1", Cwd: "/x/web", CwdVerified: true, State: domain.StateStalled, Stall: domain.StallNoOutput},
+	}
+
+	out := applyPorts(loops, map[string][]int{"/x/web": {3000}}, true)
+
+	if out[0].State != domain.StateStalled || out[0].Stall != domain.StallNoOutput {
+		t.Errorf("State/Stall = %v/%v, want untouched StateStalled/StallNoOutput", out[0].State, out[0].Stall)
+	}
+	if len(out[0].Ports) != 1 || out[0].Ports[0] != 3000 {
+		t.Errorf("Ports = %v, want [3000]", out[0].Ports)
+	}
+}
+
+func TestAnyCwdVerified(t *testing.T) {
+	if anyCwdVerified([]domain.Loop{{CwdVerified: false}, {CwdVerified: false}}) {
+		t.Error("got true, want false — no loop is verified")
+	}
+	if !anyCwdVerified([]domain.Loop{{CwdVerified: false}, {CwdVerified: true}}) {
+		t.Error("got false, want true — one verified loop is enough")
+	}
+	if anyCwdVerified(nil) {
+		t.Error("got true, want false for an empty fleet")
+	}
+}

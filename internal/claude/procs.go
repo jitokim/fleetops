@@ -4,6 +4,8 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -99,6 +101,155 @@ func parsePsClaudePids(out string) []int {
 func matchesClaudeComm(comm string) bool {
 	name := strings.TrimSuffix(filepath.Base(comm), ".exe")
 	return name == "claude"
+}
+
+// ListeningPortsByCwd returns real (unencoded) cwd → sorted distinct TCP
+// ports with a listening socket held by a process working there — the
+// captain's `make local PORT=xxxx` e2e server running as a sibling shell in
+// a worktree, found the same way LiveClaudeCwds finds claude processes: two
+// bounded lsof probes (system-wide listeners, then those pids' cwds), each
+// under procTimeout so a wedged process table never hangs the TUI's refresh.
+//
+// ok=false means a probe itself failed — the caller MUST NOT treat that as
+// "no servers": a racing lsof is not evidence a server died, so on failure
+// nothing may be attached OR cleared based on this result. (lsof exits
+// non-zero both on real failure and when zero sockets match the filter;
+// they're indistinguishable here, and both correctly attach nothing.)
+func ListeningPortsByCwd() (map[string][]int, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), procTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn").Output()
+	if err != nil {
+		return map[string][]int{}, false
+	}
+	portsByPid := parseLsofListenPorts(string(out))
+	if len(portsByPid) == 0 {
+		return map[string][]int{}, true // probe succeeded; genuinely zero listeners
+	}
+	pidStrs := make([]string, 0, len(portsByPid))
+	for pid := range portsByPid {
+		pidStrs = append(pidStrs, strconv.Itoa(pid))
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), procTimeout)
+	defer cancel2()
+	cwdOut, err := exec.CommandContext(ctx2, "lsof", "-a", "-p", strings.Join(pidStrs, ","), "-d", "cwd", "-Fn").Output()
+	if err != nil {
+		return map[string][]int{}, false
+	}
+	return joinPortsByCwd(portsByPid, parseLsofPidCwds(string(cwdOut))), true
+}
+
+// parseLsofListenPorts parses `lsof -nP -iTCP -sTCP:LISTEN -Fpn` output —
+// interleaved "p<pid>"/"f<fd>"/"n<addr>" lines, one "n" per listening
+// socket — into pid → sorted distinct ports. One server commonly listens
+// twice per port (IPv4 "*:3000" + IPv6 "[::]:3000"), so ports dedup per
+// pid. An addr whose port doesn't parse (e.g. "*:*") attaches nothing —
+// never a guessed port — and an unparseable "p" line orphans the "n" lines
+// under it rather than crediting them to the previous pid.
+func parseLsofListenPorts(out string) map[int][]int {
+	ports := make(map[int][]int)
+	pid := -1
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			id, err := strconv.Atoi(line[1:])
+			if err != nil {
+				pid = -1
+				continue
+			}
+			pid = id
+		case 'n':
+			if pid < 0 {
+				continue
+			}
+			port, ok := listenAddrPort(line[1:])
+			if !ok {
+				continue
+			}
+			if !slices.Contains(ports[pid], port) {
+				ports[pid] = append(ports[pid], port)
+			}
+		}
+	}
+	for _, ps := range ports {
+		sort.Ints(ps)
+	}
+	return ports
+}
+
+// listenAddrPort extracts the port from an lsof listen-socket name field —
+// "*:3000", "127.0.0.1:3000", "[::1]:3000" — the text after the LAST colon
+// (IPv6 addrs contain colons of their own). ok=false for anything that
+// isn't a valid port number.
+func listenAddrPort(addr string) (int, bool) {
+	idx := strings.LastIndexByte(addr, ':')
+	if idx < 0 {
+		return 0, false
+	}
+	port, err := strconv.Atoi(addr[idx+1:])
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
+}
+
+// parseLsofPidCwds parses `lsof -a -p <pids> -d cwd -Fn` output into
+// pid → cwd path — the same record shape parseLsofCwds reads, but keyed by
+// pid instead of counted, because the ports join needs to know WHICH
+// process's cwd each listener has. An unparseable "p" line orphans the "n"
+// under it (never credited to the previous pid), same as
+// parseLsofListenPorts.
+func parseLsofPidCwds(out string) map[int]string {
+	cwds := make(map[int]string)
+	pid := -1
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			id, err := strconv.Atoi(line[1:])
+			if err != nil {
+				pid = -1
+				continue
+			}
+			pid = id
+		case 'n':
+			if pid < 0 {
+				continue
+			}
+			cwds[pid] = line[1:]
+		}
+	}
+	return cwds
+}
+
+// joinPortsByCwd joins the two probes: listener pids' ports, keyed by those
+// pids' real cwd paths. A listener whose pid has no cwd record (process
+// exited between the two probes, or lsof couldn't resolve it) contributes
+// nothing — an unattributable port is never attached anywhere. Ports dedup
+// per cwd (two servers in one dir can share a port across restarts' TIME_WAIT
+// races, and a dir can host several pids listening on the same port family).
+func joinPortsByCwd(portsByPid map[int][]int, cwdByPid map[int]string) map[string][]int {
+	byCwd := make(map[string][]int)
+	for pid, ports := range portsByPid {
+		cwd, ok := cwdByPid[pid]
+		if !ok || cwd == "" {
+			continue
+		}
+		for _, p := range ports {
+			if !slices.Contains(byCwd[cwd], p) {
+				byCwd[cwd] = append(byCwd[cwd], p)
+			}
+		}
+	}
+	for _, ps := range byCwd {
+		sort.Ints(ps)
+	}
+	return byCwd
 }
 
 // parseLsofCwds parses `lsof -a -p <pids> -d cwd -Fn` output: interleaved

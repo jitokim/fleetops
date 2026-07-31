@@ -106,3 +106,103 @@ func TestParseLsofCwds_IgnoresNonNLines(t *testing.T) {
 		t.Errorf("got %+v, want {/tmp/x: 1}", counts)
 	}
 }
+
+func TestParseLsofListenPorts(t *testing.T) {
+	// real captured shape of `lsof -nP -iTCP -sTCP:LISTEN -Fpn`: p/f/n
+	// records, one n per listening socket. pid 100 listens on 3000 twice
+	// (IPv4 "*:3000" + IPv6 "[::]:3000" — the common dual-stack server,
+	// must dedup to ONE 3000) plus 8080; pid 200 on a loopback addr.
+	out := "p100\nf23\nn*:3000\nf24\nn[::]:3000\nf25\nn*:8080\n" +
+		"p200\nf10\nn127.0.0.1:5173\n"
+
+	ports := parseLsofListenPorts(out)
+	if len(ports) != 2 {
+		t.Fatalf("got %d pids, want 2: %+v", len(ports), ports)
+	}
+	if len(ports[100]) != 2 || ports[100][0] != 3000 || ports[100][1] != 8080 {
+		t.Errorf("ports[100] = %v, want [3000 8080] (dual-stack 3000 deduped, sorted)", ports[100])
+	}
+	if len(ports[200]) != 1 || ports[200][0] != 5173 {
+		t.Errorf("ports[200] = %v, want [5173]", ports[200])
+	}
+}
+
+func TestParseLsofListenPorts_UnparseableAddrAttachesNothing(t *testing.T) {
+	// an addr with no valid port ("*:*", garbage) must attach nothing —
+	// never a guessed port. Honesty rule: ambiguous → nothing.
+	out := "p100\nf23\nn*:*\nf24\nngarbage\n"
+	if ports := parseLsofListenPorts(out); len(ports) != 0 {
+		t.Errorf("got %+v, want empty — unparseable addrs must not attach", ports)
+	}
+}
+
+func TestParseLsofListenPorts_BadPidLineOrphansItsRecords(t *testing.T) {
+	// an unparseable "p" line must orphan the n-lines under it, NOT credit
+	// them to the previous pid.
+	out := "p100\nf23\nn*:3000\npNOPE\nf24\nn*:9999\n"
+	ports := parseLsofListenPorts(out)
+	if len(ports) != 1 || len(ports[100]) != 1 || ports[100][0] != 3000 {
+		t.Errorf("got %+v, want {100: [3000]} — 9999 belongs to an unparseable pid", ports)
+	}
+}
+
+func TestParseLsofListenPorts_Empty(t *testing.T) {
+	if ports := parseLsofListenPorts(""); len(ports) != 0 {
+		t.Errorf("got %+v, want empty", ports)
+	}
+}
+
+func TestListenAddrPort(t *testing.T) {
+	cases := []struct {
+		addr string
+		port int
+		ok   bool
+	}{
+		{"*:3000", 3000, true},
+		{"127.0.0.1:8080", 8080, true},
+		{"[::1]:5173", 5173, true}, // port is after the LAST colon — IPv6 addrs contain their own
+		{"[::]:80", 80, true},
+		{"*:*", 0, false},
+		{"no-colon", 0, false},
+		{"*:0", 0, false},     // 0 is not a real listening port
+		{"*:99999", 0, false}, // out of range
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		port, ok := listenAddrPort(c.addr)
+		if port != c.port || ok != c.ok {
+			t.Errorf("listenAddrPort(%q) = (%d, %v), want (%d, %v)", c.addr, port, ok, c.port, c.ok)
+		}
+	}
+}
+
+func TestParseLsofPidCwds(t *testing.T) {
+	// same record shape parseLsofCwds reads, but keyed by pid for the
+	// ports join.
+	out := "p100\nfcwd\nn/x/worktree-a\np200\nfcwd\nn/x/worktree-b\n"
+	cwds := parseLsofPidCwds(out)
+	if len(cwds) != 2 || cwds[100] != "/x/worktree-a" || cwds[200] != "/x/worktree-b" {
+		t.Errorf("got %+v, want {100: /x/worktree-a, 200: /x/worktree-b}", cwds)
+	}
+}
+
+func TestJoinPortsByCwd(t *testing.T) {
+	portsByPid := map[int][]int{
+		100: {3000},
+		200: {8080},
+		300: {9999}, // no cwd record (exited between probes) — must attach nowhere
+	}
+	cwdByPid := map[int]string{
+		100: "/x/worktree-a",
+		200: "/x/worktree-a", // second server in the same dir — ports merge
+	}
+
+	byCwd := joinPortsByCwd(portsByPid, cwdByPid)
+	if len(byCwd) != 1 {
+		t.Fatalf("got %d cwds, want 1: %+v", len(byCwd), byCwd)
+	}
+	got := byCwd["/x/worktree-a"]
+	if len(got) != 2 || got[0] != 3000 || got[1] != 8080 {
+		t.Errorf("got %v, want [3000 8080] (merged across pids, sorted)", got)
+	}
+}
