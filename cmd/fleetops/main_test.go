@@ -99,6 +99,47 @@ func TestHelpText_MentionsDemoFlag(t *testing.T) {
 	}
 }
 
+func TestParseTUIFlags(t *testing.T) {
+	cases := []struct {
+		name           string
+		args           []string
+		wantDemo       bool
+		wantRenameTabs bool
+		wantUnknown    string
+		wantOK         bool
+	}{
+		{"no flags", nil, false, false, "", true},
+		{"demo only", []string{"--demo"}, true, false, "", true},
+		{"rename-tabs only", []string{"--rename-tabs"}, false, true, "", true},
+		{"both, any order", []string{"--rename-tabs", "--demo"}, true, true, "", true},
+		{"unknown token refuses", []string{"--bogus"}, false, false, "--bogus", false},
+		{"names the offending token, not the first arg", []string{"--demo", "--nope"}, false, false, "--nope", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, unknown, ok := parseTUIFlags(tc.args)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				if unknown != tc.wantUnknown {
+					t.Errorf("unknown token = %q, want %q", unknown, tc.wantUnknown)
+				}
+				return // on refusal the flags are the zero value; nothing else to check
+			}
+			if f.demo != tc.wantDemo || f.renameTabs != tc.wantRenameTabs {
+				t.Errorf("parseTUIFlags(%v) = %+v, want demo=%v renameTabs=%v", tc.args, f, tc.wantDemo, tc.wantRenameTabs)
+			}
+		})
+	}
+}
+
+func TestHelpText_MentionsRenameTabsFlag(t *testing.T) {
+	if got := helpText(); !strings.Contains(got, "--rename-tabs") {
+		t.Errorf("expected help text to mention --rename-tabs, got:\n%s", got)
+	}
+}
+
 // TestNewModel_DemoFlag_RoutesToDemoConstructor is the "--demo flag routes
 // to demo mode" proof at this package's level: newModel(true) must be
 // tui.NewDemo()'s result, not tui.New()'s — verified through the ONLY
@@ -108,7 +149,7 @@ func TestHelpText_MentionsDemoFlag(t *testing.T) {
 // would take over the terminal and block on input), so this is safe to
 // run in-process.
 func TestNewModel_DemoFlag_RoutesToDemoConstructor(t *testing.T) {
-	demoView := newModel(true).View()
+	demoView := newModel(true, false).View()
 	if !strings.Contains(demoView, "demo mode") {
 		t.Errorf("newModel(true).View() did not contain the demo status line:\n%s", demoView)
 	}
@@ -116,7 +157,7 @@ func TestNewModel_DemoFlag_RoutesToDemoConstructor(t *testing.T) {
 		t.Errorf("newModel(true).View() did not contain the demo hostname \"dev-box\":\n%s", demoView)
 	}
 
-	normalView := newModel(false).View()
+	normalView := newModel(false, false).View()
 	if strings.Contains(normalView, "demo mode") {
 		t.Errorf("newModel(false).View() unexpectedly contained the demo status line:\n%s", normalView)
 	}

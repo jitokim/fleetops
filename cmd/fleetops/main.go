@@ -4,6 +4,9 @@
 // `--demo`: launch the same TUI seeded with a fixed synthetic fleet instead
 // of scanning ~/.claude/projects — no real data read, nothing written to
 // ~/.fleetops (see internal/tui.NewDemo).
+// `--rename-tabs`: opt-in (default off) — auto-rename the cmux tab of each
+// unambiguously-mapped loop to reflect its state/delegation (see
+// internal/tui tab-title sync; cmux-only, a terminal write side-effect).
 // Subcommands: `hook notify|session-start|session-end` (Claude Code hook
 // entry points, see hook.go), `hooks install|uninstall` (register/remove
 // those hooks in ~/.claude/settings.json, see hooks.go), and
@@ -35,18 +38,49 @@ func main() {
 		case "report":
 			runReportCmd(os.Args[2:])
 			return
-		case "--demo":
-			runTUI(true)
-			return
 		case "help", "--help", "-h":
 			fmt.Print(helpText())
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "fleetops: unknown command %q\n", os.Args[1])
-			os.Exit(1)
+			// Not a subcommand — parse the remaining args as TUI flags
+			// (--demo / --rename-tabs). An unknown token still errors (naming the
+			// OFFENDING token, not just os.Args[1]), so `fleetops bogus` keeps its
+			// exit-1 behavior.
+			f, bad, ok := parseTUIFlags(os.Args[1:])
+			if !ok {
+				fmt.Fprintf(os.Stderr, "fleetops: unknown command %q\n", bad)
+				os.Exit(1)
+			}
+			runTUI(f.demo, f.renameTabs)
+			return
 		}
 	}
-	runTUI(false)
+	runTUI(false, false)
+}
+
+// tuiFlags are the flags that modify the TUI launch (no subcommand).
+type tuiFlags struct {
+	demo       bool
+	renameTabs bool
+}
+
+// parseTUIFlags parses the TUI-launch flags out of args (everything after the
+// program name). Order-independent; on the first unrecognized token it returns
+// ok=false and that token (unknown), so the caller reports the OFFENDING token
+// rather than a misattributed os.Args[1]. Pure, so the routing is unit-testable
+// without starting a real Bubble Tea program.
+func parseTUIFlags(args []string) (f tuiFlags, unknown string, ok bool) {
+	for _, a := range args {
+		switch a {
+		case "--demo":
+			f.demo = true
+		case "--rename-tabs":
+			f.renameTabs = true
+		default:
+			return tuiFlags{}, a, false
+		}
+	}
+	return f, "", true
 }
 
 // helpText is `fleetops --help`/`-h`/`help`'s full output: a one-line
@@ -63,6 +97,7 @@ Code sessions and lets you approve/resume/inject/kill them from one TUI.
 Usage:
   fleetops                     launch the fleet cockpit (TUI)
   fleetops --demo              launch the TUI with a synthetic fleet — no real data, no disk writes
+  fleetops --rename-tabs       (with the TUI) mirror each loop's state + goal onto its cmux tab title (opt-in, cmux only)
   fleetops report [--since D]  plain-text summary of the event history (default 24h)
   fleetops hooks install       register fleetops's Claude Code hooks (gate/idle detection)
   fleetops hooks uninstall     remove them
@@ -101,14 +136,16 @@ TUI keymap:
 // directly testable without starting a real Bubble Tea program (Run()
 // takes over the terminal and blocks on input, unsafe to invoke in a
 // test).
-func newModel(demo bool) tea.Model {
+func newModel(demo, renameTabs bool) tea.Model {
 	if demo {
+		// --demo ignores renameTabs: demo never scans real loops, so there is
+		// nothing to mirror onto a tab (and demo must touch nothing real).
 		return tui.NewDemo()
 	}
-	return tui.New()
+	return tui.New().WithRenameTabs(renameTabs)
 }
 
-func runTUI(demo bool) {
+func runTUI(demo, renameTabs bool) {
 	if demo {
 		// --demo ignores ~/.fleetops/settings.json entirely and always spawns
 		// with the built-in ["claude"]. Demo mode's contract is "nothing real",
@@ -121,7 +158,7 @@ func runTUI(demo bool) {
 		// keymap.
 		control.UseDefaultSpawnCommand()
 	}
-	p := tea.NewProgram(newModel(demo), tea.WithAltScreen())
+	p := tea.NewProgram(newModel(demo, renameTabs), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fleetops:", err)
 		os.Exit(1)

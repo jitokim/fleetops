@@ -67,8 +67,16 @@ var (
 	resolveActuationTargetFn = control.ResolveActuationTarget
 	redriveFn                = control.Redrive
 	sessionsDirFn            = sessions.SessionsDir
-	historyDirFn             = events.HistoryDir
-	notifySendFn             = notify.Send
+	// resolveTabTitlerFn is control.ResolveTabTitler by default — the
+	// feat/cmux-tab-rename target resolver, which reuses actuation's SAME
+	// fail-closed locate/ambiguity discipline but returns a TabTitler+Target
+	// (terminal chrome, not the send/keystroke Actuator seam — pivot §5.1).
+	// A seam so the presentation-sync driver's debounce, opt-in gate, and
+	// ambiguity-skip are unit-testable without a real cmux binary (there is
+	// none on the dev box).
+	resolveTabTitlerFn = control.ResolveTabTitler
+	historyDirFn       = events.HistoryDir
+	notifySendFn       = notify.Send
 	// hiddenFileFn is hidden.HiddenFile by default — the persisted hide-set
 	// seam ("d"/"x"). Overridable so the hide/delete keys and startup load can
 	// be verified without touching the real ~/.fleetops/hidden.json.
@@ -715,6 +723,31 @@ type Model struct {
 	// re-surfaces a still-broken install, since "dismissed once" must never
 	// mean "silently half-working forever".
 	hookDismissed bool
+
+	// renameTabs is feat/cmux-tab-rename's OPT-IN gate (the `--rename-tabs`
+	// flag, default OFF — see WithRenameTabs). When false the fleet is observed
+	// purely: no tab is ever renamed. When true, each scan tick mirrors every
+	// unambiguously-mapped cmux loop's composed title onto its tab (see
+	// renameTabsCmd). Off by default because a rename is a write side-effect on
+	// a terminal fleetops did not create (pivot §5.1).
+	renameTabs bool
+	// lastTabTitle is the per-session debounce ledger for tab rename: sessionID
+	// → the title LAST SUCCESSFULLY WRITTEN. A rename fires only when the freshly
+	// composed title differs from this (steady state ⇒ zero cmux writes), and an
+	// entry is recorded ONLY after the write confirms (tabTitlesSyncedMsg), so a
+	// skipped/failed write is retried next tick rather than silently suppressed.
+	// In-memory only, like notifiedAt: a restart re-writes each tab once, which
+	// is harmless (the rename is idempotent).
+	lastTabTitle map[string]string
+}
+
+// WithRenameTabs sets the opt-in tab-rename gate (the `--rename-tabs` flag) and
+// returns the updated Model — a value-receiver setter so the constructor stays
+// arg-free (New()) and the flag is threaded in one explicit place at launch
+// (cmd/fleetops). Default OFF: a Model built by New() alone never renames a tab.
+func (m Model) WithRenameTabs(on bool) Model {
+	m.renameTabs = on
+	return m
 }
 
 func New() Model {
@@ -1084,6 +1117,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// promoted State/Last for anything that converged, so triggerDrives
 		// only ever sees the POST-scan picture, never a stale pre-scan one.
 		cmds := append([]tea.Cmd{m.triggerJudgments(), m.triggerDrives(), emitTransitionsCmd(transitions), gitCmd, detailCmd, fleetOracleCountsCmd(newLoops)}, autoRedriveCmds...)
+		// feat/cmux-tab-rename: mirror each unambiguously-mapped cmux loop's
+		// composed state/goal onto its tab title, opt-in and debounced (see
+		// renameTabsCmd). nil (no-op) when the flag is off or nothing changed.
+		cmds = append(cmds, m.renameTabsCmd(newLoops))
 		return m, tea.Batch(cmds...)
 	case gitStatsMsg:
 		if m.gitStats == nil {
@@ -1106,6 +1143,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detailCache = make(map[string]detailCacheEntry)
 		}
 		m.detailCache[msg.sessionID] = msg.entry
+		return m, nil
+	case tabTitlesSyncedMsg:
+		// Record ONLY the tabs whose rename actually confirmed — a skipped
+		// (ambiguous / non-cmux) or failed (bounded-exec) write leaves its
+		// sessionID out of the ledger so it is retried next tick, never
+		// silently marked "already at this title" (see lastTabTitle).
+		if len(msg.written) == 0 {
+			return m, nil
+		}
+		if m.lastTabTitle == nil {
+			m.lastTabTitle = make(map[string]string, len(msg.written))
+		}
+		for sessionID, title := range msg.written {
+			m.lastTabTitle[sessionID] = title
+		}
 		return m, nil
 	case autoRedriveScheduledMsg:
 		// Re-check the CURRENT (latest scan) state before firing — a loop

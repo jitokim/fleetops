@@ -165,6 +165,50 @@ func cmuxInterruptCmd(surfaceRef, windowRef string) []string {
 	return append(argv, "escape")
 }
 
+// SetTabTitle implements control.TabTitler: it renames the cmux TAB (window
+// chrome) hosting a surface to title, via `cmux rename-tab --surface <ref> --
+// <title>` (the name is positional, after the `--` terminator). Routed through
+// the SAME bounded-exec discipline every other cmux actuation uses
+// (runWithTimeout, via cmuxTabRunner) so a wedged cmux can never hang a scan
+// tick — a failure/timeout returns an error and the caller degrades to "didn't
+// rename", never a hang.
+//
+// SAME-WORKSPACE ONLY in v1: unlike Resume/Approve/Focus this passes NO
+// `--window` ref (see appendCmuxWindow), so cmux scopes the `--surface` ref to
+// the caller's own workspace and a tab in another workspace fails (→ caller
+// skips). Cross-workspace tab rename is a documented follow-up (pivot §5.1),
+// not fabricated here.
+//
+// cmux is the ONLY backend implementing TabTitler today; tmux/iTerm2/orca are
+// interface-sufficient follow-ups.
+//
+// NOT live-verified: no `cmux` binary is installed on the machine this was
+// written on, and the `rename-tab` subcommand's exact contract must be
+// confirmed against a real cmux (`cmux rename-tab --help`) before this is
+// relied on — cmux's public docs contradict each other on the surface-rename
+// verbs (pivot §5.1). The injectable cmuxTabRunner seam is what lets the argv
+// shape and error propagation be unit-tested WITHOUT that binary in the
+// meantime.
+func (cmuxController) SetTabTitle(t Target, title string) error {
+	return cmuxTabRunner(cmuxRenameTabCmd(t.ID, title))
+}
+
+// cmuxTabRunner is the injectable exec seam SetTabTitle's cmux call goes
+// through — runWithTimeout in production (bounded by actuationTimeout), swapped
+// by a fake in tests so the exact argv and error propagation are verifiable
+// WITHOUT a cmux binary installed. A func var defaulted to the real impl, the
+// same injectable-seam idiom cmux.go already uses for ttyResolver.
+var cmuxTabRunner = runWithTimeout
+
+// cmuxRenameTabCmd builds the argv that renames the tab hosting a surface:
+// cmux rename-tab --surface <ref> -- <title>. The title is positional AFTER the
+// `--` terminator so a title beginning with a dash (e.g. a glyph that reads as
+// a flag) is never mis-parsed as an option. No `--window`: v1 is same-workspace
+// only (see SetTabTitle).
+func cmuxRenameTabCmd(surfaceRef, title string) []string {
+	return []string{"cmux", "rename-tab", "--surface", surfaceRef, "--", title}
+}
+
 // cmuxTreeJSON runs `cmux tree --json`, bounded by availabilityTimeout so a
 // wedged cmux never hangs a keypress.
 func cmuxTreeJSON() ([]byte, error) {
